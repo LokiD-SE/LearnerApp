@@ -1,0 +1,743 @@
+id: idempotency-keys
+title: Idempotency keys and duplicate payment requests
+subject: api-testing
+module: payment-api-testing
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: Why a retried payment request can charge twice, how idempotency keys prevent it, and how to test and debug them.
+tags: [payments, api, retries, idempotency, root-cause analysis, interview]
+
+environment: |
+  - **Universal concepts:** idempotency, retries, ambiguous timeouts and exactly-once business outcomes apply to any payment system.
+  - **Standards:** HTTP method semantics come from **RFC 9110** (HTTP Semantics), section 9.2.2. The `Idempotency-Key` request header and the status codes it suggests (400, 409, 422) come from an IETF HTTPAPI working-group Internet-Draft, *The Idempotency-Key HTTP Header Field*. Check its current status before quoting it as a standard.
+  - **Provider-specific:** header name, key format, how long keys are kept, which responses are stored and replayed, and the exact error codes all differ between real providers. Always confirm them in the provider's API reference.
+  - **Examples:** **SandPay** (`https://api.sandpay.example`) is a fictional provider used for practice. No real credentials, cards or money are involved.
+  - **Code:** Java 17 or later, using the JDK's `java.net.http` client (no extra libraries).
+
+prerequisites:
+  - http-methods-safety-idempotency
+  - payment-lifecycle-overview
+
+concepts:
+  - id: idempotent-operations
+    name: Idempotent operations
+    summary: Repeating an operation has the same intended effect as doing it once.
+  - id: idempotency-key-contract
+    name: The idempotency key contract
+    summary: A client-chosen key lets the server recognise a retry and replay the first result.
+  - id: duplicate-payment-diagnosis
+    name: Diagnosing duplicate charges
+    summary: Using evidence to decide which layer produced the second charge.
+
+objectives:
+  - Explain the difference between an idempotent HTTP method and an idempotent business operation, and why `POST /payments` needs extra protection.
+  - Describe how a server implements idempotency keys - atomic reservation, request fingerprint, stored response and expiry.
+  - Design positive, negative and concurrency test cases for an idempotent payment endpoint, and name the evidence each one needs.
+  - Trace a duplicate-charge incident to the responsible layer, separating a confirmed cause from a plausible one.
+
+sections:
+  - id: intuition
+    kind: intuition
+    title: The idea in plain language
+    body: |
+      Imagine posting a valuable parcel. The clerk takes it, but before you get your receipt the
+      power fails. Did the parcel go? You can't tell. If you hand over a **second** parcel "just in
+      case", you may pay twice and send two parcels.
+
+      Now imagine every parcel slip has a number that **you** wrote on it. When the power comes back
+      you show the same slip again. The clerk looks up the number: *"Already accepted - here is your
+      original receipt."* Nothing is sent twice, and you finally know the outcome.
+
+      An **idempotency key** is that slip number. The client writes it on a request that changes
+      something (like charging a card). If the request has to be sent again, the server recognises
+      the number and returns the first result instead of doing the work again.
+
+  - id: what
+    kind: what
+    title: What it is
+    body: |
+      **Idempotent operation:** an operation whose *intended effect* is the same whether it runs once
+      or many times. RFC 9110 defines it for HTTP methods. The **effect** must be the same; the
+      **response** may differ (a second `DELETE` might return `404` instead of `204`).
+
+      | Method | Safe (read-only)? | Idempotent by definition? |
+      |---|---|---|
+      | `GET`, `HEAD`, `OPTIONS`, `TRACE` | Yes | Yes |
+      | `PUT` | No | Yes - the same full replacement again leaves the same state |
+      | `DELETE` | No | Yes - deleting twice leaves it deleted |
+      | `POST` | No | **No** - each request may create something new |
+      | `PATCH` | No | **No** in general - it depends on the patch |
+
+      Creating a payment is almost always a `POST`, so by itself it is **not** idempotent.
+
+      **Idempotency key:** a unique value the client sends with a non-idempotent request (commonly in
+      an `Idempotency-Key` header) to identify **one logical operation**. The server remembers the key
+      with the outcome, so a retry with the same key gets the stored result instead of a new charge.
+
+  - id: why
+    kind: why
+    title: Why it exists - the ambiguous timeout
+    body: |
+      Networks fail in a way that hides the outcome. A client sends `POST /v1/payments`, the server
+      charges the card, and then the response is lost - a mobile network drops, a proxy times out, the
+      app is killed. The client sees **"timeout"**, which means *"I don't know"*, not *"it failed"*.
+
+      Retries are everywhere, and most of them are not the user's fault:
+
+      - the user taps **Pay** twice, or refreshes the page;
+      - the app or SDK retries automatically after a timeout;
+      - a mobile app re-sends a pending request when connectivity returns;
+      - a proxy or service mesh retries an upstream call;
+      - a message queue delivers the same message again (at-least-once delivery).
+
+      The business requirement is an **exactly-once business outcome**: the customer is charged once,
+      however many times the request travels. Networks can't promise exactly-once *delivery*;
+      idempotency keys let the server turn many deliveries into one effect.
+
+  - id: internals
+    kind: internals
+    title: How it works internally
+    body: |
+      A typical server-side implementation, step by step:
+
+      1. **Validate the key.** If the API requires keys and one is missing or malformed, reject the
+         request (the IETF draft suggests `400 Bad Request`).
+      2. **Fingerprint the request.** Hash what identifies the operation - usually method, path and a
+         canonical form of the body. Keys are scoped to the caller (merchant or account), so two
+         merchants using the same key do not collide.
+      3. **Reserve the key atomically** - for example `INSERT` a row with status `IN_PROGRESS` under a
+         unique constraint on *(account, key)*. Exactly one request wins the insert. This is what
+         stops two simultaneous requests from both charging.
+      4. **If the key already exists**, decide without doing the work again:
+         - fingerprint differs → reject: the key was reused for a *different* request
+           (the draft suggests `422`);
+         - still `IN_PROGRESS` → tell the client to retry later (the draft suggests `409 Conflict`),
+           or wait for the first request to finish;
+         - finished with the same fingerprint → **replay** the stored status code and body.
+      5. **Do the work** - call the processor. Good designs pass their own idempotency reference
+         downstream too, so a retry towards the processor is also safe.
+      6. **Store the final response** (status code and body) with the key and mark it `COMPLETED`,
+         ideally in the same database transaction that records the payment.
+      7. **Expire** keys after a retention window. How long is provider-specific.
+
+      The dangerous gap is between steps 5 and 6: if the server crashes after the processor approved
+      the charge but before the result is stored, the key stays `IN_PROGRESS`. A recovery job must ask
+      the processor what happened (using the downstream reference) instead of charging again.
+
+  - id: when
+    kind: when
+    title: When to use it - and when not
+    body: |
+      **Use an idempotency key for** any request with side effects that a retry could repeat:
+      creating a payment, capturing an authorisation, refunding, paying out, creating an order,
+      sending a receipt email.
+
+      **You don't need one for** safe reads (`GET /v1/payments/{id}`), or for a correctly implemented
+      `PUT` that replaces a whole resource the client already named.
+
+      **Generate one key per logical operation** - per payment *intent*, for example when the
+      checkout is created or the first time **Pay** is tapped - and reuse it for every retry of that
+      operation. Never reuse a key for a new operation.
+
+      **It does not replace:**
+
+      - business rules about genuine repeat purchases - two real orders must use two keys;
+      - concurrency control on shared resources (for example optimistic locking on a balance);
+      - de-duplication of webhooks or queue messages - consumers use the **event id** for that.
+
+  - id: visual-sequence
+    kind: visual
+    title: "Sequence: a lost response and a safe retry"
+    body: |
+      The first response never reaches the client. The retry carries the **same key**, so the server
+      replays the stored result and the card is charged once.
+
+      ```mermaid
+      sequenceDiagram
+          participant C as Client (app)
+          participant A as Payments API
+          participant K as Key store / DB
+          participant P as Processor
+          C->>A: POST /v1/payments (Idempotency-Key k-42)
+          A->>K: reserve k-42 as IN_PROGRESS
+          A->>P: authorise 25.00 EUR
+          P-->>A: approved (auth 7781)
+          A->>K: store 201 response, mark COMPLETED
+          A--xC: 201 Created (response lost)
+          Note over C: Timeout - outcome unknown
+          C->>A: retry POST /v1/payments (Idempotency-Key k-42)
+          A->>K: look up k-42 - COMPLETED, same fingerprint
+          A-->>C: 201 Created (replayed, same payment id)
+      ```
+
+  - id: visual-flow
+    kind: visual
+    title: "Flowchart: how the server decides"
+    body: |
+      ```mermaid
+      flowchart TD
+          A[Request arrives] --> B{Key present and valid?}
+          B -- No --> B1[400 Bad Request]
+          B -- Yes --> C[Fingerprint method, path and body]
+          C --> D{Atomic insert of the key succeeds?}
+          D -- Yes --> E[Process the payment]
+          E --> F[Store status and body, mark COMPLETED]
+          F --> G[Return the response]
+          D -- No, key exists --> H{Same fingerprint?}
+          H -- No --> H1[422 - key reused for a different request]
+          H -- Yes --> I{Still in progress?}
+          I -- Yes --> I1[409 Conflict - retry later]
+          I -- No --> J[Replay the stored response]
+      ```
+
+  - id: steps
+    kind: steps
+    title: Step by step - verifying idempotency by hand
+    body: |
+      Using a client such as Postman against the SandPay sandbox:
+
+      1. **Create a key** and keep it in an environment variable, for example `paymentKey`. Postman's
+         dynamic variable `{{$guid}}` creates a new GUID each time it is used, so set it **once** (for
+         example in a pre-request script that only runs when the variable is empty) - otherwise every
+         send gets a new key and you are no longer testing a retry.
+      2. **Send** `POST /v1/payments` with `Idempotency-Key: {{paymentKey}}`. Record the status code,
+         the payment `id` and `status`.
+      3. **Send the identical request again.** Expect the same status code and the same payment `id`.
+      4. **Check the side effects**, not only the response: one payment row, one authorisation in the
+         processor's sandbox dashboard, one ledger entry.
+      5. **Change the amount, keep the key**, and send. Expect a rejection and no new charge. Confirm the
+         original payment is unchanged.
+      6. **Send two identical requests at the same moment** (Postman sends one at a time, so use two
+         terminals or `curl ... & curl ... & wait`). Expect exactly one charge.
+      7. **Write down provider-specific results** - how long keys live, whether a failed first attempt
+         is replayed - as facts about *this* API, not as universal rules.
+
+  - id: example
+    kind: example
+    title: "Real-world example: a mobile checkout on a bad network"
+    body: |
+      A retail app lets customers pay for order `ORD-1042`.
+
+      - When the customer taps **Pay**, the app creates a key and **saves it with the pending order**
+        on the device before sending anything.
+      - The request times out on a train. The app retries twice with backoff, **with the same key**.
+      - The app is killed before an answer arrives. On relaunch it finds the pending order with its
+        saved key, and asks the server for the status of `ORD-1042` instead of starting a new
+        payment.
+
+      What a tester checks: kill the app at each stage (before the request, during it, after the
+      charge but before the response), relaunch, and verify one charge and a correct final status.
+      Evidence: app logs showing the key per attempt, API access logs, the payment record and the
+      processor's sandbox transaction list.
+
+  - id: code
+    kind: code
+    title: Requests, responses and client code
+    collapsed: true
+    body: |
+      **First request** (new key):
+
+      ```http
+      POST /v1/payments HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      Content-Type: application/json
+      Idempotency-Key: 5f0c2c1e-8a6b-4d6e-9b8e-2f4a7c1d9e30
+
+      {"amount": 2500, "currency": "EUR", "payment_method": "pm_card_visa_test", "reference": "ORD-1042"}
+      ```
+
+      ```http
+      HTTP/1.1 201 Created
+      Content-Type: application/json
+
+      {"id": "pay_81Fz", "status": "authorized", "amount": 2500, "currency": "EUR", "reference": "ORD-1042"}
+      ```
+
+      **Retry with the same key and body** - the stored response is replayed: same `id`, no new charge.
+      (Some providers add a response header that marks a replay; SandPay is fictional, so check your
+      provider's documentation.)
+
+      **Same key, different body** (amount changed to `3500`):
+
+      ```http
+      HTTP/1.1 422 Unprocessable Content
+      Content-Type: application/json
+
+      {"error": {"code": "idempotency_key_reused", "message": "This key was already used with a different request."}}
+      ```
+
+      **Java client** that reuses one key across its own retries (Java 17+, JDK HTTP client):
+
+      ```java
+      import java.io.IOException;
+      import java.net.URI;
+      import java.net.http.HttpClient;
+      import java.net.http.HttpRequest;
+      import java.net.http.HttpResponse;
+      import java.time.Duration;
+
+      public class PaymentClient {
+          private final HttpClient http = HttpClient.newBuilder()
+                  .connectTimeout(Duration.ofSeconds(5))
+                  .build();
+
+          public HttpResponse<String> createPayment(String idempotencyKey, String json)
+                  throws IOException, InterruptedException {
+              HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.sandpay.example/v1/payments"))
+                      .timeout(Duration.ofSeconds(10))
+                      .header("Content-Type", "application/json")
+                      .header("Idempotency-Key", idempotencyKey)
+                      .POST(HttpRequest.BodyPublishers.ofString(json))
+                      .build();
+
+              IOException lastFailure = null;
+              for (int attempt = 1; attempt <= 3; attempt++) {
+                  try {
+                      HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+                      if (response.statusCode() != 409) {
+                          return response;
+                      }
+                  } catch (IOException e) {
+                      lastFailure = e;
+                  }
+                  Thread.sleep(500L * attempt);
+              }
+              throw lastFailure != null ? lastFailure : new IOException("payment still in progress after 3 attempts");
+          }
+      }
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    title: Line by line - the important parts of the client
+    body: |
+      - **`createPayment(String idempotencyKey, String json)`** - the key is a *parameter*. The caller
+        creates it once per payment intent and stores it (for example with the pending order). If the
+        method generated the key itself, a caller that retries `createPayment` would send a **new** key
+        and could charge twice.
+      - **`.timeout(Duration.ofSeconds(10))`** - a response timeout. When it fires, `send` throws
+        `HttpTimeoutException` (a subclass of `IOException`). A timeout means *unknown outcome*, which
+        is exactly when a retry with the same key is needed.
+      - **`.header("Idempotency-Key", idempotencyKey)`** - the request object is built once and sent up
+        to three times, so every attempt carries the same key and body.
+      - **`if (response.statusCode() != 409)`** - any real answer, success or error, is returned to the
+        caller. `409` here means the first attempt is still being processed, so waiting and asking
+        again is correct. (Retrying other errors such as `500` depends on the provider's guidance.)
+      - **`catch (IOException e)`** - connection failures and timeouts are retried; the loop does not
+        hide them, it rethrows the last one after three attempts.
+      - **`Thread.sleep(500L * attempt)`** - a simple linear backoff so retries don't hammer a struggling
+        server. Production code usually adds jitter and handles `InterruptedException` deliberately.
+
+  - id: tests
+    kind: tests
+    title: Positive and negative test cases
+    body: |
+      | ID | Scenario | Expected result | Evidence |
+      |---|---|---|---|
+      | P1 | New key, valid payment | `201`, payment created | response; one payment row; one processor authorisation |
+      | P2 | Same key and body again after success | same status and body, same payment `id` | response diff; still one charge |
+      | P3 | Client times out, retries with same key | replayed result, one charge | client log with key per attempt; processor transactions |
+      | P4 | Different keys, identical body | **two** payments - keys identify operations, not payloads | two rows; confirm this is the intended product behaviour |
+      | N1 | Same key, different amount | rejected (draft suggests `422`), no new charge, original unchanged | error body; payment rows unchanged |
+      | N2 | Key missing where required | `400` with a clear error | error body; no payment row |
+      | N3 | Malformed key (empty, too long, invalid characters) | `400` | error body |
+      | N4 | Two concurrent requests, same key | exactly one charge; the other gets `409` or the replayed result | both responses; one processor authorisation |
+      | N5 | Same key from a different merchant account | treated as unrelated - keys are scoped per account | two independent payments |
+      | N6 | Same key after the retention window | **provider-specific** - often treated as new | documented behaviour; risk noted |
+      | N7 | First attempt declined, retried with same key | **provider-specific** - many APIs replay the decline; a genuine new attempt needs a new key | documented behaviour |
+
+      Positive tests prove the replay works. Negative and concurrency tests prove the server cannot be
+      tricked into a second charge - that is where the real defects hide.
+
+  - id: mistakes
+    kind: mistakes
+    title: Common mistakes and how to debug them
+    body: |
+      **Mistakes that cause duplicate charges**
+
+      - **A new key on every retry** - the most common cause. The retry looks like a brand-new payment.
+      - **Check-then-insert instead of an atomic reservation** - two simultaneous requests both see
+        "no key yet" and both charge.
+      - **No fingerprint check** - a reused key silently replays an old result for a *different*
+        request, so the customer is told an order was paid when it was not.
+      - **Storing the result outside the payment transaction** - a crash between charging and storing
+        leaves a charge with no record the retry can find.
+      - **Treating `409` as a failure** and starting a new payment with a new key.
+      - **Keys scoped globally instead of per account** - one merchant's key blocks another's request.
+
+      **A debugging method for "charged twice"**
+
+      1. Collect both requests (gateway or access logs, by order reference and time).
+      2. **Compare the keys.** Different keys → look at whatever sent the second request (client retry
+         logic, double submit, a job). Same key → look at the server's idempotency implementation or
+         key expiry.
+      3. Find **who** sent the second request: client logs, user-agent, source IP, request ids.
+      4. Reproduce in the sandbox with the same timing and confirm before naming a root cause.
+
+      **Safe logging:** log the key, payment id and reference - never card numbers, CVV or full tokens.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    title: Limitations, trade-offs and alternatives
+    body: |
+      - **Storage and retention** - every key costs storage; too short a window turns late retries into
+        new charges, too long costs money and widens the window for stale replays.
+      - **Stale answers** - a replay returns the result *as it was*. To learn the current status, query
+        the payment (`GET`) instead of replaying the create.
+      - **Not a fraud or business control** - it cannot tell a genuine second purchase from a mistake.
+      - **Alternatives and complements:**
+        - a natural key with a unique constraint (one payment per order reference);
+        - client-chosen resource ids with `PUT /payments/{id}`, making creation idempotent by method;
+        - consumer-side de-duplication by event id for webhooks and queues.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Idempotent = same **effect** however many times it runs. `POST` is not idempotent by definition.
+      - A timeout is an **unknown** outcome, so retries are normal - and dangerous without a key.
+      - One key per **logical operation**; reuse it for every retry; never for a new operation.
+      - Server: validate → fingerprint → **atomic** reserve → process → store result → expire.
+      - Same key + different body → reject. In progress → `409`/wait. Done → replay.
+      - Duplicate charge, **different keys** → suspect the sender. **Same key** → suspect the server.
+      - Header names, retention and error codes are **provider-specific** - verify them.
+
+exercises:
+  - id: methods-idempotent
+    type: mcq
+    concept: idempotent-operations
+    skill: recognition
+    title: Which methods are idempotent?
+    prompt: |
+      According to RFC 9110, which of these HTTP methods are idempotent **by definition**?
+      Select every one that applies.
+    options:
+      - id: get
+        text: "`GET`"
+        feedback: Correct - safe methods are also idempotent; reading changes nothing.
+      - id: post
+        text: "`POST`"
+        feedback: Not idempotent. Each `POST` may create something new - which is exactly why payment creation needs a key.
+      - id: put
+        text: "`PUT`"
+        feedback: Correct - sending the same full replacement twice leaves the same state.
+      - id: delete
+        text: "`DELETE`"
+        feedback: Correct - the effect (it is gone) is the same; only the response may differ, such as `204` then `404`.
+      - id: patch
+        text: "`PATCH`"
+        feedback: Not idempotent by definition. A patch such as "add 1 to quantity" changes the result each time; some patches happen to be idempotent, but the method does not promise it.
+    correct: [get, put, delete]
+    hints:
+      - Idempotency is about the *effect* on the server, not about the response being identical.
+      - Safe (read-only) methods are idempotent. Of the methods that change state, which ones describe a final state rather than an action to apply?
+    solution: |
+      **`GET`, `PUT` and `DELETE`.** RFC 9110 lists `PUT`, `DELETE` and the safe methods (`GET`,
+      `HEAD`, `OPTIONS`, `TRACE`) as idempotent. `POST` and `PATCH` are not idempotent by definition.
+
+      The trap is `DELETE`: the second call may return `404`, but the state is the same - the resource
+      is gone - so it is still idempotent.
+    followUp: |
+      Is `POST /v1/payments/{id}/capture` idempotent by definition? What would you test to find out
+      whether this API makes it idempotent anyway?
+
+  - id: which-need-keys
+    type: mcq
+    concept: idempotent-operations
+    skill: application
+    title: Which requests need duplicate protection?
+    prompt: |
+      You are reviewing the SandPay API. Which of these requests need an idempotency key (or another
+      mechanism) to stop a retry from repeating a side effect? Select every one that applies.
+    options:
+      - id: refund
+        text: "`POST /v1/refunds` - refund 10.00 EUR of a payment"
+        feedback: Yes - a retried refund could return money twice.
+      - id: capture
+        text: "`POST /v1/payments/pay_81Fz/capture` - capture an authorisation"
+        feedback: Yes - unless the API documents capture as idempotent, a retry could attempt a second capture. Test it.
+      - id: put-profile
+        text: "`PUT /v1/customers/cus_12` with the complete customer profile"
+        feedback: Not needed if implemented as the method defines - replacing a resource with the same full representation twice leaves the same state.
+      - id: get-status
+        text: "`GET /v1/payments/pay_81Fz` - read the status"
+        feedback: Not needed - a safe read has no side effect to repeat.
+      - id: receipt
+        text: "`POST /v1/receipts` - email a receipt to the customer"
+        feedback: Yes - the side effect is an email; a retry without protection sends it twice.
+    correct: [refund, capture, receipt]
+    hints:
+      - Ask of each request - if it is sent twice, does anything happen twice?
+      - Side effects are not only about money. Think about what the customer would see.
+    solution: |
+      **Refund, capture and receipt email.** Each has a side effect that a retry could repeat: money
+      returned twice, a second capture attempt, a second email. The full-replacement `PUT` and the
+      `GET` leave the same state however many times they run.
+
+      The habit to build: for every endpoint, ask *"what happens if this exact request arrives twice?"*
+    followUp: |
+      A webhook consumer receives `payment.succeeded` for the same event twice. Which mechanism
+      prevents a double fulfilment there, and what identifier does it use?
+
+  - id: order-server-steps
+    type: order
+    concept: idempotency-key-contract
+    skill: recall
+    title: Order the server's steps
+    prompt: |
+      Put the server's handling of a new `POST /v1/payments` request with an idempotency key in the
+      correct order. Use the arrow buttons to move items.
+    items:
+      - id: validate
+        text: Validate that the key is present and well formed
+      - id: fingerprint
+        text: Fingerprint the request (method, path, canonical body)
+      - id: reserve
+        text: Atomically reserve the key as IN_PROGRESS
+      - id: process
+        text: Call the processor to authorise the payment
+      - id: store
+        text: Store the status code and body, mark the key COMPLETED
+      - id: respond
+        text: Return the response to the client
+    hints:
+      - You can't compare a later retry with this request unless you know what this request was.
+      - The reservation must happen before anything that has a side effect.
+    solution: |
+      **Validate → fingerprint → reserve → process → store → respond.**
+
+      The fingerprint must exist before the reservation so a later request with the same key can be
+      compared. The reservation must come before the processor call, otherwise two concurrent
+      requests can both reach the processor. Storing before responding means a lost response can
+      still be replayed.
+    followUp: |
+      Where in this sequence could a crash leave a charge with no stored result, and what should a
+      recovery job do about it?
+
+  - id: race-condition-debug
+    type: debug
+    concept: idempotency-key-contract
+    skill: analysis
+    title: Find the race condition
+    prompt: |
+      Two identical requests with the **same** key arrived 3 ms apart and the card was charged
+      **twice**. Click the line or lines that together allow this to happen.
+    language: java
+    code: |
+      public PaymentResponse create(String key, PaymentRequest request) {
+          Optional<StoredResult> existing = keyStore.find(key);
+          if (existing.isPresent()) {
+              return existing.get().response();
+          }
+          PaymentResponse response = processor.charge(request);
+          keyStore.save(key, response);
+          return response;
+      }
+    correctLines: [2, 7]
+    lineNotes:
+      - line: 6
+        note: Charging is the side effect that gets duplicated, but the call itself is fine. The defect is that nothing stops a second request from reaching it - look at how the key is checked and when it is recorded.
+      - line: 4
+        note: Replaying a stored result is correct behaviour. The problem is that, 3 ms apart, nothing has been stored yet.
+      - line: 3
+        note: The condition is fine; it just runs on a lookup that the other request cannot see yet.
+    hints:
+      - Walk both requests through the code at the same time. What does each one see on line 2?
+      - The key is only recorded after the charge. What would have to happen *before* the charge?
+    solution: |
+      **Lines 2 and 7.** The method checks for the key (line 2) and records it only after charging
+      (line 7). Between the two there is a window: both requests run line 2, both see nothing, both
+      charge on line 6.
+
+      **Fix:** reserve the key atomically *before* charging - for example an `INSERT ... (key, status
+      IN_PROGRESS)` under a unique constraint. Only one request can win; the other gets a conflict and
+      either waits or replays. A second problem in this code: it never compares a request fingerprint,
+      so a reused key with a different body would silently get the old response.
+    followUp: |
+      Rewrite the method so it reserves the key first. Which exception or result tells the second
+      request that it lost the race, and what should it return to the client?
+
+  - id: duplicate-charge-rca
+    type: mcq
+    concept: duplicate-payment-diagnosis
+    skill: analysis
+    title: Charged twice - where is the defect?
+    prompt: |
+      A customer was charged twice for order `ORD-7731`. You collect this evidence:
+
+      - API gateway logs: two `POST /v1/payments` 1.4 s apart, same amount and payment method,
+        `Idempotency-Key` values `6f1c...` and `9a02...`.
+      - Mobile app log: `payment request timed out after 10 s, retrying`.
+      - The server's idempotency table has two `COMPLETED` rows, one per key.
+
+      Which is the most likely root cause?
+    options:
+      - id: processor
+        text: The processor processed one authorisation twice.
+        feedback: Unlikely - the processor received two separate requests, each with its own key. The duplication happened before the processor.
+      - id: server-race
+        text: A race condition in the server's idempotency store.
+        feedback: A race needs two requests with the **same** key. These keys differ, so the server correctly treated them as two operations.
+      - id: client-new-key
+        text: The app generated a new key when it retried after the timeout.
+        feedback: Correct - the retry carried a different key, so it was a new payment as far as the server could tell. The fix belongs in the client's retry logic.
+      - id: load-balancer
+        text: The load balancer replayed the request.
+        feedback: A proxy or load-balancer retry forwards the same headers, so the key would be the same. Different keys point at whatever built the second request.
+    correct: [client-new-key]
+    hints:
+      - What does the server use to decide whether two requests are the same operation?
+      - Which layers could have produced a request with a different header value?
+    solution: |
+      **The app generated a new key for its retry.** The keys differ, so the server - correctly -
+      treated the second request as a new payment. That rules out a server race (needs the same key)
+      and a proxy replay (would forward the same key), and the processor simply received two
+      requests.
+
+      **Confirm before you conclude:** the app log should show the key used for each attempt. Then
+      reproduce in the sandbox by forcing a timeout and checking that the retry reuses the key.
+      **Fix and regression:** store the key with the pending order, reuse it for retries, and add a
+      test that forces a timeout and asserts one charge.
+    followUp: |
+      Same complaint, but this time both requests carry the **same** key and the idempotency table has
+      a single row. List three hypotheses and the evidence that would separate them.
+
+  - id: retry-same-key-explain
+    type: short
+    concept: idempotent-operations
+    skill: recall
+    title: Explain the retry rule
+    prompt: |
+      In two to four sentences: a `POST /v1/payments` request timed out. Why must the retry reuse the
+      **same** idempotency key, and what can happen if it sends a new one?
+    hints:
+      - What does a timeout tell you about whether the server processed the payment?
+    modelAnswer: |
+      A timeout means the outcome is unknown - the server may already have charged the card and only
+      the response was lost. Reusing the same key lets the server recognise the retry as the same
+      operation and return the original result instead of charging again. A new key makes the retry
+      look like a new payment, so the customer can be charged twice.
+    rubric:
+      - Said that a timeout means the outcome is unknown - the server may have processed the request
+      - Said that the same key lets the server recognise the retry and replay the original result
+      - Said that a new key is treated as a new operation, risking a second charge
+      - Connected it to the goal of charging the customer exactly once
+    solution: |
+      Compare your answer with the model answer and the rubric. The essential chain is:
+      **unknown outcome → same key = same operation → replay, not re-charge; new key = new charge.**
+
+  - id: design-idempotency-tests
+    type: testdesign
+    concept: idempotency-key-contract
+    skill: application
+    title: Design the idempotency test suite
+    prompt: |
+      Write test cases for idempotency on SandPay's `POST /v1/payments`. Aim for at least six. For
+      each one give the precondition, the steps, the expected result and the **evidence** you would
+      collect. Write them before looking at the rubric.
+    hints:
+      - Cover retries that should replay, requests that should be rejected, and requests that arrive at the same time.
+      - A `201` response alone does not prove there was only one charge. Where else would a second charge show up?
+    modelAnswer: |
+      1. **Replay:** send a payment with key K; resend the same request with K. Expect the same status,
+         body and payment id. Evidence: both responses, one payment row, one processor authorisation.
+      2. **Retry after timeout:** force a client timeout (short client timeout or a delaying proxy),
+         retry with K. Expect the stored result and one charge.
+      3. **Key reuse, different body:** reuse K with a different amount. Expect a rejection (the draft
+         suggests `422`), no new charge, original unchanged.
+      4. **Concurrency:** send two identical requests with K at the same moment. Expect exactly one
+         charge; the other gets `409` or the replayed result.
+      5. **Missing or malformed key:** expect `400` with a clear error and no payment.
+      6. **Different keys, same body:** expect two payments, and confirm with the product owner that this
+         is intended.
+      7. **Provider-specific behaviour:** retention window (retry after expiry) and whether a declined or
+         failed first attempt is replayed - documented as facts about this API.
+    rubric:
+      - Identical retry with the same key returns the same result and creates one charge
+      - Retry after a client timeout is covered
+      - Same key with a different body is rejected and the original payment is unchanged
+      - Concurrent requests with the same key result in exactly one charge
+      - Missing or malformed key handling is covered
+      - Different keys with the same body (two genuine payments) is covered
+      - Evidence goes beyond the HTTP response - database or ledger rows and processor transactions
+      - Provider-specific behaviour (retention window, replay of failed attempts) is checked rather than assumed
+    solution: |
+      Compare your cases with the model answer and tick only what you really covered. The two cases
+      most often missed are **concurrency** and **evidence beyond the response** - the duplicate
+      charge usually hides in the processor's transaction list, not in the API response.
+    followUp: |
+      Turn your concurrency case into precise steps a colleague could run with two terminals and
+      `curl`, including how they will prove only one charge happened.
+
+  - id: interview-refund-idempotency
+    type: interview
+    concept: duplicate-payment-diagnosis
+    skill: application
+    title: "Interview: design and test idempotent refunds"
+    prompt: |
+      **Interviewer:** "Our refund endpoint sometimes refunds twice. How would you design idempotency
+      for refunds, and how would you test it?"
+
+      Answer out loud or in writing as you would in an interview, then compare.
+    hints:
+      - Start from how a duplicate refund can happen, then the mechanism, then the tests and evidence.
+    modelAnswer: |
+      - **How duplicates happen:** a refund request times out and is retried, a user or agent clicks
+        twice, or a job re-runs. Without protection each one is a new refund.
+      - **Design:** the client sends an idempotency key per refund intent. The server fingerprints the
+        request, reserves the key atomically, calls the processor with a downstream reference, stores
+        the result with the refund in one transaction, and replays it on retries. A business invariant
+        backs it up: total refunded can never exceed the captured amount.
+      - **Tests:** replay with the same key; retry after a forced timeout; same key with a different
+        amount rejected; concurrent requests with one key; two genuine partial refunds with different
+        keys that stay within the captured amount; a refund that would exceed it is rejected.
+      - **Evidence:** API responses, refund rows, ledger totals and the processor's refund list.
+      - **Investigating the bug:** compare the keys of the duplicate refunds first - different keys point
+        at the caller, the same key at the server.
+    followUps:
+      - What happens if the processor times out after you reserved the key? How does your system find out whether the refund happened?
+      - How long would you keep refund keys, and what is the risk of a short window?
+      - How would you make the concurrency test reliable instead of hoping two requests overlap?
+    rubric:
+      - Explained how duplicate refunds arise (retries, double submits, re-run jobs)
+      - Described key per refund intent with atomic reservation and replay
+      - Mentioned the invariant that total refunds cannot exceed the captured amount
+      - Listed replay, timeout retry, key reuse with a different body and concurrency tests
+      - Named evidence beyond the HTTP response (refund rows, ledger, processor records)
+      - Used the key comparison to decide whether the caller or the server is at fault
+    solution: |
+      Strong answers move from **cause → mechanism → tests → evidence → diagnosis**. Weak answers stop
+      at "add an idempotency key". Practise the follow-up questions - interviewers use them to tell
+      memorised answers from understanding.
+
+recall:
+  - id: recall-definition
+    concept: idempotent-operations
+    prompt: What does "idempotent" mean for an HTTP method, according to RFC 9110?
+    answer: Several identical requests have the same intended effect on the server as one. The responses may differ - only the effect has to be the same.
+  - id: recall-methods
+    concept: idempotent-operations
+    prompt: Which HTTP methods are idempotent by definition, and which are not?
+    answer: "Idempotent: GET, HEAD, OPTIONS, TRACE (the safe methods) and PUT and DELETE. Not idempotent by definition: POST and PATCH."
+  - id: recall-server-stores
+    concept: idempotency-key-contract
+    prompt: What does a server keep for each idempotency key?
+    answer: A fingerprint of the request, the processing state (in progress or completed) and the final response (status and body), scoped to the account and kept for a retention window.
+  - id: recall-reuse-different-body
+    concept: idempotency-key-contract
+    prompt: A request reuses an existing key with a different body. What should the server do?
+    answer: Reject it without processing (the IETF draft suggests 422) and leave the original operation unchanged. It must never silently replay the old result.
+  - id: recall-different-keys
+    concept: duplicate-payment-diagnosis
+    prompt: Two charges, two different idempotency keys. Which layer do you suspect first?
+    answer: Whatever created the second request with a new key - usually client retry logic or an unguarded double submit. Confirm with the client's logs of the key per attempt.
+  - id: recall-same-key
+    concept: duplicate-payment-diagnosis
+    prompt: Two charges, the same idempotency key. Which layer do you suspect first?
+    answer: The server's idempotency handling - a non-atomic check and insert, a missing scope or fingerprint, or an expired key - and check whether the processor call was retried without a downstream reference.
+
+next:
+  - webhooks-and-async-status
+  - payment-api-negative-matrix
