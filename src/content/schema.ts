@@ -131,6 +131,13 @@ export const ExerciseSchema = z.discriminatedUnion('type', [
   InterviewSchema,
 ]);
 
+/**
+ * Placement questions decide whether a learner can skip ("test out of") a lesson. They are
+ * auto-graded only - a placement result must not rest on self-assessment - and separate from
+ * the lesson's practice exercises so practice stays fresh for those who study the lesson.
+ */
+export const PlacementQuestionSchema = z.discriminatedUnion('type', [McqSchema, OrderSchema, DebugSchema]);
+
 export const RecallCardSchema = z.strictObject({
   id: Id,
   concept: Id,
@@ -160,6 +167,7 @@ export const LessonSchema = z.strictObject({
   objectives: z.array(Text).min(1),
   sections: z.array(SectionSchema).min(1),
   exercises: z.array(ExerciseSchema).default([]),
+  placement: z.array(PlacementQuestionSchema).default([]),
   recall: z.array(RecallCardSchema).default([]),
   next: z.array(Id).default([]),
   tags: z.array(Text).default([]),
@@ -212,6 +220,7 @@ export type OrderExercise = z.infer<typeof OrderSchema>;
 export type DebugExercise = z.infer<typeof DebugSchema>;
 export type RubricExercise =
   z.infer<typeof ShortAnswerSchema> | z.infer<typeof TestDesignSchema> | z.infer<typeof InterviewSchema>;
+export type PlacementQuestion = z.infer<typeof PlacementQuestionSchema>;
 export type RecallCard = z.infer<typeof RecallCardSchema>;
 export type Concept = z.infer<typeof ConceptSchema>;
 export type Lesson = z.infer<typeof LessonSchema>;

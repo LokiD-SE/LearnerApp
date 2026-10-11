@@ -11,6 +11,7 @@ export type Route =
   | { name: 'review' }
   | { name: 'progress' }
   | { name: 'search'; query: string }
+  | { name: 'placement'; kind: 'path' | 'lesson'; id: string }
   | { name: 'not-found'; path: string };
 
 export function parseHash(hash: string): Route {
@@ -33,6 +34,9 @@ export function parseHash(hash: string): Route {
   if (head === 'review' && parts.length === 1) return { name: 'review' };
   if (head === 'progress' && parts.length === 1) return { name: 'progress' };
   if (head === 'search' && parts.length === 1) return { name: 'search', query: query.get('q') ?? '' };
+  if (head === 'placement' && parts.length === 3 && (id === 'path' || id === 'lesson')) {
+    return { name: 'placement', kind: id, id: parts[2]! };
+  }
   return { name: 'not-found', path };
 }
 
@@ -49,6 +53,7 @@ export const href = {
   review: () => '#/review',
   progress: () => '#/progress',
   search: (query = '') => (query ? `#/search?q=${encodeURIComponent(query)}` : '#/search'),
+  placement: (kind: 'path' | 'lesson', id: string) => `#/placement/${kind}/${encodeURIComponent(id)}`,
 };
 
 export function useRoute(): Route {

@@ -35,12 +35,23 @@ Goal: the eight lessons of the "Payments QA - core path", written to the lesson 
 - [x] End-to-end test that opens every lesson at desktop and mobile size and requires every diagram to render
       with no page errors.
 
+## Increment 3 - diagnostic placement (done)
+
+Goal: learners skip what they can already show they know (prompt section 14).
+
+- [x] Placement questions per lesson (auto-graded, at least one per concept): 20 across the core path.
+- [x] Placement test for a learning path (offered on the home page) and "Test out" on each lesson page: no
+      hints or feedback until the end, "I don't know this yet", results with a question review.
+- [x] New lesson status **Tested out**: paths skip it, prerequisites show it, recall cards join the review
+      queue; "Study it anyway" undoes it. Not mastery evidence (documented in the mastery model).
+- [x] Placement results on the Progress page; Learn filter for tested-out lessons.
+- [x] Unit tests (rules, status precedence, path progress, routing, loading older saved progress), content
+      rules (placement per concept), end-to-end tests of the path test, the lesson test-out and empty states.
+
 ## Next increments
 
 Each increment ends with `npm run check` green.
 
-3. **Diagnostic placement.** A short diagnostic per stage that marks prerequisites as "known" so learners skip
-   what they already know (prompt section 14).
 4. **Adaptive practice.** After a wrong answer, recommend the remediation section and a sibling exercise on the
    same concept. Add cumulative quizzes that interleave across lessons.
 5. **Java track (E) with runnable code.** A companion Maven project (`practice/java/`) with JUnit exercises the

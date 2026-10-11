@@ -5,6 +5,7 @@ import { dueReviews } from '../store/selectors';
 import { HomePage } from './pages/HomePage';
 import { LearnPage } from './pages/LearnPage';
 import { LessonPage } from './pages/LessonPage';
+import { PlacementPage } from './pages/PlacementPage';
 import { ProgressPage } from './pages/ProgressPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { SearchPage } from './pages/SearchPage';
@@ -126,6 +127,10 @@ function Page({ route, index }: { route: Route; index: Extract<ValidationResult,
       return <ProgressPage index={index} />;
     case 'search':
       return <SearchPage index={index} query={route.query} />;
+    case 'placement':
+      return (
+        <PlacementPage key={`${route.kind}/${route.id}`} index={index} kind={route.kind} id={route.id} />
+      );
     case 'not-found':
       return (
         <section class="page narrow">

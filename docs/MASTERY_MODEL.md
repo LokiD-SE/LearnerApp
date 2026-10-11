@@ -77,7 +77,25 @@ Recall cards enter the queue when a lesson is marked as read (first due the next
 first attempted. Due items are **interleaved**: consecutive items come from different concepts where possible,
 so similar ideas have to be told apart.
 
-## 6. Known simplifications (candidates to revisit)
+## 6. Placement (testing out)
+
+A placement test lets a learner skip lessons they can already show they know. It is a different question from
+mastery, so it has its own rules (`recordPlacement` in `src/store/state.ts`):
+
+- Placement questions are **auto-graded only** (multiple choice, ordering, spot-the-lines) and separate from a
+  lesson's practice exercises. Every concept of a published lesson has at least one.
+- There are **no hints and no feedback until the end**, and "I don't know this yet" is offered to discourage
+  guessing.
+- A lesson is **tested out** only when **every** one of its placement questions is fully correct (score 1).
+  Anything less recommends studying the lesson.
+- Testing out sets the lesson status to **Tested out** - below Completed and Mastered, which a learner can still
+  reach by working through the lesson. Learning paths skip tested-out lessons when suggesting what is next.
+- Placement answers are **not mastery evidence**. A short test at one moment shows familiarity, not retained,
+  practised ability. Instead, the lesson's recall cards enter the review queue (first due the next day), and
+  those reviews _are_ evidence.
+- A retake replaces the earlier result; "Study it anyway" on the lesson removes it.
+
+## 7. Known simplifications (candidates to revisit)
 
 - Box intervals are fixed. An SM-2/FSRS-style per-item ease factor would adapt better, but needs more data.
 - Self-assessment trusts the learner. The rubric makes it concrete; honesty still matters.

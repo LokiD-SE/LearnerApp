@@ -1,6 +1,6 @@
 import type { ContentIndex } from '../../content/validate';
 import { useProgress } from '../../store/ProgressContext';
-import { dueReviews, lessonStatus, pathProgress, weakConcepts } from '../../store/selectors';
+import { dueReviews, lessonStatus, pathProgress, placementItems, weakConcepts } from '../../store/selectors';
 import { StatusBadge } from '../components/Badges';
 import { href } from '../router';
 
@@ -15,7 +15,10 @@ export function HomePage({ index }: { index: ContentIndex }) {
   const mainProgress = mainPath ? pathProgress(index, state, mainPath) : undefined;
   // Without a path, fall back to the first published lesson in curriculum order.
   const nextLesson = mainProgress?.next ?? [...index.refs.values()].find((ref) => !ref.planned);
-  const fresh = state.attempts.length === 0 && !last;
+  const fresh = state.attempts.length === 0 && !last && Object.keys(state.placements).length === 0;
+  const placementCount = mainPath ? placementItems(index, { kind: 'path', id: mainPath.id }).length : 0;
+  const offerPlacement =
+    Boolean(mainPath) && placementCount > 0 && Object.keys(state.placements).length === 0;
 
   return (
     <section class="page">
@@ -57,6 +60,19 @@ export function HomePage({ index }: { index: ContentIndex }) {
             </p>
           )}
         </section>
+
+        {offerPlacement && mainPath && (
+          <section class="card">
+            <h2>Already know some of this?</h2>
+            <p>
+              Take the placement test for {mainPath.title}: {placementCount} questions, about{' '}
+              {Math.ceil(placementCount * 1.5)} minutes. Skip the lessons you can show you know.
+            </p>
+            <a class="button secondary" href={href.placement('path', mainPath.id)}>
+              Take the placement test
+            </a>
+          </section>
+        )}
 
         <section class="card">
           <h2>Review</h2>
@@ -103,15 +119,17 @@ export function HomePage({ index }: { index: ContentIndex }) {
                   <p class="small muted">
                     {progress.ready === 0
                       ? `${progress.total} lessons, all planned`
-                      : `${progress.completed} of ${progress.ready} ready lessons completed` +
+                      : `${progress.completed} completed` +
+                        (progress.testedOut ? `, ${progress.testedOut} tested out` : '') +
+                        ` of ${progress.ready} ready lessons` +
                         (progress.ready < progress.total
                           ? ` (${progress.total - progress.ready} more planned)`
                           : '')}
                   </p>
                   <progress
                     max={Math.max(progress.ready, 1)}
-                    value={progress.completed}
-                    aria-label={`${path.title}: ${progress.completed} of ${progress.ready} completed`}
+                    value={progress.completed + progress.testedOut}
+                    aria-label={`${path.title}: ${progress.completed + progress.testedOut} of ${progress.ready} done`}
                   />
                   {progress.next ? (
                     <p class="small">

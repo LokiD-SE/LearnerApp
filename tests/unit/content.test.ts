@@ -87,6 +87,20 @@ describe('every published lesson', () => {
           expect(new Set(feedback).size, `${exercise.id} reuses feedback text`).toBe(feedback.length);
         }
       });
+      it('has placement questions covering every concept, with distinct feedback', () => {
+        expect(lesson.placement.length).toBeGreaterThanOrEqual(2);
+        for (const concept of lesson.concepts) {
+          expect(
+            lesson.placement.some((q) => q.concept === concept.id),
+            `no placement question for concept '${concept.id}'`,
+          ).toBe(true);
+        }
+        for (const question of lesson.placement) {
+          if (question.type !== 'mcq') continue;
+          const feedback = question.options.map((o) => o.feedback);
+          expect(new Set(feedback).size, `${question.id} reuses feedback text`).toBe(feedback.length);
+        }
+      });
       it('has enough recall cards for spaced review', () => {
         expect(lesson.recall.length).toBeGreaterThanOrEqual(4);
       });

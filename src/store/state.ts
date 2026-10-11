@@ -66,6 +66,18 @@ const ReviewEntrySchema = z.object({
   lapses: z.number().int().min(0),
 });
 
+const PlacementResultSchema = z.object({
+  /** 'tested-out' only when every placement question of the lesson was answered fully correctly */
+  result: z.enum(['tested-out', 'study']),
+  at: IsoDate,
+  correct: z.number().int().min(0),
+  total: z.number().int().min(1),
+  /** a whole learning path's placement test, or one lesson's "test out" */
+  source: z.enum(['path', 'lesson']),
+  /** question id -> score (0..1); "I don't know" is 0 */
+  answers: z.record(z.string(), Score).default({}),
+});
+
 export const ProgressStateSchema = z.object({
   version: z.literal(STATE_VERSION),
   lastLessonId: z.string().optional(),
@@ -73,12 +85,15 @@ export const ProgressStateSchema = z.object({
   exercises: z.record(z.string(), ExerciseStateSchema).default({}),
   reviews: z.record(z.string(), ReviewEntrySchema).default({}),
   attempts: z.array(AttemptSchema).default([]),
+  // Added after version 1 shipped; the default keeps older saved progress loading unchanged.
+  placements: z.record(z.string(), PlacementResultSchema).default({}),
 });
 
 export type Attempt = z.infer<typeof AttemptSchema>;
 export type ExerciseState = z.infer<typeof ExerciseStateSchema>;
 export type LessonState = z.infer<typeof LessonStateSchema>;
 export type ReviewEntry = z.infer<typeof ReviewEntrySchema>;
+export type PlacementResult = z.infer<typeof PlacementResultSchema>;
 export type ProgressState = z.infer<typeof ProgressStateSchema>;
 
 /** Exercises and recall cards are keyed by lesson so ids only need to be unique per lesson. */
@@ -90,6 +105,7 @@ export const emptyState = (): ProgressState => ({
   exercises: {},
   reviews: {},
   attempts: [],
+  placements: {},
 });
 
 const emptyLesson = (): LessonState => ({ bookmarked: false, notes: '' });
@@ -115,10 +131,9 @@ export function visitLesson(state: ProgressState, lessonId: string, now: Date): 
   };
 }
 
-/** Reading a lesson puts its recall cards into the review queue (first due tomorrow). */
-export function markRead(state: ProgressState, lesson: Lesson, now: Date): ProgressState {
-  let next = withLesson(state, lesson.id, { readAt: lessonOf(state, lesson.id).readAt ?? now.toISOString() });
-  const reviews = { ...next.reviews };
+/** Puts a lesson's recall cards into the review queue (first due tomorrow), once. */
+function scheduleRecallCards(state: ProgressState, lesson: Lesson, now: Date): ProgressState {
+  const reviews = { ...state.reviews };
   for (const card of lesson.recall) {
     const key = itemKey(lesson.id, card.id);
     if (!reviews[key]) {
@@ -131,8 +146,56 @@ export function markRead(state: ProgressState, lesson: Lesson, now: Date): Progr
       };
     }
   }
-  next = { ...next, reviews };
-  return updateCompletion(next, lesson, now);
+  return { ...state, reviews };
+}
+
+/** Reading a lesson puts its recall cards into the review queue (first due tomorrow). */
+export function markRead(state: ProgressState, lesson: Lesson, now: Date): ProgressState {
+  const next = withLesson(state, lesson.id, {
+    readAt: lessonOf(state, lesson.id).readAt ?? now.toISOString(),
+  });
+  return updateCompletion(scheduleRecallCards(next, lesson, now), lesson, now);
+}
+
+export interface PlacementAnswer {
+  questionId: string;
+  /** 0..1; "I don't know" is 0 */
+  score: number;
+}
+
+/**
+ * Records a lesson's placement result. Testing out needs every placement question answered
+ * fully correctly; a tested-out lesson's recall cards join the review queue, so retention is
+ * still checked. Placement answers are not mastery evidence (docs/MASTERY_MODEL.md).
+ */
+export function recordPlacement(
+  state: ProgressState,
+  lesson: Lesson,
+  answers: readonly PlacementAnswer[],
+  source: PlacementResult['source'],
+  now: Date,
+): ProgressState {
+  const total = lesson.placement.length;
+  if (total === 0) return state;
+  const scores = new Map(answers.map((a) => [a.questionId, Math.min(1, Math.max(0, a.score))]));
+  const correct = lesson.placement.filter((q) => scores.get(q.id) === 1).length;
+  const result: PlacementResult = {
+    result: correct === total ? 'tested-out' : 'study',
+    at: now.toISOString(),
+    correct,
+    total,
+    source,
+    answers: Object.fromEntries(lesson.placement.map((q) => [q.id, scores.get(q.id) ?? 0])),
+  };
+  const next = { ...state, placements: { ...state.placements, [lesson.id]: result } };
+  return result.result === 'tested-out' ? scheduleRecallCards(next, lesson, now) : next;
+}
+
+/** "Study it anyway": forget the placement result for a lesson. */
+export function clearPlacement(state: ProgressState, lessonId: string): ProgressState {
+  const placements = { ...state.placements };
+  delete placements[lessonId];
+  return { ...state, placements };
 }
 
 export function markUnread(state: ProgressState, lessonId: string): ProgressState {

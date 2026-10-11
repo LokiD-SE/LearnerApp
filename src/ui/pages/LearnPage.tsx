@@ -105,6 +105,7 @@ export function LearnPage({
             <option value="all">Any</option>
             <option value="not-started">Not started</option>
             <option value="in-progress">In progress</option>
+            <option value="tested-out">Tested out</option>
             <option value="completed">Completed</option>
             <option value="mastered">Mastered</option>
           </select>

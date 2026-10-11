@@ -8,12 +8,14 @@ import { conceptMastery, type ConceptItem, type ConceptMastery, type Evidence } 
 import { interleave, isDue } from '../domain/srs';
 import { exerciseOf, isLessonComplete, itemKey, type ProgressState, type ReviewEntry } from './state';
 
-export type LessonStatus = 'planned' | 'not-started' | 'in-progress' | 'completed' | 'mastered';
+export type LessonStatus =
+  'planned' | 'not-started' | 'in-progress' | 'tested-out' | 'completed' | 'mastered';
 
 export const LESSON_STATUS_LABEL: Record<LessonStatus, string> = {
   planned: 'Planned',
   'not-started': 'Not started',
   'in-progress': 'In progress',
+  'tested-out': 'Tested out',
   completed: 'Completed',
   mastered: 'Mastered',
 };
@@ -56,6 +58,8 @@ export function lessonStatus(index: ContentIndex, state: ProgressState, lessonId
     const allMastered = lesson.concepts.every((c) => masteryOf(lesson, c.id, state).level === 'mastered');
     return allMastered ? 'mastered' : 'completed';
   }
+  // Working through a lesson (completed, above) outranks having tested out of it.
+  if (state.placements[lessonId]?.result === 'tested-out') return 'tested-out';
   if (progress?.readAt || progress?.lastVisitedAt || attempted) return 'in-progress';
   return 'not-started';
 }
@@ -151,7 +155,9 @@ export interface PathProgress {
   ready: number;
   /** published lessons completed or mastered */
   completed: number;
-  /** the first published lesson in path order that isn't completed yet */
+  /** published lessons skipped through placement (and not since completed) */
+  testedOut: number;
+  /** the first published lesson in path order that is neither completed nor tested out */
   next: LessonRef | undefined;
 }
 
@@ -159,11 +165,33 @@ export interface PathProgress {
 export function pathProgress(index: ContentIndex, state: ProgressState, path: LearningPath): PathProgress {
   const refs = path.lessons.map((id) => index.refs.get(id)).filter((ref): ref is LessonRef => Boolean(ref));
   const ready = refs.filter((ref) => !ref.planned);
-  const done = (id: string) => ['completed', 'mastered'].includes(lessonStatus(index, state, id));
+  const status = (id: string) => lessonStatus(index, state, id);
+  const done = (id: string) => ['completed', 'mastered'].includes(status(id));
   return {
     total: refs.length,
     ready: ready.length,
     completed: ready.filter((ref) => done(ref.id)).length,
-    next: ready.find((ref) => !done(ref.id)),
+    testedOut: ready.filter((ref) => status(ref.id) === 'tested-out').length,
+    next: ready.find((ref) => !done(ref.id) && status(ref.id) !== 'tested-out'),
   };
+}
+
+export interface PlacementItem {
+  lesson: Lesson;
+  question: Lesson['placement'][number];
+}
+
+/** The placement questions for a learning path (in path order) or for one lesson. */
+export function placementItems(
+  index: ContentIndex,
+  scope: { kind: 'path' | 'lesson'; id: string },
+): PlacementItem[] {
+  const lessonIds =
+    scope.kind === 'lesson'
+      ? [scope.id]
+      : (index.curriculum.paths.find((p) => p.id === scope.id)?.lessons ?? []);
+  return lessonIds.flatMap((id) => {
+    const lesson = index.lessons.get(id);
+    return lesson ? lesson.placement.map((question) => ({ lesson, question })) : [];
+  });
 }

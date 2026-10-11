@@ -18,6 +18,7 @@ export function ProgressPage({ index }: { index: ContentIndex }) {
   ).length;
   const bookmarks = Object.entries(state.lessons).filter(([id, l]) => l.bookmarked && index.refs.has(id));
   const recent = [...state.attempts].reverse().slice(0, 15);
+  const placements = Object.entries(state.placements).filter(([id]) => index.refs.has(id));
   const [pending, setPending] = useState<ProgressState | undefined>();
   const [importError, setImportError] = useState<string | undefined>();
   const [importDone, setImportDone] = useState(false);
@@ -76,6 +77,29 @@ export function ProgressPage({ index }: { index: ContentIndex }) {
               <li key={row.conceptId}>
                 <a href={href.lesson(row.lesson.id)}>{row.name}</a> <MasteryBadge level={row.mastery.level} />{' '}
                 <span class="muted small">{percent(row.mastery.score)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section>
+        <h2>Placement results</h2>
+        {placements.length === 0 ? (
+          <p class="muted">
+            No placement tests taken. Lessons with placement questions offer <em>Test out</em> in their
+            "Before you start" panel.
+          </p>
+        ) : (
+          <ul>
+            {placements.map(([id, result]) => (
+              <li key={id}>
+                <a href={href.lesson(id)}>{index.refs.get(id)!.title}</a>{' '}
+                <StatusBadge status={result.result === 'tested-out' ? 'tested-out' : 'not-started'} />{' '}
+                <span class="muted small">
+                  {result.correct} of {result.total} correct on {formatDate(result.at)}
+                  {result.result === 'study' ? ' - study recommended' : ''}
+                </span>
               </li>
             ))}
           </ul>

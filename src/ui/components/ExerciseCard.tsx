@@ -41,7 +41,7 @@ interface Feedback {
   details: ComponentChildren;
 }
 
-interface SubmitArgs {
+export interface SubmitArgs {
   score: number;
   response: string;
   details: ComponentChildren;
@@ -268,7 +268,8 @@ export function ExerciseCard(props: {
 
 /* ---------------------------------------------------------------- multiple choice */
 
-function McqBody(props: {
+export function McqBody(props: {
+  submitLabel?: string;
   exercise: McqExercise;
   idPrefix: string;
   locked: boolean;
@@ -340,7 +341,7 @@ function McqBody(props: {
         disabled={selected.length === 0 || locked}
         onClick={submit}
       >
-        Check answer
+        {props.submitLabel ?? 'Check answer'}
       </button>
     </fieldset>
   );
@@ -366,7 +367,8 @@ export function initialOrder(ids: readonly string[], seed: string): string[] {
   return result;
 }
 
-function OrderBody(props: {
+export function OrderBody(props: {
+  submitLabel?: string;
   exercise: OrderExercise;
   locked: boolean;
   onSubmit: (args: SubmitArgs) => void;
@@ -440,7 +442,7 @@ function OrderBody(props: {
         ))}
       </ol>
       <button type="button" class="button primary" disabled={locked} onClick={submit}>
-        Check order
+        {props.submitLabel ?? 'Check order'}
       </button>
     </div>
   );
@@ -448,7 +450,8 @@ function OrderBody(props: {
 
 /* ---------------------------------------------------------------- debugging */
 
-function DebugBody(props: {
+export function DebugBody(props: {
+  submitLabel?: string;
   exercise: DebugExercise;
   locked: boolean;
   onSubmit: (args: SubmitArgs) => void;
@@ -524,7 +527,7 @@ function DebugBody(props: {
         disabled={locked || selected.length === 0}
         onClick={submit}
       >
-        Check lines
+        {props.submitLabel ?? 'Check lines'}
       </button>
     </div>
   );

@@ -147,9 +147,13 @@ export function validateContent(
     };
     lesson.sections.forEach((section) => unique('section', section.id));
 
-    for (const exercise of lesson.exercises) {
-      unique('exercise', exercise.id);
-      const where = `lesson '${lesson.id}' exercise '${exercise.id}'`;
+    const checked = [
+      ...lesson.exercises.map((exercise) => ({ exercise, kind: 'exercise' })),
+      ...lesson.placement.map((exercise) => ({ exercise, kind: 'placement question' })),
+    ];
+    for (const { exercise, kind } of checked) {
+      unique(kind, exercise.id);
+      const where = `lesson '${lesson.id}' ${kind} '${exercise.id}'`;
       if (!concepts.has(exercise.concept)) errors.push(`${where}: unknown concept '${exercise.concept}'`);
       if (exercise.type === 'mcq') {
         const optionIds = new Set(exercise.options.map((o) => o.id));

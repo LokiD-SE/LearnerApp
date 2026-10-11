@@ -20,17 +20,18 @@ How to write a LearnerApp lesson. The schema is `src/content/schema.ts`; the ref
 `content/lessons/<subject-id>/<lesson-id>.yaml`. The file name is the lesson id (kebab-case), and the lesson
 must be listed under the right module in `content/curriculum.yaml`.
 
-| Field                                                                                | Notes                                                                                   |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `id`, `title`, `subject`, `module`, `level`, `status`, `estimatedMinutes`, `summary` | `status: draft` relaxes the practical-exercise rule while writing                       |
-| `environment`                                                                        | versions, sources, assumptions, what is fictional                                       |
-| `prerequisites`                                                                      | lesson ids (published or planned)                                                       |
-| `concepts`                                                                           | 1-4 per lesson; ids unique across all content; every exercise and recall card names one |
-| `objectives`                                                                         | measurable: "explain", "design", "trace", "write" - not "understand"                    |
-| `sections`                                                                           | the template below, in teaching order                                                   |
-| `exercises`                                                                          | see types below; **each concept needs an `application` or `analysis` exercise**         |
-| `recall`                                                                             | 4-8 active-recall cards: a question and a short answer                                  |
-| `next`, `tags`                                                                       | suggested next lessons; search keywords                                                 |
+| Field                                                                                | Notes                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`, `title`, `subject`, `module`, `level`, `status`, `estimatedMinutes`, `summary` | `status: draft` relaxes the practical-exercise rule while writing                                                                                                          |
+| `environment`                                                                        | versions, sources, assumptions, what is fictional                                                                                                                          |
+| `prerequisites`                                                                      | lesson ids (published or planned)                                                                                                                                          |
+| `concepts`                                                                           | 1-4 per lesson; ids unique across all content; every exercise and recall card names one                                                                                    |
+| `objectives`                                                                         | measurable: "explain", "design", "trace", "write" - not "understand"                                                                                                       |
+| `sections`                                                                           | the template below, in teaching order                                                                                                                                      |
+| `exercises`                                                                          | see types below; **each concept needs an `application` or `analysis` exercise**                                                                                            |
+| `placement`                                                                          | 2-3 auto-graded questions (`mcq`, `order`, `debug`) that decide whether a learner may skip the lesson; **at least one per concept**, different from the practice exercises |
+| `recall`                                                                             | 4-8 active-recall cards: a question and a short answer                                                                                                                     |
+| `next`, `tags`                                                                       | suggested next lessons; search keywords                                                                                                                                    |
 
 ## The lesson template (section `kind`s)
 
@@ -85,6 +86,14 @@ Good exercises:
 - Hints guide reasoning; they don't give the answer away until the last one.
 - Scenario questions give **evidence** (logs, ids, timings), and the solution explains how to **confirm** the
   root cause before acting - not only which option is right.
+
+## Placement questions
+
+- They test whether the lesson can be **skipped**, so ask about applying the concept, not about wording from the
+  lesson.
+- Use only auto-graded types, and give every wrong option its own feedback - learners see it in the results.
+- A learner tests out only if every question is right, so keep it to 2-3 well-chosen questions per lesson.
+- Write the `solution` for someone who got it wrong: it is shown in the results review.
 
 ## YAML pitfalls
 

@@ -3,7 +3,14 @@ import type { ContentIndex } from '../../content/validate';
 import type { Lesson, SectionKind } from '../../content/schema';
 import { useProgress } from '../../store/ProgressContext';
 import { lessonProgress, lessonStatus, masteryOf } from '../../store/selectors';
-import { markRead, markUnread, setNotes, toggleBookmark, visitLesson } from '../../store/state';
+import {
+  clearPlacement,
+  markRead,
+  markUnread,
+  setNotes,
+  toggleBookmark,
+  visitLesson,
+} from '../../store/state';
 import { LevelBadge, MasteryBadge, StatusBadge, formatDate, percent } from '../components/Badges';
 import { ExerciseCard } from '../components/ExerciseCard';
 import { Markdown } from '../components/Markdown';
@@ -83,6 +90,7 @@ function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesso
   const subject = index.subjects.get(ref.subjectId);
   const mod = index.modules.get(ref.moduleId);
   const progress = state.lessons[lesson.id];
+  const placement = state.placements[lesson.id];
   const summary = lessonProgress(index, state, lesson.id);
   const [notes, setNotesText] = useState(progress?.notes ?? '');
   const notesTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -151,9 +159,28 @@ function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesso
                 })}
               </ul>
             )}
-            <p class="muted small">
-              Unsure about these? Skim them, or try this lesson's exercises first as a diagnostic.
-            </p>
+            <p class="muted small">Unsure about these? Skim them first.</p>
+            {lesson.placement.length > 0 &&
+              (placement?.result === 'tested-out' ? (
+                <p class="small placement-note">
+                  You tested out of this lesson on {formatDate(placement.at)}.{' '}
+                  <button
+                    type="button"
+                    class="link-button"
+                    onClick={() => update((s) => clearPlacement(s, lesson.id))}
+                  >
+                    Study it anyway
+                  </button>
+                </p>
+              ) : (
+                <p class="small placement-note">
+                  Already know this?{' '}
+                  <a href={href.placement('lesson', lesson.id)}>
+                    Test out ({lesson.placement.length} questions)
+                  </a>
+                  {placement ? ` - last result ${placement.correct} of ${placement.total}` : ''}
+                </p>
+              ))}
           </section>
           <nav class="panel toc" aria-label="Contents">
             <h2 class="panel-title">Contents</h2>

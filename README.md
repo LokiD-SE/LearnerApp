@@ -10,6 +10,8 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 
 - **Static and offline-friendly.** All content is bundled into the build; there is no server, account or paid
   API. Progress is stored in your browser.
+- **Skip what you already know.** A placement test per learning path (and "Test out" on each lesson) marks
+  lessons you can already show you know as _tested out_; their recall cards still come back for review.
 - **Desktop and mobile.** Responsive layout, touch-sized controls and pinch-zoom allowed everywhere. Diagrams
   have a full-size toggle.
 
@@ -132,7 +134,7 @@ Lessons are YAML files. The UI never needs to change to add one. Read
 - **Free-text answers are self-assessed** against a model answer and rubric. They are not auto-graded, and
   the mastery model gives them slightly less weight (see [docs/MASTERY_MODEL.md](docs/MASTERY_MODEL.md)).
 - **Progress is per browser.** Use export/import to move it; there is no sync.
-- **No diagnostic placement test yet.** Prerequisites are shown with their status and you choose what to skip.
+- **Placement covers lessons that have placement questions** - currently the eight core-path lessons.
 - **Java code is shown, not run.** There is no in-browser JVM; exercises check understanding of the code.
 - **Bundle size.** Mermaid is large, but it is a separate lazily loaded chunk fetched only on pages with
   diagrams.
