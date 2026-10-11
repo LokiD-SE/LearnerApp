@@ -20,7 +20,15 @@ const yamlFiles = (dir: string): string[] =>
 /** Loads content/*.yaml as JS modules and refuses to start or build on invalid content. */
 function learnerContent(): Plugin {
   const checkAll = () => {
-    const read = (file: string) => parse(readFileSync(file, 'utf8')) as unknown;
+    const read = (file: string): unknown => {
+      try {
+        return parse(readFileSync(file, 'utf8'));
+      } catch (error) {
+        throw new Error(`${relative(import.meta.dirname, file)}: ${(error as Error).message}`, {
+          cause: error,
+        });
+      }
+    };
     const lessons = Object.fromEntries(
       yamlFiles(join(CONTENT_DIR, 'lessons')).map((file) => [
         relative(import.meta.dirname, file),

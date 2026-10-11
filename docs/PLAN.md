@@ -21,14 +21,24 @@ Acceptance criteria - all met and covered by automated tests:
 - [x] Checks: typecheck, lint, format, 68 unit/integration/component tests, 8 end-to-end runs (4 journeys ×
       desktop and mobile viewports).
 
+## Increment 2 - Payments QA core path (done)
+
+Goal: the eight lessons of the "Payments QA - core path", written to the lesson template and checked.
+
+- [x] Seven new lessons: HTTP anatomy, methods and idempotency, payment lifecycle, sandboxes and test data,
+      declines/timeouts/unknown outcomes, webhooks and signatures, payment scenario matrix (plus the existing
+      idempotency-keys lesson).
+- [x] Home page follows the path: "Start here" opens the first unfinished lesson of the core path; path
+      progress is shown for every learning path.
+- [x] Content-quality tests for every published lesson (environment, core template sections, a diagram,
+      varied practice with hints, distinct feedback per option, recall cards, no card-number-like digits).
+- [x] End-to-end test that opens every lesson at desktop and mobile size and requires every diagram to render
+      with no page errors.
+
 ## Next increments
 
 Each increment ends with `npm run check` green.
 
-2. **Stage 1-2 core content (payments path).** Write the planned lessons on the "Payments QA - core path":
-   HTTP anatomy, methods and idempotency, payment lifecycle, sandbox test data, declines/timeouts/unknown
-   outcomes, webhooks, scenario matrix. Add a `scenario` matrix exercise type if test-case writing needs more
-   structure than the rubric gives.
 3. **Diagnostic placement.** A short diagnostic per stage that marks prerequisites as "known" so learners skip
    what they already know (prompt section 14).
 4. **Adaptive practice.** After a wrong answer, recommend the remediation section and a sibling exercise on the
@@ -43,6 +53,5 @@ Each increment ends with `npm run check` green.
 
 ## Open questions for the owner
 
-- Should the default first lesson follow the "Payments QA - core path" order, or start at stage 1 foundations?
 - Which real payment provider (if any) should provider-specific notes compare against? Lessons currently stay
   provider-neutral with a fictional SandPay.

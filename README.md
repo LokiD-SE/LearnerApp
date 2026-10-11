@@ -15,10 +15,20 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 
 ## Status
 
-The first vertical slice is complete. The full curriculum map is navigable (7 stages, foundations plus tracks
-A-G, 63 lessons), and one lesson is fully written: **Idempotency keys and duplicate payment requests**
-(Track C, payment API testing). The rest are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the
-roadmap and what is deferred.
+The foundation and the **Payments QA core path** are complete. The full curriculum map is navigable
+(7 stages, foundations plus tracks A-G, 63 lessons), and the eight lessons of the core path are fully written:
+
+1. Anatomy of an HTTP request and response
+2. HTTP methods - safety and idempotency
+3. Payment lifecycle - authorise, capture, settle, refund
+4. Test cards, sandboxes and mock services
+5. Idempotency keys and duplicate payment requests
+6. Declines, timeouts and unknown outcomes
+7. Webhooks, signatures and asynchronous status
+8. Building a payment scenario matrix
+
+The other 55 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+deferred.
 
 ## Requirements
 
@@ -118,7 +128,7 @@ Lessons are YAML files. The UI never needs to change to add one. Read
 
 ## Known limitations
 
-- **One complete lesson.** The other 62 lessons are planned entries on the map.
+- **Eight complete lessons** (the Payments QA core path). The other 55 are planned entries on the map.
 - **Free-text answers are self-assessed** against a model answer and rubric. They are not auto-graded, and
   the mastery model gives them slightly less weight (see [docs/MASTERY_MODEL.md](docs/MASTERY_MODEL.md)).
 - **Progress is per browser.** Use export/import to move it; there is no sync.

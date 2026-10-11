@@ -2,8 +2,8 @@
  * Read-only views of progress joined with content: lesson status, concept mastery,
  * the review queue and weak areas. Pure functions, so they are unit-tested directly.
  */
-import type { ContentIndex } from '../content/validate';
-import type { Exercise, Lesson, RecallCard } from '../content/schema';
+import type { ContentIndex, LessonRef } from '../content/validate';
+import type { Exercise, LearningPath, Lesson, RecallCard } from '../content/schema';
 import { conceptMastery, type ConceptItem, type ConceptMastery, type Evidence } from '../domain/mastery';
 import { interleave, isDue } from '../domain/srs';
 import { exerciseOf, isLessonComplete, itemKey, type ProgressState, type ReviewEntry } from './state';
@@ -143,4 +143,27 @@ export function weakConcepts(index: ContentIndex, state: ProgressState): Concept
   return conceptRows(index, state)
     .filter((row) => row.mastery.level === 'attempted' || row.mastery.level === 'practising')
     .sort((a, b) => a.mastery.score - b.mastery.score);
+}
+
+export interface PathProgress {
+  total: number;
+  /** lessons in the path that are published */
+  ready: number;
+  /** published lessons completed or mastered */
+  completed: number;
+  /** the first published lesson in path order that isn't completed yet */
+  next: LessonRef | undefined;
+}
+
+/** Progress along a learning path, in the path's own order. */
+export function pathProgress(index: ContentIndex, state: ProgressState, path: LearningPath): PathProgress {
+  const refs = path.lessons.map((id) => index.refs.get(id)).filter((ref): ref is LessonRef => Boolean(ref));
+  const ready = refs.filter((ref) => !ref.planned);
+  const done = (id: string) => ['completed', 'mastered'].includes(lessonStatus(index, state, id));
+  return {
+    total: refs.length,
+    ready: ready.length,
+    completed: ready.filter((ref) => done(ref.id)).length,
+    next: ready.find((ref) => !done(ref.id)),
+  };
 }

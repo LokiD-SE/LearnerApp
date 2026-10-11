@@ -1,0 +1,553 @@
+id: declines-timeouts-unknown-outcomes
+title: Declines, timeouts and unknown outcomes
+subject: payments-testing
+module: payment-failure-modes
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: The difference between a decline, an error, a pending payment and an unknown outcome - and how to test that a system recovers from each without losing orders or charging twice.
+tags: [payments, declines, timeouts, unknown outcome, pending, retries, fault injection, root-cause analysis]
+
+environment: |
+  - **Universal:** the categories approved / declined / error / pending / unknown, and the rule that a
+    timeout means "unknown", apply to every payment integration.
+  - **Card decline codes:** issuers answer with response codes, commonly the ISO 8583-style two-digit
+    codes (for example `51` insufficient funds). Processors and providers usually translate them into
+    their own codes - use your provider's list.
+  - **Network rules:** card networks restrict how often a declined transaction may be retried and may
+    charge fees for excessive retries. The rules change; your acquirer or provider has the current ones.
+  - **Tools mentioned:** mitmproxy and Charles (HTTP debugging proxies), Toxiproxy (simulates network
+    conditions between services), and emulator/device network settings. Check each tool's own
+    documentation for set-up.
+  - **Fictional:** SandPay and its codes. Java code: Java 17+, JDK HTTP client.
+
+prerequisites:
+  - payment-lifecycle-overview
+  - idempotency-keys
+
+concepts:
+  - id: decline-handling
+    name: Handling declines
+    summary: A decline is a final answer for that attempt; show a helpful message, don't hammer retries, and don't reveal fraud reasons.
+  - id: unknown-outcome-recovery
+    name: Recovering from unknown outcomes
+    summary: A timeout means "unknown" - find out what happened (status lookup, same-key retry, events) before telling anyone it failed.
+
+objectives:
+  - Classify a payment result as approved, declined, error, pending or unknown, and state the correct next action for each.
+  - Explain why treating a timeout as a failure causes double charges and lost orders.
+  - Simulate declines, slow responses and dropped responses in a test environment.
+  - Design tests and investigate incidents where the customer-facing result and the real payment disagree.
+
+sections:
+  - id: intuition
+    kind: intuition
+    title: The idea in plain language
+    body: |
+      You phone a restaurant to book a table. Three things can happen:
+
+      - "Yes, booked" - **approved**.
+      - "Sorry, we're full" - **declined**. A clear answer; calling back five times won't change it.
+      - The line drops while they're typing your name - **unknown**. Maybe they booked it, maybe not.
+
+      In the third case, booking again at another restaurant "to be safe" could leave you with two
+      tables, and assuming "no booking" could cost you the table you actually have. The sensible move is
+      to **call back and ask "did my booking go through?"** - that's a status lookup.
+
+      Payment systems face the third case all the time, and most double charges and lost orders come from
+      treating "the line dropped" as "they said no".
+
+  - id: what
+    kind: what
+    title: Five kinds of result
+    body: |
+      | Result | Who decided | Money | Typical signal | Next action |
+      |---|---|---|---|---|
+      | **Approved** | issuer (or provider) | authorised or captured | `authorized` / `captured` | fulfil the order |
+      | **Declined** | issuer or risk rules | nothing taken for this attempt | `declined` plus a reason code | tell the customer; offer another method |
+      | **Error** | the API rejected the request before any decision | nothing taken | `4xx` validation/auth error | fix the request; don't blindly retry |
+      | **Pending** | decision still to come | not yet known | `requires_action`, `processing` | wait for the event or poll; show "pending" |
+      | **Unknown** | **nobody told you** | **may or may not have moved** | timeout, connection lost, many `5xx` | **find out** - look up status, retry with the same key |
+
+      Two subtleties:
+
+      - **A `5xx` is not always "nothing happened".** If the server failed *after* calling the processor,
+        the payment may exist. Treat server errors on payment creation as unknown unless the API documents
+        otherwise.
+      - **How a decline is reported is provider-specific.** Some APIs return `2xx` with
+        `"status": "declined"`, others a `4xx` (for example `402`). Read the contract.
+
+  - id: why
+    kind: why
+    title: Why "unknown" deserves its own handling
+    body: |
+      When an unknown outcome is shown as "Payment failed":
+
+      - the customer **pays again** - with the same card (a second charge) or another one;
+      - or the order is **cancelled** while the money was actually taken - a support case and a refund;
+      - support sees "failed" in the system while the customer sees a charge in their banking app, and
+        nobody trusts either.
+
+      When a decline is handled badly:
+
+      - automatic rapid retries **break card-network rules** and can create fees, and they rarely turn a
+        "no" into a "yes";
+      - over-specific messages ("card reported stolen") **leak fraud signals** to whoever is using the
+        card.
+
+  - id: internals
+    kind: internals
+    title: Where timeouts happen, and the recovery tools
+    body: |
+      An unknown outcome can appear at three boundaries:
+
+      1. **App/browser ↔ merchant API** - mobile networks, closed laptops, killed apps.
+      2. **Merchant API ↔ payment provider** - the merchant's HTTP call times out.
+      3. **Provider ↔ network/issuer** - the provider usually handles this and reports a pending or
+         failed status, or a decline such as "issuer unavailable".
+
+      The tools for turning "unknown" into a known answer:
+
+      | Tool | How it helps | Watch out for |
+      |---|---|---|
+      | **Retry with the same idempotency key** | replays the original result, or completes the attempt once | a new key creates a new payment |
+      | **Status lookup** by payment id or merchant reference | asks "what happened?" | you may not have the id yet - look up by reference |
+      | **Events / webhooks** | the provider tells you when the outcome is final | can arrive late or out of order |
+      | **Reconciliation** | compares your records with the provider's reports | runs later; catches what the others missed |
+
+      **Decline codes.** Issuers answer with response codes, often in the ISO 8583 style: `05` do not
+      honour, `14` invalid card number, `51` insufficient funds, `54` expired card, `91` issuer
+      unavailable. Teams often group declines as **soft** (may succeed later or after customer action,
+      such as insufficient funds or issuer unavailable) and **hard** (won't succeed for this card, such as
+      a closed or stolen card). Your provider's codes and guidance decide which is which.
+
+  - id: visual-states
+    kind: visual
+    title: "State diagram: resolving an attempt on the client side"
+    body: |
+      ```mermaid
+      stateDiagram-v2
+          [*] --> sending
+          sending --> approved: success response
+          sending --> declined: decline response
+          sending --> rejected: validation or auth error
+          sending --> unknown: timeout or connection lost
+          unknown --> checking: look up by reference or key
+          checking --> approved: payment found, approved
+          checking --> declined: payment found, declined
+          checking --> retrying: no payment found
+          checking --> unknown: lookup also failed - try again later
+          retrying --> approved: same-key retry succeeds
+          retrying --> declined
+          approved --> [*]
+          declined --> [*]
+          rejected --> [*]
+      ```
+
+      The important part is the loop: **unknown never jumps straight to failed**.
+
+  - id: visual-sequence
+    kind: visual
+    title: "Sequence: the merchant's call to the provider times out"
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant App as Checkout app
+          participant API as Merchant API
+          participant SP as SandPay
+          App->>API: Pay order ORD-2210
+          API->>SP: POST /v1/payments (key k-77, reference ORD-2210)
+          SP->>SP: payment authorised
+          SP--xAPI: response lost (timeout after 10 s)
+          API-->>App: Confirming your payment...
+          API->>SP: GET /v1/payments?reference=ORD-2210
+          SP-->>API: pay_91Qa authorized
+          API-->>App: Payment successful
+      ```
+
+  - id: when
+    kind: when
+    title: When to retry - and who should
+    body: |
+      | Outcome | Retry? | Who | How |
+      |---|---|---|---|
+      | Unknown (timeout, connection lost) | yes, carefully | the system | status lookup first, or retry with the **same** idempotency key |
+      | `5xx` on creation | treat as unknown | the system | as above |
+      | Pending | no - wait | the system | webhook or polling with backoff |
+      | Soft decline | maybe later | the **customer** decides | let them retry or choose another method; no rapid automatic retries |
+      | Hard decline | no | - | ask for another payment method |
+      | `4xx` validation / auth error | no, not unchanged | developer / configuration | fix the request |
+
+  - id: steps
+    kind: steps
+    title: Step by step - simulating failures
+    body: |
+      1. **Declines:** use the sandbox's published decline triggers (for SandPay,
+         `pm_sandpay_decline_insufficient_funds` and `pm_sandpay_decline_stolen`).
+      2. **Slow provider responses:** use a sandbox delay trigger if there is one (SandPay:
+         `pm_sandpay_processing_delay`), or put a fault-injection proxy such as Toxiproxy between your
+         service and the provider (or the provider mock) and add latency above your timeout.
+      3. **Lost responses on a device:** route the app through an HTTP debugging proxy (mitmproxy,
+         Charles) and drop or delay the payment response; or switch the device to flight mode right after
+         tapping **Pay**.
+      4. **App killed mid-payment:** start the payment, then force-stop the app (Android: from settings or
+         `adb shell am force-stop <package>`; iOS: swipe away) and relaunch.
+      5. **For every case, record:** what the customer saw, the order status, the payment status at the
+         provider, the number of payments created, and any events received.
+
+  - id: example
+    kind: example
+    title: "Real-world example: \"failed\" but charged twice"
+    body: |
+      A customer pays 120.00 in the app on a weak connection. After 30 seconds the app shows **"Payment
+      failed - try again"**. They try again with a second card, which works. Next day: **two charges**.
+
+      Evidence:
+
+      - Merchant API logs: request 1 reached SandPay and was **authorised** after 31 s; the app's
+        client timeout was 30 s.
+      - App logs: `timeout -> showing failure screen`.
+      - Two orders? No - one order, with **two payments** attached, because the retry used the same
+        order but a new card and a new key.
+
+      **Root cause:** the app mapped "timeout" to "failed" and invited a retry. **Fix:** a "confirming
+      your payment" state that looks the payment up before offering a retry, plus a server-side rule that
+      an order with an approved payment can't accept another. **Regression tests:** delayed response
+      longer than the client timeout; app killed during the payment.
+
+  - id: code
+    kind: code
+    title: "Code: mapping outcomes correctly"
+    collapsed: true
+    body: |
+      A client that keeps "unknown" separate and resolves it before reporting (Java 17+, illustrative -
+      `lookupByReference` and the result types are your own):
+
+      ```java
+      PaymentResult pay(PaymentRequest request, String idempotencyKey) throws InterruptedException {
+          try {
+              HttpResponse<String> response = http.send(toHttpRequest(request, idempotencyKey),
+                      HttpResponse.BodyHandlers.ofString());
+              return PaymentResult.fromResponse(response);   // approved, declined, rejected or 5xx -> unknown
+          } catch (HttpConnectTimeoutException | ConnectException e) {
+              return PaymentResult.notSent(e);              // never reached the server: safe to retry
+          } catch (IOException e) {                         // includes response timeouts
+              return resolveUnknown(request.reference(), idempotencyKey);
+          }
+      }
+
+      PaymentResult resolveUnknown(String reference, String idempotencyKey) throws InterruptedException {
+          Optional<PaymentResult> found = lookupByReference(reference);
+          return found.orElseGet(() -> PaymentResult.unknown(reference, idempotencyKey)); // retry later, same key
+      }
+      ```
+
+      - `HttpConnectTimeoutException` (connect phase) is a subclass of `HttpTimeoutException`; the
+        multi-catch must list it before the general `IOException` handler, which then covers response
+        timeouts and connections lost mid-request.
+      - `fromResponse` must treat `5xx` on creation as unknown, not as failure.
+      - `unknown` is a real state the UI shows ("We're confirming your payment"), not a polite word for
+        failure.
+
+  - id: tests
+    kind: tests
+    title: Test cases
+    body: |
+      | ID | Scenario | Expected | Evidence |
+      |---|---|---|---|
+      | F1 | Insufficient-funds decline | helpful message, another method offered, order unpaid, no automatic retry | UI, order, provider: one attempt |
+      | F2 | Stolen-card decline | **generic** decline message; no fraud detail shown | UI text |
+      | F3 | Provider responds after the merchant's timeout, payment approved | customer ends up seeing success; one payment | merchant logs, provider records |
+      | F4 | Provider responds after the timeout, payment declined | customer ends up seeing the decline | as above |
+      | F5 | Response lost on the device (flight mode after **Pay**) | "confirming" state, then the real result on reconnect; no second payment | app logs, provider records |
+      | F6 | App killed during payment, then relaunched | the order shows the real result; no duplicate | app, order, provider |
+      | F7 | `5xx` from the merchant API on creation | treated as unknown; status resolved | API logs |
+      | F8 | Lookup also fails | stays "confirming"; retries later; never "failed" by default | logs over time |
+      | F9 | Customer taps **Pay** again while unknown | blocked or replays the same attempt | provider: one payment |
+      | F10 | Decline retried by the customer later | a new attempt with a **new** key; the earlier decline is unchanged | provider: two attempts |
+
+  - id: mistakes
+    kind: mistakes
+    title: Common mistakes
+    body: |
+      - **Timeout = failure.** The single most expensive mistake in payment UIs.
+      - **A new idempotency key for the retry of an unknown attempt** - creates a second payment.
+      - **Automatic rapid retries of declines** - against network rules, rarely helpful.
+      - **Leaking fraud reasons** ("card reported stolen") to the customer; show a generic decline and
+        let them contact their bank.
+      - **One timeout for everything.** A 10-second timeout in the app with a 30-second timeout on the
+        server guarantees "unknown" cases. Check the timeout chain end to end.
+      - **Reporting "the provider is slow" as the root cause** without asking what the client did with
+        the slowness. Slowness is a condition; mishandling it is the defect.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    title: Trade-offs
+    body: |
+      - **Short timeouts** feel responsive but create more unknowns; **long timeouts** frustrate users.
+        A "confirming" state lets you keep the UI responsive without guessing.
+      - **Polling** is simple and works without public endpoints; **webhooks** are efficient but arrive
+        late or out of order. Many systems use both: webhooks first, polling as the safety net.
+      - **Showing decline reasons** helps honest customers fix the problem (wrong expiry date) but must
+        not reveal fraud signals.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Five results: **approved, declined, error, pending, unknown.** Only unknown means "we don't know
+        if money moved".
+      - Unknown → **look up, or retry with the same key** → only then report.
+      - Treat `5xx` on payment creation as unknown.
+      - Declines: helpful but generic messages, customer-driven retries, never hammer.
+      - Test with decline triggers, delays beyond the timeout, dropped responses and killed apps - and
+        always check the provider's records for the number of payments.
+
+exercises:
+  - id: right-actions
+    type: mcq
+    concept: decline-handling
+    skill: application
+    title: Which handling is correct?
+    prompt: |
+      Which of these behaviours are correct? Select every one that applies.
+    options:
+      - id: nsf
+        text: "Insufficient funds: show a clear message and let the customer choose another payment method."
+        feedback: Correct - a soft decline the customer can act on; the customer decides what to do next.
+      - id: stolen-message
+        text: "Stolen card: tell the customer \"This card has been reported stolen\"."
+        feedback: Leaks a fraud signal to whoever holds the card. Show a generic decline and suggest contacting the bank.
+      - id: timeout-failed
+        text: "Timeout: mark the order failed and email the customer \"Your payment failed\"."
+        feedback: A timeout is unknown, not failed. The payment may have succeeded - this is how lost orders and double charges start.
+      - id: timeout-lookup
+        text: "Timeout: show \"Confirming your payment\" and look the payment up by its reference before deciding."
+        feedback: Correct - resolve the unknown first, then report the real outcome.
+      - id: auto-retry
+        text: "Hard decline: retry automatically three times within a minute."
+        feedback: Hard declines won't change, and rapid automatic retries can break card-network rules and create fees.
+    correct: [nsf, timeout-lookup]
+    hints:
+      - Separate "the bank said no" from "we never heard back".
+      - Who should decide whether to try again after a decline - the system or the customer?
+    solution: |
+      **Insufficient funds with a clear message, and "confirming" plus a lookup for timeouts.** The others
+      either leak fraud signals, turn an unknown into a false failure, or hammer the networks with
+      pointless retries.
+    followUp: |
+      Write the exact customer-facing messages for: insufficient funds, a stolen-card decline, and an
+      unknown outcome that is still being confirmed.
+
+  - id: failed-but-charged
+    type: mcq
+    concept: unknown-outcome-recovery
+    skill: analysis
+    title: "\"Failed\" but charged twice"
+    prompt: |
+      A customer reports two charges. Evidence: the app showed "Payment failed" after its 30 s timeout;
+      the merchant API log shows the first payment authorised at 31 s; the customer then paid with a
+      second card. What is the root cause?
+    options:
+      - id: provider-slow
+        text: The provider was too slow.
+        feedback: Slowness was the trigger, not the defect. Networks and providers will be slow sometimes; the system must handle it.
+      - id: double-tap
+        text: The customer tapped Pay twice.
+        feedback: The second payment came after the app showed failure and the customer chose another card - a deliberate retry the app invited.
+      - id: timeout-as-failure
+        text: The app treated an unknown outcome (timeout) as a failure and invited a retry.
+        feedback: Correct - the first attempt's outcome was unknown at 30 s and approved at 31 s. Showing "failed" caused the second payment.
+      - id: idempotency
+        text: The idempotency key wasn't reused.
+        feedback: Reusing the key protects a retry of the same attempt. Here the customer used a different card, which is a new attempt - the real defect is telling them the first one failed.
+    correct: [timeout-as-failure]
+    hints:
+      - When did the first payment actually succeed, compared with when the app gave up?
+      - Which component told the customer something that wasn't true?
+    solution: |
+      **The app turned "unknown" into "failed".** At 30 s nobody knew the outcome; at 31 s it was
+      approved. The false failure message caused the customer's second payment.
+
+      **Confirm it:** reproduce in the sandbox with a delay longer than the app's timeout and check the
+      screens. **Fix:** a confirming state with a status lookup, and a server rule that an order with an
+      approved payment can't take another. **Regression:** the delayed-response and killed-app tests.
+    followUp: |
+      Besides the app fix, what server-side check would have stopped the second charge even with the
+      buggy app? Write it as a test case.
+
+  - id: exception-mapping-bug
+    type: debug
+    concept: unknown-outcome-recovery
+    skill: analysis
+    title: Which catch blocks lie?
+    prompt: |
+      This (illustrative) client reports payment results to the app. Click the line or lines that report
+      a failure when the payment may in fact have gone through.
+    language: java
+    code: |
+      PaymentResult pay(PaymentRequest request, String idempotencyKey) throws InterruptedException {
+          try {
+              HttpResponse<String> response = http.send(toHttpRequest(request, idempotencyKey), BodyHandlers.ofString());
+              return PaymentResult.fromResponse(response);
+          } catch (HttpTimeoutException e) {
+              return PaymentResult.failed("Payment failed, please try again");
+          } catch (ConnectException e) {
+              return PaymentResult.failed("Could not reach the payment service");
+          } catch (IOException e) {
+              return PaymentResult.failed("Payment failed, please try again");
+          }
+      }
+    correctLines: [6, 10]
+    lineNotes:
+      - line: 8
+        note: A ConnectException means the connection was never established, so the request was never sent - reporting "could not reach the service" and allowing a retry is reasonable here.
+      - line: 3
+        note: Sending the request is fine; the question is how each failure afterwards is interpreted.
+    hints:
+      - For each catch block, ask - could the server have received and processed the request before this exception happened?
+      - A response timeout and a connection dropped while waiting both happen after the request was sent.
+    solution: |
+      **Lines 6 and 10.** A response timeout (line 6) and most other `IOException`s (line 10), such as a
+      connection reset while waiting, happen **after** the request was sent - the payment may exist.
+      Both must return an *unknown* result that is resolved by a status lookup or a same-key retry.
+
+      Line 8 is the one honest failure: a `ConnectException` means the connection never opened. (A
+      refinement: a connect timeout is thrown as `HttpConnectTimeoutException`, a subclass of
+      `HttpTimeoutException`, so line 5's block also catches some never-sent cases - when in doubt,
+      treating them as unknown is always safe.)
+    followUp: |
+      Rewrite the method so each catch block returns the right kind of result, and list the three unit
+      tests you would write for it.
+
+  - id: order-recovery
+    type: order
+    concept: unknown-outcome-recovery
+    skill: recall
+    title: Order the recovery steps
+    prompt: |
+      A payment request timed out. Put the recovery steps in the right order.
+    items:
+      - id: show-confirming
+        text: Show the customer "Confirming your payment" instead of a failure
+      - id: lookup
+        text: Look the payment up by its merchant reference or id
+      - id: report
+        text: If found with a final status, report that status
+      - id: retry-same-key
+        text: If no payment is found, retry with the same idempotency key
+      - id: reconcile
+        text: If still unresolved, leave it pending for the reconciliation job to settle
+    hints:
+      - The customer should never be left looking at a false failure while you investigate.
+      - Asking is cheaper and safer than repeating.
+    solution: |
+      **Show "confirming" → look up → report if final → otherwise retry with the same key → otherwise
+      leave it pending for reconciliation.** Each step only runs if the previous one couldn't give a
+      final answer, and none of them can create a second payment.
+    followUp: |
+      Which of these steps could run on the server instead of the app, and what would that change for a
+      customer who closes the app?
+
+  - id: timeout-tests
+    type: testdesign
+    concept: unknown-outcome-recovery
+    skill: application
+    title: Test the unknowns
+    prompt: |
+      Design test cases for SandPay checkout's handling of unknown outcomes - on the web and in the
+      mobile app. Say how you would create each condition and what evidence proves the result.
+    hints:
+      - There are three boundaries where an outcome can become unknown. Cover more than one.
+      - The decisive evidence is not on the screen.
+    modelAnswer: |
+      1. Provider responds after the merchant API's timeout, payment approved: Toxiproxy latency (or
+         SandPay's delay trigger). Expected: customer finally sees success; exactly one payment.
+      2. Same, payment declined: the decline is shown after confirmation.
+      3. App loses the response: flight mode right after Pay, or a proxy that drops the response.
+         Expected: "confirming", then the real result on reconnect.
+      4. App killed during payment and relaunched: the order shows the real outcome.
+      5. `5xx` from the merchant API on creation: treated as unknown and resolved.
+      6. Status lookup also fails: stays confirming, retries later; never shown as failed by default.
+      7. Customer taps Pay again while confirming: blocked, or replays the same attempt.
+      Evidence for each: what the customer saw, order status, provider records (number of payments),
+      logs with the idempotency key and reference.
+    rubric:
+      - Covered a slow provider response beyond the merchant's timeout
+      - Covered a lost response on the client (device or browser)
+      - Covered the app being killed or the page closed during payment
+      - Covered the lookup itself failing
+      - Covered a second Pay attempt while the first is unknown
+      - Named how to create each condition (sandbox trigger, proxy, flight mode, force-stop)
+      - Used provider records to prove the number of payments, not only the UI
+    solution: |
+      The answers that stand out cover the **killed app** and the **failed lookup** - the cases where most
+      implementations quietly fall back to "failed".
+    followUp: |
+      Pick your killed-app test and write it at the level of detail a colleague could follow on an
+      Android emulator.
+
+  - id: interview-decline-testing
+    type: interview
+    concept: decline-handling
+    skill: application
+    title: "Interview: testing declines"
+    prompt: |
+      **Interviewer:** "How would you test decline handling in our checkout, and what would you be
+      careful about in the messages?"
+    hints:
+      - Cover how to produce declines, what to check for each, and the message rules.
+    modelAnswer: |
+      - Produce declines with the sandbox's published triggers, one per decline type the product treats
+        differently (insufficient funds, expired card, do-not-honour, stolen/lost, issuer unavailable).
+      - For each: the order stays unpaid, no money is held or captured, the message helps the customer
+        act (another method, check details) and the attempt is recorded with its reason code.
+      - Messages: helpful for fixable cases, generic for fraud-related declines - never reveal "stolen"
+        or risk-rule details.
+      - Retries: the customer may retry or switch method; the system doesn't auto-retry rapidly; a retry
+        is a new attempt with a new idempotency key.
+      - Evidence: provider records (one declined attempt), logs with the reason code but no card data.
+    followUps:
+      - Which decline reasons would you show in detail, and which only generically?
+      - How do you stop your own system from retrying declines automatically, and how would you test it?
+      - What is the difference between a decline and an unknown outcome in your tests?
+    rubric:
+      - Used sandbox triggers for several decline types handled differently
+      - Checked order state and that no money was taken
+      - Distinguished helpful messages from fraud-sensitive generic ones
+      - Covered retry behaviour (customer-driven, new key, no rapid automatic retries)
+      - Named evidence in provider records and logs without card data
+    solution: |
+      Strong answers treat the **message** as a security-relevant part of the test, and separate declines
+      from unknown outcomes.
+
+recall:
+  - id: recall-five
+    concept: unknown-outcome-recovery
+    prompt: Name the five kinds of payment result.
+    answer: Approved, declined, error (request rejected), pending (decision to come) and unknown (no answer received).
+  - id: recall-timeout
+    concept: unknown-outcome-recovery
+    prompt: What does a timeout on payment creation mean, and what do you do?
+    answer: The outcome is unknown - the payment may exist. Show "confirming", look it up by reference, or retry with the same idempotency key before reporting anything.
+  - id: recall-5xx
+    concept: unknown-outcome-recovery
+    prompt: Is a 5xx on payment creation a failure?
+    answer: Not necessarily - the server may have failed after calling the processor. Treat it as unknown unless the API documents otherwise.
+  - id: recall-soft-hard
+    concept: decline-handling
+    prompt: What is the difference between a soft and a hard decline?
+    answer: A soft decline may succeed later or after customer action (for example insufficient funds); a hard decline won't succeed for that card (for example a closed or stolen card).
+  - id: recall-fraud-message
+    concept: decline-handling
+    prompt: What should the customer see for a stolen-card decline?
+    answer: A generic decline message suggesting another payment method or contacting their bank - never the fraud reason.
+  - id: recall-retry-decline
+    concept: decline-handling
+    prompt: Who should decide to retry a declined payment, and how?
+    answer: The customer, as a new attempt (new idempotency key). The system must not retry declines rapidly on its own - networks restrict it.
+
+next:
+  - webhooks-and-async-status
+  - interruptions-refresh-back-navigation
+  - payment-scenario-matrix

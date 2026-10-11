@@ -1,6 +1,6 @@
 import type { ContentIndex } from '../../content/validate';
 import { useProgress } from '../../store/ProgressContext';
-import { dueReviews, lessonStatus, weakConcepts } from '../../store/selectors';
+import { dueReviews, lessonStatus, pathProgress, weakConcepts } from '../../store/selectors';
 import { StatusBadge } from '../components/Badges';
 import { href } from '../router';
 
@@ -9,8 +9,13 @@ export function HomePage({ index }: { index: ContentIndex }) {
   const due = dueReviews(index, state, now());
   const last = state.lastLessonId ? index.refs.get(state.lastLessonId) : undefined;
   const weak = weakConcepts(index, state).slice(0, 3);
-  const published = [...index.refs.values()].filter((ref) => !ref.planned);
-  const firstLesson = published[0];
+  const lastStatus = last ? lessonStatus(index, state, last.id) : undefined;
+  const resume = last && lastStatus !== 'completed' && lastStatus !== 'mastered' ? last : undefined;
+  const mainPath = index.curriculum.paths[0];
+  const mainProgress = mainPath ? pathProgress(index, state, mainPath) : undefined;
+  // Without a path, fall back to the first published lesson in curriculum order.
+  const nextLesson = mainProgress?.next ?? [...index.refs.values()].find((ref) => !ref.planned);
+  const fresh = state.attempts.length === 0 && !last;
 
   return (
     <section class="page">
@@ -24,26 +29,32 @@ export function HomePage({ index }: { index: ContentIndex }) {
 
       <div class="cards">
         <section class="card">
-          <h2>{last ? 'Continue' : 'Start here'}</h2>
-          {last ? (
+          <h2>{resume ? 'Continue' : fresh ? 'Start here' : 'Next on your path'}</h2>
+          {resume ? (
             <>
               <p>
-                <a href={href.lesson(last.id)}>{last.title}</a>{' '}
-                <StatusBadge status={lessonStatus(index, state, last.id)} />
+                <a href={href.lesson(resume.id)}>{resume.title}</a> <StatusBadge status={lastStatus!} />
               </p>
-              <a class="button primary" href={href.lesson(last.id)}>
+              <a class="button primary" href={href.lesson(resume.id)}>
                 Resume lesson
               </a>
             </>
-          ) : firstLesson ? (
+          ) : nextLesson ? (
             <>
-              <p>{firstLesson.title}</p>
-              <a class="button primary" href={href.lesson(firstLesson.id)}>
-                Open the first lesson
+              <p>
+                {mainPath && mainProgress?.next ? <span class="muted small">{mainPath.title} · </span> : null}
+                {nextLesson.title}
+              </p>
+              <a class="button primary" href={href.lesson(nextLesson.id)}>
+                {fresh ? 'Open the first lesson' : 'Open the next lesson'}
               </a>
             </>
           ) : (
-            <p class="muted">No lessons are published yet.</p>
+            <p class="muted">
+              {index.lessons.size > 0
+                ? 'You have completed every published lesson on your path. New lessons will appear here.'
+                : 'No lessons are published yet.'}
+            </p>
           )}
         </section>
 
@@ -80,8 +91,46 @@ export function HomePage({ index }: { index: ContentIndex }) {
         </section>
       </div>
 
+      {index.curriculum.paths.length > 0 && (
+        <section class="paths" aria-labelledby="paths-title">
+          <h2 id="paths-title">Learning paths</h2>
+          <ul class="path-list">
+            {index.curriculum.paths.map((path) => {
+              const progress = pathProgress(index, state, path);
+              return (
+                <li key={path.id} class="card">
+                  <h3>{path.title}</h3>
+                  <p class="small muted">
+                    {progress.ready === 0
+                      ? `${progress.total} lessons, all planned`
+                      : `${progress.completed} of ${progress.ready} ready lessons completed` +
+                        (progress.ready < progress.total
+                          ? ` (${progress.total - progress.ready} more planned)`
+                          : '')}
+                  </p>
+                  <progress
+                    max={Math.max(progress.ready, 1)}
+                    value={progress.completed}
+                    aria-label={`${path.title}: ${progress.completed} of ${progress.ready} completed`}
+                  />
+                  {progress.next ? (
+                    <p class="small">
+                      Next: <a href={href.lesson(progress.next.id)}>{progress.next.title}</a>
+                    </p>
+                  ) : (
+                    <p class="small muted">
+                      {progress.ready > 0 ? 'All ready lessons completed.' : 'Lessons coming soon.'}
+                    </p>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
       <section class="stages">
-        <h2>The learning path</h2>
+        <h2>The stages</h2>
         <ol class="stage-list">
           {index.curriculum.stages.map((stage) => {
             const refs = [...index.refs.values()].filter((ref) => ref.stageId === stage.id);

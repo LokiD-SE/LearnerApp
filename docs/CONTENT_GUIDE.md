@@ -86,6 +86,16 @@ Good exercises:
 - Scenario questions give **evidence** (logs, ids, timings), and the solution explains how to **confirm** the
   root cause before acting - not only which option is right.
 
+## YAML pitfalls
+
+- A value containing `: ` (colon and space) must be **quoted**, or YAML reads it as a nested key - common
+  with headers (`` `Content-Type: application/json` ``) and JSON snippets. Use `"..."`, or `'...'` when the
+  text contains double quotes.
+- The same applies to list items such as hints and rubric points.
+- Long Markdown belongs in a block scalar (`body: |`), where colons are safe.
+- `npm run validate:content` names the file and field for schema errors, and `npm run dev` / `build` name the
+  file for YAML syntax errors.
+
 ## Checking your lesson
 
 ```bash

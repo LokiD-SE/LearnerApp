@@ -46,6 +46,58 @@ describe('the bundled content', () => {
   });
 });
 
+/* ------------------------------------------------------------------ content quality */
+
+describe('every published lesson', () => {
+  if (!contentResult.ok) throw new Error('invalid content');
+  const published = [...contentResult.index.lessons.values()].filter((l) => l.status === 'published');
+
+  it('exists in useful numbers', () => {
+    expect(published.length).toBeGreaterThanOrEqual(8);
+  });
+
+  for (const lesson of published) {
+    describe(lesson.id, () => {
+      const kinds = new Set(lesson.sections.map((s) => s.kind));
+      it('states its environment, sources and assumptions', () => {
+        expect(lesson.environment?.length ?? 0).toBeGreaterThan(40);
+      });
+      it('covers the core of the lesson template', () => {
+        for (const kind of ['intuition', 'what', 'why', 'mistakes', 'summary'] as const) {
+          expect(kinds, `missing '${kind}' section`).toContain(kind);
+        }
+      });
+      it('has at least one diagram', () => {
+        expect(lesson.sections.some((s) => s.body.includes('```mermaid'))).toBe(true);
+      });
+      it('has varied practice with hints and worked solutions', () => {
+        expect(lesson.exercises.length).toBeGreaterThanOrEqual(5);
+        expect(lesson.exercises.some((e) => ['mcq', 'order', 'debug'].includes(e.type))).toBe(true);
+        expect(lesson.exercises.some((e) => ['short', 'testdesign', 'interview'].includes(e.type))).toBe(
+          true,
+        );
+        for (const exercise of lesson.exercises) {
+          expect(exercise.hints.length, `${exercise.id} has no hints`).toBeGreaterThan(0);
+        }
+      });
+      it('gives every wrong multiple-choice option its own explanation', () => {
+        for (const exercise of lesson.exercises) {
+          if (exercise.type !== 'mcq') continue;
+          const feedback = exercise.options.map((o) => o.feedback);
+          expect(new Set(feedback).size, `${exercise.id} reuses feedback text`).toBe(feedback.length);
+        }
+      });
+      it('has enough recall cards for spaced review', () => {
+        expect(lesson.recall.length).toBeGreaterThanOrEqual(4);
+      });
+      it('never contains anything that looks like a real card number', () => {
+        const text = JSON.stringify(lesson);
+        expect(text).not.toMatch(/\b(?:\d[ -]?){13,19}\b/);
+      });
+    });
+  }
+});
+
 /* ------------------------------------------------------------------ validator */
 
 const curriculum = (lessons: object[] = [{ id: 'l1' }]) => ({

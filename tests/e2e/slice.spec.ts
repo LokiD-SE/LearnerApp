@@ -144,7 +144,7 @@ test('empty, planned, not-found and corrupt-storage states', async ({ page }) =>
   await page.getByRole('button', { name: 'Clear filters' }).click();
   await expect(page.locator('.lesson-list').getByRole('link', { name: LESSON })).toBeVisible();
 
-  await page.goto('./#/lesson/webhooks-and-async-status');
+  await page.goto('./#/lesson/reconciliation-for-testers');
   await expect(page.getByText(/This lesson is planned but not written yet/)).toBeVisible();
 
   await page.goto('./#/lesson/does-not-exist');

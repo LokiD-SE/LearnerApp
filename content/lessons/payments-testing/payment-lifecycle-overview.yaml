@@ -1,0 +1,524 @@
+id: payment-lifecycle-overview
+title: Payment lifecycle - authorise, capture, settle, refund
+subject: payments-testing
+module: payment-lifecycle
+level: beginner
+status: published
+estimatedMinutes: 45
+summary: The stages a card payment goes through, who acts at each stage, what the customer sees, and how to test the transitions between them.
+tags: [payments, card, authorization, capture, settlement, refund, void, chargeback, state machine]
+
+environment: |
+  - **Universal concepts:** authorisation, capture, clearing and settlement, void, refund and chargeback
+    exist in every card payment system, though the names vary.
+  - **Varies by network, acquirer and region:** how long an authorisation hold lasts, how soon a released
+    hold disappears from the customer's banking app, settlement timing, whether partial capture is
+    supported, and the dispute process. Take these from your processor's documentation - this lesson
+    deliberately gives no fixed numbers.
+  - **Fictional:** SandPay (`https://api.sandpay.example`) and its status names (`authorized`,
+    `captured`, ...). Real providers use their own names and may have more states.
+  - Bank transfers and many wallets follow different lifecycles; they are covered in later lessons.
+
+prerequisites: []
+
+concepts:
+  - id: payment-roles
+    name: Roles in a card payment
+    summary: Cardholder, merchant, gateway, processor, acquirer, card network and issuer - and which one makes each decision.
+  - id: authorization-capture-settlement
+    name: Authorisation, capture and settlement
+    summary: Authorisation reserves the money, capture claims it, settlement moves it; each can happen at a different time.
+  - id: payment-state-transitions
+    name: Payment state transitions
+    summary: A payment is a state machine; testing it means checking every allowed transition and rejecting every illegal one.
+
+objectives:
+  - Describe the lifecycle of a card payment from initiation to settlement, and where void, refund and chargeback fit.
+  - Name the role that decides each step (for example, the issuer approves an authorisation).
+  - Choose between immediate and delayed capture for a business scenario, and explain the risk of each.
+  - Design tests for payment state transitions, including the illegal ones.
+
+sections:
+  - id: intuition
+    kind: intuition
+    title: The idea in plain language
+    body: |
+      Think of a **hotel stay**. At check-in, the hotel "puts a hold" on your card for the expected
+      amount - no money has moved, but that amount is no longer available to you. That is an
+      **authorisation**.
+
+      At check-out the final bill is known (maybe less, because you skipped breakfast). The hotel now
+      claims the money - that is a **capture** - and the hold is replaced by a real charge.
+
+      Over the next days, banks exchange the money and the hotel receives it, minus fees. That is
+      **clearing and settlement**.
+
+      If you cancel before check-out, the hotel **voids** the hold. If you complain after paying and get
+      money back, that is a **refund**. If you instead ask *your bank* to claw it back, that is a
+      **chargeback**.
+
+  - id: roles
+    kind: what
+    title: Who does what
+    body: |
+      | Role | What it does | Example decision |
+      |---|---|---|
+      | **Cardholder** | the customer who pays | enters card details, completes authentication |
+      | **Merchant** | the business being paid | decides when to capture, issues refunds |
+      | **Payment gateway** | the API or SDK the merchant integrates with | routes the request, often tokenises card data |
+      | **Processor** | processes transactions on behalf of the acquirer or merchant | formats and forwards to the network |
+      | **Acquirer** (acquiring bank) | the merchant's bank for card payments | settles funds to the merchant |
+      | **Card network** (scheme) | connects acquirers and issuers, sets the rules | routes authorisations, runs clearing |
+      | **Issuer** (issuing bank) | the cardholder's bank | **approves or declines** the authorisation |
+
+      In practice one company may play several roles - many "payment providers" are gateway, processor
+      and sometimes acquirer at once. What matters for testing is **which party decides what**: only the
+      issuer can approve an authorisation; only the merchant decides when to capture; the cardholder
+      starts a chargeback through the issuer.
+
+  - id: what
+    kind: what
+    title: The stages
+    body: |
+      1. **Initiation** - the customer submits payment details; the merchant creates a payment.
+      2. **Authentication** (often) - the customer proves they are the cardholder, for example through
+         3-D Secure. Required or skipped depending on region, risk and rules.
+      3. **Authorisation** - the request travels through processor and network to the issuer, which
+         checks the card, funds and risk and approves or declines. An approval **reserves** the amount
+         (a hold); no money moves yet.
+      4. **Capture** - the merchant asks to collect the authorised amount. It can happen immediately
+         ("authorise and capture", often called a sale) or later. Some setups allow capturing **less**
+         than authorised (partial capture).
+      5. **Clearing and settlement** - captured transactions are exchanged through the network, the
+         issuer debits the cardholder, and the acquirer pays the merchant (minus fees). This happens in
+         batches, usually over days.
+      6. **Afterwards** - money can flow back:
+         - **Void** (cancel): before capture, the authorisation is cancelled and the hold released.
+         - **Refund**: after capture, the merchant sends money back - a new transaction in the opposite
+           direction. It can be partial.
+         - **Chargeback**: the cardholder disputes the payment with their issuer, which reverses it and
+           starts a dispute process the merchant can respond to.
+
+  - id: why
+    kind: why
+    title: Why the stages are separate
+    body: |
+      - **Goods ship later.** A shop shouldn't take money for an item it may not be able to ship; it
+        authorises at checkout and captures when it ships.
+      - **The final amount isn't known yet.** Hotels, car rental, fuel and restaurants with tips
+        authorise an estimate and capture the real amount.
+      - **Fraud review.** A merchant can authorise, review a risky order, and void it instead of paying a
+        refund later.
+      - **Money moves slowly and in bulk.** Settlement in batches is how banks exchange funds between
+        each other.
+
+      For testers this means one "payment" has **many states**, each with different customer-visible
+      effects (a pending hold, a posted charge, a refund that takes days) and different allowed next
+      steps.
+
+  - id: internals
+    kind: internals
+    title: How an authorisation travels
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant C as Cardholder
+          participant M as Merchant (checkout)
+          participant G as Gateway / processor
+          participant N as Card network
+          participant I as Issuer
+          C->>M: Pay 25.00 EUR
+          M->>G: create payment (authorise)
+          G->>N: authorisation request
+          N->>I: authorisation request
+          I->>I: check card, funds, risk
+          I-->>N: approved (hold placed)
+          N-->>G: approved
+          G-->>M: status authorized
+          M-->>C: order confirmed
+          Note over M,G: Later - capture, then clearing and settlement in batches
+      ```
+
+      Notice that **every arrow is a place a request can fail or time out**, and that the decision is
+      made far from the merchant - by the issuer. When a test shows "declined", the merchant's system
+      did not decide that; it is reporting the issuer's (or a risk system's) answer.
+
+  - id: states
+    kind: visual
+    title: "State diagram: SandPay payment statuses"
+    body: |
+      The fictional SandPay status model. Real providers name and split states differently, but the
+      shape is the same.
+
+      ```mermaid
+      stateDiagram-v2
+          [*] --> created
+          created --> requires_action: authentication needed
+          requires_action --> authorized: authenticated and approved
+          created --> authorized: approved
+          created --> declined
+          requires_action --> declined
+          authorized --> captured: capture
+          authorized --> voided: void
+          authorized --> expired: hold not captured in time
+          captured --> partially_refunded: partial refund
+          captured --> refunded: full refund
+          partially_refunded --> refunded: remaining amount refunded
+          captured --> disputed: chargeback
+          declined --> [*]
+          voided --> [*]
+          expired --> [*]
+          refunded --> [*]
+      ```
+
+  - id: when
+    kind: when
+    title: When to capture immediately - and when not
+    body: |
+      | Situation | Usual choice | Why | Risk to test |
+      |---|---|---|---|
+      | Digital goods, delivered at once | authorise and capture together | nothing to wait for | refund flow when delivery fails |
+      | Physical goods shipped later | authorise at checkout, capture at shipping | don't charge for what can't ship | hold expiry before shipping; partial shipment |
+      | Final amount unknown (hotel, fuel, tips) | authorise an estimate, capture the final amount | the bill changes | capturing less (or more, where rules allow) |
+      | Orders needing fraud review | authorise, review, then capture or void | cancel without a refund | void after review; capture after review |
+
+      The risk of delaying capture: an authorisation **expires** if it isn't captured in time, and
+      capturing after that fails or needs a new authorisation.
+
+  - id: steps
+    kind: steps
+    title: Step by step - walking a payment through the sandbox
+    body: |
+      1. Create a payment with **delayed capture** and a sandbox approval payment method; check the status
+         is `authorized`.
+      2. Look at the merchant's order record and at the customer-facing view: the order should not
+         show "paid" yet if your business treats paid as captured.
+      3. **Capture** the full amount; check `captured`, the capture time, and any event or webhook.
+      4. **Refund** part of it; check `partially_refunded`, the refunded amount, the remaining refundable
+         amount, and the receipt or notification.
+      5. Try an **illegal step**: refund more than remains, or capture a voided payment. It must be
+         rejected with a clear error and no state change.
+      6. Repeat with a payment you **void** instead of capturing, and one you leave until it **expires**
+         (if the sandbox can simulate expiry).
+
+      At each step record: API response, payment status from a separate `GET`, order status in your
+      system, customer-visible message, and any event received.
+
+  - id: example
+    kind: example
+    title: "Real-world example: the partial shipment"
+    body: |
+      A customer orders a lamp (60.00) and a rug (140.00). The shop authorises 200.00 at checkout.
+      The lamp ships the next day; the rug is out of stock and cancelled.
+
+      - If the provider supports **partial capture**: capture 60.00 and release the remaining hold - the
+        customer is charged only for the lamp.
+      - If it doesn't: one option is to capture 200.00 and refund 140.00 - the customer briefly sees the
+        full charge and then a refund, which generates support calls.
+
+      What the tester checks: the captured amount equals the shipped items; the remainder of the hold is
+      released (or refunded); order, invoice and payment records agree; the customer's email shows the
+      right amount; the "refundable amount" afterwards is 60.00, not 200.00.
+
+  - id: tests
+    kind: tests
+    title: State-transition test cases
+    body: |
+      | ID | From | Action | Expected |
+      |---|---|---|---|
+      | T1 | created | approve | `authorized`; hold amount equals payment amount |
+      | T2 | created | decline | `declined`; no capture or refund possible afterwards |
+      | T3 | authorized | capture full | `captured` |
+      | T4 | authorized | capture less (if supported) | `captured` with the smaller amount; rest released |
+      | T5 | authorized | void | `voided`; capture afterwards rejected |
+      | T6 | authorized | refund | **rejected** - nothing to refund before capture (void instead) |
+      | T7 | captured | refund part | `partially_refunded`; refundable amount reduced |
+      | T8 | partially_refunded | refund the rest | `refunded` |
+      | T9 | captured | refund more than captured | rejected; no state change |
+      | T10 | voided | capture | rejected; no state change |
+      | T11 | captured | capture again | rejected (or idempotent no-op, as documented) - **never a second charge** |
+
+      For every rejected action, check three things: the error is clear, the status is unchanged, and no
+      money moved (no new transaction at the processor).
+
+  - id: mistakes
+    kind: mistakes
+    title: Common mistakes and misunderstandings
+    body: |
+      - **"Authorised" treated as "paid".** Orders shipped on authorisation alone, then the capture fails
+        or the hold expires.
+      - **Testing only the happy path's final state.** Most payment defects are in transitions: double
+        capture, refund before capture, capture after void.
+      - **"The customer was charged after we cancelled."** Usually a **pending hold** that the issuer
+        hasn't released from the customer's view yet - check whether a capture actually happened before
+        reporting a defect.
+      - **Refund confused with void.** A void cancels before money moves; a refund sends money back after
+        capture. They have different timings and fees.
+      - **Ignoring the refundable amount.** After partial refunds, the remaining refundable amount must be
+        exact - an off-by-one minor unit here means money lost or refunds blocked.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    title: Trade-offs
+    body: |
+      - **Immediate capture:** simple, fewer states - but every cancellation becomes a refund (slower for
+        the customer, may cost fees).
+      - **Delayed capture:** flexible and avoids refunds - but more states, expiry handling, and a capture
+        job that must not fail silently or run twice.
+      - **Partial capture:** precise charges - but not supported everywhere, and multi-capture rules
+        differ between providers.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Authorise** = reserve (issuer decides). **Capture** = claim (merchant decides). **Settle** =
+        money moves in batches.
+      - **Void** before capture; **refund** after capture; **chargeback** comes from the cardholder's bank.
+      - A payment is a **state machine**: test legal transitions *and* rejected illegal ones, with no
+        money movement on rejection.
+      - Hold duration, release timing and settlement timing depend on network, acquirer and region.
+
+exercises:
+  - id: order-lifecycle
+    type: order
+    concept: authorization-capture-settlement
+    skill: recall
+    title: Put the lifecycle in order
+    prompt: |
+      Order these stages of a card payment that is later partly refunded.
+    items:
+      - id: initiation
+        text: The customer submits payment details at checkout
+      - id: authentication
+        text: The customer completes authentication (for example 3-D Secure)
+      - id: authorisation
+        text: The issuer approves the authorisation and places a hold
+      - id: capture
+        text: The merchant captures the amount when the order ships
+      - id: settlement
+        text: Clearing and settlement move the money to the merchant
+      - id: refund
+        text: The merchant refunds part of the amount
+    hints:
+      - Money cannot be claimed before it has been reserved.
+      - A refund sends back money that the merchant has actually received.
+    solution: |
+      **Initiation → authentication → authorisation → capture → settlement → refund.**
+
+      Authentication happens before the issuer approves. Capture claims the reserved money; settlement
+      moves it; only then is there something to refund.
+    followUp: |
+      Where would a **void** fit in this sequence, and which later stages would then never happen?
+
+  - id: capture-strategy
+    type: mcq
+    concept: authorization-capture-settlement
+    skill: application
+    title: Choose the capture strategy
+    prompt: |
+      An online furniture shop ships items 3 to 10 days after the order, sometimes in several parcels.
+      Which approach fits best?
+    options:
+      - id: immediate
+        text: Authorise and capture the full amount at checkout.
+        feedback: It works, but the customer pays for items that may never ship, and every cancelled item becomes a refund.
+      - id: delayed-partial
+        text: Authorise at checkout and capture each parcel's amount when it ships, if partial capture is supported.
+        feedback: Correct - the customer is charged only for what ships. Test hold expiry for slow items and what happens to the remaining hold.
+      - id: authorise-on-ship
+        text: Don't authorise at checkout; take the card details and authorise when shipping.
+        feedback: The shop would only learn at shipping time that the card is declined - after the order was accepted. It also means storing card details or tokens just to charge later.
+      - id: capture-twice
+        text: Authorise and capture at checkout, then capture again for each parcel.
+        feedback: That would charge more than once for the same goods. A capture claims an existing authorisation; it isn't repeatable on top of a full capture.
+    correct: [delayed-partial]
+    hints:
+      - When does the shop actually know what it can deliver?
+      - Which approach checks the card at checkout but claims money only for what ships?
+    solution: |
+      **Authorise at checkout, capture per shipment.** The authorisation checks the card while the
+      customer is still there; capturing at shipping charges only for delivered goods.
+
+      What to test: an item that ships after the hold expires (capture fails - is the order flagged?),
+      partial capture amounts adding up to the order total, and the remaining hold being released when
+      items are cancelled.
+    followUp: |
+      The provider doesn't support partial capture. Design the next best flow and list what the customer
+      would see on their statement.
+
+  - id: transition-bug
+    type: debug
+    concept: payment-state-transitions
+    skill: analysis
+    title: Find the illegal transition
+    prompt: |
+      This (illustrative) excerpt defines which status changes the payment service allows. A support
+      agent was able to "refund" a payment that had only been authorised. Click the line that allows it.
+    language: java
+    code: |
+      Map<Status, Set<Status>> allowed = Map.of(
+          Status.CREATED,            Set.of(Status.AUTHORIZED, Status.DECLINED, Status.REQUIRES_ACTION),
+          Status.REQUIRES_ACTION,    Set.of(Status.AUTHORIZED, Status.DECLINED),
+          Status.AUTHORIZED,         Set.of(Status.CAPTURED, Status.VOIDED, Status.REFUNDED),
+          Status.CAPTURED,           Set.of(Status.PARTIALLY_REFUNDED, Status.REFUNDED),
+          Status.PARTIALLY_REFUNDED, Set.of(Status.PARTIALLY_REFUNDED, Status.REFUNDED)
+      );
+    correctLines: [4]
+    lineNotes:
+      - line: 5
+        note: Refunds after capture are correct - that is when there is money to send back.
+      - line: 6
+        note: Several partial refunds in a row are normal, as long as the total never exceeds the captured amount.
+    hints:
+      - Before capture, has any money been collected that could be refunded?
+      - What is the correct way to cancel an authorised payment?
+    solution: |
+      **Line 4** lets an `AUTHORIZED` payment become `REFUNDED`. Nothing has been captured, so there is
+      no money to refund - the correct action is a **void**, which releases the hold. Depending on the
+      processor, this "refund" may be rejected downstream (leaving the merchant's record wrong) or worse,
+      create a credit that was never paid for.
+
+      Fix: remove `REFUNDED` from the `AUTHORIZED` set, and add a test that a refund on an authorised
+      payment is rejected with no state change.
+    followUp: |
+      Which transition is missing from this map that a real system needs when an authorisation is never
+      captured? Add it and write the test for it.
+
+  - id: charged-after-cancel
+    type: mcq
+    concept: payment-roles
+    skill: analysis
+    title: Charged after cancelling?
+    prompt: |
+      A customer cancelled an order an hour after placing it. They complain: "My banking app still shows
+      the 80.00 payment." Your evidence: the payment status is `voided`, there is no capture in the
+      processor's records, and the void request was accepted. What is the most likely explanation?
+    options:
+      - id: double-charge
+        text: The void failed and the customer was charged.
+        feedback: The evidence says otherwise - the void was accepted and there is no capture. Without a capture, no money was taken.
+      - id: pending-hold
+        text: The banking app still shows the released authorisation hold; the issuer will drop it from the customer's view.
+        feedback: Correct - the hold was released by the void, but the issuer controls when the pending entry disappears from the customer's view. No money moved.
+      - id: settlement
+        text: The payment was settled before the void.
+        feedback: Settlement only happens after capture, and there was no capture.
+      - id: chargeback
+        text: A chargeback is in progress.
+        feedback: A chargeback is started by the cardholder through their bank, and only applies to captured payments.
+    correct: [pending-hold]
+    hints:
+      - Which role decides what appears in the customer's banking app?
+      - Was any money claimed? Check the evidence for a capture.
+    solution: |
+      **A released hold still visible in the banking app.** The void cancelled the authorisation, but
+      the **issuer** decides when the pending entry disappears from the customer's view - the merchant
+      can't make it vanish.
+
+      How to confirm rather than assume: check the processor for any capture or settlement record
+      (none), and check the void response and event. Then give support a clear answer: no money was
+      taken, the pending amount disappears according to the bank's own timing.
+    followUp: |
+      What would change in your investigation if the processor showed a capture 5 minutes before the
+      void request?
+
+  - id: state-transition-tests
+    type: testdesign
+    concept: payment-state-transitions
+    skill: application
+    title: Test the state machine
+    prompt: |
+      Using SandPay's state diagram from this lesson, write test cases for the transitions out of
+      `authorized` and `captured`, including at least two illegal ones. For each, say what evidence
+      proves no money moved when the action is rejected.
+    hints:
+      - List every arrow leaving the two states, then think of actions that have no arrow.
+      - A rejected action must change nothing - how do you prove "nothing" for money?
+    modelAnswer: |
+      Legal: authorized → capture (full; partial if supported) → `captured`; authorized → void →
+      `voided`; authorized → expiry → `expired`; captured → partial refund → `partially_refunded`;
+      captured → full refund → `refunded`.
+
+      Illegal: refund an `authorized` payment; capture a `voided` payment; capture a `captured` payment
+      again; refund more than the captured amount; void a `captured` payment.
+
+      For each rejection: a clear error, the status unchanged in a separate `GET`, no new transaction in
+      the processor's sandbox records, no ledger entry, no customer notification.
+    rubric:
+      - Covered capture and void out of authorized
+      - Covered partial and full refund out of captured
+      - Included refund-before-capture as an illegal action
+      - Included a second capture or capture after void as an illegal action
+      - Included refunding more than was captured
+      - For rejections, checked the status is unchanged with a separate read
+      - For rejections, checked the processor or ledger shows no money movement
+    solution: |
+      The difference between a good and a great answer is the **proof of no money movement**. An error
+      message alone doesn't prove the processor wasn't called.
+    followUp: |
+      Add tests for the `expired` state: how would you produce it in a sandbox, and what should happen
+      to the order when it occurs?
+
+  - id: roles-interview
+    type: interview
+    concept: payment-roles
+    skill: application
+    title: "Interview: who declined the payment?"
+    prompt: |
+      **Interviewer:** "A customer's payment is declined at our checkout. Walk me through who could have
+      declined it, and how you would find out which one did."
+    hints:
+      - Follow the path of the authorisation and name every party that can say no.
+    modelAnswer: |
+      - The issuer is the usual source - funds, card status, fraud rules - and returns a decline reason.
+      - The merchant's or provider's own risk rules can block it before it reaches the issuer.
+      - Authentication (3-D Secure) can fail before authorisation.
+      - Technical problems - network or issuer unavailable - may come back as a decline or an error.
+      - To find out: read the decline code and source in the provider's response or dashboard, check
+        whether the request reached the issuer, check risk-rule logs, and compare with other cards in the
+        same period (one card versus everyone).
+    followUps:
+      - Which decline reasons would you show the customer, and which not?
+      - How do you tell a soft decline (retry later may work) from a hard decline?
+      - In the sandbox, how do you reproduce each of these sources?
+    rubric:
+      - Named the issuer as the main decision maker
+      - Named the merchant or provider risk rules as a possible source
+      - Mentioned authentication failure as a possible source
+      - Separated technical failures from business declines
+      - Described concrete evidence (decline code, provider logs, comparison across cards)
+    solution: |
+      Interviewers listen for whether you **follow the path** instead of guessing, and whether you name
+      evidence for each hypothesis.
+
+recall:
+  - id: recall-auth
+    concept: authorization-capture-settlement
+    prompt: What happens to money at authorisation?
+    answer: Nothing moves yet - the issuer approves and places a hold, so the amount is reserved and unavailable to the cardholder.
+  - id: recall-capture
+    concept: authorization-capture-settlement
+    prompt: What is a capture, and who decides when it happens?
+    answer: The merchant's request to collect authorised money. The merchant decides - immediately with the authorisation, or later (for example at shipping).
+  - id: recall-void-refund
+    concept: payment-state-transitions
+    prompt: Void or refund - which one, when?
+    answer: Void before capture (cancels the authorisation and releases the hold). Refund after capture (sends collected money back).
+  - id: recall-chargeback
+    concept: payment-roles
+    prompt: Who starts a chargeback?
+    answer: The cardholder, by disputing the payment with their issuer - not the merchant.
+  - id: recall-issuer
+    concept: payment-roles
+    prompt: Which party approves or declines a card authorisation?
+    answer: The issuer (the cardholder's bank), although the merchant's or provider's risk rules can block a payment before it reaches the issuer.
+  - id: recall-illegal-transition
+    concept: payment-state-transitions
+    prompt: What three things must you check when an illegal payment action is rejected?
+    answer: A clear error, the status unchanged (checked with a separate read), and no money movement at the processor or in the ledger.
+
+next:
+  - sandbox-test-data
+  - void-reversal-refund-chargeback
+  - payment-ecosystem-roles

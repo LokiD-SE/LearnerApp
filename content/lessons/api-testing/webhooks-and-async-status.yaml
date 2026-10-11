@@ -1,0 +1,588 @@
+id: webhooks-and-async-status
+title: Webhooks, signatures and asynchronous status
+subject: api-testing
+module: payment-api-testing
+level: intermediate
+status: published
+estimatedMinutes: 55
+summary: How payment providers report outcomes later through webhooks, why events arrive twice or out of order, how signatures prove who sent them, and how to test a consumer that stays correct anyway.
+tags: [payments, webhooks, events, hmac, signatures, idempotency, ordering, async, reconciliation]
+
+environment: |
+  - **Universal:** webhooks are HTTP requests a provider sends to *your* endpoint when something happens.
+    Providers generally deliver **at least once** (so duplicates happen), **don't guarantee order**, and
+    **retry** when your endpoint doesn't answer with a `2xx`.
+  - **Provider-specific:** event names, payload shape, the signature scheme and header names, the
+    response timeout, the retry schedule and how long retries continue, and tools for replaying events.
+    Use your provider's documentation for all of these.
+  - **Fictional:** SandPay's events and its signature scheme - the headers `SandPay-Timestamp` and
+    `SandPay-Signature`, where the signature is the hex HMAC-SHA256 of `timestamp + "." + raw body` with a
+    shared secret. Similar schemes are common in real providers, but check the exact recipe.
+  - **Code:** Java 17+ (`HexFormat` was added in Java 17), using only `javax.crypto` and `java.security`.
+
+prerequisites:
+  - declines-timeouts-unknown-outcomes
+  - http-request-response-anatomy
+
+concepts:
+  - id: webhook-delivery-semantics
+    name: Webhook delivery semantics
+    summary: At-least-once delivery, retries on failure and no ordering guarantee - so consumers must de-duplicate and tolerate reordering.
+  - id: webhook-signature-verification
+    name: Webhook signature verification
+    summary: An HMAC over the exact raw body and a timestamp proves the sender and limits replays.
+  - id: async-status-consistency
+    name: Consistent status from asynchronous events
+    summary: Late, duplicate or reordered events must never move a payment to a wrong or older status.
+
+objectives:
+  - Explain why webhooks arrive late, twice or out of order, and design a consumer that stays correct.
+  - Verify a webhook signature correctly and name the mistakes that make verification insecure or flaky.
+  - Choose between webhooks and polling, and explain why many systems use both.
+  - Design tests for duplicates, reordering, tampering, replays and endpoint downtime, with evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    title: The idea in plain language
+    body: |
+      Instead of you phoning the bank every five minutes to ask "has my transfer arrived?", the bank
+      promises to **send you a letter** when it happens. That letter is a webhook.
+
+      The postal service has quirks, though: if you don't sign for a letter, they **deliver it again**
+      later; letters sent on Monday and Tuesday may **arrive in either order**; and anyone could post you a
+      letter claiming to be from the bank - so real letters carry a **seal only the bank can make**.
+
+      A good mailroom therefore: checks the seal, notes every letter's reference number so a second copy is
+      ignored, and never lets Monday's news overwrite Tuesday's.
+
+  - id: what
+    kind: what
+    title: What a webhook looks like
+    body: |
+      SandPay sends an HTTP `POST` to the URL you registered:
+
+      ```http
+      POST /webhooks/sandpay HTTP/1.1
+      Host: shop.example
+      Content-Type: application/json
+      SandPay-Timestamp: 1791990000
+      SandPay-Signature: 6c1f...e09a
+
+      {"id": "evt_5Kd2", "type": "payment.captured", "created": 1791989998,
+       "data": {"object": {"id": "pay_81Fz", "status": "captured", "amount": 2500, "currency": "EUR"}}}
+      ```
+
+      - **`id`** - unique per event. The key to recognising duplicates.
+      - **`type`** - what happened.
+      - **`created`** - when the event was created at SandPay (not when it reached you).
+      - **`data.object`** - a snapshot of the payment *at the time of the event*.
+
+      Your endpoint answers `2xx` quickly to say "received". Any other answer - or no answer within the
+      provider's timeout - counts as a failure, and the provider will try again later.
+
+  - id: why
+    kind: why
+    title: Why payments need asynchronous status
+    body: |
+      Many payment outcomes are decided **after** your API call returns:
+
+      - authentication (3-D Secure) completed in another window or app;
+      - bank transfers and many wallets that confirm minutes or days later;
+      - captures, refunds and settlements processed in batches;
+      - disputes (chargebacks) opened weeks later.
+
+      Polling for all of these is slow and wasteful. Webhooks push the news - but their delivery rules
+      create a new class of defects: **double fulfilment** from duplicate events, **status going
+      backwards** from reordered events, and **forged events** if signatures aren't checked.
+
+  - id: internals
+    kind: internals
+    title: How delivery, signatures and ordering work
+    body: |
+      **Delivery.** The provider sends the event and waits a limited time. No `2xx` → it schedules a
+      retry, typically with growing gaps, for hours or days. If your endpoint processed the event but
+      answered slowly or with an error, the next attempt is a **duplicate** - that is why delivery is "at
+      least once".
+
+      **Signatures (SandPay's scheme).** The provider computes `HMAC-SHA256(secret, timestamp + "." +
+      raw_body)` and sends it in a header. Your endpoint:
+
+      1. reads the **raw bytes** of the body exactly as received - before any JSON parsing;
+      2. rejects the event if the timestamp is too far from now (this limits replays of old captured
+         requests);
+      3. computes the HMAC with the shared secret and compares it with the header using a
+         **constant-time** comparison;
+      4. only then parses the JSON.
+
+      **Ordering.** Events can overtake each other (retries, parallel deliveries). Three defences, often
+      combined:
+
+      - **Only move forward**: apply a status change only if the state machine allows it from the current
+        status (for example `refunded` must never become `captured` again);
+      - **Compare event times**: ignore an event older than the last one applied to that object;
+      - **Re-fetch**: treat the event as a "something changed" signal and `GET` the payment's current state
+        from the API.
+
+      **De-duplication.** Store each processed event `id` (with a unique constraint) and skip events
+      already seen - but still answer `2xx`, or the provider keeps retrying.
+
+  - id: visual-delivery
+    kind: visual
+    title: "Sequence: a slow answer becomes a duplicate"
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant SP as SandPay
+          participant W as Webhook endpoint
+          participant DB as Orders DB
+          SP->>W: POST event evt_5Kd2 (payment.captured)
+          W->>DB: mark order ORD-1042 paid, create shipment
+          Note over W: took 12 s - longer than SandPay's timeout
+          SP-->>SP: no 2xx in time, schedule a retry
+          W--xSP: 200 OK (too late, ignored)
+          SP->>W: POST event evt_5Kd2 again
+          W->>DB: seen evt_5Kd2 already?
+          DB-->>W: yes
+          W-->>SP: 200 OK (no second shipment)
+      ```
+
+  - id: visual-consumer
+    kind: visual
+    title: "Flowchart: a robust webhook consumer"
+    body: |
+      ```mermaid
+      flowchart TD
+          A[POST arrives] --> B{Timestamp within tolerance?}
+          B -- No --> R1[Reject with 400]
+          B -- Yes --> C{HMAC of raw body matches, compared in constant time?}
+          C -- No --> R2[Reject with 400 - log the attempt, not the secret]
+          C -- Yes --> D{Event id already processed?}
+          D -- Yes --> OK1[Return 200, do nothing]
+          D -- No --> E[Store event id and enqueue the work]
+          E --> OK2[Return 200 quickly]
+          E --> F[Worker applies the change only if the status moves forward]
+      ```
+
+  - id: when
+    kind: when
+    title: Webhooks or polling?
+    body: |
+      | | Webhooks | Polling |
+      |---|---|---|
+      | Speed | near real time | as often as you poll |
+      | Load | one request per event | requests even when nothing changed |
+      | Needs a public endpoint | yes | no |
+      | Failure mode | missed, late, duplicate or reordered events | stale until the next poll; rate limits |
+      | Best for | reacting to changes | catching anything webhooks missed |
+
+      Most robust systems use **both**: webhooks to react quickly, plus a periodic job (or reconciliation)
+      that looks up payments stuck in a non-final state for too long.
+
+  - id: steps
+    kind: steps
+    title: Step by step - testing a webhook endpoint
+    body: |
+      1. **Receive real sandbox events.** Your test endpoint must be reachable by the provider: deploy it
+         to a test environment, or use a tunnelling tool or the provider's command-line forwarder if it
+         offers one.
+      2. **Trigger events** by doing the real action in the sandbox (capture, refund) and watch the
+         endpoint logs.
+      3. **Replay events** - many provider dashboards can resend an event; otherwise capture one and resend
+         it with your own signed request.
+      4. **Craft edge cases yourself** with a small script that signs payloads with the test secret:
+         duplicates, an old timestamp, a tampered body, events in reverse order.
+      5. **Make the endpoint fail on purpose** (return `500`, or sleep longer than the provider's timeout)
+         and watch the provider's retries arrive.
+      6. **For every case check:** the response code your endpoint returned, the order or payment status,
+         side effects (shipments, emails) counted, and the event log.
+
+  - id: example
+    kind: example
+    title: "Real-world example: paid, then \"failed\""
+    body: |
+      An order shows **failed** although the customer was charged. The event log:
+
+      | Arrived | Event | Created at SandPay | Applied? |
+      |---|---|---|---|
+      | 10:00:03 | `payment.succeeded` | 10:00:01 | yes → order paid |
+      | 10:00:09 | `payment.failed` | 09:59:58 | yes → order **failed** |
+
+      The customer's first attempt failed (wrong 3-D Secure code), the second succeeded. The `failed`
+      event for the first attempt was retried and arrived **last**, and the consumer applied events in
+      arrival order.
+
+      **Root cause:** status changes applied without checking event time or allowed transitions.
+      **Fix:** ignore events older than the latest applied one for that payment, allow only forward
+      transitions, and re-fetch the payment when in doubt. **Regression test:** deliver the two events in
+      reverse order.
+
+  - id: code
+    kind: code
+    title: "Code: verifying a SandPay signature"
+    collapsed: true
+    body: |
+      ```java
+      import java.nio.charset.StandardCharsets;
+      import java.security.GeneralSecurityException;
+      import java.security.MessageDigest;
+      import java.util.HexFormat;
+      import javax.crypto.Mac;
+      import javax.crypto.spec.SecretKeySpec;
+
+      public final class WebhookVerifier {
+          private static final long TOLERANCE_SECONDS = 300;
+          private final byte[] secret;
+
+          public WebhookVerifier(byte[] secret) {
+              this.secret = secret.clone();
+          }
+
+          /** rawBody must be the exact bytes received, before any JSON parsing. */
+          public boolean isValid(byte[] rawBody, String timestamp, String signatureHex, long nowEpochSeconds) {
+              try {
+                  long sentAt = Long.parseLong(timestamp);
+                  if (Math.abs(nowEpochSeconds - sentAt) > TOLERANCE_SECONDS) {
+                      return false;
+                  }
+                  Mac mac = Mac.getInstance("HmacSHA256");
+                  mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+                  mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
+                  byte[] expected = mac.doFinal(rawBody);
+                  byte[] given = HexFormat.of().parseHex(signatureHex);
+                  return MessageDigest.isEqual(expected, given);
+              } catch (IllegalArgumentException e) {
+                  return false;
+              } catch (GeneralSecurityException e) {
+                  throw new IllegalStateException("HMAC-SHA256 is not available", e);
+              }
+          }
+      }
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    title: Line by line - why it is written this way
+    body: |
+      - **`byte[] rawBody`** - the HMAC was computed over the exact bytes the provider sent. Parsing the
+        JSON and serialising it again can change whitespace, escaping or number formats, and the signature
+        no longer matches.
+      - **`Math.abs(nowEpochSeconds - sentAt) > TOLERANCE_SECONDS`** - rejects old (or far-future)
+        timestamps, so a captured genuine request can't be replayed days later. The tolerance must allow
+        for small clock differences.
+      - **`mac.update(timestamp + ".")` then `doFinal(rawBody)`** - the signed message is the timestamp,
+        a dot, then the body. Because the timestamp is inside the signature, an attacker can't change it
+        without breaking the HMAC.
+      - **`HexFormat.of().parseHex(signatureHex)`** - turns the header into bytes; malformed hex throws
+        `IllegalArgumentException`, which is caught and treated as invalid. `NumberFormatException` from
+        `parseLong` is a subclass of the same exception, so one catch covers both.
+      - **`MessageDigest.isEqual(expected, given)`** - compares in time that doesn't depend on how many
+        leading bytes match, unlike `String.equals` or `Arrays.equals`, which can leak information
+        through timing.
+      - **`GeneralSecurityException` → `IllegalStateException`** - a missing algorithm is a broken
+        environment, not an invalid webhook; it should fail loudly, not quietly reject every event.
+
+  - id: tests
+    kind: tests
+    title: Test cases for a webhook consumer
+    body: |
+      | ID | Scenario | Expected | Evidence |
+      |---|---|---|---|
+      | W1 | Genuine event | `200`; order updated once | endpoint log, order status |
+      | W2 | Same event delivered twice | `200` both times; side effects once (one shipment, one email) | event table, shipment count |
+      | W3 | Events in reverse order (success, then an older failure) | final status stays correct | status history |
+      | W4 | Body changed after signing (amount edited) | `400`; nothing applied | log entry, unchanged order |
+      | W5 | Signed with the wrong secret | `400`; nothing applied | as above |
+      | W6 | Valid signature, timestamp outside the tolerance | `400`; nothing applied | as above |
+      | W7 | Missing or malformed signature header | `400`, not `500` | response |
+      | W8 | Endpoint returns `500`, then recovers | provider retries; event applied once after recovery | provider delivery log |
+      | W9 | Endpoint slower than the provider's timeout | duplicate arrives; still applied once | event table |
+      | W10 | Event for an unknown payment | `2xx` or documented behaviour, logged for investigation; no crash | logs |
+      | W11 | Webhook never arrives | a polling or reconciliation job resolves the payment | job log, final status |
+
+  - id: mistakes
+    kind: mistakes
+    title: Common mistakes
+    body: |
+      - **Verifying a re-serialised body** instead of the raw bytes - genuine events fail at random.
+      - **`String.equals` for signatures** - works, but leaks timing information.
+      - **No timestamp check** - captured requests can be replayed later.
+      - **Doing slow work before answering** - the provider times out and retries, creating duplicates.
+      - **Answering `500` for duplicates or unknown events** - the provider retries them for days.
+      - **Applying events in arrival order** - statuses go backwards.
+      - **Trusting the event snapshot for money decisions** without checking current state - for critical
+        actions, re-fetch the object.
+      - **Logging full payloads** that contain personal data, or logging the webhook secret while
+        debugging a signature mismatch.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    title: Trade-offs and alternatives
+    body: |
+      - **Processing synchronously** is simpler but risks timeouts and duplicates; **queueing** answers
+        fast but needs a worker, retries and monitoring of its own.
+      - **Re-fetching** on every event is the most reliable way to get the current state, but costs an API
+        call per event and is limited by rate limits.
+      - **Tight timestamp tolerance** blocks replays better, but rejects genuine events when clocks drift.
+      - **Webhooks plus reconciliation** is the usual answer for money: events for speed, reconciliation
+        for certainty.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Webhooks are **at least once, unordered, retried** until you answer `2xx`.
+      - Verify: **timestamp tolerance → HMAC over the raw body → constant-time compare → then parse**.
+      - De-duplicate by **event id**; answer `2xx` for duplicates.
+      - Never let an older event move status backwards: forward-only transitions, event times, re-fetch.
+      - Answer fast, process in a queue; back webhooks with polling or reconciliation.
+
+exercises:
+  - id: delivery-facts
+    type: mcq
+    concept: webhook-delivery-semantics
+    skill: recognition
+    title: What can you rely on?
+    prompt: |
+      Which statements about typical payment webhook delivery are true? Select every one that applies.
+    options:
+      - id: at-least-once
+        text: The same event can be delivered more than once.
+        feedback: True - delivery is at least once; retries after slow or failed answers create duplicates.
+      - id: unordered
+        text: Events can arrive in a different order from the order they were created in.
+        feedback: True - retries and parallel deliveries let events overtake each other.
+      - id: retries
+        text: If your endpoint doesn't answer 2xx in time, the provider tries again later.
+        feedback: True - the schedule and duration are provider-specific.
+      - id: exactly-once
+        text: Each event is delivered exactly once.
+        feedback: False - no provider can promise that over a network. Design for duplicates.
+      - id: real-time
+        text: Events always arrive within a second of the change.
+        feedback: False - they are usually quick, but retries, outages and queues can delay them by minutes or hours.
+    correct: [at-least-once, unordered, retries]
+    hints:
+      - Think about what happens when your endpoint processes an event but answers too slowly.
+    solution: |
+      **Duplicates, reordering and retries** are all normal. Exactly-once delivery and guaranteed timing
+      are not promised - so the consumer must de-duplicate, tolerate reordering and have a fallback for
+      missing events.
+    followUp: |
+      For each true statement, name the consumer feature that makes it harmless.
+
+  - id: endpoint-design
+    type: mcq
+    concept: webhook-delivery-semantics
+    skill: application
+    title: Design the endpoint's response
+    prompt: |
+      Your webhook endpoint must create a shipment when `payment.captured` arrives. Creating a shipment
+      takes up to 20 seconds; SandPay waits about 10 seconds for an answer. Which design is best?
+    options:
+      - id: sync
+        text: Verify the signature, create the shipment, then answer 200.
+        feedback: Creating the shipment takes longer than SandPay waits, so it retries - and without de-duplication you ship twice.
+      - id: async-dedupe
+        text: Verify the signature, store the event id (skip if seen), queue the shipment job, then answer 200.
+        feedback: Correct - fast answer, duplicates recognised, and the slow work happens in a worker that can retry on its own.
+      - id: ack-first
+        text: Answer 200 immediately, then verify the signature and create the shipment.
+        feedback: Answering first is fine for speed, but processing before verifying lets forged events create shipments.
+      - id: error-dupes
+        text: Answer 500 for events already processed, so SandPay knows they are duplicates.
+        feedback: A non-2xx answer means "failed" to the provider - it will keep retrying the duplicate for hours or days.
+    correct: [async-dedupe]
+    hints:
+      - Which designs answer within the provider's timeout?
+      - Which designs stay correct if the same event arrives twice?
+    solution: |
+      **Verify, record the event id, queue, answer 200.** It answers well inside the timeout, recognises
+      duplicates, and never acts on unverified data. The worker processes the queue with its own retries
+      and monitoring.
+    followUp: |
+      The queue worker crashes halfway through creating a shipment. What stops a second shipment when it
+      retries the job?
+
+  - id: signature-bug
+    type: debug
+    concept: webhook-signature-verification
+    skill: analysis
+    title: Genuine webhooks rejected
+    prompt: |
+      Some **genuine** SandPay webhooks fail signature verification - always ones whose JSON contains
+      escaped characters such as `é`. The others pass. Click the line that causes it.
+    language: java
+    code: |
+      boolean isValid(String rawBody, String timestamp, String signatureHex, long nowSeconds) throws Exception {
+          if (Math.abs(nowSeconds - Long.parseLong(timestamp)) > 300) {
+              return false;
+          }
+          String payload = mapper.writeValueAsString(mapper.readTree(rawBody));
+          Mac mac = Mac.getInstance("HmacSHA256");
+          mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+          byte[] expected = mac.doFinal((timestamp + "." + payload).getBytes(StandardCharsets.UTF_8));
+          return MessageDigest.isEqual(expected, HexFormat.of().parseHex(signatureHex));
+      }
+    correctLines: [5]
+    lineNotes:
+      - line: 2
+        note: The timestamp tolerance check is correct - it limits replays and isn't related to the content of the body.
+      - line: 9
+        note: MessageDigest.isEqual is the right, constant-time comparison.
+      - line: 8
+        note: The message layout (timestamp, dot, body) and the UTF-8 encoding are right - but look at which body is being signed.
+    hints:
+      - Which bytes did SandPay sign - and are those the bytes this code signs?
+      - What can parsing JSON and writing it out again change, even when the data means the same?
+    solution: |
+      **Line 5.** The code parses the JSON and serialises it again, then signs *that*. The re-serialised
+      text is equivalent JSON but not identical bytes - a library may write `é` as `é`, drop
+      whitespace or reformat numbers - so the HMAC differs. Events without such characters happen to
+      serialise identically, which is why only some fail.
+
+      **Fix:** compute the HMAC over the raw request body exactly as received, and parse the JSON only after
+      the signature is verified. **Regression test:** a genuine event with escaped Unicode and extra
+      whitespace must pass.
+    followUp: |
+      An engineer "fixes" the flaky verification by catching the failure and accepting the event anyway
+      when the JSON parses. Explain the risk and write the test that would catch it.
+
+  - id: status-went-backwards
+    type: mcq
+    concept: async-status-consistency
+    skill: analysis
+    title: Paid, then failed?
+    prompt: |
+      An order shows **failed**, yet the customer was charged. The consumer's log:
+
+      - 10:00:03 received `payment.succeeded` (created 10:00:01) → order set to paid
+      - 10:00:09 received `payment.failed` (created 09:59:58) → order set to failed
+
+      What is the root cause?
+    options:
+      - id: provider-bug
+        text: SandPay sent a wrong event.
+        feedback: Both events are genuine - the first attempt really failed, the second succeeded. The problem is the order they were applied in.
+      - id: duplicate
+        text: A duplicate event was processed twice.
+        feedback: These are two different events about two different moments, not a duplicate of one event.
+      - id: arrival-order
+        text: The consumer applied events in arrival order, so an older event overwrote a newer status.
+        feedback: Correct - the failed event was created earlier but arrived later. The consumer should ignore older events or only allow forward transitions.
+      - id: signature
+        text: The signature check was missing.
+        feedback: Nothing suggests a forged event; both match real attempts. The defect is in how genuine events are ordered.
+    correct: [arrival-order]
+    hints:
+      - Compare the "created" times with the arrival times.
+    solution: |
+      **Events applied in arrival order.** `payment.failed` was created at 09:59:58 (the first attempt)
+      but arrived after `payment.succeeded`, and overwrote it.
+
+      **Confirm:** the event ids and creation times in the provider's delivery log match two attempts.
+      **Fix:** ignore events older than the latest applied one for the payment, allow only forward
+      transitions, or re-fetch the payment. **Regression test:** deliver the two events in reverse order.
+    followUp: |
+      Which of the three defences would still work if two events had the same creation time to the
+      second? Explain why.
+
+  - id: webhook-test-suite
+    type: testdesign
+    concept: webhook-signature-verification
+    skill: application
+    title: Test the webhook endpoint
+    prompt: |
+      Write test cases for SandPay webhook handling at `POST /webhooks/sandpay`. Cover security, delivery
+      behaviour and ordering, and say what evidence each case needs.
+    hints:
+      - Security - what could an attacker send? Delivery - what does the provider do when you're slow or down? Ordering - what if events overtake each other?
+    modelAnswer: |
+      Security: genuine event accepted; body tampered after signing → 400, nothing applied; wrong secret →
+      400; timestamp outside tolerance → 400; missing or malformed signature → 400 (not 500); genuine event
+      with escaped Unicode and whitespace → accepted (raw-body check).
+      Delivery: same event twice → 200 twice, side effects once; endpoint returns 500 then recovers →
+      retried and applied once; endpoint slower than the timeout → duplicate handled; webhook never
+      arrives → polling or reconciliation resolves the payment.
+      Ordering: success then an older failure → stays paid; refund before capture event arrives → final
+      status still correct.
+      Evidence: endpoint responses, event-id table, order status history, counts of side effects
+      (shipments, emails), provider delivery log.
+    rubric:
+      - Included tampered body, wrong secret and stale timestamp cases
+      - Included a malformed or missing signature that must not cause a 500
+      - Included a genuine event that would break a re-serialising verifier
+      - Included duplicate delivery with side effects counted once
+      - Included endpoint failure or slowness with provider retries
+      - Included out-of-order events
+      - Included a missing webhook resolved by polling or reconciliation
+    solution: |
+      The cases most often missed are the **genuine-but-awkward** event (escaped characters) and the
+      **never-arrives** case - one finds flaky verification, the other proves the safety net exists.
+    followUp: |
+      Write the small script outline (any language) that produces a correctly signed SandPay request from
+      a payload and the test secret, so you can generate W3 to W6 on demand.
+
+  - id: interview-final-status
+    type: interview
+    concept: async-status-consistency
+    skill: application
+    title: "Interview: how do you know the final status?"
+    prompt: |
+      **Interviewer:** "Our payments complete asynchronously. How do you make sure every order ends up with
+      the right final status, and how would you test it?"
+    hints:
+      - Cover the mechanisms (events, polling, reconciliation) and the failure modes each one covers.
+    modelAnswer: |
+      - Webhooks give fast updates; the consumer verifies signatures, de-duplicates by event id, applies
+        only forward transitions (or re-fetches), and answers fast.
+      - Polling picks up payments stuck in a non-final state too long - covering missed or delayed
+        webhooks.
+      - Reconciliation compares our records with the provider's reports and flags mismatches for review.
+      - Tests: duplicates, reverse order, tampered and stale events, endpoint down then up, a webhook that
+        never arrives, and a reconciliation run that finds a planted mismatch.
+      - Monitoring: count of payments in non-final states by age, signature failures, retry volume.
+    followUps:
+      - What would you alert on, and at what threshold?
+      - How long would you wait before polling a pending payment, and why?
+      - What does reconciliation catch that webhooks and polling don't?
+    rubric:
+      - Described a verified, de-duplicated, order-safe webhook consumer
+      - Added polling for stuck non-final payments
+      - Added reconciliation against provider records
+      - Listed tests for duplicates, reordering, tampering and missing events
+      - Mentioned monitoring of stuck payments or signature failures
+    solution: |
+      Strong answers show **layers**: events for speed, polling for gaps, reconciliation for certainty -
+      and a test for each layer's failure.
+
+recall:
+  - id: recall-delivery
+    concept: webhook-delivery-semantics
+    prompt: What three delivery properties must a webhook consumer assume?
+    answer: At-least-once delivery (duplicates), no ordering guarantee, and retries when it doesn't answer 2xx in time.
+  - id: recall-dedupe
+    concept: webhook-delivery-semantics
+    prompt: How should an endpoint respond to an event it has already processed?
+    answer: With a 2xx and no side effects - a non-2xx makes the provider retry it again and again.
+  - id: recall-raw-body
+    concept: webhook-signature-verification
+    prompt: Why must the signature be computed over the raw body?
+    answer: The provider signed the exact bytes it sent; parsing and re-serialising JSON can change whitespace, escaping or numbers, so the HMAC no longer matches.
+  - id: recall-constant-time
+    concept: webhook-signature-verification
+    prompt: Why compare signatures with MessageDigest.isEqual rather than String.equals?
+    answer: It takes the same time however many bytes match, so it doesn't leak how close a guess is through timing.
+  - id: recall-timestamp
+    concept: webhook-signature-verification
+    prompt: What does the timestamp tolerance protect against?
+    answer: Replay of a captured genuine request later - the timestamp is part of the signed message, so it can't be updated without breaking the signature.
+  - id: recall-ordering
+    concept: async-status-consistency
+    prompt: Name three ways to stop an older event overwriting a newer status.
+    answer: Allow only forward state transitions, ignore events older than the last applied one, and re-fetch the current state from the API.
+
+next:
+  - payment-scenario-matrix
+  - reconciliation-for-testers
+  - sync-vs-async-payments
