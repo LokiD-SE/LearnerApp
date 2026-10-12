@@ -23,8 +23,9 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 
 ## Status
 
-The foundation and the **Payments QA core path** are complete. The full curriculum map is navigable
-(7 stages, foundations plus tracks A-G, 63 lessons), and the eight lessons of the core path are fully written:
+The foundation and the **Payments QA core path** are complete, and the **Java automation engineer** path
+has started. The full curriculum map is navigable (7 stages, foundations plus tracks A-G, 63 lessons). The
+eight lessons of the core path are fully written:
 
 1. Anatomy of an HTTP request and response
 2. HTTP methods - safety and idempotency
@@ -35,7 +36,20 @@ The foundation and the **Payments QA core path** are complete. The full curricul
 7. Webhooks, signatures and asynchronous status
 8. Building a payment scenario matrix
 
-The other 55 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+Six lessons of the automation path are written, each with coding exercises you run locally:
+
+1. Primitive and reference types (Java)
+2. equals, hashCode and why HashMap needs both (Java)
+3. Locator strategy - CSS, XPath and stable attributes (Selenium)
+4. Explicit waits and synchronisation (Selenium)
+5. Page objects done right
+6. A small reference framework, and why it is small
+
+They use two practice projects - `practice/java` and `practice/framework`, a small Selenium + JUnit
+framework - and the **SandPay Demo Shop** (`practice/shop`), a fictional shop built to be awkward to
+automate, published with the app at `shop/`. See [practice/README.md](practice/README.md).
+
+The other 49 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
 
 ## Requirements

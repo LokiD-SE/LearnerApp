@@ -28,7 +28,7 @@ for (const id of lessonIds) {
     });
     await page.goto(`./#/lesson/${id}`);
     await expect(page.locator('main h1')).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Practice' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Practice', exact: true })).toBeVisible();
 
     const diagrams = page.locator('.diagram');
     const count = await diagrams.count();

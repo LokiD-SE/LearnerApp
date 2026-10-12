@@ -30,6 +30,9 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
 - **Practice projects** (`practice/`) are separate builds (Maven for Java) that the app only links to. Coding
   exercises name a project from `practice:` in the curriculum; a content test checks the named files exist,
   and `practice/verify.sh` checks the reference solutions pass and the unsolved exercises fail.
+- **The practice shop** (`practice/shop`, static files, no build) is a UI-automation target. A small Vite
+  plugin serves it at `/shop/` in `npm run dev` and copies it to `dist/shop/`, so it is published with the
+  app; lessons link to it relatively (`shop/index.html`).
 - **All progress changes are pure functions** in `src/store/state.ts`: `(state, input, now) → state`. The
   Preact context only holds the state and saves it after each change. That makes the rules testable without a
   browser and keeps time injectable (tests and Playwright fix the clock).

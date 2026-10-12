@@ -12,3 +12,5 @@ Static Vite + TypeScript + Preact app; content in `content/*.yaml`; progress in 
   in `src/store/storage.ts` if the stored shape changes.
 - Mastery/grading/SRS rule changes must update `docs/MASTERY_MODEL.md` and the unit tests together.
 - Keep the UI content-agnostic: a new lesson must never need UI code.
+- Practice projects (`practice/`): after changing an exercise, its tests or its solution, run
+  `practice/verify.sh <project>` (needs a JDK 17+; the framework project also needs Chrome).

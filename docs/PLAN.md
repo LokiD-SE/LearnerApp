@@ -73,12 +73,31 @@ Goal: Java practice that is judged by real tests, not by multiple choice.
 - [ ] Remaining Track E lessons: strings and StringBuilder, OOP pillars, exceptions, choosing collections,
       streams and lambdas, concurrency basics - each with at least one coding exercise.
 
+## Increment 6 - Selenium and framework tracks (first slice done)
+
+Goal: UI automation practised against a real (fictional) shop, with a framework small enough to understand.
+
+- [x] `practice/shop`: the SandPay Demo Shop - static HTML, CSS and JavaScript with deliberate automation
+      traps (asynchronous loading, re-sorting, generated ids and classes, an iframe, a processing overlay,
+      PENDING orders that settle later) and test cards instead of card numbers. Published with the app at
+      `shop/`; `npm run dev` serves it; Playwright smoke tests cover the published copy.
+- [x] `practice/framework`: Selenium 4.51 + JUnit 6 reference framework - `Config`, `ShopServer` (JDK HTTP
+      server), `Browser`, a JUnit extension (shop per class, browser per test, evidence on failure), page
+      objects and components, and journey tests. Each part's Javadoc names the need that justified it.
+- [x] Coding exercises with tests: `ShopLocators` (stable locators, checked across reloads and re-sorts),
+      `OrderWaits` (explicit waits, checked for timeouts and hidden sleeps), `CartPage` (a page object,
+      checked for waiting and for keeping Selenium inside). CI runs `practice/verify.sh framework` with
+      headless Chrome and keeps evidence on failure.
+- [x] Lessons: **Locator strategy**, **Explicit waits and synchronisation**, **Page objects done right**,
+      **A small reference framework, and why it is small**.
+- [ ] Appium lessons (architecture, contexts) - written as concepts with illustrative code; a runnable Appium
+      exercise needs an emulator in CI, which is a separate decision.
+- [ ] Maven lessons, parallel runs and thread safety, CI quality gates, and the capstone.
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).
 
-6. **Selenium/Appium and framework tracks (F, G).** A small reference framework against a local mock shop with
-   simulated payment outcomes - added component by component, each justified by a test that needed it.
 7. **Offline install (PWA).** A service worker and manifest so the app installs on a phone and works offline
    after the first visit.
 8. **Interview simulations (stage 7).** Timed mixed-topic sessions with follow-ups and rubric scoring.

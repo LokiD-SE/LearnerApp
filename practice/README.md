@@ -3,9 +3,11 @@
 Code you write and run on your own computer. Each coding exercise in LearnerApp names a project, the
 files to change, the test class that checks them and the command to run.
 
-| Folder          | Track    | What you practise                           | Needs               |
-| --------------- | -------- | ------------------------------------------- | ------------------- |
-| [`java/`](java) | E - Java | Small Java exercises checked by JUnit tests | JDK 17+, Maven 3.8+ |
+| Folder                    | Track                          | What you practise                                                               | Needs                              |
+| ------------------------- | ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
+| [`java/`](java)           | E - Java                       | Small Java exercises checked by JUnit tests                                     | JDK 17+, Maven 3.8+                |
+| [`framework/`](framework) | F, G - Selenium and frameworks | A small reference framework, and exercises for locators, waits and page objects | JDK 17+, Maven 3.8+, Google Chrome |
+| [`shop/`](shop)           | -                              | The SandPay Demo Shop the framework tests: static HTML, CSS and JavaScript      | a browser                          |
 
 ## How every project works
 
@@ -23,14 +25,54 @@ mvn test                          # every exercise (the unsolved ones fail)
 mvn -Psolutions test              # every test against the reference solutions
 ```
 
+## The SandPay Demo Shop
+
+A fictional shop built to be awkward in the ways real web apps are: products load asynchronously,
+sorting re-renders the list, ids and one CSS class are generated on every load, card details are in an
+iframe, an overlay covers the page while a payment runs, and some payments stay PENDING until the order
+page updates. Stable `data-testid` attributes are the intended test hooks. Test cards are codes, not
+card numbers:
+
+| Code                          | Outcome                                 |
+| ----------------------------- | --------------------------------------- |
+| `sandpay-success`             | paid after about 1.5 s                  |
+| `sandpay-slow`                | paid after about 4 s                    |
+| `sandpay-insufficient-funds`  | declined: insufficient funds            |
+| `sandpay-card-declined`       | declined by the card issuer             |
+| `sandpay-unknown`             | PENDING, then SUCCEEDED about 3 s later |
+| `sandpay-pending-then-failed` | PENDING, then FAILED about 3 s later    |
+
+It is published with LearnerApp at `shop/` (for example `https://lokid-se.github.io/LearnerApp/shop/`),
+and `npm run dev` serves it at `http://localhost:5173/shop/`.
+
+## The reference framework
+
+```bash
+cd practice/framework
+mvn test -Dtest=CheckoutJourneyTest                    # watch it in a Chrome window
+mvn test -Dheadless=true                               # no window (the default in CI)
+mvn test -Dshop.url=https://lokid-se.github.io/LearnerApp/shop/   # against the published shop
+```
+
+| Setting             | Default                                                    | Meaning                             |
+| ------------------- | ---------------------------------------------------------- | ----------------------------------- |
+| `-Dheadless`        | `true` when the `CI` variable is `true`, otherwise `false` | run Chrome without a window         |
+| `-Dshop.url`        | empty: serve `-Dshop.dir` locally                          | test a shop that is already running |
+| `-Dshop.dir`        | `../shop`                                                  | the shop's files                    |
+| `-Dtimeout.seconds` | `10`                                                       | the longest any wait waits          |
+
+Failed tests leave a screenshot and the page source in `target/evidence`.
+
 ## Troubleshooting
 
-| Symptom                                           | Cause and fix                                                                                                                                                                                          |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `release version 17 not supported`                | Maven is running on a Java **runtime** without a compiler, or on a JDK without the files `--release` needs. Install a full JDK 17+ and point `JAVA_HOME` at it (`mvn -v` shows which Java Maven uses). |
-| `The practice projects need Java 17 or later`     | Maven runs on an older Java. Set `JAVA_HOME` to a JDK 17+.                                                                                                                                             |
-| `No tests matching pattern "XTest" were executed` | Check the class name in `-Dtest=` - it is the test class, without `.java`.                                                                                                                             |
-| The first run is slow                             | Maven downloads its plugins and JUnit once into `~/.m2/repository`.                                                                                                                                    |
+| Symptom                                             | Cause and fix                                                                                                                                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `release version 17 not supported`                  | Maven is running on a Java **runtime** without a compiler, or on a JDK without the files `--release` needs. Install a full JDK 17+ and point `JAVA_HOME` at it (`mvn -v` shows which Java Maven uses). |
+| `The practice projects need Java 17 or later`       | Maven runs on an older Java. Set `JAVA_HOME` to a JDK 17+.                                                                                                                                             |
+| `No tests matching pattern "XTest" were executed`   | Check the class name in `-Dtest=` - it is the test class, without `.java`.                                                                                                                             |
+| The first run is slow                               | Maven downloads its plugins and JUnit once into `~/.m2/repository`.                                                                                                                                    |
+| `SessionNotCreatedException`                        | Chrome is missing or could not start. Install Google Chrome; on a server without a display add `-Dheadless=true`.                                                                                      |
+| `Unable to find an exact match for CDP version ...` | A harmless warning: your Chrome is newer than this Selenium version knows. The framework doesn't use CDP; a newer Selenium silences it.                                                                |
 
 ## For maintainers: changing an exercise
 
