@@ -94,9 +94,17 @@ Goal: UI automation practised against a real (fictional) shop, with a framework 
       headless Chrome and keeps evidence on failure.
 - [x] Lessons: **Locator strategy**, **Explicit waits and synchronisation**, **Page objects done right**,
       **A small reference framework, and why it is small**.
-- [ ] Appium lessons (architecture, contexts) - written as concepts with illustrative code; a runnable Appium
-      exercise needs an emulator in CI, which is a separate decision.
-- [ ] Maven lessons, parallel runs and thread safety, CI quality gates, and the capstone.
+- [x] Appium lessons: **Appium architecture, drivers and capabilities** and **Native, hybrid and WebView
+      contexts**. Their coding exercises need no device: `AndroidSessions` (Appium 1 capabilities migrated
+      to `UiAutomator2Options`, checked capability by capability) and `Contexts` (waiting for and choosing a
+      webview context, with simulated context lists). `practice/framework` now uses `io.appium:java-client`
+      10.1.1 and imports the Selenium BOM, because java-client asks for Selenium with a version range.
+      Running against a real emulator is shown as optional, illustrative code.
+- [x] Maven lessons: **pom.xml, dependencies and scopes** and **The Maven lifecycle and Surefire**, with
+      `practice/maven`: broken exercise projects (`receipt-tool`, `checkout-suite`) whose test classes run
+      Maven on the learner's project and check the outcome - build success, the real test count, the
+      Failsafe phase, a failing integration test failing the build. CI runs `practice/verify.sh maven`.
+- [ ] Parallel runs and thread safety, CI quality gates, the capstone and the mock interview.
 
 ## Next increments
 

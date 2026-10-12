@@ -47,18 +47,23 @@ eight lessons of the core path are fully written:
 7. Lambdas, functional interfaces and streams
 8. Concurrency basics for parallel test runs
 
-Four Selenium and framework lessons are written too:
+Eight Selenium, Appium, Maven and framework lessons are written too:
 
 1. Locator strategy - CSS, XPath and stable attributes
 2. Explicit waits and synchronisation
-3. Page objects done right
-4. A small reference framework, and why it is small
+3. Appium architecture, drivers and capabilities
+4. Native, hybrid and WebView contexts
+5. pom.xml, dependencies and scopes
+6. The Maven lifecycle and running tests with Surefire
+7. Page objects done right
+8. A small reference framework, and why it is small
 
-They use two practice projects - `practice/java` and `practice/framework`, a small Selenium + JUnit
-framework - and the **SandPay Demo Shop** (`practice/shop`), a fictional shop built to be awkward to
+They use three practice projects - `practice/java`, `practice/framework` (a small Selenium + JUnit framework,
+which also holds the Appium exercises - no device needed) and `practice/maven` (broken builds to fix) - and
+the **SandPay Demo Shop** (`practice/shop`), a fictional shop built to be awkward to
 automate, published with the app at `shop/`. See [practice/README.md](practice/README.md).
 
-The other 43 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+The other 39 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
 
 ## Requirements

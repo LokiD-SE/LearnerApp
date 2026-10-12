@@ -63,11 +63,23 @@ describe('pathProgress', () => {
   });
 
   it('skips planned lessons when suggesting the next one', () => {
+    const planned = [...index.refs.values()].find((ref) => ref.planned)!;
+    const mixed = {
+      id: 'mixed',
+      title: 'M',
+      level: 'beginner' as const,
+      summary: 'S',
+      lessons: [planned.id, 'java-types-and-variables'],
+    };
+    const progress = pathProgress(index, emptyState(), mixed);
+    expect(progress).toMatchObject({ total: 2, ready: 1 });
+    expect(progress.next?.id).toBe('java-types-and-variables');
+  });
+
+  it('has every lesson of the automation path written', () => {
     const automation = index.curriculum.paths.find((p) => p.id === 'automation-engineer')!;
     const progress = pathProgress(index, emptyState(), automation);
-    expect(progress.ready).toBeGreaterThan(0);
-    expect(progress.ready).toBeLessThan(progress.total);
-    expect(progress.next?.planned).toBe(false);
+    expect(progress.ready).toBe(progress.total);
     expect(progress.next?.id).toBe('java-types-and-variables');
   });
 });

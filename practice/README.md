@@ -7,6 +7,7 @@ files to change, the test class that checks them and the command to run.
 | ------------------------- | ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
 | [`java/`](java)           | E - Java                       | Small Java exercises checked by JUnit tests                                     | JDK 17+, Maven 3.8+                |
 | [`framework/`](framework) | F, G - Selenium and frameworks | A small reference framework, and exercises for locators, waits and page objects | JDK 17+, Maven 3.8+, Google Chrome |
+| [`maven/`](maven)         | G - Maven                      | Broken `pom.xml` files to fix; tests run Maven on them and check the result     | JDK 17+, Maven 3.8+                |
 | [`shop/`](shop)           | -                              | The SandPay Demo Shop the framework tests: static HTML, CSS and JavaScript      | a browser                          |
 
 ## How every project works
@@ -62,6 +63,19 @@ mvn test -Dshop.url=https://lokid-se.github.io/LearnerApp/shop/   # against the 
 | `-Dtimeout.seconds` | `10`                                                       | the longest any wait waits          |
 
 Failed tests leave a screenshot and the page source in `target/evidence`.
+
+## The Maven exercises
+
+Each exercise is a small Maven project of its own in `practice/maven/src/exercises/projects/<name>`. Fix its
+`pom.xml` - build it there with `mvn test` while you work - then run the exercise's test class from
+`practice/maven`. The test class runs Maven on your project (the same Maven you started it with) and checks
+what happened: whether it builds, how many tests really ran, which phase ran the integration tests, and
+whether a failing test fails the build.
+
+```bash
+cd practice/maven/src/exercises/projects/receipt-tool && mvn test   # work on the exercise
+cd practice/maven && mvn test -Dtest=ReceiptToolBuildTest           # check it
+```
 
 ## Troubleshooting
 
