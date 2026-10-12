@@ -36,7 +36,16 @@ function learnerContent(): Plugin {
         read(file),
       ]),
     );
-    const result = validateContent(read(join(CONTENT_DIR, 'curriculum.yaml')), lessons);
+    const interviewQuestions = Object.fromEntries(
+      yamlFiles(join(CONTENT_DIR, 'interviews', 'questions')).map((file) => [
+        relative(import.meta.dirname, file),
+        read(file),
+      ]),
+    );
+    const result = validateContent(read(join(CONTENT_DIR, 'curriculum.yaml')), lessons, {
+      config: read(join(CONTENT_DIR, 'interviews', 'interviews.yaml')),
+      questions: interviewQuestions,
+    });
     if (!result.ok) throw new Error(`Invalid content:\n  ${result.errors.join('\n  ')}`);
   };
   return {

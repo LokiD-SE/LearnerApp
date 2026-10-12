@@ -145,6 +145,11 @@ export function HomePage({ index }: { index: ContentIndex }) {
                       {progress.ready > 0 ? 'All ready lessons completed.' : 'Lessons coming soon.'}
                     </p>
                   )}
+                  {progress.ready > 0 && (
+                    <p class="small">
+                      <a href={href.interviews(`path:${path.id}`)}>Practise an interview for this path</a>
+                    </p>
+                  )}
                 </li>
               );
             })}

@@ -15,6 +15,10 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 - **Practice that adapts.** A wrong answer points back to the sections that teach the concept and a similar
   exercise. The Practice page builds interleaved sessions from what you have studied, weakest concepts first,
   and says why each item was chosen.
+- **Interview practice.** Generate a practice interview for any learning path or track in the style of Google,
+  Meta, the Big 4, IT-services MNCs, mid-market product companies or startups - their reported rounds, with
+  sources. Each round ends with a score, model answers, strengths and areas to improve; retake it as often as
+  you like and compare your rounds over time.
 - **Code you run yourself.** Coding exercises name a file in a practice project in this repository
   (`practice/`), the test class that checks it and the command to run. The tests are the judge; reference
   solutions are next to the exercises.
@@ -24,7 +28,7 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 ## Status
 
 The foundation and the **Payments QA core path** are complete, and the **Java automation engineer** path
-has started. The full curriculum map is navigable (7 stages, foundations plus tracks A-G, 63 lessons). The
+has started. The full curriculum map is navigable (7 stages, foundations plus tracks A-H, 67 lessons). The
 eight lessons of the core path are fully written:
 
 1. Anatomy of an HTTP request and response
@@ -58,10 +62,22 @@ Eight Selenium, Appium, Maven and framework lessons are written too:
 7. Page objects done right
 8. A small reference framework, and why it is small
 
-They use three practice projects - `practice/java`, `practice/framework` (a small Selenium + JUnit framework,
-which also holds the Appium exercises - no device needed) and `practice/maven` (broken builds to fix) - and
-the **SandPay Demo Shop** (`practice/shop`), a fictional shop built to be awkward to
-automate, published with the app at `shop/`. See [practice/README.md](practice/README.md).
+**Track H (Playwright with TypeScript and JavaScript)** has four lessons and a
+**Playwright automation engineer** learning path:
+
+1. JavaScript and TypeScript for testers: async, promises and types
+2. Playwright locators, auto-waiting and web-first assertions
+3. Fixtures and page objects in Playwright Test
+4. Network mocking and API testing with Playwright
+
+They use four practice projects - `practice/java`, `practice/framework` (a small Selenium + JUnit framework,
+which also holds the Appium exercises - no device needed), `practice/maven` (broken builds to fix) and
+`practice/playwright` (Playwright Test in TypeScript) - and the **SandPay Demo Shop** (`practice/shop`), a
+fictional shop built to be awkward to automate, published with the app at `shop/`. See
+[practice/README.md](practice/README.md).
+
+**Interview practice** (`#/interview`) covers every path and track: six company profiles, 14 round types and
+about 100 interview questions, alongside the exercises of the chosen course.
 
 The other 39 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
@@ -131,6 +147,7 @@ There is nothing to configure for normal use: no environment variables, keys or 
 
 ```
 content/                  the course: curriculum.yaml + lessons/<subject>/<lesson-id>.yaml
+                          + interviews/ (company loops, round types, question bank)
 src/content/              schema (zod), validation, loader, search
 src/domain/               grading, spaced repetition, mastery model (pure functions)
 src/store/                progress state, persistence, derived views, Preact context
@@ -150,6 +167,9 @@ Lessons are YAML files. The UI never needs to change to add one. Read
 3. Run `npm run validate:content`, or keep `npm run dev` running: invalid content stops the dev server with a
    list of every problem, by file and field.
 
+Interview questions go in `content/interviews/questions/*.yaml` and company profiles in
+`content/interviews/interviews.yaml`; see "Interview practice content" in the content guide.
+
 ## Troubleshooting
 
 | Symptom                                                             | Cause and fix                                                                                                            |
@@ -165,12 +185,15 @@ Lessons are YAML files. The UI never needs to change to add one. Read
 
 ## Known limitations
 
-- **Eight complete lessons** (the Payments QA core path). The other 55 are planned entries on the map.
+- **28 complete lessons.** The other 39 are planned entries on the map.
 - **Free-text answers are self-assessed** against a model answer and rubric. They are not auto-graded, and
   the mastery model gives them slightly less weight (see [docs/MASTERY_MODEL.md](docs/MASTERY_MODEL.md)).
 - **Progress is per browser.** Use export/import to move it; there is no sync.
-- **Placement covers lessons that have placement questions** - currently the eight core-path lessons.
-- **Java code is shown, not run.** There is no in-browser JVM; exercises check understanding of the code.
+- **Code runs on your computer, not in the browser.** Coding exercises name a practice project and a test
+  command; the app links to the files and you self-assess against the rubric.
+- **Interview profiles come from public reports** (checked 2026-10-12, sources listed with each). Real loops
+  vary by team, level and year, and questions are written for practice, not taken from any company.
+  Interview scores are practice signals, not predictions.
 - **Bundle size.** Mermaid is large, but it is a separate lazily loaded chunk fetched only on pages with
   diagrams.
 - `npm audit` reports two low-severity advisories in `katex`, which Mermaid depends on. LearnerApp content does

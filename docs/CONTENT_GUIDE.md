@@ -107,6 +107,10 @@ instructions); the app links to their files on GitHub.
   (no `double`, the right fields, an explanation).
 - `modelAnswer` - the key part of the reference solution, with the reasoning.
 
+The Playwright project (`practice/playwright`) follows the same idea with its own layout: exercises in
+`exercises/`, reference solutions at the same path under `solutions/`, and exercise specs tagged
+`{ tag: '@exercise' }`; `command` names the spec (`npx playwright test tests/shop-locators.spec.ts`).
+
 The app can't run the code, so coding exercises are self-assessed. The rest is checked automatically: a
 content test fails if a named file, solution or test class is missing, and `practice/verify.sh <project>`
 (run in CI) checks that the reference solutions pass every test and that every exercise test class fails
@@ -120,6 +124,35 @@ against the unsolved exercise. Write the exercise, its tests and its solution to
 - Use only auto-graded types, and give every wrong option its own feedback - learners see it in the results.
 - A learner tests out only if every question is right, so keep it to 2-3 well-chosen questions per lesson.
 - Write the `solution` for someone who got it wrong: it is shown in the results review.
+
+## Interview practice content
+
+Interview practice reads `content/interviews/interviews.yaml` and the question bank in
+`content/interviews/questions/*.yaml`; the validator checks both with the lessons.
+
+- **`asOf` and `note`** - when the company profiles were last checked against their sources, and the caveat
+  shown to learners. Update `asOf` whenever you re-check a profile.
+- **`competencies`** - what feedback is given on (`id`, `name`, `improve` in Markdown, optional `lesson`).
+  Every bank question's `concept` is a competency id.
+- **`roundTypes`** - `id`, `title`, `minutes` (the real round's usual length), `questions` (how many a practice
+  round asks), `summary`, `assesses[]`, `tips[]`, and optional `fromLessons` (`types`, `skills`, `subjects`) to
+  also use exercises from the chosen course's lessons.
+- **`profiles`** - a company or kind of company: `name`, `category`, `summary`, `notes[]`, `sources[]` (title
+  and https URL - **required**) and `stages[]` in loop order. A stage lists one or more round types (one is
+  picked per interview) and an optional `chance` (0-1) for stages only some candidates get.
+- **Question files** - `questions[]` of `{ rounds, subjects?, exercise }`. `exercise` is any exercise type
+  above. `subjects` limits a tool-specific question (Selenium, JavaScript...) to courses about those subjects.
+
+Rules:
+
+- **Profiles describe what is publicly reported**, with sources, and say where reports are thin (for example
+  no reports found for one firm). Never present a question as a company's real or leaked question.
+- Write questions **in the style of the round** - "Tell me about a time..." for behavioural, a problem with
+  examples for coding - with a model answer, a rubric of what interviewers listen for, and follow-ups.
+- Every round type a profile uses needs at least `questions` bank questions **without** `subjects`, so any
+  course can fill it; the validator enforces this.
+- Links to lessons (`#/lesson/<id>`) are checked; link the lesson that teaches what a question tests.
+- Coding questions' reference solutions must compile and pass their own examples - run them before committing.
 
 ## YAML pitfalls
 

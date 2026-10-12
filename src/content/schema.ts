@@ -259,6 +259,94 @@ export const CurriculumSchema = z.strictObject({
     .optional(),
 });
 
+/* ------------------------------------------------------------------ interview practice */
+
+export const EXERCISE_TYPES = [
+  'mcq',
+  'order',
+  'debug',
+  'short',
+  'testdesign',
+  'interview',
+  'coding',
+] as const;
+
+/** What interview feedback is given on; every question-bank question names one. */
+export const CompetencySchema = z.strictObject({
+  id: Id,
+  name: Text,
+  /** How to get better at it, shown as an area to improve. */
+  improve: Markdown,
+  /** A lesson that teaches it. */
+  lesson: Id.optional(),
+});
+
+/** A kind of interview round (coding, behavioural...), with what it assesses and how to prepare. */
+export const RoundTypeSchema = z.strictObject({
+  id: Id,
+  title: Text,
+  /** The usual length of the real round. */
+  minutes: z.number().int().positive(),
+  /** How many questions a practice round asks. */
+  questions: z.number().int().min(1).max(6),
+  summary: Text,
+  assesses: z.array(Text).min(1),
+  tips: z.array(Text).min(1),
+  /** Exercises from the chosen course's lessons that suit this round, besides the question bank. */
+  fromLessons: z
+    .strictObject({
+      types: z.array(z.enum(EXERCISE_TYPES)).min(1),
+      skills: z.array(z.enum(SKILLS)).optional(),
+      subjects: z.array(Id).optional(),
+    })
+    .optional(),
+});
+
+/** A company's (or a kind of company's) reported interview loop, with its sources. */
+export const InterviewProfileSchema = z.strictObject({
+  id: Id,
+  name: Text,
+  category: Text,
+  summary: Text,
+  notes: z.array(Text).default([]),
+  sources: z.array(z.strictObject({ title: Text, url: z.url({ protocol: /^https$/ }) })).min(1),
+  /** The loop in order. A stage names one or more round types (one is chosen per interview);
+   * `chance` makes a stage that only some candidates get appear in that share of interviews. */
+  stages: z
+    .array(
+      z.strictObject({
+        label: Text,
+        rounds: z.array(Id).min(1),
+        chance: z.number().gt(0).lt(1).optional(),
+      }),
+    )
+    .min(2),
+});
+
+export const InterviewConfigSchema = z.strictObject({
+  /** When the profiles were last checked against their sources (YYYY-MM-DD). */
+  asOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'a date like 2026-10-12'),
+  note: Markdown,
+  competencies: z.array(CompetencySchema).min(1),
+  roundTypes: z.array(RoundTypeSchema).min(1),
+  profiles: z.array(InterviewProfileSchema).min(1),
+});
+
+/** A file of question-bank questions; each exercise's `concept` is a competency id. */
+export const InterviewQuestionFileSchema = z.strictObject({
+  questions: z
+    .array(
+      z.strictObject({
+        /** Round types the question can be asked in. */
+        rounds: z.array(Id).min(1),
+        /** Only for courses that include one of these subjects; omitted means any course. */
+        subjects: z.array(Id).min(1).optional(),
+        exercise: ExerciseSchema,
+      }),
+    )
+    .min(1),
+});
+
 export type Section = z.infer<typeof SectionSchema>;
 export type Exercise = z.infer<typeof ExerciseSchema>;
 export type McqExercise = z.infer<typeof McqSchema>;
@@ -281,6 +369,11 @@ export type Stage = Curriculum['stages'][number];
 export type LearningPath = Curriculum['paths'][number];
 export type Practice = NonNullable<Curriculum['practice']>;
 export type PracticeProject = Practice['projects'][number];
+export type Competency = z.infer<typeof CompetencySchema>;
+export type RoundType = z.infer<typeof RoundTypeSchema>;
+export type InterviewProfile = z.infer<typeof InterviewProfileSchema>;
+export type InterviewConfig = z.infer<typeof InterviewConfigSchema>;
+export type BankQuestion = z.infer<typeof InterviewQuestionFileSchema>['questions'][number];
 
 export const isRubricExercise = (exercise: Exercise): exercise is RubricExercise =>
   exercise.type === 'short' ||

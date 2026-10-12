@@ -108,7 +108,42 @@ mastery, so it has its own rules (`recordPlacement` in `src/store/state.ts`):
 - Practice answers are first tries in a new sitting, so they are evidence. A practice or review answer of 0.8 or
   more at least 24 hours after the first evidence counts as **retention** (mode `practice` or `review`).
 
-## 8. Known simplifications (candidates to revisit)
+## 8. Interview practice
+
+Interview practice (`#/interview`) rehearses whole interview rounds. Its scores answer "how would this round
+have gone?", which is a different question from mastery, so it has its own rules (`src/store/interviews.ts`,
+updates in `src/store/state.ts`):
+
+- **Generating.** An interview follows one company profile's reported loop (`content/interviews/interviews.yaml`):
+  every stage in order, optional stages included with their reported `chance`, one round type chosen per stage.
+  With "any company", the company differs from the last interview for the same course; a new interview for
+  the same course and company re-draws (up to 8 times) to avoid repeating the last set of round types.
+- **Questions.** Each round asks `questions` items from the question bank (`content/interviews/questions/`)
+  and, when the round type names `fromLessons`, from the chosen course's published lessons - about half from
+  the course where it has suitable exercises (a one-question round: every other time). Bank questions marked
+  with `subjects` are used only for courses _about_ one of those subjects: the subjects at least two of the
+  course's lessons belong to. Questions asked in fewer earlier interviews come first, concepts vary within a
+  round, and no question repeats within an interview. Generation is seeded, so it is reproducible in tests.
+- **Scoring.** Raw scores and the hint penalty are the same as for exercises (section 1). Only the first answer
+  to a question in an attempt counts; "Skip and show the answer" scores 0. A round's score is the average
+  credit over its questions, with unanswered questions scoring 0 when the round is finished; a finished round
+  is frozen. Self-assessed answers are **not** down-weighted here: most interview rounds are spoken answers, so
+  a discount would only shift every round down.
+- **Bands.** 85% and above **Strong** (a strong hire signal), 70% **Good** (a hire signal), 50% **Borderline**
+  (a mixed signal), below that **Needs work** (no hire signal yet). They describe practice performance, not a
+  prediction of any company's decision.
+- **Feedback.** Answers at 85% or more are listed as strengths. The others are areas to improve, grouped by
+  competency (bank questions) or lesson concept (lesson exercises), with how to improve, a link to study it and
+  the rubric points the answer missed. The report compares the round with the learner's previous and best
+  finished attempts at it.
+- **Retakes.** "Retake the interview" or "Retake this round" starts a new attempt with the same rounds and
+  questions; every attempt is kept (the last 12 per interview, the last 30 interviews) for the round-by-round
+  history.
+- **Not mastery evidence.** Interview answers never create attempts, reviews or lesson completion. The
+  conditions differ from study (a timer, mixed topics, bank questions that belong to no lesson), and counting
+  lesson exercises answered in interviews would let the same answer count twice.
+
+## 9. Known simplifications (candidates to revisit)
 
 - Box intervals are fixed. An SM-2/FSRS-style per-item ease factor would adapt better, but needs more data.
 - Self-assessment trusts the learner. The rubric makes it concrete; honesty still matters.

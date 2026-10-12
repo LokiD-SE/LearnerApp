@@ -186,7 +186,8 @@ export function ExerciseCard(props: {
             draft={stored.draft ?? ''}
             onDraft={(text) => update((s) => saveDraft(s, key, text))}
             onReveal={() => setSelfAssessing(true)}
-            onAssess={(covered, response) => {
+            onAssess={(points, response) => {
+              const covered = points.filter(Boolean).length;
               const score = gradeRubric(covered, exercise.rubric.length);
               record(score, response, true);
               update((s) => saveDraft(s, key, ''));
@@ -561,14 +562,15 @@ const ANSWER_PLACEHOLDER: Record<RubricExercise['type'], string> = {
   coding: 'Paste the test summary (the "Tests run: ..." line) and note anything that surprised you',
 };
 
-function RubricBody(props: {
+export function RubricBody(props: {
   exercise: RubricExercise;
   practice?: Practice;
   idPrefix: string;
   draft: string;
   onDraft: (text: string) => void;
   onReveal: () => void;
-  onAssess: (covered: number, response: string) => void;
+  /** which rubric points the learner says they covered, in rubric order */
+  onAssess: (covered: boolean[], response: string) => void;
   recorded: boolean;
 }) {
   const { exercise, idPrefix, onDraft, onReveal, onAssess, recorded } = props;
@@ -657,11 +659,7 @@ function RubricBody(props: {
               );
             })}
             {!recorded && (
-              <button
-                type="button"
-                class="button primary"
-                onClick={() => onAssess(covered.filter(Boolean).length, text)}
-              >
+              <button type="button" class="button primary" onClick={() => onAssess(covered, text)}>
                 Save my self-assessment
               </button>
             )}

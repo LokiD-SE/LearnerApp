@@ -14,6 +14,9 @@ export const STATE_VERSION = 1;
 export const MAX_ATTEMPTS_KEPT = 2000;
 export const MAX_RESPONSE_CHARS = 4000;
 export const MAX_NOTES_CHARS = 20000;
+export const MAX_INTERVIEWS_KEPT = 30;
+export const MAX_INTERVIEW_ATTEMPTS_KEPT = 12;
+export const MAX_INTERVIEW_RESPONSE_CHARS = 2000;
 
 const IsoDate = z.string().refine((value) => !Number.isNaN(Date.parse(value)), 'not an ISO date');
 const Score = z.number().min(0).max(1);
@@ -78,6 +81,52 @@ const PlacementResultSchema = z.object({
   answers: z.record(z.string(), Score).default({}),
 });
 
+const InterviewAnswerSchema = z.object({
+  /** raw score before the hint penalty */
+  score: Score,
+  credit: Score,
+  hintsUsed: z.number().int().min(0),
+  selfAssessed: z.boolean(),
+  /** rubric points the answer did not cover (indexes into the rubric), for feedback */
+  missed: z.array(z.number().int().min(0)).default([]),
+  response: z.string().max(MAX_INTERVIEW_RESPONSE_CHARS).optional(),
+  at: IsoDate,
+});
+
+const InterviewRoundAttemptSchema = z.object({
+  startedAt: IsoDate,
+  finishedAt: IsoDate.optional(),
+  /** question key -> hints shown before answering */
+  hints: z.record(z.string(), z.number().int().min(0)).default({}),
+  /** question key -> the answer; only the first answer in an attempt counts */
+  answers: z.record(z.string(), InterviewAnswerSchema).default({}),
+});
+
+const InterviewAttemptSchema = z.object({
+  startedAt: IsoDate,
+  /** round index (as a string) -> that round in this attempt; rounds can be taken in any order */
+  rounds: z.record(z.string(), InterviewRoundAttemptSchema).default({}),
+});
+
+/** A generated practice interview: fixed rounds and questions, taken any number of times. */
+const MockInterviewSchema = z.object({
+  id: z.string(),
+  course: z.object({ kind: z.enum(['path', 'subject']), id: z.string() }),
+  /** the company profile in content/interviews/interviews.yaml */
+  profileId: z.string(),
+  seed: z.number().int(),
+  createdAt: IsoDate,
+  rounds: z.array(
+    z.object({
+      type: z.string(),
+      label: z.string(),
+      /** question keys: bank:<id> or lesson:<lessonId>/<exerciseId> */
+      questions: z.array(z.string()),
+    }),
+  ),
+  attempts: z.array(InterviewAttemptSchema).default([]),
+});
+
 export const ProgressStateSchema = z.object({
   version: z.literal(STATE_VERSION),
   lastLessonId: z.string().optional(),
@@ -87,6 +136,8 @@ export const ProgressStateSchema = z.object({
   attempts: z.array(AttemptSchema).default([]),
   // Added after version 1 shipped; the default keeps older saved progress loading unchanged.
   placements: z.record(z.string(), PlacementResultSchema).default({}),
+  // Also added after version 1 shipped, the same way. Oldest first.
+  interviews: z.array(MockInterviewSchema).default([]),
 });
 
 export type Attempt = z.infer<typeof AttemptSchema>;
@@ -95,6 +146,10 @@ export type LessonState = z.infer<typeof LessonStateSchema>;
 export type ReviewEntry = z.infer<typeof ReviewEntrySchema>;
 export type PlacementResult = z.infer<typeof PlacementResultSchema>;
 export type ProgressState = z.infer<typeof ProgressStateSchema>;
+export type MockInterview = z.infer<typeof MockInterviewSchema>;
+export type InterviewAttempt = z.infer<typeof InterviewAttemptSchema>;
+export type InterviewRoundAttempt = z.infer<typeof InterviewRoundAttemptSchema>;
+export type InterviewAnswer = z.infer<typeof InterviewAnswerSchema>;
 
 /** Exercises and recall cards are keyed by lesson so ids only need to be unique per lesson. */
 export const itemKey = (lessonId: string, itemId: string) => `${lessonId}/${itemId}`;
@@ -106,6 +161,7 @@ export const emptyState = (): ProgressState => ({
   reviews: {},
   attempts: [],
   placements: {},
+  interviews: [],
 });
 
 const emptyLesson = (): LessonState => ({ bookmarked: false, notes: '' });
@@ -308,4 +364,143 @@ function updateCompletion(state: ProgressState, lesson: Lesson, now: Date): Prog
   const current = lessonOf(state, lesson.id);
   if (current.completedAt || !isLessonComplete(state, lesson)) return state;
   return withLesson(state, lesson.id, { completedAt: now.toISOString() });
+}
+
+/* ------------------------------------------------------------------ interview practice */
+/* Interview answers are practice for interviews, not mastery evidence (docs/MASTERY_MODEL.md):
+ * they never touch attempts, reviews or lesson completion. */
+
+function withInterview(
+  state: ProgressState,
+  id: string,
+  change: (interview: MockInterview) => MockInterview,
+): ProgressState {
+  const index = state.interviews.findIndex((interview) => interview.id === id);
+  if (index < 0) return state;
+  const interviews = [...state.interviews];
+  interviews[index] = change(interviews[index]!);
+  return { ...state, interviews };
+}
+
+/** Changes one round of the interview's latest attempt; does nothing if that round isn't started. */
+function withLatestRound(
+  state: ProgressState,
+  id: string,
+  roundIndex: number,
+  change: (round: InterviewRoundAttempt) => InterviewRoundAttempt,
+): ProgressState {
+  return withInterview(state, id, (interview) => {
+    const attempt = interview.attempts.at(-1);
+    const round = attempt?.rounds[String(roundIndex)];
+    if (!attempt || !round) return interview;
+    const attempts = [...interview.attempts];
+    attempts[attempts.length - 1] = {
+      ...attempt,
+      rounds: { ...attempt.rounds, [roundIndex]: change(round) },
+    };
+    return { ...interview, attempts };
+  });
+}
+
+/** Keeps the newest interviews when there are too many. */
+export function addInterview(state: ProgressState, interview: MockInterview): ProgressState {
+  return { ...state, interviews: [...state.interviews, interview].slice(-MAX_INTERVIEWS_KEPT) };
+}
+
+export function deleteInterview(state: ProgressState, id: string): ProgressState {
+  return { ...state, interviews: state.interviews.filter((interview) => interview.id !== id) };
+}
+
+/** A fresh attempt at the same rounds and questions; the oldest attempts go when there are too many. */
+export function startInterviewAttempt(state: ProgressState, id: string, now: Date): ProgressState {
+  return withInterview(state, id, (interview) => ({
+    ...interview,
+    attempts: [...interview.attempts, { startedAt: now.toISOString(), rounds: {} }].slice(
+      -MAX_INTERVIEW_ATTEMPTS_KEPT,
+    ),
+  }));
+}
+
+/** Starts a round in the latest attempt (starting an attempt first if there is none). */
+export function startInterviewRound(
+  state: ProgressState,
+  id: string,
+  roundIndex: number,
+  now: Date,
+): ProgressState {
+  const interview = state.interviews.find((candidate) => candidate.id === id);
+  if (!interview || roundIndex < 0 || roundIndex >= interview.rounds.length) return state;
+  const started = interview.attempts.length > 0 ? state : startInterviewAttempt(state, id, now);
+  return withInterview(started, id, (current) => {
+    const attempt = current.attempts.at(-1)!;
+    if (attempt.rounds[String(roundIndex)]) return current;
+    const attempts = [...current.attempts];
+    attempts[attempts.length - 1] = {
+      ...attempt,
+      rounds: { ...attempt.rounds, [roundIndex]: { startedAt: now.toISOString(), hints: {}, answers: {} } },
+    };
+    return { ...current, attempts };
+  });
+}
+
+export function showInterviewHint(
+  state: ProgressState,
+  id: string,
+  roundIndex: number,
+  questionKey: string,
+  totalHints: number,
+): ProgressState {
+  return withLatestRound(state, id, roundIndex, (round) => {
+    if (round.finishedAt || round.answers[questionKey]) return round;
+    const shown = Math.min((round.hints[questionKey] ?? 0) + 1, totalHints);
+    return { ...round, hints: { ...round.hints, [questionKey]: shown } };
+  });
+}
+
+export interface InterviewAnswerInput {
+  /** raw score, 0..1 */
+  score: number;
+  selfAssessed: boolean;
+  /** rubric points not covered */
+  missed?: number[];
+  response?: string;
+}
+
+/** Records the first answer to a question in the latest attempt; hints shown reduce its credit. */
+export function recordInterviewAnswer(
+  state: ProgressState,
+  id: string,
+  roundIndex: number,
+  questionKey: string,
+  input: InterviewAnswerInput,
+  now: Date,
+): ProgressState {
+  return withLatestRound(state, id, roundIndex, (round) => {
+    if (round.finishedAt || round.answers[questionKey]) return round;
+    const hintsUsed = round.hints[questionKey] ?? 0;
+    const score = Math.min(1, Math.max(0, input.score));
+    const response = input.response?.slice(0, MAX_INTERVIEW_RESPONSE_CHARS);
+    const answer: InterviewAnswer = {
+      score,
+      credit: creditFor(score, hintsUsed),
+      hintsUsed,
+      selfAssessed: input.selfAssessed,
+      missed: input.missed ?? [],
+      at: now.toISOString(),
+      ...(response === undefined ? {} : { response }),
+    };
+    return { ...round, answers: { ...round.answers, [questionKey]: answer } };
+  });
+}
+
+/** Ends a round; questions left unanswered score zero. */
+export function finishInterviewRound(
+  state: ProgressState,
+  id: string,
+  roundIndex: number,
+  now: Date,
+): ProgressState {
+  return withLatestRound(state, id, roundIndex, (round) =>
+    round.finishedAt ? round : { ...round, finishedAt: now.toISOString() },
+  );
 }

@@ -104,15 +104,43 @@ Goal: UI automation practised against a real (fictional) shop, with a framework 
       `practice/maven`: broken exercise projects (`receipt-tool`, `checkout-suite`) whose test classes run
       Maven on the learner's project and check the outcome - build success, the real test count, the
       Failsafe phase, a failing integration test failing the build. CI runs `practice/verify.sh maven`.
-- [ ] Parallel runs and thread safety, CI quality gates, the capstone and the mock interview.
+- [ ] Parallel runs and thread safety, CI quality gates and the capstone.
+
+## Increment 7 - Playwright track and interview practice (done)
+
+Goal: the same hands-on depth for Playwright in TypeScript and JavaScript, and interview rehearsal for any
+course.
+
+- [x] `practice/playwright`: Playwright Test 1.64 with TypeScript (one JavaScript exercise, type-checked with
+      `checkJs`). Exercises in `exercises/`, solutions in `solutions/`, specs tagged `@exercise`;
+      `npm run verify` (CI: `practice/verify.sh playwright`) type-checks, runs the solutions and checks every
+      exercise spec fails on the stubs. Eight exercises: `checkAll`, `pollUntil`, shop locators, order-status
+      waits, a cart page object, fixtures, network mocks, an API client.
+- [x] The shop's catalog now loads `products.json` (with an error state and Try again), so there is a real
+      request to mock and an API to test.
+- [x] Lessons (Track H): **JavaScript and TypeScript for testers**, **Playwright locators, auto-waiting and
+      web-first assertions**, **Fixtures and page objects in Playwright Test**, **Network mocking and API
+      testing with Playwright**; a **Playwright automation engineer** learning path.
+- [x] Interview practice (`#/interview`): company profiles for Google, Meta, the Big 4, IT-services MNCs,
+      mid-market product companies and startups, each with its reported loop and sources (checked
+      2026-10-12); 14 round types; a question bank of about 100 original questions with model answers,
+      rubrics and follow-ups, plus exercises from the chosen course's lessons.
+- [x] Generate an interview for any path or track: a company's loop with its optional stages, a different
+      company and set of rounds each time, unseen questions first. Rounds are timed against the real round's
+      length; hints cost credit; every round ends with a report - score and band, strengths, areas to improve
+      with links to lessons, missed rubric points, tips, and the change since the previous attempt. Retake an
+      interview or a round any number of times; the interview page compares every attempt round by round.
+- [x] Rules in [MASTERY_MODEL.md](MASTERY_MODEL.md) (interview answers are not mastery evidence); unit tests
+      for generation, scoring, feedback and state; an end-to-end journey on desktop and mobile.
 
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).
 
-7. **Offline install (PWA).** A service worker and manifest so the app installs on a phone and works offline
+8. **Offline install (PWA).** A service worker and manifest so the app installs on a phone and works offline
    after the first visit.
-8. **Interview simulations (stage 7).** Timed mixed-topic sessions with follow-ups and rubric scoring.
+9. **More interview depth.** Spoken-answer practice with a recording timer, and company profiles for more
+   companies as reports are checked.
 
 ## Open questions for the owner
 

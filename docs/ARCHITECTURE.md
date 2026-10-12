@@ -21,18 +21,23 @@ content/*.yaml ──(Vite plugin: YAML → JS, validate all)──► src/conte
 src/domain (pure: grading, mastery, srs) ◄────────────────────┤
                                                               ▼
 src/store (state.ts pure updates → ProgressContext → localStorage via storage.ts; selectors.ts derived views;
-           adaptive.ts remediation and practice sessions)
+           adaptive.ts remediation and practice sessions; interviews.ts interview generation, scoring, reports)
                                                               │
 src/ui (router, Markdown/Mermaid, components, pages) ◄────────┘
 ```
 
 - **Content never contains UI** and the UI hard-codes no content. A new lesson is a new YAML file.
-- **Practice projects** (`practice/`) are separate builds (Maven for Java) that the app only links to. Coding
+- **Practice projects** (`practice/`) are separate builds (Maven for Java, npm for Playwright) that the app
+  only links to. Coding
   exercises name a project from `practice:` in the curriculum; a content test checks the named files exist,
   and `practice/verify.sh` checks the reference solutions pass and the unsolved exercises fail.
 - **The practice shop** (`practice/shop`, static files, no build) is a UI-automation target. A small Vite
   plugin serves it at `/shop/` in `npm run dev` and copies it to `dist/shop/`, so it is published with the
   app; lessons link to it relatively (`shop/index.html`).
+- **Interview practice** is content too: company loops, round types and a question bank in
+  `content/interviews/`. A generated interview stores only question keys (`bank:<id>`,
+  `lesson:<lesson>/<exercise>`), its seed and the learner's attempts, and is resolved against the current
+  content when shown - a question removed from the content is left out rather than breaking old interviews.
 - **All progress changes are pure functions** in `src/store/state.ts`: `(state, input, now) → state`. The
   Preact context only holds the state and saves it after each change. That makes the rules testable without a
   browser and keeps time injectable (tests and Playwright fix the clock).

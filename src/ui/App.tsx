@@ -3,6 +3,9 @@ import type { ValidationResult } from '../content/validate';
 import { useProgress } from '../store/ProgressContext';
 import { dueReviews } from '../store/selectors';
 import { HomePage } from './pages/HomePage';
+import { InterviewHomePage } from './pages/InterviewHomePage';
+import { InterviewPage } from './pages/InterviewPage';
+import { InterviewRoundPage } from './pages/InterviewRoundPage';
 import { LearnPage } from './pages/LearnPage';
 import { LessonPage } from './pages/LessonPage';
 import { PlacementPage } from './pages/PlacementPage';
@@ -46,7 +49,8 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
     document.title = heading?.textContent ? `${heading.textContent} - LearnerApp` : 'LearnerApp';
   }, [route]);
 
-  const current = route.name;
+  // The interview pages all live under the "Interview" link.
+  const current = route.name === 'interview' || route.name === 'interview-round' ? 'interviews' : route.name;
   const navLink = (target: Route['name'], to: string, label: string, extra?: preact.ComponentChildren) => (
     <a
       href={to}
@@ -90,6 +94,7 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
             ) : null,
           )}
           {navLink('practice', href.practice(), 'Practice')}
+          {navLink('interviews', href.interviews(), 'Interview')}
           {navLink('progress', href.progress(), 'Progress')}
           {navLink('search', href.search(), 'Search')}
         </nav>
@@ -134,6 +139,19 @@ function Page({ route, index }: { route: Route; index: Extract<ValidationResult,
     case 'placement':
       return (
         <PlacementPage key={`${route.kind}/${route.id}`} index={index} kind={route.kind} id={route.id} />
+      );
+    case 'interviews':
+      return <InterviewHomePage key={route.course ?? 'all'} index={index} course={route.course} />;
+    case 'interview':
+      return <InterviewPage key={route.id} index={index} id={route.id} />;
+    case 'interview-round':
+      return (
+        <InterviewRoundPage
+          key={`${route.id}/${route.round}`}
+          index={index}
+          id={route.id}
+          round={route.round}
+        />
       );
     case 'not-found':
       return (

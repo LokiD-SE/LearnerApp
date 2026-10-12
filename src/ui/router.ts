@@ -13,6 +13,10 @@ export type Route =
   | { name: 'progress' }
   | { name: 'search'; query: string }
   | { name: 'placement'; kind: 'path' | 'lesson'; id: string }
+  | { name: 'interviews'; course?: string }
+  | { name: 'interview'; id: string }
+  /** round is 0-based here and 1-based in the address */
+  | { name: 'interview-round'; id: string; round: number }
   | { name: 'not-found'; path: string };
 
 const FOCUS_PATTERN = /^(section|exercise)-[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -48,6 +52,20 @@ export function parseHash(hash: string): Route {
   if (head === 'placement' && parts.length === 3 && (id === 'path' || id === 'lesson')) {
     return { name: 'placement', kind: id, id: parts[2]! };
   }
+  if (head === 'interview' && parts.length === 1) {
+    const course = query.get('course');
+    return course ? { name: 'interviews', course } : { name: 'interviews' };
+  }
+  if (head === 'interview' && id && parts.length === 2) return { name: 'interview', id };
+  if (
+    head === 'interview' &&
+    id &&
+    parts.length === 4 &&
+    parts[2] === 'round' &&
+    /^[1-9]\d?$/.test(parts[3]!)
+  ) {
+    return { name: 'interview-round', id, round: Number(parts[3]) - 1 };
+  }
   return { name: 'not-found', path };
 }
 
@@ -67,6 +85,11 @@ export const href = {
   progress: () => '#/progress',
   search: (query = '') => (query ? `#/search?q=${encodeURIComponent(query)}` : '#/search'),
   placement: (kind: 'path' | 'lesson', id: string) => `#/placement/${kind}/${encodeURIComponent(id)}`,
+  interviews: (course?: string) =>
+    course ? `#/interview?course=${encodeURIComponent(course)}` : '#/interview',
+  interview: (id: string) => `#/interview/${encodeURIComponent(id)}`,
+  /** round is 0-based */
+  interviewRound: (id: string, round: number) => `#/interview/${encodeURIComponent(id)}/round/${round + 1}`,
 };
 
 export function useRoute(): Route {

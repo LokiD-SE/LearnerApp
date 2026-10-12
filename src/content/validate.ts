@@ -5,14 +5,25 @@
  * Used by the Vite plugin (a broken file fails `npm run dev` / `npm run build`), by the
  * content test, and at runtime to build the index the UI reads.
  */
-import { CurriculumSchema, LessonSchema, isRubricExercise } from './schema.ts';
+import {
+  CurriculumSchema,
+  InterviewConfigSchema,
+  InterviewQuestionFileSchema,
+  LessonSchema,
+  isRubricExercise,
+} from './schema.ts';
 import type {
+  BankQuestion,
+  Competency,
   Curriculum,
   CurriculumModule,
   CurriculumSubject,
+  Exercise,
+  InterviewProfile,
   Lesson,
   Level,
   PracticeProject,
+  RoundType,
 } from './schema.ts';
 
 export interface LessonRef {
@@ -38,6 +49,25 @@ export interface ContentIndex {
   conceptLesson: Map<string, string>;
   /** practice projects that coding exercises run in, by id */
   practiceProjects: Map<string, PracticeProject>;
+  /** interview practice content, when the content set includes it */
+  interviews: InterviewContent | null;
+}
+
+export interface InterviewContent {
+  asOf: string;
+  note: string;
+  competencies: Map<string, Competency>;
+  roundTypes: Map<string, RoundType>;
+  /** in content order */
+  profiles: InterviewProfile[];
+  /** question-bank questions by exercise id */
+  questions: Map<string, BankQuestion>;
+}
+
+/** The raw interview files: content/interviews/interviews.yaml and content/interviews/questions/*.yaml */
+export interface RawInterviews {
+  config: unknown;
+  questions: Record<string, unknown>;
 }
 
 export type ValidationResult = { ok: true; index: ContentIndex } | { ok: false; errors: string[] };
@@ -45,9 +75,44 @@ export type ValidationResult = { ok: true; index: ContentIndex } | { ok: false; 
 const formatZod = (file: string, issues: { path: PropertyKey[]; message: string }[]) =>
   issues.map((issue) => `${file}: ${issue.path.map(String).join('.') || '(root)'} - ${issue.message}`);
 
+/** Checks that only need the exercise itself (and the practice projects). */
+function checkExercise(
+  exercise: Exercise,
+  where: string,
+  practiceProjects: Map<string, PracticeProject>,
+  errors: string[],
+) {
+  if (exercise.type === 'mcq') {
+    const optionIds = new Set(exercise.options.map((o) => o.id));
+    if (optionIds.size !== exercise.options.length) errors.push(`${where}: duplicate option ids`);
+    for (const id of exercise.correct) {
+      if (!optionIds.has(id)) errors.push(`${where}: correct answer '${id}' is not an option`);
+    }
+    if (exercise.correct.length === exercise.options.length) errors.push(`${where}: every option is correct`);
+  }
+  if (exercise.type === 'order') {
+    const itemIds = new Set(exercise.items.map((i) => i.id));
+    if (itemIds.size !== exercise.items.length) errors.push(`${where}: duplicate item ids`);
+  }
+  if (exercise.type === 'debug') {
+    const lineCount = exercise.code.replace(/\n$/, '').split('\n').length;
+    for (const line of [...exercise.correctLines, ...exercise.lineNotes.map((n) => n.line)]) {
+      if (line > lineCount)
+        errors.push(`${where}: line ${line} is past the end of the code (${lineCount} lines)`);
+    }
+  }
+  if (exercise.type === 'coding' && !practiceProjects.has(exercise.project)) {
+    errors.push(`${where}: unknown practice project '${exercise.project}'`);
+  }
+  if (isRubricExercise(exercise) && new Set(exercise.rubric).size !== exercise.rubric.length) {
+    errors.push(`${where}: duplicate rubric items`);
+  }
+}
+
 export function validateContent(
   rawCurriculum: unknown,
   rawLessons: Record<string, unknown>,
+  rawInterviews?: RawInterviews,
 ): ValidationResult {
   const errors: string[] = [];
 
@@ -177,32 +242,7 @@ export function validateContent(
       unique(kind, exercise.id);
       const where = `lesson '${lesson.id}' ${kind} '${exercise.id}'`;
       if (!concepts.has(exercise.concept)) errors.push(`${where}: unknown concept '${exercise.concept}'`);
-      if (exercise.type === 'mcq') {
-        const optionIds = new Set(exercise.options.map((o) => o.id));
-        if (optionIds.size !== exercise.options.length) errors.push(`${where}: duplicate option ids`);
-        for (const id of exercise.correct) {
-          if (!optionIds.has(id)) errors.push(`${where}: correct answer '${id}' is not an option`);
-        }
-        if (exercise.correct.length === exercise.options.length)
-          errors.push(`${where}: every option is correct`);
-      }
-      if (exercise.type === 'order') {
-        const itemIds = new Set(exercise.items.map((i) => i.id));
-        if (itemIds.size !== exercise.items.length) errors.push(`${where}: duplicate item ids`);
-      }
-      if (exercise.type === 'debug') {
-        const lineCount = exercise.code.replace(/\n$/, '').split('\n').length;
-        for (const line of [...exercise.correctLines, ...exercise.lineNotes.map((n) => n.line)]) {
-          if (line > lineCount)
-            errors.push(`${where}: line ${line} is past the end of the code (${lineCount} lines)`);
-        }
-      }
-      if (exercise.type === 'coding' && !practiceProjects.has(exercise.project)) {
-        errors.push(`${where}: unknown practice project '${exercise.project}'`);
-      }
-      if (isRubricExercise(exercise) && new Set(exercise.rubric).size !== exercise.rubric.length) {
-        errors.push(`${where}: duplicate rubric items`);
-      }
+      checkExercise(exercise, where, practiceProjects, errors);
     }
     for (const card of lesson.recall) {
       unique('recall card', card.id);
@@ -245,9 +285,117 @@ export function validateContent(
   };
   for (const id of lessons.keys()) visit(id, []);
 
+  const interviews = rawInterviews
+    ? validateInterviews(rawInterviews, { lessons, subjects, practiceProjects }, errors)
+    : null;
+
   if (errors.length) return { ok: false, errors };
   return {
     ok: true,
-    index: { curriculum, lessons, refs, subjects, modules, conceptLesson, practiceProjects },
+    index: { curriculum, lessons, refs, subjects, modules, conceptLesson, practiceProjects, interviews },
+  };
+}
+
+const LESSON_LINK = /#\/lesson\/([a-z0-9-]+)/g;
+
+function validateInterviews(
+  raw: RawInterviews,
+  known: {
+    lessons: Map<string, Lesson>;
+    subjects: Map<string, CurriculumSubject>;
+    practiceProjects: Map<string, PracticeProject>;
+  },
+  errors: string[],
+): InterviewContent | null {
+  const configFile = 'content/interviews/interviews.yaml';
+  const parsed = InterviewConfigSchema.safeParse(raw.config);
+  if (!parsed.success) {
+    errors.push(...formatZod(configFile, parsed.error.issues));
+    return null;
+  }
+  const config = parsed.data;
+  const where = (id: string) => `${configFile} '${id}'`;
+  // Links to lessons in interview text must keep working when lessons are renamed.
+  const checkLinks = (place: string, value: unknown) => {
+    for (const [, id] of JSON.stringify(value).matchAll(LESSON_LINK)) {
+      if (!known.lessons.has(id!)) errors.push(`${place}: links to unknown lesson '${id}'`);
+    }
+  };
+
+  const competencies = new Map<string, Competency>();
+  for (const competency of config.competencies) {
+    if (competencies.has(competency.id)) errors.push(`${where(competency.id)}: duplicate competency id`);
+    competencies.set(competency.id, competency);
+    if (competency.lesson && !known.lessons.has(competency.lesson))
+      errors.push(`${where(competency.id)}: unknown lesson '${competency.lesson}'`);
+    checkLinks(where(competency.id), competency.improve);
+  }
+
+  const roundTypes = new Map<string, RoundType>();
+  for (const round of config.roundTypes) {
+    if (roundTypes.has(round.id)) errors.push(`${where(round.id)}: duplicate round type id`);
+    roundTypes.set(round.id, round);
+    for (const subject of round.fromLessons?.subjects ?? []) {
+      if (!known.subjects.has(subject)) errors.push(`${where(round.id)}: unknown subject '${subject}'`);
+    }
+  }
+
+  const profileIds = new Set<string>();
+  const usedRounds = new Set<string>();
+  for (const profile of config.profiles) {
+    if (profileIds.has(profile.id)) errors.push(`${where(profile.id)}: duplicate profile id`);
+    profileIds.add(profile.id);
+    for (const stage of profile.stages) {
+      for (const round of stage.rounds) {
+        usedRounds.add(round);
+        if (!roundTypes.has(round))
+          errors.push(`${where(profile.id)} stage '${stage.label}': unknown round type '${round}'`);
+      }
+    }
+  }
+
+  const questions = new Map<string, BankQuestion>();
+  for (const [file, data] of Object.entries(raw.questions)) {
+    const parsedFile = InterviewQuestionFileSchema.safeParse(data);
+    if (!parsedFile.success) {
+      errors.push(...formatZod(file, parsedFile.error.issues));
+      continue;
+    }
+    for (const question of parsedFile.data.questions) {
+      const { exercise } = question;
+      const place = `${file} '${exercise.id}'`;
+      if (questions.has(exercise.id)) errors.push(`${place}: duplicate question id`);
+      questions.set(exercise.id, question);
+      if (!competencies.has(exercise.concept))
+        errors.push(`${place}: concept '${exercise.concept}' is not a competency`);
+      for (const round of question.rounds) {
+        if (!roundTypes.has(round)) errors.push(`${place}: unknown round type '${round}'`);
+      }
+      for (const subject of question.subjects ?? []) {
+        if (!known.subjects.has(subject)) errors.push(`${place}: unknown subject '${subject}'`);
+      }
+      checkExercise(exercise, place, known.practiceProjects, errors);
+      checkLinks(place, exercise);
+    }
+  }
+
+  // Every round must be fillable for any course, even one whose lessons add nothing to it.
+  for (const id of usedRounds) {
+    const round = roundTypes.get(id);
+    if (!round) continue;
+    const forAnyCourse = [...questions.values()].filter((q) => q.rounds.includes(id) && !q.subjects).length;
+    if (forAnyCourse < round.questions)
+      errors.push(
+        `${where(id)}: needs at least ${round.questions} question-bank questions open to any course, has ${forAnyCourse}`,
+      );
+  }
+
+  return {
+    asOf: config.asOf,
+    note: config.note,
+    competencies,
+    roundTypes,
+    profiles: config.profiles,
+    questions,
   };
 }
