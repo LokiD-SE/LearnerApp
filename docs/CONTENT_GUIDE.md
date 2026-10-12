@@ -33,6 +33,12 @@ must be listed under the right module in `content/curriculum.yaml`.
 | `recall`                                                                             | 4-8 active-recall cards: a question and a short answer                                                                                                                     |
 | `next`, `tags`                                                                       | suggested next lessons; search keywords                                                                                                                                    |
 
+`estimatedMinutes` is the whole lesson: reading, diagrams, every exercise and the recall cards. It is the only
+time figure you write. The app shares it between the lesson's parts by their size (prose at 180 words a
+minute, code at 12 lines a minute, 1.5 minutes per diagram, a typical time per exercise type, a minute per
+recall card) and adds lessons up for chapters, courses, paths and stages - see `src/content/time.ts`. Planned
+lessons have no figure; totals show them separately as "about" the typical published lesson.
+
 ## The lesson template (section `kind`s)
 
 Use each kind when it helps the concept - not mechanically.

@@ -1,7 +1,16 @@
+import { pathTime, stageTime } from '../../content/time';
 import type { ContentIndex } from '../../content/validate';
 import { useProgress } from '../../store/ProgressContext';
-import { dueReviews, lessonStatus, pathProgress, placementItems, weakConcepts } from '../../store/selectors';
+import {
+  dueReviews,
+  lessonStatus,
+  minutesLeft,
+  pathProgress,
+  placementItems,
+  weakConcepts,
+} from '../../store/selectors';
 import { StatusBadge } from '../components/Badges';
+import { ShortTime, TimeSummary } from '../components/Duration';
 import { href } from '../router';
 
 export function HomePage({ index }: { index: ContentIndex }) {
@@ -118,6 +127,7 @@ export function HomePage({ index }: { index: ContentIndex }) {
           <ul class="path-list">
             {index.curriculum.paths.map((path) => {
               const progress = pathProgress(index, state, path);
+              const refs = path.lessons.flatMap((id) => index.refs.get(id) ?? []);
               return (
                 <li key={path.id} class="card">
                   <h3>{path.title}</h3>
@@ -131,6 +141,7 @@ export function HomePage({ index }: { index: ContentIndex }) {
                           ? ` (${progress.total - progress.ready} more planned)`
                           : '')}
                   </p>
+                  <TimeSummary total={pathTime(index, path.lessons)} left={minutesLeft(index, state, refs)} />
                   <progress
                     max={Math.max(progress.ready, 1)}
                     value={progress.completed + progress.testedOut}
@@ -171,6 +182,7 @@ export function HomePage({ index }: { index: ContentIndex }) {
                   <p class="muted">{stage.summary}</p>
                   <p class="small">
                     {refs.length} lessons{ready > 0 ? `, ${ready} ready` : ', all planned'} ·{' '}
+                    <ShortTime total={stageTime(index, stage.id)} /> ·{' '}
                     <a href={href.learn({ stage: stage.id })}>See lessons</a>
                   </p>
                 </div>

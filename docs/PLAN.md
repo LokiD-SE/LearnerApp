@@ -133,6 +133,17 @@ course.
 - [x] Rules in [MASTERY_MODEL.md](MASTERY_MODEL.md) (interview answers are not mastery evidence); unit tests
       for generation, scoring, feedback and state; an end-to-end journey on desktop and mobile.
 
+## Increment 7b - study times and navigation (done)
+
+- [x] Study time for every course (subject), chapter (module), lesson and lesson section, and for learning
+      paths and stages; "time left" for courses and paths once a learner has made progress. Section times are
+      shares of the lesson's figure, so they add up to it; planned lessons are shown apart as a rough figure.
+- [x] A course outline beside the course page and every lesson page: all courses with their times, the current
+      course open with its chapters and lessons, and the current lesson's sections (with times) under it.
+      Collapsed into one panel on narrow screens. It replaces the lesson's separate Contents panel.
+- [x] "Back to home" on every page except the home page.
+- [x] Unit tests (sharing, totals, formatting, time left) and an end-to-end spec on desktop and mobile.
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).

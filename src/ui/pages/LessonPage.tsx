@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { lessonTimes } from '../../content/time';
 import type { ContentIndex } from '../../content/validate';
 import type { Lesson, SectionKind } from '../../content/schema';
 import { useProgress } from '../../store/ProgressContext';
@@ -12,6 +13,8 @@ import {
   visitLesson,
 } from '../../store/state';
 import { LevelBadge, MasteryBadge, StatusBadge, formatDate, percent } from '../components/Badges';
+import { CourseNav } from '../components/CourseNav';
+import { Duration } from '../components/Duration';
 import { ExerciseCard } from '../components/ExerciseCard';
 import { Markdown } from '../components/Markdown';
 import { RecallCardView } from '../components/RecallCard';
@@ -72,7 +75,7 @@ function PlannedLesson({ index, id }: { index: ContentIndex; id: string }) {
   const mod = index.modules.get(ref.moduleId);
   const subject = index.subjects.get(ref.subjectId);
   return (
-    <section class="page narrow">
+    <section class="page lesson">
       <p class="crumbs">
         <a href={href.learn({ subject: ref.subjectId })}>{subject?.title}</a> / {mod?.title}
       </p>
@@ -80,14 +83,22 @@ function PlannedLesson({ index, id }: { index: ContentIndex; id: string }) {
       <p>
         <LevelBadge level={ref.level} /> <StatusBadge status="planned" />
       </p>
-      <p>{ref.summary}</p>
-      <div class="empty-state">
-        <p>
-          This lesson is planned but not written yet. It is on the curriculum so you can see where it fits.
-        </p>
-        <a class="button secondary" href={href.learn({ subject: ref.subjectId })}>
-          Back to {subject?.title}
-        </a>
+      <div class="lesson-grid">
+        <aside class="lesson-aside" aria-label="Lesson overview">
+          <CourseNav index={index} subject={ref.subjectId} lesson={id} />
+        </aside>
+        <div class="lesson-main">
+          <p>{ref.summary}</p>
+          <div class="empty-state">
+            <p>
+              This lesson is planned but not written yet. It is on the curriculum so you can see where it
+              fits.
+            </p>
+            <a class="button secondary" href={href.learn({ subject: ref.subjectId })}>
+              Back to {subject?.title}
+            </a>
+          </div>
+        </div>
       </div>
     </section>
   );
@@ -134,6 +145,7 @@ function PublishedLesson({
   }, [focus]);
 
   const jump = (target: string) => focusElement(target);
+  const times = lessonTimes(lesson);
 
   return (
     <article class="page lesson" aria-labelledby="lesson-title">
@@ -147,7 +159,9 @@ function PublishedLesson({
         <div class="lesson-meta">
           <LevelBadge level={lesson.level} />
           <StatusBadge status={summary.status} />
-          <span class="muted">{lesson.estimatedMinutes} min</span>
+          <span class="muted">
+            <Duration minutes={lesson.estimatedMinutes} />
+          </span>
           <span class="muted">
             Exercises {summary.requiredAttempted}/{summary.requiredTotal}
           </span>
@@ -165,6 +179,40 @@ function PublishedLesson({
 
       <div class="lesson-grid">
         <aside class="lesson-aside" aria-label="Lesson overview">
+          <CourseNav index={index} subject={ref.subjectId} lesson={lesson.id}>
+            <ol class="toc" aria-label="Sections of this lesson">
+              <li>
+                <button type="button" class="link-button" onClick={() => jump('objectives')}>
+                  Objectives
+                </button>{' '}
+                <Duration minutes={times.objectives} />
+              </li>
+              {lesson.sections.map((section) => (
+                <li key={section.id}>
+                  <button type="button" class="link-button" onClick={() => jump(`section-${section.id}`)}>
+                    {section.title}
+                  </button>{' '}
+                  <Duration minutes={times.sections.get(section.id)!} />
+                </li>
+              ))}
+              {lesson.exercises.length > 0 && (
+                <li>
+                  <button type="button" class="link-button" onClick={() => jump('practice')}>
+                    Practice ({lesson.exercises.length})
+                  </button>{' '}
+                  <Duration minutes={times.practice} />
+                </li>
+              )}
+              {lesson.recall.length > 0 && (
+                <li>
+                  <button type="button" class="link-button" onClick={() => jump('recall')}>
+                    Test yourself
+                  </button>{' '}
+                  <Duration minutes={times.recall} />
+                </li>
+              )}
+            </ol>
+          </CourseNav>
           <section class="panel">
             <h2 class="panel-title">Before you start</h2>
             {lesson.prerequisites.length === 0 ? (
@@ -205,37 +253,6 @@ function PublishedLesson({
                 </p>
               ))}
           </section>
-          <nav class="panel toc" aria-label="Contents">
-            <h2 class="panel-title">Contents</h2>
-            <ol>
-              <li>
-                <button type="button" class="link-button" onClick={() => jump('objectives')}>
-                  Objectives
-                </button>
-              </li>
-              {lesson.sections.map((section) => (
-                <li key={section.id}>
-                  <button type="button" class="link-button" onClick={() => jump(`section-${section.id}`)}>
-                    {section.title}
-                  </button>
-                </li>
-              ))}
-              {lesson.exercises.length > 0 && (
-                <li>
-                  <button type="button" class="link-button" onClick={() => jump('practice')}>
-                    Practice ({lesson.exercises.length})
-                  </button>
-                </li>
-              )}
-              {lesson.recall.length > 0 && (
-                <li>
-                  <button type="button" class="link-button" onClick={() => jump('recall')}>
-                    Test yourself
-                  </button>
-                </li>
-              )}
-            </ol>
-          </nav>
           <section class="panel">
             <h2 class="panel-title">Concept mastery</h2>
             <ul class="mastery-list">
@@ -281,7 +298,9 @@ function PublishedLesson({
               id={`section-${section.id}`}
               class={`lesson-section kind-${section.kind}`}
             >
-              <p class="section-kind">{KIND_LABEL[section.kind]}</p>
+              <p class="section-kind">
+                {KIND_LABEL[section.kind]} · <Duration minutes={times.sections.get(section.id)!} />
+              </p>
               {section.collapsed ? (
                 <details>
                   <summary>
@@ -302,8 +321,9 @@ function PublishedLesson({
             <section id="practice" class="lesson-section">
               <h2>Practice</h2>
               <p class="muted">
-                Answer before you look. Hints cost a little credit; the solution unlocks after you try. Your
-                first answer in each sitting is what counts towards mastery.
+                About <Duration minutes={times.practice} />. Answer before you look. Hints cost a little
+                credit; the solution unlocks after you try. Your first answer in each sitting is what counts
+                towards mastery.
               </p>
               {lesson.exercises.map((exercise) => (
                 <ExerciseCard
@@ -321,7 +341,8 @@ function PublishedLesson({
             <section id="recall" class="lesson-section">
               <h2>Test yourself</h2>
               <p class="muted">
-                Answer each from memory, then reveal. These cards come back in your review queue.
+                About <Duration minutes={times.recall} />. Answer each from memory, then reveal. These cards
+                come back in your review queue.
               </p>
               <div class="recall-grid">
                 {lesson.recall.map((card) => (

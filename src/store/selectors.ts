@@ -195,3 +195,16 @@ export function placementItems(
     return lesson ? lesson.placement.map((question) => ({ lesson, question })) : [];
   });
 }
+
+/** Minutes of study left in these lessons: published ones not yet completed, mastered or tested out. */
+export function minutesLeft(index: ContentIndex, state: ProgressState, refs: Iterable<LessonRef>): number {
+  let minutes = 0;
+  for (const ref of refs) {
+    const lesson = index.lessons.get(ref.id);
+    if (!lesson) continue;
+    const status = lessonStatus(index, state, ref.id);
+    if (status !== 'completed' && status !== 'mastered' && status !== 'tested-out')
+      minutes += lesson.estimatedMinutes;
+  }
+  return minutes;
+}

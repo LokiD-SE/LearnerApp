@@ -108,6 +108,13 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
         </div>
       )}
       <main id="main" tabIndex={-1}>
+        {route.name !== 'home' && (
+          <p class="back-home">
+            <a class="button ghost small" href={href.home()}>
+              <span aria-hidden="true">←</span> Back to home
+            </a>
+          </p>
+        )}
         <Page route={route} index={index} />
       </main>
       <footer class="site-footer">

@@ -38,6 +38,10 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
   `content/interviews/`. A generated interview stores only question keys (`bank:<id>`,
   `lesson:<lesson>/<exercise>`), its seed and the learner's attempts, and is resolved against the current
   content when shown - a question removed from the content is left out rather than breaking old interviews.
+- **Study times are derived, not stored.** `src/content/time.ts` (pure) shares each lesson's
+  `estimatedMinutes` between its parts by their size, so section times always add up to the lesson, and sums
+  lessons for chapters, courses, paths and stages. Planned lessons are counted apart with the median published
+  lesson as a rough figure. The time left for a learner is a selector (`minutesLeft`).
 - **All progress changes are pure functions** in `src/store/state.ts`: `(state, input, now) → state`. The
   Preact context only holds the state and saves it after each change. That makes the rules testable without a
   browser and keeps time injectable (tests and Playwright fix the clock).

@@ -48,7 +48,7 @@ test('placement test for the core path, then test out of a single lesson', async
   ).toBeVisible();
 
   // Home: the offer is gone, the path skips the tested-out lesson, and progress says so.
-  await page.getByRole('link', { name: 'Home' }).click();
+  await page.getByRole('link', { name: 'Home', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Already know some of this?' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Next on your path' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open the next lesson' })).toBeVisible();

@@ -22,6 +22,10 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 - **Code you run yourself.** Coding exercises name a file in a practice project in this repository
   (`practice/`), the test class that checks it and the command to run. The tests are the judge; reference
   solutions are next to the exercises.
+- **Know how long it takes.** Every course, chapter, lesson and lesson section shows its study time, and
+  courses and paths show how much is left for you. Planned lessons are counted apart, as a rough figure.
+- **Find your way.** Beside a course and a lesson, an outline lists every course with its chapters, lessons
+  and the current lesson's sections; on a phone it folds into one panel. Every page has a way back home.
 - **Desktop and mobile.** Responsive layout, touch-sized controls and pinch-zoom allowed everywhere. Diagrams
   have a full-size toggle.
 
