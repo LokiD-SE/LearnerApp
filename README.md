@@ -36,20 +36,29 @@ eight lessons of the core path are fully written:
 7. Webhooks, signatures and asynchronous status
 8. Building a payment scenario matrix
 
-Six lessons of the automation path are written, each with coding exercises you run locally:
+**Track E (Java) is complete** - eight lessons, each with coding exercises you run locally:
 
-1. Primitive and reference types (Java)
-2. equals, hashCode and why HashMap needs both (Java)
-3. Locator strategy - CSS, XPath and stable attributes (Selenium)
-4. Explicit waits and synchronisation (Selenium)
-5. Page objects done right
-6. A small reference framework, and why it is small
+1. Primitive and reference types
+2. Strings, immutability and StringBuilder
+3. Encapsulation, inheritance, polymorphism and abstraction
+4. Exceptions and resource management
+5. equals, hashCode and why HashMap needs both
+6. Choosing the right collection
+7. Lambdas, functional interfaces and streams
+8. Concurrency basics for parallel test runs
+
+Four Selenium and framework lessons are written too:
+
+1. Locator strategy - CSS, XPath and stable attributes
+2. Explicit waits and synchronisation
+3. Page objects done right
+4. A small reference framework, and why it is small
 
 They use two practice projects - `practice/java` and `practice/framework`, a small Selenium + JUnit
 framework - and the **SandPay Demo Shop** (`practice/shop`), a fictional shop built to be awkward to
 automate, published with the app at `shop/`. See [practice/README.md](practice/README.md).
 
-The other 49 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+The other 43 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
 
 ## Requirements

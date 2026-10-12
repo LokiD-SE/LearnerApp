@@ -55,7 +55,7 @@ Goal: learners skip what they can already show they know (prompt section 14).
 - [x] Practice page: adaptive, interleaved sessions across studied lessons or one lesson, with reasons.
 - [x] Practice answers count as retention evidence after 24 hours; unit and end-to-end tests.
 
-## Increment 5 - Java track with runnable code (first slice done)
+## Increment 5 - Java track with runnable code (done)
 
 Goal: Java practice that is judged by real tests, not by multiple choice.
 
@@ -70,8 +70,12 @@ Goal: Java practice that is judged by real tests, not by multiple choice.
 - [x] Lessons: **Primitive and reference types** (`==` vs `equals`, the `Integer` cache, money types; coding
       exercises `PaymentChecks`, `MinorUnits`) and **equals, hashCode and HashMap** (coding exercises `Money`,
       `Payment`).
-- [ ] Remaining Track E lessons: strings and StringBuilder, OOP pillars, exceptions, choosing collections,
-      streams and lambdas, concurrency basics - each with at least one coding exercise.
+- [x] The rest of Track E, each with two coding exercises: **Strings and StringBuilder** (`ReportLine`,
+      `Receipt`), **OOP pillars** (`CapturedPayment`, `FeePolicies`), **Exceptions** (`PaymentSubmitter`,
+      `Transfers`), **Choosing collections** (`Reconciliation`, `RetryQueue`), **Streams and lambdas**
+      (`PaymentStats`, `LatestAttempts`), **Concurrency basics** (`IdempotencyGuard`, `ParallelChecks`).
+      Performance and concurrency tests use wide margins (each solution runs in under a quarter of its time
+      limit) and latches rather than luck, so they stay stable in CI.
 
 ## Increment 6 - Selenium and framework tracks (first slice done)
 

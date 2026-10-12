@@ -1,0 +1,690 @@
+id: java-concurrency-basics
+title: Concurrency basics for parallel test runs
+subject: java
+module: java-modern
+level: advanced
+status: published
+estimatedMinutes: 60
+summary: Why shared mutable state breaks under threads, how executors and futures run work in parallel safely, and why every parallel UI test needs its own WebDriver.
+tags: [java, concurrency, threads, race condition, atomic, concurrenthashmap, executorservice, future, threadlocal, parallel tests, webdriver, interview]
+
+environment: |
+  - **Language:** Java 17 or later. `java.util.concurrent` (executors, futures, atomic classes, concurrent
+    collections) has been in the JDK since Java 5. `ExecutorService` became `AutoCloseable` in Java 19, and
+    virtual threads (`Executors.newVirtualThreadPerTaskExecutor()`) arrived in Java 21 - both are mentioned,
+    labelled, and not needed for the exercises. Visibility rules come from the Java Memory Model (**The Java
+    Language Specification**, chapter 17).
+  - **Selenium:** the Selenium documentation states that WebDriver instances are not thread-safe.
+  - **JUnit:** parallel execution is enabled with the configuration parameter
+    `junit.jupiter.execution.parallel.enabled=true`.
+  - **Practice project:** `practice/java` - JDK 17+, Maven 3.8+, JUnit 6.
+  - **Measured, labelled:** the lost-update numbers below come from one run on one machine; they differ
+    every run - that is the point.
+
+prerequisites:
+  - java-exceptions
+  - java-collections-choice
+
+concepts:
+  - id: shared-mutable-state
+    name: Shared mutable state
+    summary: Threads that read and write shared data without coordination lose updates, see stale values and break check-then-act logic; atomic operations, concurrent collections or locks fix it.
+  - id: executors-and-futures
+    name: Executors and futures
+    summary: Run tasks on an ExecutorService, collect results through Futures in submission order, unwrap ExecutionException, and always shut the pool down.
+  - id: thread-confinement
+    name: Thread confinement
+    summary: Give each thread or test its own mutable objects - one WebDriver per test - so nothing mutable is shared at all.
+
+objectives:
+  - Explain lost updates, stale reads and check-then-act races, and recognise them in code.
+  - Make shared state safe with atomic classes, concurrent collections or synchronisation - and choose between them.
+  - Run independent tasks on an ExecutorService and collect their results and failures correctly.
+  - Design parallel UI tests so that each test owns its browser and data.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [shared-mutable-state, thread-confinement]
+    title: The idea in plain language
+    body: |
+      Two cashiers share one notebook with the day's total. Each reads the total, adds a sale in their head,
+      and writes the new total. If both read "100" at the same moment and each adds 10, both write "110" -
+      one sale has vanished. That is a **lost update**.
+
+      Two receptionists check the same booking book: "is room 12 free?" - both see yes, both give it away.
+      That is **check-then-act**. In payments it is a duplicate charge.
+
+      Three fixes:
+
+      - a **till that adds atomically** (atomic classes, concurrent collections);
+      - a **rule that only one person may hold the notebook** at a time (locks);
+      - or best of all, **give each cashier their own notebook** (confinement) - nothing shared, nothing to
+        coordinate. That is how parallel UI tests stay sane: one browser per test.
+
+  - id: what
+    kind: what
+    concepts: [shared-mutable-state, executors-and-futures, thread-confinement]
+    title: What the tools are
+    body: |
+      | Tool | Use it for |
+      |---|---|
+      | `AtomicLong`, `AtomicInteger`, `LongAdder` | counters updated by many threads |
+      | `ConcurrentHashMap`, `ConcurrentHashMap.newKeySet()` | maps and sets shared between threads; atomic `putIfAbsent`, `computeIfAbsent`, `merge`, and `add` that reports whether the key was new |
+      | `synchronized`, `ReentrantLock` | several steps that must happen as one, when no atomic operation fits |
+      | `volatile` | a flag that one thread writes and others read - visibility only, **not** atomic updates |
+      | `ExecutorService` | a pool of threads that runs submitted tasks |
+      | `Future<T>` | the result of a submitted task: `get()` waits for it and rethrows failures as `ExecutionException` |
+      | `CountDownLatch` | let threads wait until something happened (a start signal in tests) |
+      | `ThreadLocal<T>` | one value per thread - for objects that must not be shared |
+
+  - id: why
+    kind: why
+    concepts: [thread-confinement, shared-mutable-state]
+    title: Why testers meet concurrency
+    body: |
+      - **Parallel test runs.** To make a suite faster, tests run on several threads. Anything shared - a
+        static WebDriver, a static "current user", a shared test-data list, a non-thread-safe date formatter
+        - turns into random failures that never happen when a test runs alone.
+      - **Concurrency defects in the product.** Two simultaneous requests with the same idempotency key, a
+        double-clicked Pay button, a webhook arriving while the client is still polling: the bugs are
+        check-then-act races. Testers find them by sending things *at the same moment* - which needs
+        threads in the test code.
+      - **Smoke checks and data setup** that wait on the network finish much faster in parallel.
+
+  - id: internals
+    kind: internals
+    concepts: [shared-mutable-state, executors-and-futures]
+    title: How races happen, and how executors work
+    body: |
+      **`count++` is three steps:** read the value, add one, write it back. Two threads can read the same
+      value and both write value + 1. In one run of eight threads each incrementing a `volatile` counter a
+      million times, the result was about 4 million instead of 8 million; an `AtomicLong` gave exactly 8
+      million.
+
+      **Visibility.** Without synchronisation, a thread may not see another thread's writes when you expect
+      (the Java Memory Model allows caching and reordering). `volatile` fixes visibility for single reads and
+      writes, but `count++` on a volatile is still three steps.
+
+      **Check-then-act** (`if (!seen.contains(key)) { ...; seen.add(key); }`) is a race even with a
+      thread-safe set: the check and the act are two operations. Make them one: `if (seen.add(key))` on a
+      concurrent set, `putIfAbsent`, `computeIfAbsent`.
+
+      **Executors:**
+
+      1. `Executors.newFixedThreadPool(n)` creates n worker threads and a queue.
+      2. `submit(task)` puts the task in the queue and returns a `Future` immediately.
+      3. Workers take tasks from the queue and run them.
+      4. `future.get()` blocks until that task finishes, then returns its result - or throws
+         `ExecutionException` whose **cause** is the task's own exception.
+      5. `shutdown()` stops accepting tasks and lets queued ones finish; `shutdownNow()` also interrupts
+         running ones. Without either, the pool's threads stay alive. (Since Java 19, `ExecutorService` is
+         `AutoCloseable`, so try-with-resources can close it.)
+
+  - id: visual
+    kind: visual
+    concepts: [shared-mutable-state]
+    title: "Sequence: check-then-act processes a payment twice"
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant A as Thread A
+          participant S as Seen keys
+          participant B as Thread B
+          A->>S: contains key-7? no
+          B->>S: contains key-7? no
+          Note over A,B: both decide the request is new
+          A->>A: record in database, 20 ms
+          B->>B: record in database, 20 ms
+          A->>S: add key-7
+          B->>S: add key-7
+          Note over A,B: both process the payment - a duplicate charge
+      ```
+
+      The window between the check and the act is the database call. Make "check and claim" one atomic
+      step - `seen.add(key)` on a concurrent set returns true for exactly one of the threads - and do the
+      slow work after it.
+
+  - id: when
+    kind: when
+    concepts: [shared-mutable-state, thread-confinement]
+    title: Which fix, when
+    body: |
+      | Situation | Prefer |
+      |---|---|
+      | each thread can have its own object (drivers, formatters, test data) | **confinement** - nothing to coordinate |
+      | a counter or sum | `AtomicLong` (or `LongAdder` under heavy contention) |
+      | "first one wins" for a key | a concurrent set's `add`, or `ConcurrentHashMap.putIfAbsent` / `computeIfAbsent` |
+      | several fields that must change together | `synchronized` (keep the critical section short; no slow calls inside) |
+      | collecting results from tasks | futures, or `invokeAll` - not a shared `ArrayList` |
+      | a stop flag | `volatile boolean` |
+
+  - id: example
+    kind: example
+    concepts: [thread-confinement]
+    title: "Real-world example: parallel tests that closed each other's browsers"
+    body: |
+      A team switched on JUnit's parallel execution to halve their 40-minute UI suite. Failures exploded:
+      `NoSuchSessionException`, screenshots of the wrong page, a login test typing into a checkout form.
+
+      **Evidence:** the failures never happened with one thread; logs showed two tests using the same
+      session id; the base class held `protected static WebDriver driver`, assigned in `@BeforeEach` and quit
+      in `@AfterEach`.
+
+      **Cause:** every test wrote its new driver into the same static field. The last test to start "won";
+      the others drove its browser, and the first to finish quit it for everyone.
+
+      **Fix:** one driver per test - held by the test instance (or, in the practice framework, by the JUnit
+      extension's per-test store) instead of a static field. Test data got unique ids per test. The suite
+      then ran in 14 minutes on four threads without new failures.
+
+  - id: code
+    kind: code
+    concepts: [shared-mutable-state, executors-and-futures, thread-confinement]
+    title: "Code: atomic claims, executors and per-thread drivers"
+    collapsed: true
+    body: |
+      ```java
+      // first one wins: claim atomically, then do the slow work
+      private final Set<String> seen = ConcurrentHashMap.newKeySet();
+
+      public boolean firstTime(String key) {
+          if (!seen.add(key)) return false;          // exactly one caller gets true
+          recordInDatabase(key);
+          return true;
+      }
+
+      // run independent checks in parallel, results in order
+      ExecutorService pool = Executors.newFixedThreadPool(threads);
+      try {
+          List<Future<String>> futures = new ArrayList<>();
+          for (Callable<String> check : checks) futures.add(pool.submit(check));
+          List<String> results = new ArrayList<>();
+          for (Future<String> f : futures) {
+              try {
+                  results.add(f.get());
+              } catch (ExecutionException e) {
+                  throw new IllegalStateException("A check failed", e.getCause());   // unwrap
+              }
+          }
+          return results;
+      } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException(e);
+      } finally {
+          pool.shutdownNow();
+      }
+
+      // a driver per thread, when a framework must use a static accessor
+      private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();
+      static void start() { DRIVER.set(Browser.start()); }
+      static WebDriver driver() { return DRIVER.get(); }
+      static void stop() {
+          try { DRIVER.get().quit(); } finally { DRIVER.remove(); }   // pool threads are reused
+      }
+      ```
+
+  - id: tests
+    kind: tests
+    concepts: [shared-mutable-state]
+    title: Testing for races
+    body: |
+      | ID | Technique | Why |
+      |---|---|---|
+      | T1 | release many threads at the **same moment** with a `CountDownLatch`, all doing the same thing (same key, same seat, same coupon) | maximises overlap - races show up reliably |
+      | T2 | assert the invariant afterwards: exactly one success, a total equal to the sum | the outcome, not the timing, is what you check |
+      | T3 | repeat the test many times (or loop inside it) | races are probabilistic |
+      | T4 | in product tests, send duplicate API requests concurrently, double-click buttons, deliver a webhook while polling | real concurrency defects |
+      | T5 | run the test suite itself in parallel, and in a different order | finds shared state between tests |
+
+      The coding exercise's `IdempotencyGuardTest` uses T1 and T2 against the guard with sixteen threads.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [shared-mutable-state, executors-and-futures, thread-confinement]
+    title: Common mistakes
+    body: |
+      - **Static WebDrivers, pages or test data** in parallel suites.
+      - **`count++` or `list.add` from several threads** on plain fields and collections.
+      - **`volatile` for counters** - visibility is not atomicity.
+      - **Check-then-act** on a concurrent collection, believing "thread-safe collection" means "thread-safe
+        logic".
+      - **Holding a lock during slow calls** - correct but serialises everything.
+      - **Forgetting to shut down executors** - threads leak, and JVMs don't exit.
+      - **Ignoring `ExecutionException`'s cause**, or swallowing `InterruptedException`.
+      - **`ThreadLocal` without `remove()`** in thread pools - the next task on that thread inherits the
+        value.
+      - **`Thread.sleep` to "fix" a race** - it only changes the odds.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [shared-mutable-state, thread-confinement]
+    title: Trade-offs
+    body: |
+      | Approach | Strengths | Costs |
+      |---|---|---|
+      | confinement (no sharing) | nothing to coordinate; simplest to reason about | more objects (a browser per test costs memory and start-up time) |
+      | atomic classes, concurrent collections | fast, fine-grained, no deadlocks | only single operations are atomic; compound logic needs care |
+      | `synchronized` / locks | any compound logic | contention, deadlock risk, easy to make too broad |
+      | more threads | shorter wall-clock time for waiting-bound work | more resources; exposes hidden shared state |
+      | virtual threads (Java 21+) | very many cheap threads for blocking I/O | not a fix for shared-state bugs; needs Java 21 |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Races: lost updates (`count++`), stale reads, check-then-act.
+      - Fixes: confinement first; then atomic operations (`AtomicLong`, `ConcurrentHashMap`, `set.add`); locks
+        for compound steps, kept short.
+      - `volatile` = visibility, not atomicity.
+      - Executors: submit everything, keep the futures in order, `get()` each, unwrap `ExecutionException`,
+        shut down in `finally`.
+      - Parallel UI tests: one WebDriver per test, never static; `ThreadLocal` only with `remove()`.
+      - Test races by releasing many threads at once with a latch and checking the invariant.
+
+exercises:
+  - id: atomic-or-not
+    type: mcq
+    concept: shared-mutable-state
+    skill: recognition
+    title: Safe from many threads?
+    prompt: |
+      Eight threads each run the operation a thousand times on one shared object. Which give a correct
+      result without any extra locking? Select every one that applies.
+    options:
+      - id: atomic-long
+        text: "`counter.incrementAndGet()` on an `AtomicLong`"
+        feedback: Correct - a single atomic read-modify-write.
+      - id: chm-put-if-absent
+        text: "`map.putIfAbsent(key, value)` on a `ConcurrentHashMap`"
+        feedback: Correct - checking and inserting happen as one atomic step.
+      - id: int-plus-plus
+        text: "`count++` on an `int` field"
+        feedback: Read, add, write - three steps that other threads can interleave. Updates get lost.
+      - id: volatile-plus-plus
+        text: "`count++` on a `volatile long` field"
+        feedback: volatile makes writes visible, but the increment is still three steps - updates are still lost.
+      - id: hashmap-put
+        text: "`map.put(key, value)` on a `HashMap`"
+        feedback: HashMap is not thread-safe; concurrent puts can lose entries or corrupt its internal structure.
+    correct: [atomic-long, chm-put-if-absent]
+    hints:
+      - Which of these is a single atomic operation provided by a concurrent class?
+    solution: |
+      **`AtomicLong.incrementAndGet` and `ConcurrentHashMap.putIfAbsent`.** In one measured run, eight
+      threads incrementing a `volatile` counter a million times each ended at about 4 million instead of 8
+      million.
+    followUp: |
+      `if (!map.containsKey(key)) map.put(key, value);` on a `ConcurrentHashMap` - is that safe? Rewrite it so
+      it is.
+
+  - id: static-driver-parallel
+    type: debug
+    concept: thread-confinement
+    skill: analysis
+    title: Tests that close each other's browsers
+    prompt: |
+      With parallel execution switched on, tests fail with `NoSuchSessionException` and drive the wrong
+      pages. Every UI test extends this class. Click the line that causes it.
+    language: java
+    code: |
+      public class BaseUiTest {
+          protected static WebDriver driver;
+
+          @BeforeEach
+          void start() {
+              driver = new ChromeDriver();
+          }
+
+          @AfterEach
+          void stop() {
+              driver.quit();
+          }
+      }
+    correctLines: [2]
+    lineNotes:
+      - line: 6
+        note: Starting a new browser for every test is right - the problem is that it is stored in one static field shared by all tests, so the last test to start overwrites the others' driver.
+      - line: 11
+        note: Quitting after each test is right too - but through the shared field it quits whichever browser was stored last, possibly another test's.
+    hints:
+      - How many driver fields exist when four tests run at the same time?
+    solution: |
+      **Line 2.** A `static` field is one variable for all tests. In parallel, each `@BeforeEach` overwrites
+      it, so tests use and quit each other's browsers. Make the driver belong to the test: an instance field
+      (JUnit creates a test instance per test method by default), a parameter injected by an extension, or a
+      `ThreadLocal` cleared after each test.
+    followUp: |
+      The suite also has `static List<String> createdOrderIds` used for cleanup. What happens to it in
+      parallel runs, and how would you fix it?
+
+  - id: idempotency-guard
+    type: coding
+    concept: shared-mutable-state
+    skill: analysis
+    title: Process each payment request once
+    prompt: |
+      `IdempotencyGuard.firstTime` must return true for exactly one caller per idempotency key, even when
+      copies of a request arrive on several threads at the same moment. Today two simultaneous requests are
+      both processed - a duplicate charge. Fix it. Keep the `recordInDatabase` call, and don't make requests
+      with different keys wait for each other. The tests release sixteen threads at once.
+    project: java
+    files:
+      - src/exercises/java/learnerapp/concurrency/IdempotencyGuard.java
+    test: src/test/java/learnerapp/concurrency/IdempotencyGuardTest.java
+    command: mvn test -Dtest=IdempotencyGuardTest
+    hints:
+      - Where is the window between "check" and "act"? How long is it?
+      - "`Set.add` returns false if the element was already there - on a concurrent set, exactly one of several simultaneous adds returns true."
+      - "`ConcurrentHashMap.newKeySet()` gives you a concurrent set. Do the slow call after claiming the key."
+    modelAnswer: |
+      ```java
+      private final Set<String> seen = ConcurrentHashMap.newKeySet();
+
+      public boolean firstTime(String key) {
+          if (!seen.add(key)) {
+              return false;
+          }
+          recordInDatabase(key);
+          return true;
+      }
+      ```
+
+      A `synchronized` method would also return the right answers, but every request would wait for every
+      other request's database call - one of the tests measures that.
+    rubric:
+      - Every test in IdempotencyGuardTest passes
+      - Check and claim are one atomic operation (add on a concurrent set, putIfAbsent, computeIfAbsent)
+      - The slow database call is outside any lock
+      - Explained the race in the original code
+    solution: |
+      The original checked with `contains`, waited 20 ms "in the database", then added - so every thread
+      that arrived within those 20 ms saw the key as new. The test releases sixteen threads together with a
+      latch and checks the invariant (exactly one true), the reliable way to test for a race. Reference:
+      `src/solutions/java/learnerapp/concurrency/IdempotencyGuard.java`.
+    followUp: |
+      The database call fails after the key was claimed. What should happen to the key, and how would the
+      code and the tests change?
+
+  - id: parallel-checks
+    type: coding
+    concept: executors-and-futures
+    skill: application
+    title: Run smoke checks in parallel
+    prompt: |
+      Implement `ParallelChecks.runAll`: run every check on a pool of `threads` threads, return the results
+      in the order of the checks (not the order they finish), turn a failing check into an
+      `IllegalStateException` whose cause is the check's own exception, and always shut the pool down.
+    project: java
+    files:
+      - src/exercises/java/learnerapp/concurrency/ParallelChecks.java
+    test: src/test/java/learnerapp/concurrency/ParallelChecksTest.java
+    command: mvn test -Dtest=ParallelChecksTest
+    hints:
+      - "`Executors.newFixedThreadPool(threads)`; submit every check first, keeping the futures in a list."
+      - Then call `get()` on the futures in list order - that gives the results in check order.
+      - "`ExecutionException.getCause()` is the check's exception. Shut the pool down in a `finally` block."
+    modelAnswer: |
+      ```java
+      ExecutorService pool = Executors.newFixedThreadPool(threads);
+      try {
+          List<Future<String>> futures = new ArrayList<>();
+          for (Callable<String> check : checks) futures.add(pool.submit(check));
+          List<String> results = new ArrayList<>();
+          for (Future<String> future : futures) {
+              try {
+                  results.add(future.get());
+              } catch (ExecutionException e) {
+                  throw new IllegalStateException("A check failed", e.getCause());
+              } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  throw new IllegalStateException("Interrupted while waiting for the checks", e);
+              }
+          }
+          return results;
+      } finally {
+          pool.shutdownNow();
+      }
+      ```
+
+      `pool.invokeAll(checks)` submits everything and waits for all of them in one call - an equally good
+      start.
+    rubric:
+      - Every test in ParallelChecksTest passes
+      - All checks are submitted before any result is awaited
+      - The ExecutionException is unwrapped so the check's own exception is the cause
+      - The pool is shut down in finally, and InterruptedException restores the interrupt flag
+    solution: |
+      The tests time the run: eight 300 ms checks on eight threads must finish in well under the 2.4 s a
+      serial run needs, and four checks on two threads must take at least two rounds - so the pool size is
+      really used. Reference: `src/solutions/java/learnerapp/concurrency/ParallelChecks.java`.
+    followUp: |
+      One slow check shouldn't hold up the whole smoke suite. Add a per-check timeout: which `Future` method
+      helps, and what should happen to the check that timed out?
+
+  - id: executor-steps
+    type: order
+    concept: executors-and-futures
+    skill: recall
+    title: Using an executor correctly
+    prompt: |
+      Put the steps for running independent tasks on a thread pool in order.
+    items:
+      - id: create
+        text: Create the pool, for example Executors.newFixedThreadPool(n)
+      - id: submit
+        text: Submit every task and keep the returned futures in a list
+      - id: get
+        text: Call get() on each future in list order to collect the results
+      - id: unwrap
+        text: For an ExecutionException, use its cause - the task's own exception
+      - id: shutdown
+        text: Shut the pool down in a finally block
+    hints:
+      - Submitting everything before waiting is what makes the tasks run at the same time.
+    solution: |
+      **Create → submit all → get in order → unwrap failures → shut down in finally.** Calling `get()`
+      right after each `submit` would wait for each task before starting the next - serial again.
+    followUp: |
+      What changes if you replace the fixed pool with `Executors.newVirtualThreadPerTaskExecutor()` on Java
+      21, and what stays the same?
+
+  - id: driver-per-test
+    type: mcq
+    concept: thread-confinement
+    skill: application
+    title: Browsers for parallel tests
+    prompt: |
+      A suite will run UI tests on four threads. Which design gives every test its own browser?
+    options:
+      - id: per-test
+        text: Create the driver per test and keep it in the test instance or the extension's per-test store - or in a ThreadLocal that is removed after each test
+        feedback: Correct - confinement. Nothing mutable is shared between tests.
+      - id: synchronized-static
+        text: Keep a static driver and make its getter synchronized
+        feedback: Synchronizing access doesn't give tests separate browsers - they still drive the same one.
+      - id: volatile-static
+        text: Make the static driver field volatile
+        feedback: volatile makes the latest assignment visible to all threads - which means every test sees the same, last-created driver.
+      - id: one-per-class
+        text: One static driver per test class, created in @BeforeAll
+        feedback: Test methods of the same class can run in parallel too, and they would share it.
+    correct: [per-test]
+    hints:
+      - Which option means the tests never share a driver object at all?
+    solution: |
+      **A driver per test.** WebDriver instances aren't thread-safe and hold per-session state (cookies,
+      the current page), so sharing them can't be made safe with locks - only avoided. The practice
+      framework's `ShopExtension` stores each test's driver in its per-test store.
+    followUp: |
+      Each test also needs a customer account. How do you keep test *data* from being shared between parallel
+      tests?
+
+  - id: volatile-counter
+    type: mcq
+    concept: shared-mutable-state
+    skill: analysis
+    title: A volatile counter
+    prompt: |
+      A load-test helper counts processed payments with `volatile long processed;` and `processed++` from
+      eight threads. After 8,000,000 increments it reports fewer. Why?
+    options:
+      - id: not-atomic
+        text: volatile makes each write visible, but processed++ is still read, add, write - threads overwrite each other's increments
+        feedback: Correct - use AtomicLong (or LongAdder).
+      - id: cache
+        text: The CPU cache hides some increments, and volatile was supposed to prevent that but doesn't work on long
+        feedback: volatile works for long - it guarantees visibility. The lost updates come from interleaved read-modify-write steps.
+      - id: overflow
+        text: The long overflowed
+        feedback: 8 million is far below the range of a long.
+      - id: jit
+        text: The JIT compiler removed some increments as dead code
+        feedback: The JIT may not remove volatile writes; the threads themselves overwrite each other's updates.
+    correct: [not-atomic]
+    hints:
+      - How many steps is `processed++`, and can another thread run between them?
+    solution: |
+      **volatile is visibility, not atomicity.** `AtomicLong.incrementAndGet()` makes the whole
+      read-modify-write one operation.
+    followUp: |
+      When *is* volatile the right tool? Give one example from test automation.
+
+  - id: interview-parallel-tests
+    type: interview
+    concept: thread-confinement
+    skill: application
+    title: "Interview: running UI tests in parallel"
+    prompt: |
+      **Interviewer:** "Your UI suite takes 40 minutes. How would you run it in parallel, and what breaks
+      when you do?"
+    hints:
+      - The mechanism, isolation of drivers and data, what typically breaks, how you'd roll it out.
+    modelAnswer: |
+      - Enable parallel execution in the runner (JUnit's `junit.jupiter.execution.parallel.enabled`, or
+        TestNG's parallel settings, or several CI jobs).
+      - Isolation: a WebDriver per test (never static; ThreadLocal only with remove()), unique test data per
+        test (generated ids, separate accounts), no shared static state.
+      - What breaks: static drivers and pages, shared accounts and carts, order-dependent tests, fixed ports,
+        shared files, rate limits on the system under test.
+      - Rollout: measure first; start with two or four threads; run the suite repeatedly to flush out shared
+        state; fix causes rather than adding retries.
+    followUps:
+      - Why is WebDriver not shared between threads even with synchronization?
+      - How do you generate unique test data safely in parallel?
+      - How do you pick the number of threads?
+    rubric:
+      - Named a concrete mechanism to run tests in parallel
+      - One driver per test and no static shared state
+      - Isolated test data per test
+      - Listed typical breakages such as static state, shared accounts or order dependence
+      - Described a measured, gradual rollout
+    solution: |
+      Strong answers lead with **isolation** - drivers and data - rather than with a configuration flag.
+
+recall:
+  - id: recall-plus-plus
+    concept: shared-mutable-state
+    prompt: Why is count++ unsafe from several threads?
+    answer: It is three steps - read, add, write. Threads interleave them and overwrite each other's updates.
+  - id: recall-volatile
+    concept: shared-mutable-state
+    prompt: What does volatile guarantee, and what not?
+    answer: Visibility of reads and writes across threads - not atomicity of compound operations such as count++.
+  - id: recall-check-then-act
+    concept: shared-mutable-state
+    prompt: How do you make "if absent, add" safe?
+    answer: One atomic operation - add on a concurrent set (it returns whether it was new), putIfAbsent or computeIfAbsent on ConcurrentHashMap.
+  - id: recall-future
+    concept: executors-and-futures
+    prompt: What does Future.get() throw when the task failed?
+    answer: ExecutionException - its getCause() is the task's own exception.
+  - id: recall-shutdown
+    concept: executors-and-futures
+    prompt: Why must an ExecutorService be shut down?
+    answer: Its worker threads stay alive otherwise - they leak and can keep the JVM from exiting. Shut it down in finally (or use try-with-resources on Java 19+).
+  - id: recall-driver
+    concept: thread-confinement
+    prompt: How do parallel UI tests avoid sharing a WebDriver?
+    answer: One driver per test, held by the test (instance field or extension store) or a ThreadLocal that is removed after each test - never a static field.
+
+next:
+  - parallel-runs-and-thread-safety
+  - reference-framework-skeleton
+
+placement:
+  - id: place-lost-update
+    type: mcq
+    concept: shared-mutable-state
+    skill: application
+    title: A shared total
+    prompt: |
+      Several threads add amounts to `long total` with `total += amount`. The final total is sometimes too
+      small. What is the best fix?
+    options:
+      - id: atomic
+        text: Use an AtomicLong (addAndGet) or LongAdder
+        feedback: Correct - an atomic add can't lose updates.
+      - id: volatile
+        text: Declare total volatile
+        feedback: Visibility doesn't make += atomic; updates are still lost.
+      - id: sleep
+        text: Add a short sleep between additions
+        feedback: It changes the odds, not the race.
+      - id: thread-priority
+        text: Give the threads different priorities
+        feedback: Priorities don't stop interleaving.
+    correct: [atomic]
+    solution: |
+      **An atomic accumulator.** Even better, if each thread can sum its own part and the parts are added at
+      the end, nothing needs to be shared at all.
+
+  - id: place-execution-exception
+    type: mcq
+    concept: executors-and-futures
+    skill: application
+    title: A failed task
+    prompt: |
+      A task submitted to an ExecutorService throws `IOException("sandbox unreachable")`. What does
+      `future.get()` throw?
+    options:
+      - id: execution
+        text: ExecutionException, whose cause is the IOException
+        feedback: Correct - unwrap it with getCause() before reporting.
+      - id: io
+        text: The IOException itself
+        feedback: get() wraps the task's exception in ExecutionException.
+      - id: nothing
+        text: Nothing - it returns null
+        feedback: A failed task never yields a result; get() reports the failure.
+      - id: interrupted
+        text: InterruptedException
+        feedback: That is thrown when the waiting thread is interrupted - not when the task fails.
+    correct: [execution]
+    solution: |
+      **ExecutionException wrapping the IOException.**
+
+  - id: place-static-driver
+    type: mcq
+    concept: thread-confinement
+    skill: application
+    title: One driver field for all
+    prompt: |
+      A base test class declares `protected static WebDriver driver;` and assigns a new ChromeDriver in
+      `@BeforeEach`. What happens when tests run in parallel?
+    options:
+      - id: shared
+        text: Tests overwrite the shared field, then use and quit each other's browsers
+        feedback: Correct - give each test its own driver.
+      - id: fine
+        text: Nothing - each test assigns its own driver
+        feedback: They assign it to the same static field; there is only one.
+      - id: slow
+        text: It works, just more slowly
+        feedback: It fails - wrong pages, NoSuchSessionException, browsers closed under running tests.
+      - id: compile
+        text: It doesn't compile with parallel execution enabled
+        feedback: It compiles; the problem appears at run time.
+    correct: [shared]
+    solution: |
+      **They share - and break - one browser slot.** Confine drivers to the test.
