@@ -45,3 +45,21 @@ test('lessons link to the published shop', async ({ page }) => {
   await expect(page.getByRole('heading', { level: 1, name: 'Coffee things' })).toBeVisible();
   await expect(page.getByTestId('product-card')).toHaveCount(6);
 });
+
+test('the catalog API and the price list used by the cart agree', async ({ page }) => {
+  await page.goto('./shop/');
+  await expect(page.getByTestId('product-card')).toHaveCount(6);
+  const fromApi = await page.evaluate(async () => (await fetch('products.json')).json());
+  // PRODUCTS is the shop's in-page price list (a global constant in shop.js)
+  const priceList = await page.evaluate('PRODUCTS');
+  expect(fromApi).toEqual(priceList);
+});
+
+test('a failed catalog request shows an error, and Try again recovers', async ({ page }) => {
+  await page.route('**/products.json', (route) => route.fulfill({ status: 503 }));
+  await page.goto('./shop/');
+  await expect(page.getByTestId('catalog-error')).toContainText('Products could not be loaded.');
+  await page.unroute('**/products.json');
+  await page.getByTestId('retry').click();
+  await expect(page.getByTestId('product-card')).toHaveCount(6);
+});

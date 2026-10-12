@@ -3,12 +3,13 @@
 Code you write and run on your own computer. Each coding exercise in LearnerApp names a project, the
 files to change, the test class that checks them and the command to run.
 
-| Folder                    | Track                          | What you practise                                                               | Needs                              |
-| ------------------------- | ------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------- |
-| [`java/`](java)           | E - Java                       | Small Java exercises checked by JUnit tests                                     | JDK 17+, Maven 3.8+                |
-| [`framework/`](framework) | F, G - Selenium and frameworks | A small reference framework, and exercises for locators, waits and page objects | JDK 17+, Maven 3.8+, Google Chrome |
-| [`maven/`](maven)         | G - Maven                      | Broken `pom.xml` files to fix; tests run Maven on them and check the result     | JDK 17+, Maven 3.8+                |
-| [`shop/`](shop)           | -                              | The SandPay Demo Shop the framework tests: static HTML, CSS and JavaScript      | a browser                          |
+| Folder                      | Track                          | What you practise                                                                                                                            | Needs                                               |
+| --------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| [`java/`](java)             | E - Java                       | Small Java exercises checked by JUnit tests                                                                                                  | JDK 17+, Maven 3.8+                                 |
+| [`framework/`](framework)   | F, G - Selenium and frameworks | A small reference framework, and exercises for locators, waits and page objects                                                              | JDK 17+, Maven 3.8+, Google Chrome                  |
+| [`maven/`](maven)           | G - Maven                      | Broken `pom.xml` files to fix; tests run Maven on them and check the result                                                                  | JDK 17+, Maven 3.8+                                 |
+| [`playwright/`](playwright) | H - Playwright                 | Playwright Test in TypeScript (and one JavaScript exercise): async code, locators, waits, page objects, fixtures, network mocking, API tests | Node.js 20+; Playwright's Chromium or Google Chrome |
+| [`shop/`](shop)             | -                              | The SandPay Demo Shop the framework tests: static HTML, CSS and JavaScript                                                                   | a browser                                           |
 
 ## How every project works
 
@@ -63,6 +64,25 @@ mvn test -Dshop.url=https://lokid-se.github.io/LearnerApp/shop/   # against the 
 | `-Dtimeout.seconds` | `10`                                                       | the longest any wait waits          |
 
 Failed tests leave a screenshot and the page source in `target/evidence`.
+
+## The Playwright project
+
+`practice/playwright` is a Node project. Exercises are in `exercises/`, their tests in `tests/` (tagged
+`@exercise`), reference solutions in `solutions/`, and given page objects in `framework/pages`.
+
+```bash
+cd practice/playwright
+npm ci
+npx playwright install chromium               # once - or use Google Chrome: PW_CHANNEL=chrome
+npx playwright test tests/shop-locators.spec.ts
+npx playwright test --ui                      # watch, step through, pick locators
+npm run typecheck                             # Playwright runs TypeScript but doesn't type-check it
+npm run test:solutions                        # every test against the reference solutions
+```
+
+`npm run verify` (what CI runs through `practice/verify.sh playwright`) type-checks, runs the solutions,
+checks that every exercise spec fails against the unsolved exercises, and runs the journey tests. Set
+`SHOP_URL=https://lokid-se.github.io/LearnerApp/shop/` to test the published shop instead of the local one.
 
 ## The Maven exercises
 

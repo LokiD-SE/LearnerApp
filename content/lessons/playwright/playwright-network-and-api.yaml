@@ -1,0 +1,653 @@
+id: playwright-network-and-api
+title: Network mocking and API testing with Playwright
+subject: playwright
+module: playwright-test
+level: advanced
+estimatedMinutes: 55
+status: published
+summary: Intercepting and faking requests with page.route to test states that are hard to reach, testing APIs with the request fixture, and debugging failures with traces.
+tags: [playwright, page.route, network mocking, api testing, request fixture, apirequestcontext, traces, debugging, payments, interview]
+
+environment: |
+  - **Tool:** Playwright Test 1.64 with TypeScript. Sources: the Playwright documentation pages "Mock APIs",
+    "Network", "API testing" and "Trace viewer".
+  - **Behaviour, labelled:** when several routes match a request, the most recently registered one handles
+    it first; requests handled by a service worker are not seen by `page.route`. The `request` fixture is
+    separate from the browser's cookies, while `page.request` shares them with the page's context.
+  - **Practice target:** the SandPay Demo Shop's catalog loads `products.json` with `fetch` and shows an
+    error with "Try again" when that fails. The practice project's local server also serves a deliberately
+    malformed `broken/products.json` for the validation test.
+
+prerequisites:
+  - playwright-fixtures-and-page-objects
+  - http-request-response-anatomy
+
+concepts:
+  - id: network-interception
+    name: Network interception
+    summary: page.route intercepts matching requests and fulfils, aborts, continues or modifies them - to reach error and edge states on demand, without changing the backend.
+  - id: api-testing-with-playwright
+    name: API testing with Playwright
+    summary: The request fixture (an APIRequestContext) sends HTTP requests with the config's baseURL - for API tests, fast test setup and checks of what the UI did.
+  - id: debugging-with-traces
+    name: Debugging with traces
+    summary: A trace records every action, DOM snapshot, network request and console message of a test - kept on failure, it explains CI failures without re-running them.
+
+objectives:
+  - Mock, fail and modify requests with page.route, and decide what a mocked test proves.
+  - Write API tests and API-based setup with the request fixture, validating status and body.
+  - Combine UI actions with network and API checks in one test where it adds evidence.
+  - Diagnose a failing test from its trace, UI mode or the inspector.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [network-interception, api-testing-with-playwright]
+    title: The idea in plain language
+    body: |
+      Testing how a page behaves when the server misbehaves is hard - you can't ask the payment provider to fail
+      on cue. `page.route` puts **you** between the page and the network: for chosen requests you can answer
+      yourself ("here are two products"), fail them ("503"), or let them through and change the answer.
+
+      The other direction matters too. Not everything needs a browser: creating a test order, checking what an
+      API returns, confirming the UI really saved what it showed. The `request` fixture is a small HTTP client
+      that speaks to the same server as the page.
+
+      When something fails in CI, the **trace** is the flight recorder: every action, screenshot, network call
+      and console line - replayable afterwards.
+
+  - id: what
+    kind: what
+    concepts: [network-interception, api-testing-with-playwright, debugging-with-traces]
+    title: What the tools are
+    body: |
+      **Routing** (`page.route(pattern, handler)`, or `context.route` for every page of a context):
+
+      | In the handler | Effect |
+      |---|---|
+      | `route.fulfill({ json })` / `({ status, body, headers })` | answer without contacting the server |
+      | `route.abort()` | the request fails with a network error |
+      | `route.continue({ headers })` | send it on - optionally changed |
+      | `const response = await route.fetch(); route.fulfill({ response, json: changed })` | real response, modified |
+      | `route.fallback()` | let an earlier-registered route handle it |
+
+      Waiting on traffic: `page.waitForResponse(urlOrPredicate)`, `page.waitForRequest(...)`. Recording and
+      replaying: `page.routeFromHAR(file)`.
+
+      **API testing:** the `request` fixture (`request.get`, `post`, `put`, `delete`, `fetch`), using the config's
+      `baseURL`; `response.ok()`, `status()`, `json()`, `headers()`; the assertion `await
+      expect(response).toBeOK()`. `page.request` does the same with the page's cookies.
+
+      **Debugging:** `trace: 'retain-on-failure'` (or `'on-first-retry'`) in the config, then `npx playwright
+      show-trace path/to/trace.zip`; `npx playwright test --ui` (watch, time-travel, pick locators); `--debug`
+      (the inspector, step by step); `npx playwright codegen` (record actions and locators).
+
+  - id: why
+    kind: why
+    concepts: [network-interception, api-testing-with-playwright]
+    title: Why testers need both directions
+    body: |
+      - **Error states are where payment UIs fail:** a 503 from the catalog, a timeout from the provider, an
+        empty list, a malformed response. Real backends rarely produce them when you need them.
+      - **Deterministic data:** a mocked product list doesn't change when someone edits the test environment.
+      - **Speed and focus:** creating an order through the API takes milliseconds; through the UI, seconds - and
+        the UI test for checkout shouldn't depend on the UI for creating products.
+      - **Evidence beyond the screen:** after the UI says "paid", asking the API what it stored is the stronger
+        check ([payment lifecycle](#/lesson/payment-lifecycle-overview)).
+      - **CI failures** are only analysable with recorded evidence - traces are that evidence.
+
+  - id: internals
+    kind: internals
+    concepts: [network-interception, debugging-with-traces]
+    title: How routing and traces work
+    body: |
+      **Routing.** Playwright intercepts the browser's requests at the protocol level, before they leave the
+      browser:
+
+      1. A request starts - a document, script, image, `fetch` or XHR.
+      2. Playwright checks the routes registered for the page and its context; the **most recently registered**
+         matching route handles it first.
+      3. The handler decides: fulfil, abort, continue, or fall back to the next matching route.
+      4. With no matching route, the request goes to the network as usual.
+
+      Consequences: register routes **before** the action that triggers the request (often before `goto`); a
+      glob that is too broad (`'**/*'`) also catches the HTML page, scripts and styles; requests handled by a
+      service worker bypass `page.route` (block service workers in the context if that matters).
+
+      **Traces** record, per action: the call and its log, DOM snapshots before and after, screenshots, network
+      requests and responses, console messages and the source line. `retain-on-failure` keeps the file only when
+      the test fails, so passing runs cost little.
+
+  - id: visual
+    kind: visual
+    concepts: [network-interception]
+    title: "Sequence: the catalog with a mocked failure"
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant T as Test
+          participant P as Page - SandPay shop
+          participant R as page.route handler
+          participant S as Server
+          T->>R: route products.json - fulfil with status 503
+          T->>P: goto index.html
+          P->>S: GET index.html, shop.js, shop.css - no route matches
+          S-->>P: 200
+          P->>R: GET products.json
+          R-->>P: 503 - the server never sees it
+          P->>P: show "Products could not be loaded" and Try again
+          T->>P: expect the error state
+      ```
+
+      Only the request that matches the route is answered by the test; everything else reaches the server.
+
+  - id: when
+    kind: when
+    concepts: [network-interception, api-testing-with-playwright]
+    title: Mock, real, or API?
+    body: |
+      | Goal | Use |
+      |---|---|
+      | the UI's handling of errors, timeouts, empty and huge responses | mock with `page.route` |
+      | the UI and backend working together on the happy path | the real backend, no mocks |
+      | the backend's contract (status codes, schema, rules) | API tests with `request` - faster and more precise than UI |
+      | test setup (orders, accounts, carts) | API calls in fixtures, then the UI for the part under test |
+      | proof that the UI saved what it showed | a UI action, then an API read |
+      | third-party pages you don't control (a provider's 3-D Secure page) | a sandbox or a mock - never production |
+
+      A mocked UI test proves the **UI's behaviour for that response** - not that the server sends it. Pair
+      important mocks with API or contract tests on the real backend.
+
+  - id: example
+    kind: example
+    concepts: [network-interception]
+    title: "Real-world example: the blank catalog nobody had seen"
+    body: |
+      A shop's catalog loaded products from an API. Every test ran against a healthy staging server, and every
+      test passed. During a provider incident the API returned 503 for twenty minutes, and customers saw a blank
+      page with a spinner that never stopped.
+
+      **What testing could have shown:** a five-line test that fulfils the catalog request with a 503 and expects
+      an error message with a way to retry. Written after the incident, it failed at once - the frontend had no
+      error branch. The fix added the error state (the SandPay shop's "Products could not be loaded" and "Try
+      again" are modelled on it) and the test now guards it, with mocks for 500, 503, a timeout (abort) and
+      malformed JSON.
+
+  - id: code
+    kind: code
+    concepts: [network-interception, api-testing-with-playwright, debugging-with-traces]
+    title: "Code: routes, API calls and traces"
+    collapsed: true
+    body: |
+      ```ts
+      test('the catalog survives an API outage', async ({ page }) => {
+        await page.route('**/products.json', (route) => route.fulfill({ status: 503 }));   // before goto
+        await page.goto('index.html');
+        await expect(page.getByTestId('catalog-error')).toContainText('could not be loaded');
+
+        await page.unroute('**/products.json');                                            // the API recovers
+        await page.getByTestId('retry').click();
+        await expect(page.getByTestId('product-card')).toHaveCount(6);
+      });
+
+      test('prices shown are the prices served', async ({ page }) => {
+        const response = page.waitForResponse('**/products.json');     // start waiting before the action
+        await page.goto('index.html');
+        const served = await (await response).json();
+        await expect(page.getByTestId('product-price').first()).toHaveAttribute(
+          'data-amount-minor',
+          String(served[0].price),
+        );
+      });
+
+      // modify a real response: one product out of stock
+      await page.route('**/products.json', async (route) => {
+        const response = await route.fetch();
+        const products = await response.json();
+        await route.fulfill({ response, json: products.slice(1) });
+      });
+
+      // API test with the request fixture
+      test('the catalog API', async ({ request }) => {
+        const response = await request.get('products.json');
+        await expect(response).toBeOK();
+        expect(response.headers()['content-type']).toContain('application/json');
+        expect(await response.json()).toHaveLength(6);
+      });
+      ```
+
+      ```ts
+      // playwright.config.ts
+      use: { trace: 'retain-on-failure' }      // then: npx playwright show-trace test-results/.../trace.zip
+      ```
+
+  - id: tests
+    kind: tests
+    concepts: [network-interception, api-testing-with-playwright]
+    title: A network-aware test set for the catalog
+    body: |
+      | ID | Test | Technique |
+      |---|---|---|
+      | N1 | happy path with the real API: six products, prices match the API | real backend + `waitForResponse` |
+      | N2 | 500 and 503: error message and Try again | `fulfill({ status })` |
+      | N3 | network failure: same error state | `route.abort()` |
+      | N4 | empty list: no cards, no error (or an "empty" message, if specified) | `fulfill({ json: [] })` |
+      | N5 | malformed JSON or missing fields: no crash, an error state | `fulfill({ body: '...' })` |
+      | N6 | slow response: loading state, then products | a handler that waits, then continues |
+      | N7 | the API's contract: status, content type, field types | `request` fixture |
+      | N8 | recovery: error, then Try again succeeds | `unroute`, then click |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [network-interception, api-testing-with-playwright, debugging-with-traces]
+    title: Common mistakes
+    body: |
+      - **Registering the route after the request** - set it up before `goto` or the triggering action.
+      - **Over-broad patterns** (`'**/*'`, `'**/api/**'`) that also catch pages, scripts or unrelated calls - and
+        tests that then pass for the wrong reason.
+      - **Mocking the thing under test** - a test of the API that mocks the API proves nothing.
+      - **Mocks that drift from the real API** - keep mock data shaped like real responses (record them, or
+        check them with contract tests).
+      - **`waitForResponse` started after the action** - create the promise first, then act, then await it.
+      - **API checks that only test the status code** - validate the body too.
+      - **Traces turned off in CI** - every CI failure becomes "re-run it and hope".
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [network-interception, api-testing-with-playwright]
+    title: Trade-offs
+    body: |
+      | Choice | Gains | Costs |
+      |---|---|---|
+      | mocked responses | any state on demand, deterministic, fast | can drift from the real API; proves only the UI side |
+      | real backend | proves the integration | slow to set up states; flaky environments |
+      | HAR recording and replay | realistic data without a live backend | recordings go stale; may contain secrets - review them |
+      | API setup in fixtures | fast, focused UI tests | the UI paths for that setup need their own tests |
+      | traces always on | maximum evidence | large artefacts; `retain-on-failure` is the usual balance |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - `page.route(pattern, route => route.fulfill / abort / continue / fallback)`; register before the request;
+        last registered runs first; keep patterns narrow.
+      - `page.waitForResponse` - start waiting before the action.
+      - `request` fixture for API tests and setup; `expect(response).toBeOK()`; validate bodies.
+      - Mocked UI tests prove UI behaviour; pair them with real-backend or contract tests.
+      - Traces on failure; `show-trace`, `--ui`, `--debug`, `codegen`.
+
+exercises:
+  - id: route-actions
+    type: mcq
+    concept: network-interception
+    skill: recognition
+    title: Which route action?
+    prompt: |
+      You want the browser to see the catalog request **fail at the network level** - as if the connection
+      dropped - rather than receive an HTTP error. Which route action?
+    options:
+      - id: abort
+        text: "`route.abort()`"
+        feedback: Correct - the request fails without any response.
+      - id: fulfill-500
+        text: "`route.fulfill({ status: 500 })`"
+        feedback: That is a response - an HTTP error, not a network failure. Both are worth testing.
+      - id: continue
+        text: "`route.continue()`"
+        feedback: That sends the request on to the server unchanged.
+      - id: fallback
+        text: "`route.fallback()`"
+        feedback: That hands the request to the next matching route - it decides nothing by itself.
+    correct: [abort]
+    hints:
+      - Is a 500 a network failure?
+    solution: |
+      **`route.abort()`.** The page's `fetch` rejects (no response at all), while `fulfill({ status: 500 })`
+      resolves with a response whose `ok` is false - two different code paths in the frontend.
+    followUp: |
+      Write the two tests (abort and 503) for the shop's catalog. Should both show the same message?
+
+  - id: product-mocks-pw
+    type: coding
+    concept: network-interception
+    skill: application
+    title: Mock the catalog API
+    prompt: |
+      Implement `mockProducts` (the catalog's products.json request returns exactly the given products) and
+      `failProducts` (it fails with the given HTTP status). Only that request may be affected - the page, its
+      script and styles must still load.
+    project: playwright
+    files:
+      - exercises/network/product-mocks.ts
+    test: tests/product-mocks.spec.ts
+    command: npx playwright test tests/product-mocks.spec.ts
+    hints:
+      - "`page.route` takes a glob: `'**/products.json'` matches the catalog request on any host."
+      - "`route.fulfill({ json: products })` answers with a JSON body and the right content type."
+      - "For a failure: `route.fulfill({ status, body: '...' })`."
+    modelAnswer: |
+      ```ts
+      export async function mockProducts(page: Page, products: Product[]): Promise<void> {
+        await page.route('**/products.json', (route) => route.fulfill({ json: products }));
+      }
+
+      export async function failProducts(page: Page, status: number): Promise<void> {
+        await page.route('**/products.json', (route) => route.fulfill({ status, body: 'Service unavailable' }));
+      }
+      ```
+    rubric:
+      - Every test in product-mocks.spec.ts passes
+      - The route pattern matches only products.json
+      - The helpers are called before navigation in the tests, and you can explain why
+      - Named what these tests prove and what they don't
+    solution: |
+      The fourth test checks the pattern is narrow: with a failing catalog API, the page heading and script still
+      load. Reference: `solutions/network/product-mocks.ts`.
+    followUp: |
+      Add `slowProducts(page, ms)` that delays the real response. Which state of the page would you test with it?
+
+  - id: products-api-pw
+    type: coding
+    concept: api-testing-with-playwright
+    skill: application
+    title: Test the catalog API
+    prompt: |
+      Implement `fetchProducts(request)`: GET products.json with Playwright's request context, throw an error
+      naming the status when the response isn't OK, and throw an error naming the first bad item when the body
+      isn't a list of valid products (string sku and name, positive whole-number price).
+    project: playwright
+    files:
+      - exercises/api/products-api.ts
+    test: tests/products-api.spec.ts
+    command: npx playwright test tests/products-api.spec.ts
+    hints:
+      - "`await request.get('products.json')` uses the config's baseURL; `response.ok()` and `response.status()`."
+      - "Treat `await response.json()` as `unknown` and check it before returning it as `Product[]`."
+      - "`Number.isInteger(price) && price > 0`."
+    modelAnswer: |
+      ```ts
+      export async function fetchProducts(request: APIRequestContext): Promise<Product[]> {
+        const response = await request.get('products.json');
+        if (!response.ok()) throw new Error(`GET products.json failed with HTTP ${response.status()}`);
+        const body: unknown = await response.json();
+        if (!Array.isArray(body)) throw new Error('products.json is not a list');
+        const bad = body.findIndex((item) => !isProduct(item));
+        if (bad >= 0) throw new Error(`products.json item ${bad} is not a valid product: ${JSON.stringify(body[bad])}`);
+        return body as Product[];
+      }
+      ```
+    rubric:
+      - Every test in products-api.spec.ts passes
+      - The status is checked and named in the error
+      - The body is validated before it is returned
+      - The response body is treated as unknown until checked
+    solution: |
+      The tests use the real local server, a missing endpoint (404) and a deliberately malformed one. Reference:
+      `solutions/api/products-api.ts`.
+    followUp: |
+      Use `fetchProducts` in a UI test: compare every price the catalog shows with the API's prices. Which
+      locator gives you the amount in minor units?
+
+  - id: route-too-late
+    type: debug
+    concept: network-interception
+    skill: analysis
+    title: The mock that never applied
+    prompt: |
+      This test times out waiting for the error state. Click the line that is in the wrong place.
+    language: typescript
+    code: |
+      await page.goto('index.html');
+      await page.route('**/products.json', (route) => route.fulfill({ status: 503 }));
+      await expect(page.getByTestId('catalog-error')).toBeVisible();
+    correctLines: [2]
+    lineNotes:
+      - line: 1
+        note: Navigating is right - but the page requests products.json while it loads, before line 2 runs.
+      - line: 3
+        note: The assertion is right; the error state never appears because the real request already succeeded.
+    hints:
+      - When does the catalog request products.json?
+    solution: |
+      **Line 2.** The route is registered after `goto`, when the catalog has already loaded the real products.
+      Register routes before the action that triggers the request - here, before `goto`.
+    followUp: |
+      Rewrite the test so it also checks recovery: the API comes back, the user clicks Try again, and six products
+      appear.
+
+  - id: vacuous-pass
+    type: mcq
+    concept: network-interception
+    skill: analysis
+    title: A test that passes for the wrong reason
+    prompt: |
+      ```ts
+      await page.route('**/*', (route) => route.fulfill({ json: [] }));
+      await page.goto('index.html');
+      await expect(page.getByTestId('product-card')).toHaveCount(0);
+      ```
+
+      It is meant to test "an empty catalog shows no cards". It passes. What is wrong?
+    options:
+      - id: too-broad
+        text: The route also answers index.html, shop.js and shop.css with "[]" - no shop page loads at all, so there are trivially no cards
+        feedback: Correct - the pattern is too broad, and the assertion can't tell an empty catalog from no page.
+      - id: nothing
+        text: Nothing - the catalog is empty and the test passes
+        feedback: The page under test never loaded; the test proves nothing about the catalog.
+      - id: json-type
+        text: "`json: []` sends the wrong content type"
+        feedback: fulfill with json sets a JSON content type; the problem is which requests it answers.
+      - id: timing
+        text: The route is registered too early
+        feedback: Registering before goto is right; the pattern is the problem.
+    correct: [too-broad]
+    hints:
+      - Which requests does `'**/*'` match?
+    solution: |
+      **The pattern is too broad.** Use `'**/products.json'`, and add a positive check that the page itself
+      loaded (the heading, or the list's `aria-busy` becoming false) so the test can't pass on a blank page.
+    followUp: |
+      Name two other assertions that can pass on a blank page, and how to guard them.
+
+  - id: what-to-mock
+    type: testdesign
+    concept: api-testing-with-playwright
+    skill: application
+    title: Mock, real or API?
+    prompt: |
+      For the SandPay shop's catalog and checkout, design a small test set that uses **mocked network**, the **real
+      backend** and **API tests**, each where it fits. For every test say which technique it uses and what it
+      proves.
+    hints:
+      - Which states can the real environment not produce on demand?
+      - Which claims need the real backend to be believable?
+    modelAnswer: |
+      - Mocked (page.route): catalog 503 and abort → error and Try again; empty list → no error; malformed JSON →
+        error state; slow response → loading state. Proves the UI's handling of those responses.
+      - Real backend: catalog shows six products and prices equal to products.json; checkout happy path to a
+        paid order. Proves the integration.
+      - API (request): products.json returns 200, JSON, valid fields; a missing endpoint returns 404. Proves the
+        contract the mocks imitate.
+      - Combined: after a UI payment, read the order through the API (where one exists) to confirm what was
+        stored.
+      Evidence: traces on failure, API responses attached to the report.
+    rubric:
+      - Used mocks for error, empty, malformed or slow states
+      - Kept at least one happy path on the real backend
+      - Added API tests for the contract that the mocks imitate
+      - Stated what each kind of test proves and does not prove
+      - Mentioned evidence such as traces or recorded responses
+    solution: |
+      The habit: **every mock is a claim about the real API** - back the important ones with an API or contract
+      test, or the mock becomes fiction.
+    followUp: |
+      The API team changes `price` to an object `{ amount, currency }`. Which of your tests fail, and which keep
+      passing while the shop is broken?
+
+  - id: ci-only-failure
+    type: mcq
+    concept: debugging-with-traces
+    skill: application
+    title: It fails only in CI
+    prompt: |
+      A checkout test fails in CI about once a week and never locally. What do you set up first?
+    options:
+      - id: trace
+        text: "`trace: 'retain-on-failure'` (and keep test-results as a CI artefact), then open the next failure with show-trace"
+        feedback: Correct - the trace shows each action, DOM snapshots, network and console at the moment it failed.
+      - id: retries
+        text: "`retries: 3` so the build stays green"
+        feedback: Hides the problem; a test that passes on retry is reported as flaky and still needs fixing.
+      - id: headed
+        text: Run CI headed so it behaves like local runs
+        feedback: There is nobody to watch in CI, and it doesn't capture evidence.
+      - id: sleeps
+        text: Add waitForTimeout before each step
+        feedback: Slower and still racy - and it destroys the evidence of what was slow.
+    correct: [trace]
+    hints:
+      - What would you need to see to understand a failure you can't reproduce?
+    solution: |
+      **Traces on failure.** Without evidence from the failing run you are guessing. `on-first-retry` is another
+      common setting if retries are enabled.
+    followUp: |
+      The trace shows the Pay button click happened while the processing overlay from a previous attempt was still
+      visible. What is the likely fix?
+
+  - id: interview-mocking
+    type: interview
+    concept: network-interception
+    skill: application
+    title: "Interview: mocking in UI tests"
+    prompt: |
+      **Interviewer:** "When do you mock the network in UI tests, and what are the risks? How do you keep mocks
+      honest?"
+    hints:
+      - Use cases, risks, how to keep mocks in sync, where the real backend is still needed.
+    modelAnswer: |
+      - Mock to reach states the real environment can't produce on demand: errors, timeouts, empty or huge lists,
+        malformed data; and for determinism and speed.
+      - Risks: mocks drift from the real API, tests pass while the integration is broken, over-broad routes make
+        tests pass on a blank page.
+      - Keep them honest: build mock data from recorded real responses or shared schemas; contract or API tests on
+        the real backend; a few end-to-end happy paths without mocks; review mocks when the API changes.
+      - Practical: register routes before navigation, keep patterns narrow, assert the page actually loaded,
+        traces on failure.
+    followUps:
+      - How is page.route different from a mock server like WireMock?
+      - How would you test a payment provider's 3-D Secure page?
+      - What does a mocked test prove about the backend?
+    rubric:
+      - Gave valid reasons to mock - error states, determinism, speed
+      - Named the drift risk and false confidence
+      - Described how to keep mocks in sync with the real API
+      - Kept some tests on the real backend
+      - Mentioned practical pitfalls such as broad patterns or route timing
+    solution: |
+      Strong answers treat mocks as **claims that need backing**, and balance them with real-backend and contract
+      tests.
+
+recall:
+  - id: recall-route-order
+    concept: network-interception
+    prompt: When must a route be registered, and which route wins when several match?
+    answer: Before the request is made (often before goto). The most recently registered matching route handles it first.
+  - id: recall-abort-vs-500
+    concept: network-interception
+    prompt: "What is the difference between route.abort() and route.fulfill({ status: 500 })?"
+    answer: abort is a network failure with no response; fulfill with 500 is a real HTTP error response. Frontends handle them on different paths.
+  - id: recall-wait-for-response
+    concept: network-interception
+    prompt: How do you capture the response a page action triggers?
+    answer: Start page.waitForResponse(...) before the action, perform the action, then await the promise.
+  - id: recall-request-fixture
+    concept: api-testing-with-playwright
+    prompt: What is the request fixture?
+    answer: An APIRequestContext for HTTP calls with the config's baseURL - for API tests and setup. page.request shares the page's cookies instead.
+  - id: recall-to-be-ok
+    concept: api-testing-with-playwright
+    prompt: Which assertion checks an API response is successful?
+    answer: await expect(response).toBeOK() - a 2xx status. Then validate the body.
+  - id: recall-trace
+    concept: debugging-with-traces
+    prompt: What does a Playwright trace contain, and how do you open it?
+    answer: Actions with logs, DOM snapshots, screenshots, network, console and source lines. npx playwright show-trace trace.zip (or trace.playwright.dev).
+
+next:
+  - payment-scenario-matrix
+  - ci-quality-gates
+
+placement:
+  - id: place-route
+    type: mcq
+    concept: network-interception
+    skill: application
+    title: An error state on demand
+    prompt: |
+      How do you make the catalog show its error state in a test, without changing the server?
+    options:
+      - id: route
+        text: "`page.route('**/products.json', r => r.fulfill({ status: 503 }))` before goto"
+        feedback: Correct.
+      - id: edit
+        text: Ask the team to break the staging server during the test
+        feedback: Slow, disruptive and not repeatable.
+      - id: evaluate
+        text: Use page.evaluate to show the error element
+        feedback: That fakes the outcome instead of testing the page's handling.
+      - id: offline
+        text: Turn the whole context offline
+        feedback: That also stops the page itself loading, unless done after it loads - and is less precise than a route.
+    correct: [route]
+    solution: |
+      **A route registered before navigation.**
+
+  - id: place-api
+    type: mcq
+    concept: api-testing-with-playwright
+    skill: application
+    title: Fast test data
+    prompt: |
+      A UI test about refunds needs a paid order. Creating one through the UI takes 25 seconds. What is the usual
+      better approach?
+    options:
+      - id: api-fixture
+        text: Create the paid order through the API (request fixture) in a fixture, then test the refund in the UI
+        feedback: Correct - fast setup, and the UI test focuses on what it is about.
+      - id: ui-anyway
+        text: Keep creating it through the UI so it is realistic
+        feedback: The order-creation UI has its own tests; repeating it here costs time and adds failure points.
+      - id: shared-order
+        text: Reuse one order for every refund test
+        feedback: Refunds change the order - tests would interfere with each other.
+      - id: mock-everything
+        text: Mock every request of the refund page
+        feedback: Then nothing real is refunded; that tests only the UI's handling of fake responses.
+    correct: [api-fixture]
+    solution: |
+      **API setup in a fixture.**
+
+  - id: place-trace
+    type: mcq
+    concept: debugging-with-traces
+    skill: application
+    title: Evidence from CI
+    prompt: |
+      Which configuration keeps detailed evidence for failing tests without slowing down passing runs much?
+    options:
+      - id: retain
+        text: "`trace: 'retain-on-failure'`"
+        feedback: Correct.
+      - id: on
+        text: "`trace: 'on'` for every test"
+        feedback: Records everything, including passing tests - large artefacts.
+      - id: off
+        text: "`trace: 'off'` and screenshots only"
+        feedback: A screenshot shows one moment; the trace shows the steps leading to it.
+      - id: video
+        text: "`video: 'on'` for every test"
+        feedback: Video shows what happened on screen, but not the DOM, network or console - and costs more.
+    correct: [retain]
+    solution: |
+      **`retain-on-failure`.**

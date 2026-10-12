@@ -26,7 +26,8 @@ public final class ShopServer implements AutoCloseable {
       Map.of(
           "html", "text/html; charset=utf-8",
           "css", "text/css; charset=utf-8",
-          "js", "text/javascript; charset=utf-8");
+          "js", "text/javascript; charset=utf-8",
+          "json", "application/json; charset=utf-8");
 
   private final HttpServer server;
   private final ExecutorService executor;

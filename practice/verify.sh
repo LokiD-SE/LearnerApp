@@ -10,6 +10,13 @@ set -euo pipefail
 project="${1:?usage: practice/verify.sh <project> [maven args]}"
 shift
 cd "$(dirname "$0")/$project"
+
+# Node projects (practice/playwright) verify themselves the same way: scripts/verify.mjs
+if [ -f package.json ]; then
+  [ -d node_modules ] || npm ci --no-audit --no-fund
+  exec npm run verify -- "$@"
+fi
+
 mvn=(mvn -B -ntp "$@")
 
 echo "== $project: reference solutions must pass every test"

@@ -141,8 +141,8 @@ describe('every coding exercise', () => {
       it('names files that exist in the practice project, each with a reference solution', () => {
         for (const file of exercise.files) {
           expect(existsSync(inProject(file)), `${project.path}/${file} is missing`).toBe(true);
-          if (file.startsWith('src/exercises/')) {
-            const solution = file.replace(/^src\/exercises\//, 'src/solutions/');
+          if (/^(src\/)?exercises\//.test(file)) {
+            const solution = file.replace(/^(src\/)?exercises\//, '$1solutions/');
             expect(existsSync(inProject(solution)), `${project.path}/${solution} is missing`).toBe(true);
           }
         }
@@ -151,7 +151,8 @@ describe('every coding exercise', () => {
         expect(existsSync(inProject(exercise.test)), `${project.path}/${exercise.test} is missing`).toBe(
           true,
         );
-        expect(readFileSync(inProject(exercise.test), 'utf8')).toContain('@Tag("exercise")');
+        // JUnit: @Tag("exercise"); Playwright: { tag: '@exercise' }
+        expect(readFileSync(inProject(exercise.test), 'utf8')).toMatch(/@Tag\("exercise"\)|'@exercise'/);
         const testClass = exercise.test
           .split('/')
           .pop()!

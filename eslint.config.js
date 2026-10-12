@@ -4,7 +4,17 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist', 'coverage', 'test-results', 'playwright-report', 'node_modules', 'practice/**/target'],
+    ignores: [
+      'dist',
+      'coverage',
+      'test-results',
+      'playwright-report',
+      'node_modules',
+      'practice/**/target',
+      'practice/**/node_modules',
+      'practice/**/test-results',
+      'practice/**/playwright-report',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -16,5 +26,10 @@ export default tseslint.config(
       '@typescript-eslint/no-non-null-assertion': 'off',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
     },
+  },
+  {
+    // unsolved exercise stubs keep the parameters the learner will need
+    files: ['practice/**/exercises/**'],
+    rules: { '@typescript-eslint/no-unused-vars': 'off' },
   },
 );

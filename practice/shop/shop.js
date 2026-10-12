@@ -5,7 +5,8 @@
  * sessionStorage, so every new browser session starts with an empty cart.
  *
  * The shop deliberately behaves like real web apps that are awkward to automate:
- * - products load asynchronously, and sorting re-renders the list (stale elements);
+ * - products load asynchronously from products.json (mock or break that request to test the error
+ *   state), and sorting re-renders the list (stale elements);
  * - element ids and one CSS class are generated per page load (brittle locators);
  * - "Add to cart" updates the cart count after a delay, with a toast;
  * - card details are entered in a SandPay iframe;
@@ -15,6 +16,7 @@
  */
 'use strict';
 
+/** Prices for the cart and checkout. The catalog page loads the same list from products.json. */
 const PRODUCTS = [
   { sku: 'espresso-beans', name: 'Espresso beans 1 kg', price: 1899, featured: 1 },
   { sku: 'oat-milk', name: 'Oat milk 1 L', price: 249, featured: 4 },
@@ -135,8 +137,10 @@ async function initCatalog() {
   // A class name that changes on every load, like the hashed names of CSS-in-JS libraries.
   const hashedCardClass = `card-${randomId(5)}`;
 
+  let products = [];
+
   const render = (order) => {
-    const sorted = [...PRODUCTS].sort((a, b) =>
+    const sorted = [...products].sort((a, b) =>
       order === 'price-asc'
         ? a.price - b.price
         : order === 'price-desc'
@@ -179,13 +183,36 @@ async function initCatalog() {
     );
   };
 
-  list.replaceChildren(
-    ...Array.from({ length: 3 }, () => el('li', { class: 'skeleton', 'aria-hidden': 'true' })),
-  );
-  list.setAttribute('aria-busy', 'true');
-  await sleep(800); // products "load" from the server
-  render(sort.value);
-  list.setAttribute('aria-busy', 'false');
+  const load = async () => {
+    list.replaceChildren(
+      ...Array.from({ length: 3 }, () => el('li', { class: 'skeleton', 'aria-hidden': 'true' })),
+    );
+    list.setAttribute('aria-busy', 'true');
+    try {
+      // the catalog "API" - and a minimum loading time, so the asynchronous load is noticeable
+      const [response] = await Promise.all([fetch('products.json', { cache: 'no-store' }), sleep(800)]);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      products = await response.json();
+      render(sort.value);
+    } catch {
+      const retry = el(
+        'button',
+        { type: 'button', class: 'secondary', dataset: { testid: 'retry' } },
+        'Try again',
+      );
+      retry.addEventListener('click', load);
+      list.replaceChildren(
+        el(
+          'li',
+          { class: 'panel', role: 'alert', dataset: { testid: 'catalog-error' } },
+          el('p', {}, 'Products could not be loaded.'),
+          retry,
+        ),
+      );
+    }
+    list.setAttribute('aria-busy', 'false');
+  };
+  await load();
 
   sort.addEventListener('change', async () => {
     list.setAttribute('aria-busy', 'true');
