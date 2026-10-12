@@ -144,6 +144,21 @@ course.
 - [x] "Back to home" on every page except the home page.
 - [x] Unit tests (sharing, totals, formatting, time left) and an end-to-end spec on desktop and mobile.
 
+## Increment 7c - the Foundation course (done)
+
+- [x] All eight Foundation lessons written to the template, each with its sources in `environment:`:
+      **Equivalence partitioning, boundaries and decision tables** and **State transition testing** (ISTQB
+      CTFL v4.0.1 4.2, ISO/IEC/IEEE 29119-4), **Risk-based testing** (ISTQB 5.2, ISO 31000, ISO/IEC 25010),
+      **Defect reports that get fixed** (ISTQB 5.5 and 1.2.3, ISO/IEC/IEEE 29119-3, Mozilla's Bug Writing
+      Guidelines), **From a click to a response** (RFC 1034/1035, 9293, 8446, 9110-9114, 9000, MDN),
+      **Browser DevTools for testers** (Chrome DevTools documentation), **Git for testers** (Pro Git,
+      git-scm.com), **Scientific debugging** (Zeller, _Why Programs Fail_ chapter 6, The Debugging Book,
+      git-bisect documentation).
+- [x] Command output in the lessons (curl 8.5, Git 2.43) was captured from real runs; exercises use the
+      SandPay Demo Shop's real behaviour (test cards, `products.json`, session storage keys).
+- [x] A **Testing foundations** learning path (added after the existing paths, so the home page still starts
+      with the Payments QA core path).
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).

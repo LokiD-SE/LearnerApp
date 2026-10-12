@@ -1,0 +1,745 @@
+id: client-server-request-flow
+title: From a click to a response - the client-server request flow
+subject: foundations
+module: web-mobile-basics
+level: beginner
+status: published
+estimatedMinutes: 50
+summary: What happens between a tap and a response - DNS, TCP, TLS, HTTP, gateways, servers and rendering - where each step fails, what the failure looks like, and how a tester proves which layer is at fault.
+tags: [client-server, dns, tcp, tls, https, http, cdn, load balancer, mobile, curl, network, troubleshooting]
+
+environment: |
+  - **Standards:** DNS - **RFC 1034 / RFC 1035**; TCP - **RFC 9293**; TLS 1.3 - **RFC 8446**; HTTP
+    semantics and status codes - **RFC 9110**; HTTP/1.1 - **RFC 9112**; HTTP/2 - **RFC 9113**; HTTP/3 -
+    **RFC 9114** over QUIC (**RFC 9000**). All free at [rfc-editor.org](https://www.rfc-editor.org/).
+    Reserved example names (`example.com`, the `.example` top-level domain) - **RFC 2606**.
+  - **Reference:** MDN Web Docs,
+    [Populating the page: how browsers work](https://developer.mozilla.org/en-US/docs/Web/Performance/Guides/How_browsers_work).
+  - **Tools:** `curl` - output shown is from **curl 8.5.0** on Linux, trimmed; wording and layout vary
+    between versions, and IP addresses change. Browser error codes shown are **Chrome's**; other browsers
+    word them differently.
+  - **Platform-specific:** the notes on capturing mobile app traffic refer to Android 7.0 (API level 24)
+    and later, and to iOS; check your platform's current documentation.
+  - **Examples:** SandPay (`api.sandpay.example`) is fictional - `.example` names never resolve, by design.
+    Runnable commands use `example.com`, which is reserved for documentation and safe to call.
+
+prerequisites: []
+
+concepts:
+  - id: request-journey
+    name: The request journey
+    summary: A request goes URL → DNS → connection (TCP, or QUIC) → TLS → HTTP request → gateways and servers → response → client processing, with caches along the way.
+  - id: failure-points-by-layer
+    name: Failure points by layer
+    summary: Each step fails in its own recognisable way - a DNS error, refused or timed-out connection, certificate error, HTTP status, or client-side error - which tells you who has to fix it.
+  - id: web-and-mobile-clients
+    name: Web and mobile clients
+    summary: Browsers and native apps share the network path but differ in rendering, versions in the field, storage, network changes and how their traffic can be captured.
+
+objectives:
+  - Trace the steps of an HTTPS request from a browser or app to a server and back, naming the protocol and standard for each.
+  - Identify the failing layer from the symptom - error message, timing or status code - and name the evidence that proves it.
+  - Measure where the time of a request goes with curl or the browser's Network panel.
+  - Design tests for network conditions and client differences on web and mobile.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [request-journey]
+    title: The idea in plain language
+    body: |
+      Calling a company's support line: you **look up the number** (DNS), the phone **connects** (TCP),
+      you **check you are talking to the real company** and agree to speak privately (TLS), then you
+      **ask your question** (the HTTP request). A receptionist may pass you on to a department
+      (gateways, load balancers), someone looks it up in their files (the application and database), and
+      you get an **answer** (the response) that you then **act on** (the browser draws the page, the app
+      updates the screen).
+
+      The call can fail at every step, and **each failure sounds different**: "number not found",
+      endless ringing, "this isn't who I expected", "please hold - nobody available", or an answer that is
+      simply wrong. A tester who can tell these apart can say **who** has to fix it.
+
+  - id: what
+    kind: what
+    concepts: [request-journey]
+    title: What happens, step by step
+    body: |
+      For `https://shop.example.com/checkout`:
+
+      | # | Step | Standard | What happens |
+      |---|---|---|---|
+      | 1 | **URL parsing** | - | scheme `https`, host `shop.example.com`, default port 443, path `/checkout` |
+      | 2 | **Caches** | RFC 9111 | the browser may answer from its own cache without any network |
+      | 3 | **DNS lookup** | RFC 1034/1035 | the host name is resolved to IP addresses; answers are cached for their TTL by the browser, the OS and the resolver |
+      | 4 | **Connection** | TCP RFC 9293 | three-way handshake: SYN, SYN-ACK, ACK (HTTP/3 uses QUIC over UDP instead) |
+      | 5 | **TLS handshake** | TLS 1.3 RFC 8446 | agree on keys; the server presents a **certificate** that the client checks - trusted issuer, valid dates, host name matches. TLS 1.3 needs one round trip |
+      | 6 | **HTTP request** | RFC 9110 | method, path, headers, body - over HTTP/1.1, HTTP/2 or HTTP/3 |
+      | 7 | **Intermediaries** | - | CDN, load balancer, API gateway, reverse proxy - they may answer from cache, reject, or forward |
+      | 8 | **Application** | - | the server code runs, calls the database and other services |
+      | 9 | **Response** | RFC 9110 | status code, headers, body travel back the same way |
+      | 10 | **Client processing** | - | a browser parses HTML into the DOM, applies CSS, runs JavaScript, lays out and paints; an app parses JSON and updates its screens |
+
+      A page usually needs **many** requests - HTML, then CSS, scripts, images, API calls - but connections
+      and DNS answers are **reused**, so the first request pays most of the set-up cost.
+
+  - id: why
+    kind: why
+    concepts: [failure-points-by-layer]
+    title: Why a tester needs this map
+    body: |
+      "The checkout doesn't work" can mean five different defects owned by five different teams:
+
+      - the **DNS** record was changed and some networks still have the old answer;
+      - a **firewall** drops connections from one country;
+      - the **certificate** expired on one of three load-balanced servers;
+      - the **gateway** times out because the payment service is slow;
+      - the server is fine, but a **JavaScript error** in the browser hides the pay button.
+
+      Each has a recognisable symptom and needs different evidence. Reporting the layer - with proof -
+      turns a vague report into one the right team can act on in minutes (see
+      [defect reports that get fixed](#/lesson/defect-reports-that-get-fixed)).
+
+  - id: visual
+    kind: visual
+    concepts: [request-journey]
+    title: "Sequence diagram: the first request to a site"
+    body: |
+      Each arrow pair is at least one network round trip. Notice how much happens **before** the server's
+      application sees anything.
+
+      ```mermaid
+      sequenceDiagram
+          participant C as Browser or app
+          participant D as DNS resolver
+          participant G as CDN or load balancer
+          participant A as Application server
+          participant DB as Database
+          C->>D: Where is shop.example.com?
+          D-->>C: IP addresses, cache for TTL seconds
+          C->>G: TCP SYN
+          G-->>C: SYN-ACK
+          C->>G: ACK, then TLS ClientHello
+          G-->>C: ServerHello, certificate, Finished
+          C->>G: Finished, then GET /checkout
+          G->>A: forwarded request
+          A->>DB: query
+          DB-->>A: rows
+          A-->>G: 200 OK with HTML
+          G-->>C: 200 OK with HTML
+          Note over C: parse, run scripts, render, then more requests
+      ```
+
+  - id: internals
+    kind: internals
+    concepts: [failure-points-by-layer]
+    title: How each layer fails - and what you see
+    body: |
+      | Layer | Typical cause | curl 8.5 says | Chrome shows |
+      |---|---|---|---|
+      | DNS | name doesn't exist, record missing, resolver down | `curl: (6) Could not resolve host` | `DNS_PROBE_FINISHED_NXDOMAIN` |
+      | Connection refused | nothing listening on that port, service down | `curl: (7) Failed to connect ... Couldn't connect to server` | `ERR_CONNECTION_REFUSED` |
+      | Connection timeout | firewall dropping packets, wrong IP, network down | `curl: (28) Failed to connect ... Timeout was reached` | `ERR_CONNECTION_TIMED_OUT` |
+      | TLS - dates | certificate expired, or the **device clock is wrong** | `curl: (60) SSL certificate problem: certificate has expired` | `NET::ERR_CERT_DATE_INVALID` |
+      | TLS - name | certificate for another host name | `curl: (60) SSL: no alternative certificate subject name matches target host name` | `NET::ERR_CERT_COMMON_NAME_INVALID` |
+      | Gateway | upstream returned something invalid / took too long | HTTP `502 Bad Gateway` / `504 Gateway Timeout` | the status page |
+      | Overload or maintenance | service temporarily unavailable | HTTP `503 Service Unavailable` | the status page |
+      | Application | bug, validation, permissions | HTTP `4xx` / `500` with an error body | the app's own error |
+      | Client | JavaScript error, parsing error, rendering | (curl sees a normal 200) | console errors, blank or broken page |
+
+      Three distinctions that save hours:
+
+      - **Refused versus timed out.** *Refused* comes back immediately - the host answered "nothing
+        here". *Timeout* means no answer at all - usually a firewall or routing problem.
+      - **4xx/5xx versus no response.** A status code proves the request **reached** an HTTP server. Read
+        which server: a `502` or `504` usually comes from a gateway, not the application behind it
+        (RFC 9110, 15.6).
+      - **"It works in curl but not in the browser."** The server is fine; look at the client - console
+        errors, blocked requests, cached old files, cookies.
+
+  - id: steps
+    kind: steps
+    concepts: [failure-points-by-layer, request-journey]
+    title: Step by step - find where the time goes
+    body: |
+      **With curl's timing variables** (they are cumulative, in seconds from the start):
+
+      ```bash
+      curl -o /dev/null -s -w "dns        %{time_namelookup}\nconnect    %{time_connect}\ntls        %{time_appconnect}\nfirst byte %{time_starttransfer}\ntotal      %{time_total}\n" https://example.com
+      ```
+
+      ```plaintext
+      dns        0.005349
+      connect    0.013736
+      tls        0.054709
+      first byte 0.069999
+      total      0.070139
+      ```
+
+      Read the **differences**: DNS took 5 ms, TCP 8 ms more, TLS 41 ms more, the server needed 15 ms to
+      send the first byte, and the body arrived almost at once.
+
+      **In the browser:** DevTools → **Network** → click the request → **Timing**. Chrome shows *DNS
+      Lookup*, *Initial connection* (including TLS), *Request sent*, *Waiting (TTFB)* - time to first
+      byte, which includes the server's work - and *Content Download*.
+
+      How to read the result:
+
+      1. **Large DNS** time → resolver or DNS records. Repeat the request: it should be near zero the
+         second time, from cache.
+      2. **Large connect or TLS** time → network distance, packet loss, an overloaded load balancer.
+      3. **Large TTFB** with small set-up times → the **server** is slow. Check the server logs and traces
+         for that request.
+      4. **Large download** → big responses or a slow network. Check the response size and compression.
+
+  - id: example
+    kind: example
+    concepts: [failure-points-by-layer, web-and-mobile-clients]
+    title: "Real-world example: \"your connection is not private\" for some customers"
+    body: |
+      Support reports that a few customers can't open the payment page: the browser says *"Your
+      connection is not private"*. The testers can't reproduce it, and monitoring shows the certificate
+      is valid for another two months.
+
+      Evidence collected from one customer's screenshot: the error code is `NET::ERR_CERT_DATE_INVALID`,
+      and the clock in the screenshot shows a date **three years in the past**.
+
+      Diagnosis: a certificate is only valid between its *start* and *expiry* dates **as judged by the
+      client's clock**. A phone with a wrong date sees a valid certificate as "not yet valid". Not a server
+      defect - but worth a support article, and for an app, a clear error message instead of a generic
+      "network error".
+
+      Contrast: if **every** client failed, and `curl -v` printed `certificate has expired`, the
+      certificate itself would be the defect - urgent, owned by whoever runs the TLS termination (often
+      the CDN or load balancer configuration).
+
+  - id: code
+    kind: code
+    concepts: [request-journey, failure-points-by-layer]
+    title: curl and DNS commands to practise with
+    collapsed: true
+    body: |
+      See every step of a request (trimmed output, curl 8.5.0; the addresses are replaced):
+
+      ```bash
+      curl -sv https://example.com -o /dev/null
+      ```
+
+      ```plaintext
+      * Host example.com:443 was resolved.
+      * IPv4: <address 1>, <address 2>
+      *   Trying <address 1>:443...
+      * Connected to example.com (<address 1>) port 443
+      * ALPN: curl offers h2,http/1.1
+      * TLSv1.3 (OUT), TLS handshake, Client hello (1):
+      * TLSv1.3 (IN), TLS handshake, Server hello (2):
+      * TLSv1.3 (IN), TLS handshake, Certificate (11):
+      * TLSv1.3 (OUT), TLS handshake, Finished (20):
+      * SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / id-ecPublicKey
+      * ALPN: server accepted h2
+      * Server certificate:
+      *  subject: CN=example.com
+      *  subjectAltName: host "example.com" matched cert's "example.com"
+      *  SSL certificate verify ok.
+      ```
+
+      Lines starting with `*` are curl's connection notes: name resolved (DNS), TCP connected, TLS 1.3
+      handshake, the protocol agreed with ALPN (`h2` = HTTP/2), and the certificate check - **host name
+      matched** and **verify ok**.
+
+      Look up a name directly:
+
+      ```bash
+      nslookup example.com
+      ```
+
+      Force curl to use a particular IP for a host name - useful to test one server behind a load
+      balancer, or a new server before DNS is switched:
+
+      ```bash
+      curl -v --resolve example.com:443:<server IP> https://example.com/
+      ```
+
+      Fail fast instead of waiting for the operating system's long default timeout:
+
+      ```bash
+      curl --connect-timeout 5 --max-time 20 -sS -o /dev/null -w "%{http_code}\n" https://example.com/
+      ```
+
+      `curl`'s exit code names the failing layer too: **6** could not resolve host, **7** could not
+      connect, **28** timeout, **60** certificate problem.
+
+  - id: when
+    kind: when
+    concepts: [web-and-mobile-clients]
+    title: Web and mobile clients - same path, different clients
+    body: |
+      A native app and a website usually call the **same APIs over the same network path**. What differs is
+      the client, and that changes what you test:
+
+      | | Browser | Native app |
+      |---|---|---|
+      | What it downloads | HTML, CSS, JavaScript, then API calls | mostly API calls (JSON); the screens are compiled into the app |
+      | Versions in use | the server sends the current front end on every load | **many old app versions stay installed** and keep calling the API |
+      | Network | usually stable Wi-Fi or wired | switches between Wi-Fi and mobile data, drops in lifts, goes to the background mid-request |
+      | Storage | cookies, local storage, cache | the app's own storage, keychain / keystore |
+      | Seeing its traffic | DevTools Network panel | a debugging proxy with its certificate installed on the device |
+
+      Two platform facts that surprise testers capturing app traffic:
+
+      - **Android 7.0 (API 24) and later:** apps that target API 24+ do **not** trust user-installed CA
+        certificates by default, so a proxy's certificate is ignored unless the debug build allows it in
+        its network security configuration.
+      - **iOS:** after installing a proxy's root certificate you must also enable full trust for it in
+        the certificate trust settings.
+
+      Some apps also use **certificate pinning** - they accept only a specific certificate or key - which
+      blocks proxies by design. Ask for a test build without pinning rather than trying to break it.
+
+  - id: tests
+    kind: tests
+    concepts: [failure-points-by-layer, web-and-mobile-clients]
+    title: Positive and negative test cases
+    body: |
+      For the checkout of a web shop and its app. Most network conditions can be simulated - browser
+      DevTools throttling and offline mode, a device's flight mode, a proxy that delays or drops requests,
+      or a test environment where a dependency can be switched off.
+
+      | ID | Condition | Expected | Evidence |
+      |---|---|---|---|
+      | P1 | normal network, first visit | page usable within the agreed time | Network panel timings or curl `-w` |
+      | P2 | repeat visit | DNS and static files from cache, faster | timings and "(disk cache)" / "(memory cache)" entries |
+      | N1 | offline at "Pay" | clear message, no payment attempted, retry possible | screenshot; no request in the log |
+      | N2 | network drops **after** "Pay" was sent | order status checked on reconnect, **no duplicate charge** | order list, payment provider sandbox |
+      | N3 | very slow network (throttling) | loading indicator, no double submission on repeated taps | recording; request count |
+      | N4 | payment service down (gateway returns 503 or 504) | friendly error, safe retry, nothing charged | response status and body |
+      | N5 | app in background during payment, then reopened | correct final state shown | screenshots before and after |
+      | N6 | oldest supported app version against the new API | still works, or a forced-update prompt | app version, API responses |
+      | N7 | device clock wrong by a year | understandable TLS error, not "unknown error" | screenshot of the message |
+
+      N2 links back to the unknown-outcome problem in
+      [idempotency keys and duplicate payment requests](#/lesson/idempotency-keys).
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [failure-points-by-layer, request-journey]
+    title: Common mistakes and how to debug them
+    body: |
+      - **"The server is down"** for every failure. Name the layer: DNS, connection, TLS, HTTP status or
+        client.
+      - **Blaming the application for a 502 or 504.** Check which component produced it - gateway logs
+        first.
+      - **Testing only on fast office Wi-Fi.** Most real users are on mobile data at some point. Throttle.
+      - **Forgetting caches.** A fix "doesn't work" because the browser, CDN or DNS still serves the old
+        answer. Test in a fresh profile, bypass the cache, and know the DNS TTL.
+      - **Ignoring old app versions.** The API must keep serving the versions still in use.
+      - **Disabling certificate checks** (`curl -k`, "trust all" in test code) and forgetting them. It hides
+        real TLS defects and must never reach production code.
+
+      **Debugging order:** can you resolve the name? → can you connect? → does TLS succeed? → what status
+      comes back, from which server? → what does the client do with it? Stop at the first step that fails
+      - everything after it is a consequence.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **URL → cache → DNS → TCP (or QUIC) → TLS → HTTP → gateways → application → response → render.**
+      - DNS answers are cached for their **TTL**; connections are reused.
+      - Symptoms: **could not resolve** = DNS; **refused** = nothing listening; **timeout** = no answer,
+        often a firewall; **certificate** error = TLS (also check the client's clock); **502 / 504** =
+        gateway; **4xx / 500** = application; **works in curl, not in the browser** = client.
+      - Measure with `curl -w` timings or DevTools **Timing**: DNS, connect, TLS, **TTFB** (server),
+        download.
+      - Apps: old versions in the field, network switches, background, proxies need trusted certificates.
+      - Standards: RFC 1034/1035, 9293, 8446, 9110-9114, 9000.
+
+exercises:
+  - id: symptom-to-layer
+    type: mcq
+    concept: failure-points-by-layer
+    skill: application
+    title: Which layer failed?
+    prompt: |
+      A health check from the office prints:
+
+      ```plaintext
+      curl: (7) Failed to connect to api.shop.example.com port 443 after 3 ms: Couldn't connect to server
+      ```
+
+      What does that tell you?
+    options:
+      - id: dns
+        text: The DNS name doesn't exist.
+        feedback: curl got far enough to try a connection, so the name resolved. A DNS failure is "(6) Could not resolve host".
+      - id: refused
+        text: The name resolved and the host answered quickly, but nothing accepted the connection on port 443.
+        feedback: Correct - a fast "couldn't connect" is a refused connection - the host is reachable but no service is listening on that port (or something actively rejects it).
+      - id: tls
+        text: The certificate is invalid.
+        feedback: TLS starts only after the TCP connection is established. A certificate problem is "(60) SSL certificate problem".
+      - id: app500
+        text: The application returned a 500 error.
+        feedback: An HTTP status needs a working connection and TLS. No HTTP response was received at all.
+    correct: [refused]
+    hints:
+      - Which steps must already have succeeded for curl to try to connect?
+      - Compare "after 3 ms" with what a timeout looks like.
+    solution: |
+      **Connection refused on port 443.** The name resolved (otherwise exit 6), and the answer came back
+      in 3 ms - so the host replied "nothing here" rather than staying silent (a timeout, exit 28). Likely
+      causes: the service or load balancer listener is down, or it is listening on another port. Next
+      step: check whether the service is running and what it listens on.
+    followUp: |
+      The same command from your laptop at home succeeds. What does that suggest, and which team would you
+      contact?
+
+  - id: order-https-steps
+    type: order
+    concept: request-journey
+    skill: recall
+    title: The first HTTPS request, in order
+    prompt: Put the steps of a browser's first request to `https://shop.example.com/` in order.
+    items:
+      - id: dns
+        text: Resolve shop.example.com to an IP address (DNS)
+      - id: tcp
+        text: Open a TCP connection - SYN, SYN-ACK, ACK
+      - id: tls
+        text: TLS handshake - check the server's certificate and agree on keys
+      - id: request
+        text: Send the HTTP request (GET /)
+      - id: server
+        text: Server processes the request and sends the response
+      - id: render
+        text: Browser parses the HTML, requests CSS and scripts, renders the page
+    hints:
+      - You need an address before you can connect, and a connection before you can encrypt.
+    solution: |
+      DNS → TCP → TLS → HTTP request → server → render. With HTTP/3, QUIC combines the connection and the
+      TLS handshake over UDP, but the order "find the address, connect securely, then ask" is the same.
+
+  - id: ttfb-analysis
+    type: mcq
+    concept: failure-points-by-layer
+    skill: analysis
+    title: Where did the 4 seconds go?
+    prompt: |
+      Chrome's Timing tab for a slow `POST /api/checkout`:
+
+      | Phase | Time |
+      |---|---|
+      | DNS Lookup | 0 ms |
+      | Initial connection | 0 ms |
+      | Request sent | 0.3 ms |
+      | Waiting (TTFB) | 4.1 s |
+      | Content Download | 2 ms |
+
+      What is the most likely place to investigate?
+    options:
+      - id: network
+        text: The user's network - it is too slow.
+        feedback: A slow network would show in the connection and download times too. Download took 2 ms for the whole body.
+      - id: dns
+        text: DNS - the lookup is failing.
+        feedback: DNS took 0 ms - the answer was cached, and the connection was reused. DNS isn't involved in this delay.
+      - id: server
+        text: The server side - the application or something it calls took about 4 seconds to start answering.
+        feedback: Correct - TTFB is the wait after the request is sent; with no set-up time and a fast download, the time is spent producing the response.
+      - id: browser
+        text: The browser - it is busy rendering.
+        feedback: Rendering happens after the response arrives. The browser was waiting for the first byte.
+    correct: [server]
+    hints:
+      - Which phases are set-up, which is the server's work, and which is the transfer?
+    solution: |
+      **The server.** DNS and connection are 0 because they were reused; the request went out instantly;
+      the 4.1 s is **waiting for the first byte** - the server's processing, including the database and
+      any services it calls (a payment provider, for instance). Next: find that request in the server logs
+      or traces by its time or request id.
+    followUp: |
+      The same request is fast when you send it with curl from a server in the same data centre. Does that
+      contradict the diagnosis? What would you compare next?
+
+  - id: debug-curl-cert
+    type: debug
+    concept: failure-points-by-layer
+    skill: analysis
+    title: Read the verbose output
+    prompt: |
+      A new staging host fails in the browser with a privacy warning. Here is the trimmed `curl -v`
+      output. Click the line that shows the cause.
+    language: plaintext
+    code: |
+      * Host staging-pay.shop.example.com:443 was resolved.
+      *   Trying <address>:443...
+      * Connected to staging-pay.shop.example.com (<address>) port 443
+      * TLSv1.3 (OUT), TLS handshake, Client hello (1):
+      * TLSv1.3 (IN), TLS handshake, Server hello (2):
+      * TLSv1.3 (IN), TLS handshake, Certificate (11):
+      * Server certificate:
+      *  subject: CN=pay.shop.example.com
+      *  expire date: Mar 14 23:59:59 2027 GMT
+      * SSL: no alternative certificate subject name matches target host name 'staging-pay.shop.example.com'
+    correctLines: [10]
+    lineNotes:
+      - line: 9
+        note: The certificate is valid until 2027, so the dates are not the problem.
+      - line: 3
+        note: The TCP connection succeeded - DNS and the network are fine. The failure is later, in TLS.
+    hints:
+      - Steps that succeeded are not the cause. Which is the first line that reports a problem?
+      - Compare the certificate's subject with the host name you asked for.
+    solution: |
+      **Line 10.** The server presented the certificate for `pay.shop.example.com` (line 8), not for
+      `staging-pay.shop.example.com`. The name doesn't match, so TLS fails - Chrome shows
+      `NET::ERR_CERT_COMMON_NAME_INVALID`. The fix is a certificate that covers the staging name (or the
+      right certificate configured for that host), not `curl -k`.
+    followUp: |
+      Which line would you expect to see instead if the certificate were right for the host but had expired?
+
+  - id: mobile-network-tests
+    type: testdesign
+    concept: web-and-mobile-clients
+    skill: application
+    title: Test the app's payment on a real network
+    prompt: |
+      Design tests for the **mobile app's** payment step under realistic network and device conditions.
+      Give at least five cases, each with how you create the condition, the expected behaviour and the
+      evidence.
+    hints:
+      - Think about the moment the network fails - before, during and after the request.
+      - What does a phone do that a desktop browser doesn't - background, switching networks, old versions?
+      - Which evidence proves there is no duplicate charge?
+    modelAnswer: |
+      1. Flight mode on, tap Pay → clear offline message, no request sent, Pay works after reconnecting.
+         Evidence: screenshot, proxy log with no request.
+      2. Proxy delays the response by 30 s → spinner, Pay can't be tapped twice; the app times out with a
+         message and checks the order status. Evidence: recording, request count.
+      3. Proxy drops the response after the request reached the server (unknown outcome) → on retry, no
+         second charge (idempotency key reused or status checked). Evidence: payments in the sandbox, the
+         repeated request's key.
+      4. Switch from Wi-Fi to mobile data during the request → the app recovers and shows the true status.
+         Evidence: recording, final order state.
+      5. Send the app to the background during the payment, reopen after a minute → the correct final
+         state. Evidence: screenshots before and after.
+      6. Oldest supported app version against the current API → payment works or a forced-update prompt
+         appears. Evidence: app version, API responses.
+    rubric:
+      - Covered no network before the request (offline)
+      - Covered a slow or delayed response, including double taps
+      - Covered a lost response after the server processed the request (unknown outcome)
+      - Covered a mobile-specific condition (network switch or background)
+      - Covered old app versions in the field
+      - Said how each condition is created (flight mode, proxy, throttling)
+      - Named evidence that proves no duplicate charge
+    solution: |
+      Compare with the model answer. The case that matters most is **3** - the request arrived but the
+      answer didn't. It is common on mobile networks and is where duplicate charges come from.
+    followUp: |
+      The app uses certificate pinning, so your proxy can't see its traffic. How do you still run cases 2
+      and 3?
+
+  - id: interview-type-url
+    type: interview
+    concept: request-journey
+    skill: application
+    title: "Interview: what happens when you type a URL?"
+    prompt: |
+      *"What happens when you type `https://shop.example.com` into a browser and press Enter?"* Answer as
+      you would in the interview - and connect it to testing.
+    hints:
+      - Go in order - name, connection, security, request, response, page.
+      - Mention caching and what can fail at each step.
+    modelAnswer: |
+      The browser parses the URL and checks its cache. If it needs the network, it resolves the host name
+      with DNS - browser, OS and resolver caches first, honouring the record's TTL. It opens a TCP
+      connection to port 443 with the three-way handshake (or QUIC for HTTP/3), then does a TLS handshake:
+      the server presents a certificate, the browser checks issuer, dates and host name, and they agree on
+      keys - one round trip in TLS 1.3.
+
+      Then it sends `GET /` over HTTP/2 or HTTP/1.1. The request may pass a CDN, a load balancer and a
+      gateway before the application builds the response, often with database calls. The response comes
+      back with a status, headers and HTML. The browser parses the HTML into the DOM, fetches CSS, scripts
+      and images - reusing the connection - runs the scripts, lays out and paints the page.
+
+      As a tester I care because each step fails differently: DNS errors, refused or timed-out
+      connections, certificate errors, gateway 502/504s, application errors, and client-side script
+      errors. Knowing the layer tells me what evidence to collect and who should fix it.
+    rubric:
+      - Gave the steps in the right order (URL, cache, DNS, TCP, TLS, HTTP, server, response, render)
+      - Mentioned caching (DNS TTL or browser cache)
+      - Described what TLS checks in the certificate
+      - Mentioned intermediaries such as CDN, load balancer or gateway
+      - Described the browser's work after the response (DOM, further requests, render)
+      - Connected each step to a way it can fail and how a tester would notice
+    followUps:
+      - The site loads on Wi-Fi but not on mobile data. Where do you start?
+      - What changes with HTTP/3?
+      - Why is the second page faster than the first?
+    solution: |
+      Interviewers ask this to see whether you can go **beyond the browser** and connect each step to a
+      failure you could diagnose. The testing angle at the end is what makes the answer stand out.
+
+  - id: gateway-502-504
+    type: mcq
+    concept: failure-points-by-layer
+    skill: analysis
+    title: 502 or 504?
+    prompt: |
+      During a load test, some checkout requests return **`504 Gateway Timeout`** after exactly 30 seconds;
+      the application's logs show those requests finishing successfully after 34 to 40 seconds. What is
+      happening?
+    options:
+      - id: app-crash
+        text: The application is crashing under load.
+        feedback: The application logs show the requests finishing successfully - it isn't crashing, it is slow.
+      - id: gateway-limit
+        text: The gateway gives up after its 30-second limit, while the application keeps working and finishes later.
+        feedback: Correct - 504 means a gateway didn't get a timely response from upstream. The fixed 30 s is the gateway's timeout; the application completes afterwards.
+      - id: client
+        text: The load-test tool has a 30-second timeout.
+        feedback: Then the tool would report its own timeout, not receive an HTTP 504 response. A 504 status was sent by a server - the gateway.
+      - id: bad-gateway
+        text: The application returns invalid responses, which is what 504 means.
+        feedback: An invalid response from upstream is 502 Bad Gateway. 504 is about time.
+    correct: [gateway-limit]
+    hints:
+      - Who sends a 504 - the application or something in front of it?
+      - Why exactly 30 seconds every time?
+    solution: |
+      **The gateway times out at 30 s; the application finishes later.** This is also dangerous for
+      payments: the client sees an error, but the order **was** created - an unknown outcome. Report the
+      slowness of the application, the mismatch between the timeouts, and the duplicate-order risk if
+      clients retry.
+    followUp: |
+      Write the title of the defect report for this, and list the evidence you would attach.
+
+  - id: explain-old-versions
+    type: short
+    concept: web-and-mobile-clients
+    skill: recall
+    title: Why old app versions matter
+    prompt: In two or three sentences, explain why API testing must consider old versions of a mobile app, but usually not old versions of a website.
+    hints:
+      - Who decides when a phone's app gets updated? Who decides when a website's code changes?
+    modelAnswer: |
+      A website's front end is downloaded from the server on every visit, so users get the new version as
+      soon as it is deployed. A native app is installed on the device and users update it when they choose
+      (or never), so old versions keep calling the API for months. A change that breaks an old version's
+      requests or responses breaks those users.
+    rubric:
+      - Said website code comes from the server on each load
+      - Said installed apps are updated by users and old versions stay in use
+      - Said API changes must stay compatible or force an update
+    solution: |
+      This is why APIs are versioned and why many apps have a **minimum supported version** with a
+      forced-update screen - both worth testing.
+
+placement:
+  - id: place-layer
+    type: mcq
+    concept: failure-points-by-layer
+    skill: application
+    title: Read the error
+    prompt: |
+      An automated test fails with `curl: (6) Could not resolve host: api.payments-staging.example.com`.
+      Where is the problem?
+    options:
+      - id: dns
+        text: The host name couldn't be resolved - DNS, or a typo in the name
+        feedback: Correct - curl's exit code 6 means name resolution failed, before any connection was attempted.
+      - id: server-down
+        text: The API server is down
+        feedback: A down server would make the connection fail (refused or timeout). Here curl never got an address to connect to.
+      - id: cert
+        text: The TLS certificate is invalid
+        feedback: TLS needs a connection first. Name resolution failed before that.
+      - id: auth
+        text: The API key is wrong
+        feedback: Authentication is checked by the server after it receives the request. No request was sent.
+    correct: [dns]
+    solution: |
+      **DNS (or a typo).** Check the exact name, whether the record exists (`nslookup`), and whether the
+      test machine uses the right DNS resolver - staging names often exist only on an internal resolver.
+
+  - id: place-journey
+    type: mcq
+    concept: request-journey
+    skill: application
+    title: What the TLS handshake checks
+    prompt: During the TLS handshake for `https://pay.shop.example.com`, which check does the client make on the server's certificate?
+    options:
+      - id: name-dates-issuer
+        text: That it is issued by a trusted authority, is within its validity dates, and covers the host name pay.shop.example.com
+        feedback: Correct - issuer trust, validity dates (by the client's clock) and host name match are the core checks.
+      - id: ip
+        text: That the certificate contains the server's IP address
+        feedback: Web certificates are checked against the host name in the URL, not the IP address the name resolved to.
+      - id: http-status
+        text: That the server returns 200 OK
+        feedback: The HTTP status comes later, inside the encrypted connection, after TLS has succeeded.
+      - id: dns-ttl
+        text: That the DNS record has not expired
+        feedback: DNS TTLs control caching of the name lookup, which happened before the connection. TLS doesn't check them.
+    correct: [name-dates-issuer]
+    solution: |
+      **Trusted issuer, valid dates, matching host name.** That is why a wrong device clock or a
+      certificate for another name both break HTTPS while the server itself is fine.
+
+  - id: place-clients
+    type: mcq
+    concept: web-and-mobile-clients
+    skill: analysis
+    title: Why can't you see the app's traffic?
+    prompt: |
+      You set up a debugging proxy and install its certificate on an Android 14 phone. The browser's traffic
+      appears in the proxy, but the shop's **release** app shows network errors as soon as the proxy is on.
+      What is the most likely reason?
+    options:
+      - id: user-ca
+        text: The app doesn't trust user-installed certificates (the default for apps targeting Android 7.0+), or it pins its certificate.
+        feedback: Correct - since API level 24, apps don't trust user-added CAs by default; a debug build can opt in through its network security configuration. Pinning has the same effect.
+      - id: proxy-down
+        text: The proxy is not running.
+        feedback: The browser's traffic goes through it, so the proxy works. The app is refusing it.
+      - id: app-down
+        text: The shop's API is down.
+        feedback: Then the app would fail without the proxy too. The errors start only when the proxy is on.
+      - id: http
+        text: The app uses plain HTTP, which proxies can't see.
+        feedback: Plain HTTP is the easiest traffic for a proxy to see. Errors when intercepting point to certificate trust.
+    correct: [user-ca]
+    solution: |
+      **Certificate trust.** Apps targeting Android 7.0 (API 24) and later ignore user-installed CAs unless
+      their network security configuration allows them - typically only in debug builds. Ask for a debug
+      build that trusts user certificates, rather than trying to break the release app.
+
+recall:
+  - id: recall-order
+    concept: request-journey
+    prompt: In what order do DNS, TCP, TLS and HTTP happen for an HTTPS request?
+    answer: DNS lookup, then the TCP handshake (or QUIC for HTTP/3), then the TLS handshake, then the HTTP request and response.
+  - id: recall-dns-cache
+    concept: request-journey
+    prompt: Why can a DNS change take a while to reach all users?
+    answer: DNS answers are cached by browsers, operating systems and resolvers for the record's TTL, so old answers stay in use until they expire.
+  - id: recall-refused-timeout
+    concept: failure-points-by-layer
+    prompt: What is the difference between a refused connection and a connection timeout?
+    answer: Refused comes back at once - the host answered but nothing listens on that port. Timeout means no answer at all, usually a firewall, routing or network problem.
+  - id: recall-502-504
+    concept: failure-points-by-layer
+    prompt: What do 502 and 504 usually tell you, and who sent them?
+    answer: A gateway or proxy sent them - 502 when the upstream response was invalid, 504 when the upstream didn't answer in time. The application behind it may still be running.
+  - id: recall-ttfb
+    concept: failure-points-by-layer
+    prompt: What does a long "Waiting (TTFB)" with short connection times point to?
+    answer: The server side - the time to produce the response, including database and downstream calls.
+  - id: recall-app-traffic
+    concept: web-and-mobile-clients
+    prompt: Why might a proxy not see a release Android app's HTTPS traffic?
+    answer: Apps targeting Android 7.0 (API 24) and later don't trust user-installed CA certificates by default, and some apps pin their certificate.
+
+next:
+  - browser-devtools-for-testers
+  - http-request-response-anatomy

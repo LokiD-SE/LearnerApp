@@ -80,10 +80,23 @@ which also holds the Appium exercises - no device needed), `practice/maven` (bro
 fictional shop built to be awkward to automate, published with the app at `shop/`. See
 [practice/README.md](practice/README.md).
 
+**The Foundation course is complete** - eight lessons and a **Testing foundations** learning path, built
+from the ISTQB Foundation Level syllabus v4.0.1, ISO/IEC/IEEE 29119, the RFCs, MDN, the Chrome DevTools
+documentation, Pro Git and Andreas Zeller's work on systematic debugging (each lesson lists its sources):
+
+1. Equivalence partitioning, boundaries and decision tables
+2. State transition testing
+3. Defect reports that get fixed
+4. Risk-based testing
+5. From a click to a response - the client-server request flow
+6. Browser DevTools for testers
+7. Git for testers and automation engineers
+8. Scientific debugging - hypotheses, evidence and isolation
+
 **Interview practice** (`#/interview`) covers every path and track: six company profiles, 14 round types and
 about 100 interview questions, alongside the exercises of the chosen course.
 
-The other 39 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+The other 31 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
 
 ## Requirements
@@ -189,7 +202,7 @@ Interview questions go in `content/interviews/questions/*.yaml` and company prof
 
 ## Known limitations
 
-- **28 complete lessons.** The other 39 are planned entries on the map.
+- **36 complete lessons.** The other 31 are planned entries on the map.
 - **Free-text answers are self-assessed** against a model answer and rubric. They are not auto-graded, and
   the mastery model gives them slightly less weight (see [docs/MASTERY_MODEL.md](docs/MASTERY_MODEL.md)).
 - **Progress is per browser.** Use export/import to move it; there is no sync.
