@@ -94,13 +94,18 @@ export function HomePage({ index }: { index: ContentIndex }) {
         <section class="card">
           <h2>Weak areas</h2>
           {weak.length > 0 ? (
-            <ul>
-              {weak.map((row) => (
-                <li key={row.conceptId}>
-                  <a href={href.lesson(row.lesson.id)}>{row.name}</a>
-                </li>
-              ))}
-            </ul>
+            <>
+              <ul>
+                {weak.map((row) => (
+                  <li key={row.conceptId}>
+                    <a href={href.lesson(row.lesson.id)}>{row.name}</a>
+                  </li>
+                ))}
+              </ul>
+              <a class="button secondary" href={href.practice()}>
+                Practise weak areas
+              </a>
+            </>
           ) : (
             <p class="muted">None yet. Concepts you are still practising will show up here.</p>
           )}

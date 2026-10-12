@@ -6,6 +6,7 @@ import { HomePage } from './pages/HomePage';
 import { LearnPage } from './pages/LearnPage';
 import { LessonPage } from './pages/LessonPage';
 import { PlacementPage } from './pages/PlacementPage';
+import { PracticePage } from './pages/PracticePage';
 import { ProgressPage } from './pages/ProgressPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { SearchPage } from './pages/SearchPage';
@@ -88,6 +89,7 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
               </span>
             ) : null,
           )}
+          {navLink('practice', href.practice(), 'Practice')}
           {navLink('progress', href.progress(), 'Progress')}
           {navLink('search', href.search(), 'Search')}
         </nav>
@@ -120,13 +122,15 @@ function Page({ route, index }: { route: Route; index: Extract<ValidationResult,
     case 'learn':
       return <LearnPage index={index} subject={route.subject} stage={route.stage} />;
     case 'lesson':
-      return <LessonPage key={route.id} index={index} id={route.id} />;
+      return <LessonPage key={route.id} index={index} id={route.id} focus={route.focus} />;
     case 'review':
       return <ReviewPage index={index} />;
     case 'progress':
       return <ProgressPage index={index} />;
     case 'search':
       return <SearchPage index={index} query={route.query} />;
+    case 'practice':
+      return <PracticePage key={route.lesson ?? 'all'} index={index} lessonId={route.lesson} />;
     case 'placement':
       return (
         <PlacementPage key={`${route.kind}/${route.id}`} index={index} kind={route.kind} id={route.id} />

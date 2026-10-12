@@ -29,7 +29,7 @@ const AttemptSchema = z.object({
   hintsUsed: z.number().int().min(0),
   selfAssessed: z.boolean(),
   firstTry: z.boolean(),
-  mode: z.enum(['lesson', 'review']),
+  mode: z.enum(['lesson', 'review', 'practice']),
   at: IsoDate,
   response: z.string().max(MAX_RESPONSE_CHARS).optional(),
 });
@@ -239,7 +239,7 @@ export interface AttemptInput {
   hintsUsed: number;
   selfAssessed: boolean;
   firstTry: boolean;
-  mode: 'lesson' | 'review';
+  mode: 'lesson' | 'review' | 'practice';
   response?: string;
 }
 

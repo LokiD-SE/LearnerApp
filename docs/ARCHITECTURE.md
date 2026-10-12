@@ -20,7 +20,8 @@ content/*.yaml ──(Vite plugin: YAML → JS, validate all)──► src/conte
                                                               │
 src/domain (pure: grading, mastery, srs) ◄────────────────────┤
                                                               ▼
-src/store (state.ts pure updates → ProgressContext → localStorage via storage.ts; selectors.ts derived views)
+src/store (state.ts pure updates → ProgressContext → localStorage via storage.ts; selectors.ts derived views;
+           adaptive.ts remediation and practice sessions)
                                                               │
 src/ui (router, Markdown/Mermaid, components, pages) ◄────────┘
 ```

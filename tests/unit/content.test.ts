@@ -101,6 +101,16 @@ describe('every published lesson', () => {
           expect(new Set(feedback).size, `${question.id} reuses feedback text`).toBe(feedback.length);
         }
       });
+      it('says which sections teach each concept, so wrong answers can point back to them', () => {
+        for (const concept of lesson.concepts) {
+          expect(
+            lesson.sections.some(
+              (section) => section.kind !== 'summary' && section.concepts.includes(concept.id),
+            ),
+            `no section teaches concept '${concept.id}'`,
+          ).toBe(true);
+        }
+      });
       it('has enough recall cards for spaced review', () => {
         expect(lesson.recall.length).toBeGreaterThanOrEqual(4);
       });

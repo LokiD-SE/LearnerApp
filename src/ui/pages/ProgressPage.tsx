@@ -189,7 +189,7 @@ export function ProgressPage({ index }: { index: ContentIndex }) {
                       <td>{percent(attempt.credit)}</td>
                       <td class="small">
                         {[
-                          attempt.mode === 'review' ? 'review' : 'lesson',
+                          attempt.mode,
                           attempt.firstTry ? 'first try' : 'retry',
                           attempt.selfAssessed ? 'self-assessed' : 'auto-graded',
                           attempt.hintsUsed ? `${attempt.hintsUsed} hint(s)` : '',

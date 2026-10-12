@@ -12,6 +12,9 @@ spaced repetition and a mastery model that weighs practical work over multiple c
   API. Progress is stored in your browser.
 - **Skip what you already know.** A placement test per learning path (and "Test out" on each lesson) marks
   lessons you can already show you know as _tested out_; their recall cards still come back for review.
+- **Practice that adapts.** A wrong answer points back to the sections that teach the concept and a similar
+  exercise. The Practice page builds interleaved sessions from what you have studied, weakest concepts first,
+  and says why each item was chosen.
 - **Desktop and mobile.** Responsive layout, touch-sized controls and pinch-zoom allowed everywhere. Diagrams
   have a full-size toggle.
 

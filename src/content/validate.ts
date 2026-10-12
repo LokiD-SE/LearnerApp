@@ -145,7 +145,13 @@ export function validateContent(
       if (ids.has(id)) errors.push(`lesson '${lesson.id}': duplicate id '${id}' (${kind})`);
       ids.add(id);
     };
-    lesson.sections.forEach((section) => unique('section', section.id));
+    for (const section of lesson.sections) {
+      unique('section', section.id);
+      for (const concept of section.concepts) {
+        if (!concepts.has(concept))
+          errors.push(`lesson '${lesson.id}' section '${section.id}': unknown concept '${concept}'`);
+      }
+    }
 
     const checked = [
       ...lesson.exercises.map((exercise) => ({ exercise, kind: 'exercise' })),

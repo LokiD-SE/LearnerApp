@@ -31,9 +31,10 @@ import {
 } from '../../store/state';
 import { SkillBadge, formatDate, percent } from './Badges';
 import { Markdown } from './Markdown';
+import { Remediation } from './Remediation';
 import { highlight } from '../markdown';
 
-type Mode = 'lesson' | 'review';
+type Mode = 'lesson' | 'review' | 'practice';
 
 interface Feedback {
   score: number;
@@ -79,7 +80,7 @@ export function ExerciseCard(props: {
   // solution carried over, so the next first try is honest evidence of what is remembered.
   useEffect(() => {
     const previous = exerciseOf(state, key);
-    if ((previous.attempts > 0 || mode === 'review') && (previous.hintsShown > 0 || previous.solutionShown)) {
+    if ((previous.attempts > 0 || mode !== 'lesson') && (previous.hintsShown > 0 || previous.solutionShown)) {
       update((s) => startNewEncounter(s, key));
     }
     // Runs when the exercise changes (on mount), not on every progress update.
@@ -211,6 +212,9 @@ export function ExerciseCard(props: {
               <span class="feedback-score">Score {percent(feedback.score)}</span>
             </p>
             {feedback.details}
+            {feedback.verdict !== 'correct' && (
+              <Remediation lesson={lesson} exercise={exercise} inLesson={mode === 'lesson'} />
+            )}
           </div>
         )}
       </div>

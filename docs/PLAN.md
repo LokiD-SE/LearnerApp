@@ -48,12 +48,17 @@ Goal: learners skip what they can already show they know (prompt section 14).
 - [x] Unit tests (rules, status precedence, path progress, routing, loading older saved progress), content
       rules (placement per concept), end-to-end tests of the path test, the lesson test-out and empty states.
 
+## Increment 4 - adaptive practice (done)
+
+- [x] "To fix this" after wrong answers: sections teaching the concept and a similar exercise.
+- [x] Sections declare the concepts they teach (validated; every concept has a teaching section).
+- [x] Practice page: adaptive, interleaved sessions across studied lessons or one lesson, with reasons.
+- [x] Practice answers count as retention evidence after 24 hours; unit and end-to-end tests.
+
 ## Next increments
 
 Each increment ends with `npm run check` green.
 
-4. **Adaptive practice.** After a wrong answer, recommend the remediation section and a sibling exercise on the
-   same concept. Add cumulative quizzes that interleave across lessons.
 5. **Java track (E) with runnable code.** A companion Maven project (`practice/java/`) with JUnit exercises the
    learner runs locally: write the code, the tests verify it. The app links each exercise to its test class.
 6. **Selenium/Appium and framework tracks (F, G).** A small reference framework against a local mock shop with

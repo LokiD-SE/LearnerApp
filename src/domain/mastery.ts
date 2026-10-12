@@ -36,7 +36,7 @@ export interface Evidence {
   /** score after the hint penalty, 0..1 */
   credit: number;
   selfAssessed: boolean;
-  mode: 'lesson' | 'review';
+  mode: 'lesson' | 'review' | 'practice';
   at: string;
   /** Retries straight after feedback are practice, not evidence. */
   firstTry: boolean;
@@ -86,7 +86,8 @@ export function conceptMastery(items: readonly ConceptItem[], evidence: readonly
   const firstAt = firstTries.length ? Math.min(...firstTries.map((e) => Date.parse(e.at))) : NaN;
   const retained = firstTries.some(
     (e) =>
-      e.mode === 'review' && e.credit >= PROFICIENT_SCORE && Date.parse(e.at) - firstAt >= RETENTION_GAP_MS,
+      // A later review or practice answer (not the lesson itself) shows retention.
+      e.mode !== 'lesson' && e.credit >= PROFICIENT_SCORE && Date.parse(e.at) - firstAt >= RETENTION_GAP_MS,
   );
 
   let level: MasteryLevel = 'not-started';

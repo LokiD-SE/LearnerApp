@@ -54,6 +54,10 @@ Use each kind when it helps the concept - not mechanically.
 | `tradeoffs`    | limitations, trade-offs and alternatives                                                  |
 | `summary`      | quick-reference bullets                                                                   |
 
+Each section lists the lesson `concepts` it teaches (`concepts: [idempotency-key-contract]`). After a wrong
+answer the app points the learner to the sections that teach that concept most specifically, so tag only
+what a section really explains. Every concept needs at least one section other than `summary`.
+
 Objectives, practice (exercises), interview questions and "test yourself" (recall) are rendered from their own
 fields, so the template is complete without separate sections for them.
 

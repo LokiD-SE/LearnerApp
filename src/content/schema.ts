@@ -48,6 +48,8 @@ export const SectionSchema = z.strictObject({
   body: Markdown,
   /** Long worked examples can start collapsed so the lesson stays scannable. */
   collapsed: z.boolean().default(false),
+  /** Concepts this section teaches - used to point a learner back here after a wrong answer. */
+  concepts: z.array(Id).default([]),
 });
 
 const ExerciseBase = {

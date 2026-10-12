@@ -95,7 +95,19 @@ mastery, so it has its own rules (`recordPlacement` in `src/store/state.ts`):
   those reviews _are_ evidence.
 - A retake replaces the earlier result; "Study it anyway" on the lesson removes it.
 
-## 7. Known simplifications (candidates to revisit)
+## 7. Adaptive practice
+
+- **After a wrong or partly right answer** a "To fix this" box links to the sections that teach the concept
+  most specifically (sections declare `concepts`) and to a similar exercise on the same concept (untried first,
+  otherwise the weakest last result). Code: `remediationFor` in `src/store/adaptive.ts`.
+- **Practice sessions** (`#/practice`, or one lesson) are built from lessons the learner has engaged with:
+  recognition-only or weak concepts first (with practical items first), untried concepts next, proficient ones
+  last; mastered concepts and items answered in the last 10 minutes are skipped; items are interleaved across
+  concepts. Each item states why it was chosen. Code: `buildPracticeSession`.
+- Practice answers are first tries in a new sitting, so they are evidence. A practice or review answer of 0.8 or
+  more at least 24 hours after the first evidence counts as **retention** (mode `practice` or `review`).
+
+## 8. Known simplifications (candidates to revisit)
 
 - Box intervals are fixed. An SM-2/FSRS-style per-item ease factor would adapt better, but needs more data.
 - Self-assessment trusts the learner. The rubric makes it concrete; honesty still matters.

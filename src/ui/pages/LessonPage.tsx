@@ -15,6 +15,7 @@ import { LevelBadge, MasteryBadge, StatusBadge, formatDate, percent } from '../c
 import { ExerciseCard } from '../components/ExerciseCard';
 import { Markdown } from '../components/Markdown';
 import { RecallCardView } from '../components/RecallCard';
+import { focusElement } from '../focus';
 import { href } from '../router';
 
 const KIND_LABEL: Record<SectionKind, string> = {
@@ -34,12 +35,20 @@ const KIND_LABEL: Record<SectionKind, string> = {
   summary: 'Summary',
 };
 
-export function LessonPage({ index, id }: { index: ContentIndex; id: string }) {
+export function LessonPage({
+  index,
+  id,
+  focus,
+}: {
+  index: ContentIndex;
+  id: string;
+  focus?: string | undefined;
+}) {
   const lesson = index.lessons.get(id);
   const ref = index.refs.get(id);
   if (!ref) return <LessonNotFound id={id} />;
   if (!lesson) return <PlannedLesson index={index} id={id} />;
-  return <PublishedLesson index={index} lesson={lesson} />;
+  return <PublishedLesson index={index} lesson={lesson} focus={focus} />;
 }
 
 function LessonNotFound({ id }: { id: string }) {
@@ -84,7 +93,15 @@ function PlannedLesson({ index, id }: { index: ContentIndex; id: string }) {
   );
 }
 
-function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesson }) {
+function PublishedLesson({
+  index,
+  lesson,
+  focus,
+}: {
+  index: ContentIndex;
+  lesson: Lesson;
+  focus?: string | undefined;
+}) {
   const { state, update } = useProgress();
   const ref = index.refs.get(lesson.id)!;
   const subject = index.subjects.get(ref.subjectId);
@@ -98,7 +115,7 @@ function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesso
   useEffect(() => {
     update((s, now) => visitLesson(s, lesson.id, now));
     setNotesText(state.lessons[lesson.id]?.notes ?? '');
-    window.scrollTo(0, 0);
+    if (!focus) window.scrollTo(0, 0);
     // Runs once per lesson opened.
   }, [lesson.id]);
   useEffect(() => () => clearTimeout(notesTimer.current), []);
@@ -109,8 +126,14 @@ function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesso
     notesTimer.current = setTimeout(() => update((s) => setNotes(s, lesson.id, value)), 400);
   };
 
-  const jump = (target: string) =>
-    document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  // Arriving with ?focus=section-x or exercise-y (from a "To fix this" link elsewhere).
+  useEffect(() => {
+    if (!focus) return;
+    const timer = window.setTimeout(() => focusElement(focus), 80);
+    return () => window.clearTimeout(timer);
+  }, [focus]);
+
+  const jump = (target: string) => focusElement(target);
 
   return (
     <article class="page lesson" aria-labelledby="lesson-title">
@@ -226,6 +249,10 @@ function PublishedLesson({ index, lesson }: { index: ContentIndex; lesson: Lesso
                 );
               })}
             </ul>
+            <p class="small">
+              <a href={href.practice(lesson.id)}>Practise this lesson</a> - exercises picked by what you need
+              most.
+            </p>
           </section>
         </aside>
 
