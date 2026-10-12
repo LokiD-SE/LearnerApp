@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ProgressProvider } from '../../src/store/ProgressContext';
 import { STORAGE_KEY, parseProgress } from '../../src/store/storage';
@@ -126,5 +126,47 @@ describe('ExerciseCard - self-assessed answers', () => {
     await waitFor(() => expect(saved()?.attempts).toHaveLength(1));
     expect(saved()!.attempts[0]).toMatchObject({ score: 0.5, selfAssessed: true });
     expect(saved()!.attempts[0]!.response).toMatch(/outcome is unknown/);
+  });
+});
+
+describe('ExerciseCard - coding exercises', () => {
+  it('shows where to run the exercise, then compares with the reference solution', async () => {
+    const index = realIndex();
+    const javaLesson = index.lessons.get('java-equals-hashcode')!;
+    const coding = javaLesson.exercises.find((e) => e.id === 'implement-money-equality')!;
+    const store = memoryStore();
+    render(
+      <ProgressProvider store={store} now={fixedNow}>
+        <ExerciseCard
+          lesson={javaLesson}
+          exercise={coding}
+          mode="lesson"
+          practice={index.curriculum.practice}
+        />
+      </ProgressProvider>,
+    );
+
+    expect(screen.getByText('Coding - runs on your computer')).toBeTruthy();
+    const panel = screen.getByRole('region', { name: 'Run it on your computer' });
+    const fileLink = within(panel).getByRole('link', {
+      name: 'src/exercises/java/learnerapp/equality/Money.java',
+    });
+    expect(fileLink.getAttribute('href')).toBe(
+      'https://github.com/LokiD-SE/LearnerApp/blob/main/practice/java/src/exercises/java/learnerapp/equality/Money.java',
+    );
+    expect(fileLink.getAttribute('rel')).toContain('noopener');
+    expect(panel.textContent).toContain('mvn test -Dtest=MoneyTest');
+    expect(within(panel).getByText('First time? Get the project and run it')).toBeTruthy();
+
+    fireEvent.input(screen.getByLabelText('Your result'), {
+      target: {
+        value: 'Tests run: 8, Failures: 0, Errors: 0, Skipped: 0 - after adding equals and hashCode',
+      },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Compare with the reference solution' }));
+    expect(await screen.findByText('Reference solution')).toBeTruthy();
+    fireEvent.click(screen.getAllByRole('checkbox')[0]!);
+    fireEvent.click(screen.getByRole('button', { name: 'Save my self-assessment' }));
+    expect(await screen.findByText(/You covered 1 of 4 rubric points/)).toBeTruthy();
   });
 });

@@ -143,6 +143,7 @@ function PracticeSession({
           lesson={item.lesson}
           exercise={item.exercise}
           mode="practice"
+          practice={index.curriculum.practice}
           onRecorded={(credit) => {
             setResults((r) => [...r, credit]);
             setAnswered(true);

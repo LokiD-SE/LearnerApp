@@ -104,9 +104,10 @@ test('a failed lesson test-out recommends studying the lesson', async ({ page })
   await expect(page.getByText(/Test out \(3 questions\) - last result 0 of 3/)).toBeVisible();
 });
 
-test('unknown placement targets and empty states', async ({ page }) => {
+// The "no placement questions yet" state is a component test: every real path now has questions.
+test('unknown placement targets', async ({ page }) => {
   await page.goto('./#/placement/path/no-such-path');
   await expect(page.getByRole('heading', { level: 1, name: 'Placement test not found' })).toBeVisible();
-  await page.goto('./#/placement/path/automation-engineer');
-  await expect(page.getByText('There are no placement questions for this path yet.')).toBeVisible();
+  await page.goto('./#/placement/lesson/no-such-lesson');
+  await expect(page.getByRole('heading', { level: 1, name: 'Placement test not found' })).toBeVisible();
 });

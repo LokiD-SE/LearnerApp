@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { contentResult } from '../../src/content';
 import { validateContent } from '../../src/content/validate';
@@ -122,6 +124,47 @@ describe('every published lesson', () => {
   }
 });
 
+/* ------------------------------------------------------------------ coding exercises */
+
+describe('every coding exercise', () => {
+  if (!contentResult.ok) throw new Error('invalid content');
+  const { lessons, practiceProjects } = contentResult.index;
+  const coding = [...lessons.values()].flatMap((lesson) =>
+    lesson.exercises.flatMap((exercise) => (exercise.type === 'coding' ? [{ lesson, exercise }] : [])),
+  );
+
+  for (const { lesson, exercise } of coding) {
+    describe(`${lesson.id} / ${exercise.id}`, () => {
+      const project = practiceProjects.get(exercise.project)!;
+      const inProject = (file: string) => join(process.cwd(), project.path, file);
+
+      it('names files that exist in the practice project, each with a reference solution', () => {
+        for (const file of exercise.files) {
+          expect(existsSync(inProject(file)), `${project.path}/${file} is missing`).toBe(true);
+          if (file.startsWith('src/exercises/')) {
+            const solution = file.replace(/^src\/exercises\//, 'src/solutions/');
+            expect(existsSync(inProject(solution)), `${project.path}/${solution} is missing`).toBe(true);
+          }
+        }
+      });
+      it('names an exercise test class, and a command that runs it', () => {
+        expect(existsSync(inProject(exercise.test)), `${project.path}/${exercise.test} is missing`).toBe(
+          true,
+        );
+        expect(readFileSync(inProject(exercise.test), 'utf8')).toContain('@Tag("exercise")');
+        const testClass = exercise.test
+          .split('/')
+          .pop()!
+          .replace(/\.java$/, '');
+        expect(exercise.command).toContain(testClass);
+      });
+      it('asks first whether the tests pass', () => {
+        expect(exercise.rubric[0]).toMatch(/pass/i);
+      });
+    });
+  }
+});
+
 /* ------------------------------------------------------------------ validator */
 
 const curriculum = (lessons: object[] = [{ id: 'l1' }]) => ({
@@ -233,6 +276,47 @@ describe('validateContent', () => {
         'content/lessons/sub/l1.yaml': lesson({ exercises: [recognitionOnly] }),
       }).join(),
     ).toMatch(/concept 'c1' has no application or analysis exercise/);
+  });
+
+  it('requires coding exercises to name a known practice project', () => {
+    const coding = {
+      id: 'c1x',
+      type: 'coding',
+      concept: 'c1',
+      skill: 'application',
+      title: 'Code it',
+      prompt: 'P',
+      solution: 'S',
+      modelAnswer: 'M',
+      rubric: ['The tests pass', 'Other'],
+      project: 'nope',
+      files: ['src/exercises/java/A.java'],
+      test: 'src/test/java/ATest.java',
+      command: 'mvn test -Dtest=ATest',
+    };
+    const withPractice = {
+      ...curriculum(),
+      practice: {
+        repository: 'https://example.com/repo',
+        branch: 'main',
+        projects: [{ id: 'java', title: 'J', path: 'practice/java', summary: 'S', setup: 'S' }],
+      },
+    };
+    expect(
+      errorsOf(withPractice, { 'content/lessons/sub/l1.yaml': lesson({ exercises: [coding] }) }).join(),
+    ).toMatch(/unknown practice project 'nope'/);
+    expect(
+      errorsOf(withPractice, {
+        'content/lessons/sub/l1.yaml': lesson({ exercises: [{ ...coding, project: 'java' }] }),
+      }),
+    ).toEqual([]);
+    expect(
+      errorsOf(withPractice, {
+        'content/lessons/sub/l1.yaml': lesson({
+          exercises: [{ ...coding, project: 'java', files: ['../outside.java'] }],
+        }),
+      }).join(),
+    ).toMatch(/files\.0/);
   });
 
   it('needs a title and level for planned lessons, and rejects lessons outside the curriculum', () => {

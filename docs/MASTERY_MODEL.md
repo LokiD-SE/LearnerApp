@@ -9,12 +9,13 @@ Change the code and this document together.
 
 Every answer is an **attempt**, with a raw score from 0 to 1:
 
-| Exercise type                        | Graded by                         | Raw score                                               |
-| ------------------------------------ | --------------------------------- | ------------------------------------------------------- |
-| Multiple choice / "pick the lines"   | the app                           | (right picks - wrong picks) / right answers, at least 0 |
-| Put in order                         | the app                           | share of items in the correct position                  |
-| Short answer, test design, interview | **the learner**, against a rubric | share of rubric points the learner ticks                |
-| Recall card                          | **the learner**                   | Didn't know it = 0, Partly = 0.6, Knew it = 1           |
+| Exercise type                           | Graded by                                                               | Raw score                                               |
+| --------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------- |
+| Multiple choice / "pick the lines"      | the app                                                                 | (right picks - wrong picks) / right answers, at least 0 |
+| Put in order                            | the app                                                                 | share of items in the correct position                  |
+| Short answer, test design, interview    | **the learner**, against a rubric                                       | share of rubric points the learner ticks                |
+| Coding (runs on the learner's computer) | **the learner**, against a rubric whose first point is "the tests pass" | share of rubric points the learner ticks                |
+| Recall card                             | **the learner**                                                         | Didn't know it = 0, Partly = 0.6, Knew it = 1           |
 
 **Hints cost credit.** Each hint taken before the first answer removes 15% of its credit, up to 45%. With
 three hints, a perfect answer earns 0.55.

@@ -306,7 +306,13 @@ function PublishedLesson({
                 first answer in each sitting is what counts towards mastery.
               </p>
               {lesson.exercises.map((exercise) => (
-                <ExerciseCard key={exercise.id} lesson={lesson} exercise={exercise} mode="lesson" />
+                <ExerciseCard
+                  key={exercise.id}
+                  lesson={lesson}
+                  exercise={exercise}
+                  mode="lesson"
+                  practice={index.curriculum.practice}
+                />
               ))}
             </section>
           )}

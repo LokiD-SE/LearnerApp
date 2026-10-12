@@ -6,7 +6,14 @@
  * content test, and at runtime to build the index the UI reads.
  */
 import { CurriculumSchema, LessonSchema, isRubricExercise } from './schema.ts';
-import type { Curriculum, CurriculumModule, CurriculumSubject, Lesson, Level } from './schema.ts';
+import type {
+  Curriculum,
+  CurriculumModule,
+  CurriculumSubject,
+  Lesson,
+  Level,
+  PracticeProject,
+} from './schema.ts';
 
 export interface LessonRef {
   id: string;
@@ -29,6 +36,8 @@ export interface ContentIndex {
   modules: Map<string, CurriculumModule & { subjectId: string }>;
   /** concept id -> lesson id that teaches it */
   conceptLesson: Map<string, string>;
+  /** practice projects that coding exercises run in, by id */
+  practiceProjects: Map<string, PracticeProject>;
 }
 
 export type ValidationResult = { ok: true; index: ContentIndex } | { ok: false; errors: string[] };
@@ -61,6 +70,13 @@ export function validateContent(
       errors.push(`${file}: file name must be ${expectedName} (the lesson id)`);
     if (lessons.has(lesson.id)) errors.push(`${file}: duplicate lesson id '${lesson.id}'`);
     lessons.set(lesson.id, lesson);
+  }
+
+  const practiceProjects = new Map<string, PracticeProject>();
+  for (const project of curriculum.practice?.projects ?? []) {
+    if (practiceProjects.has(project.id))
+      errors.push(`curriculum: duplicate practice project id '${project.id}'`);
+    practiceProjects.set(project.id, project);
   }
 
   const stageIds = new Set(curriculum.stages.map((s) => s.id));
@@ -181,6 +197,9 @@ export function validateContent(
             errors.push(`${where}: line ${line} is past the end of the code (${lineCount} lines)`);
         }
       }
+      if (exercise.type === 'coding' && !practiceProjects.has(exercise.project)) {
+        errors.push(`${where}: unknown practice project '${exercise.project}'`);
+      }
       if (isRubricExercise(exercise) && new Set(exercise.rubric).size !== exercise.rubric.length) {
         errors.push(`${where}: duplicate rubric items`);
       }
@@ -227,5 +246,8 @@ export function validateContent(
   for (const id of lessons.keys()) visit(id, []);
 
   if (errors.length) return { ok: false, errors };
-  return { ok: true, index: { curriculum, lessons, refs, subjects, modules, conceptLesson } };
+  return {
+    ok: true,
+    index: { curriculum, lessons, refs, subjects, modules, conceptLesson, practiceProjects },
+  };
 }

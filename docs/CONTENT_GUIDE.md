@@ -73,14 +73,15 @@ All exercises have `id`, `type`, `concept`, `skill`, `title`, `prompt`, `hints` 
 nearly the answer), `solution` (worked, with reasoning), an optional `followUp` (a similar problem: transfer
 practice), and `required` (default true).
 
-| type         | Extra fields                                                                                    | Graded        |
-| ------------ | ----------------------------------------------------------------------------------------------- | ------------- |
-| `mcq`        | `options[]` (`id`, `text`, `feedback` - explain the misconception for wrong ones), `correct[]`  | auto          |
-| `order`      | `items[]` in the **correct** order (the app shuffles)                                           | auto          |
-| `debug`      | `language`, `code`, `correctLines[]` (1-based), optional `lineNotes[]` for tempting wrong lines | auto          |
-| `short`      | `modelAnswer`, `rubric[]`                                                                       | self-assessed |
-| `testdesign` | `modelAnswer`, `rubric[]` - ask for preconditions, steps, expected result **and evidence**      | self-assessed |
-| `interview`  | `modelAnswer`, `rubric[]`, `followUps[]` - the follow-ups an interviewer would ask              | self-assessed |
+| type         | Extra fields                                                                                            | Graded        |
+| ------------ | ------------------------------------------------------------------------------------------------------- | ------------- |
+| `mcq`        | `options[]` (`id`, `text`, `feedback` - explain the misconception for wrong ones), `correct[]`          | auto          |
+| `order`      | `items[]` in the **correct** order (the app shuffles)                                                   | auto          |
+| `debug`      | `language`, `code`, `correctLines[]` (1-based), optional `lineNotes[]` for tempting wrong lines         | auto          |
+| `short`      | `modelAnswer`, `rubric[]`                                                                               | self-assessed |
+| `testdesign` | `modelAnswer`, `rubric[]` - ask for preconditions, steps, expected result **and evidence**              | self-assessed |
+| `interview`  | `modelAnswer`, `rubric[]`, `followUps[]` - the follow-ups an interviewer would ask                      | self-assessed |
+| `coding`     | `modelAnswer` (the reference solution), `rubric[]`, `project`, `files[]`, `test`, `command` - see below | self-assessed |
 
 `skill` is `recognition`, `recall`, `application` or `analysis`; see [MASTERY_MODEL.md](MASTERY_MODEL.md).
 
@@ -90,6 +91,27 @@ Good exercises:
 - Hints guide reasoning; they don't give the answer away until the last one.
 - Scenario questions give **evidence** (logs, ids, timings), and the solution explains how to **confirm** the
   root cause before acting - not only which option is right.
+
+## Coding exercises and practice projects
+
+A `coding` exercise is code the learner writes and runs on their own computer, in a **practice project** in
+this repository. Projects are registered under `practice:` in `content/curriculum.yaml` (id, folder, setup
+instructions); the app links to their files on GitHub.
+
+- `project` - the practice project's id, for example `java`.
+- `files` - what the learner changes, relative to the project folder. By convention exercises live in
+  `src/exercises/java` and the reference solution of each file in the same place under `src/solutions/java`.
+- `test` - the test class that checks the work. It must be tagged `@Tag("exercise")`.
+- `command` - the command that runs that test, from the project folder (`mvn test -Dtest=MoneyTest`).
+- `rubric` - the **first** point is "every test in X passes"; the others are what the tests cannot see
+  (no `double`, the right fields, an explanation).
+- `modelAnswer` - the key part of the reference solution, with the reasoning.
+
+The app can't run the code, so coding exercises are self-assessed. The rest is checked automatically: a
+content test fails if a named file, solution or test class is missing, and `practice/verify.sh <project>`
+(run in CI) checks that the reference solutions pass every test and that every exercise test class fails
+against the unsolved exercise. Write the exercise, its tests and its solution together, and run
+`practice/verify.sh` before committing.
 
 ## Placement questions
 
@@ -105,6 +127,8 @@ Good exercises:
   with headers (`` `Content-Type: application/json` ``) and JSON snippets. Use `"..."`, or `'...'` when the
   text contains double quotes.
 - The same applies to list items such as hints and rubric points.
+- Ids such as `null`, `true` and `false` are YAML values, not strings - the validator reports "expected
+  string". Use descriptive ids (`prints-null`, `same-object`).
 - Long Markdown belongs in a block scalar (`body: |`), where colons are safe.
 - `npm run validate:content` names the file and field for schema errors, and `npm run dev` / `build` name the
   file for YAML syntax errors.

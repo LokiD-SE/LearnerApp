@@ -55,12 +55,28 @@ Goal: learners skip what they can already show they know (prompt section 14).
 - [x] Practice page: adaptive, interleaved sessions across studied lessons or one lesson, with reasons.
 - [x] Practice answers count as retention evidence after 24 hours; unit and end-to-end tests.
 
+## Increment 5 - Java track with runnable code (first slice done)
+
+Goal: Java practice that is judged by real tests, not by multiple choice.
+
+- [x] New exercise type `coding`: the lesson names a practice project, the files to change, the test class and
+      the command; links go to the files on GitHub; self-assessed against a rubric whose first point is "the
+      tests pass" (documented in the mastery model and content guide).
+- [x] `practice/java`: Maven, Java 17+, JUnit 6. Exercises in `src/exercises/java`, reference solutions in
+      `src/solutions/java` (`-Psolutions`), exercise test classes tagged `@Tag("exercise")`.
+- [x] `practice/verify.sh`: reference solutions pass every test, every exercise test class fails against the
+      unsolved exercise; runs in CI (`practice` job), and the deployment waits for it.
+- [x] Content test: every file, solution and test class a coding exercise names exists.
+- [x] Lessons: **Primitive and reference types** (`==` vs `equals`, the `Integer` cache, money types; coding
+      exercises `PaymentChecks`, `MinorUnits`) and **equals, hashCode and HashMap** (coding exercises `Money`,
+      `Payment`).
+- [ ] Remaining Track E lessons: strings and StringBuilder, OOP pillars, exceptions, choosing collections,
+      streams and lambdas, concurrency basics - each with at least one coding exercise.
+
 ## Next increments
 
-Each increment ends with `npm run check` green.
+Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).
 
-5. **Java track (E) with runnable code.** A companion Maven project (`practice/java/`) with JUnit exercises the
-   learner runs locally: write the code, the tests verify it. The app links each exercise to its test class.
 6. **Selenium/Appium and framework tracks (F, G).** A small reference framework against a local mock shop with
    simulated payment outcomes - added component by component, each justified by a test that needed it.
 7. **Offline install (PWA).** A service worker and manifest so the app installs on a phone and works offline

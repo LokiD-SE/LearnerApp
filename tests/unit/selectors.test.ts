@@ -49,9 +49,25 @@ describe('pathProgress', () => {
   });
 
   it('reports no next lesson for a path whose lessons are all planned', () => {
+    const planned = [...index.refs.values()].filter((ref) => ref.planned).map((ref) => ref.id);
+    const plannedPath = {
+      id: 'planned',
+      title: 'P',
+      level: 'beginner' as const,
+      summary: 'S',
+      lessons: planned,
+    };
+    const progress = pathProgress(index, emptyState(), plannedPath);
+    expect(progress).toMatchObject({ total: planned.length, ready: 0 });
+    expect(progress.next).toBeUndefined();
+  });
+
+  it('skips planned lessons when suggesting the next one', () => {
     const automation = index.curriculum.paths.find((p) => p.id === 'automation-engineer')!;
     const progress = pathProgress(index, emptyState(), automation);
-    expect(progress.ready).toBe(0);
-    expect(progress.next).toBeUndefined();
+    expect(progress.ready).toBeGreaterThan(0);
+    expect(progress.ready).toBeLessThan(progress.total);
+    expect(progress.next?.planned).toBe(false);
+    expect(progress.next?.id).toBe('java-types-and-variables');
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isRubricExercise } from '../../src/content/schema';
 import { RECENT_MS, buildPracticeSession, remediationFor } from '../../src/store/adaptive';
 import { masteryOf } from '../../src/store/selectors';
 import {
@@ -36,7 +37,7 @@ function answer(
       skill: ex ? ex.skill : 'recall',
       score,
       hintsUsed: 0,
-      selfAssessed: !ex || ['short', 'testdesign', 'interview'].includes(ex.type),
+      selfAssessed: !ex || isRubricExercise(ex),
       firstTry: true,
       mode: 'lesson',
       ...extra,

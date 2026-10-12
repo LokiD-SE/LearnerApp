@@ -68,7 +68,13 @@ export function ReviewPage({ index }: { index: ContentIndex }) {
       <progress max={session.length} value={position} aria-label="Review progress" />
       <div key={item.key} class="review-item">
         {item.kind === 'exercise' ? (
-          <ExerciseCard lesson={item.lesson} exercise={item.exercise} mode="review" onRecorded={onRecorded} />
+          <ExerciseCard
+            lesson={item.lesson}
+            exercise={item.exercise}
+            mode="review"
+            practice={index.curriculum.practice}
+            onRecorded={onRecorded}
+          />
         ) : (
           <RecallCardView lesson={item.lesson} card={item.card} mode="review" onRecorded={onRecorded} />
         )}

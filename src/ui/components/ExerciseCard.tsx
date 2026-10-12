@@ -15,6 +15,7 @@ import type {
   Lesson,
   McqExercise,
   OrderExercise,
+  Practice,
   RubricExercise,
 } from '../../content/schema';
 import { isRubricExercise } from '../../content/schema';
@@ -30,6 +31,7 @@ import {
   startNewEncounter,
 } from '../../store/state';
 import { SkillBadge, formatDate, percent } from './Badges';
+import { LocalRun } from './LocalRun';
 import { Markdown } from './Markdown';
 import { Remediation } from './Remediation';
 import { highlight } from '../markdown';
@@ -55,6 +57,7 @@ const TYPE_LABEL: Record<Exercise['type'], string> = {
   short: 'Short answer',
   testdesign: 'Test design',
   interview: 'Interview question',
+  coding: 'Coding - runs on your computer',
 };
 
 const verdictOf = (score: number): Feedback['verdict'] =>
@@ -64,9 +67,11 @@ export function ExerciseCard(props: {
   lesson: Lesson;
   exercise: Exercise;
   mode: Mode;
+  /** Practice projects from the curriculum, for coding exercises. */
+  practice?: Practice;
   onRecorded?: (credit: number) => void;
 }) {
-  const { lesson, exercise, mode, onRecorded } = props;
+  const { lesson, exercise, mode, practice, onRecorded } = props;
   const { state, update } = useProgress();
   const key = itemKey(lesson.id, exercise.id);
   const stored = exerciseOf(state, key);
@@ -176,6 +181,7 @@ export function ExerciseCard(props: {
         {isRubricExercise(exercise) && (
           <RubricBody
             exercise={exercise}
+            practice={practice}
             idPrefix={key}
             draft={stored.draft ?? ''}
             onDraft={(text) => update((s) => saveDraft(s, key, text))}
@@ -541,8 +547,23 @@ export function DebugBody(props: {
 
 const MIN_ANSWER_CHARS = 20;
 
+const ANSWER_LABEL: Record<RubricExercise['type'], string> = {
+  short: 'Your answer',
+  testdesign: 'Your answer',
+  interview: 'Your answer',
+  coding: 'Your result',
+};
+
+const ANSWER_PLACEHOLDER: Record<RubricExercise['type'], string> = {
+  short: 'Write your answer before you compare it',
+  testdesign: 'Precondition / steps / expected result / evidence, one case per paragraph',
+  interview: 'Write your answer before you compare it',
+  coding: 'Paste the test summary (the "Tests run: ..." line) and note anything that surprised you',
+};
+
 function RubricBody(props: {
   exercise: RubricExercise;
+  practice?: Practice;
   idPrefix: string;
   draft: string;
   onDraft: (text: string) => void;
@@ -568,8 +589,9 @@ function RubricBody(props: {
 
   return (
     <div class="rubric-exercise">
+      {exercise.type === 'coding' && <LocalRun exercise={exercise} practice={props.practice} />}
       <label for={answerId} class="field-label">
-        Your answer
+        {ANSWER_LABEL[exercise.type]}
       </label>
       <textarea
         id={answerId}
@@ -577,11 +599,7 @@ function RubricBody(props: {
         value={text}
         readOnly={revealed}
         onInput={(event) => onInput((event.target as HTMLTextAreaElement).value)}
-        placeholder={
-          exercise.type === 'testdesign'
-            ? 'Precondition / steps / expected result / evidence, one case per paragraph'
-            : 'Write your answer before you compare it'
-        }
+        placeholder={ANSWER_PLACEHOLDER[exercise.type]}
       />
       {!revealed && (
         <div class="row">
@@ -596,7 +614,9 @@ function RubricBody(props: {
               onReveal();
             }}
           >
-            Compare with the model answer
+            {exercise.type === 'coding'
+              ? 'Compare with the reference solution'
+              : 'Compare with the model answer'}
           </button>
           {tooShort && <span class="hint-text">Write at least a couple of sentences first.</span>}
         </div>
@@ -604,7 +624,7 @@ function RubricBody(props: {
 
       {revealed && (
         <div class="model-answer">
-          <h4>Model answer</h4>
+          <h4>{exercise.type === 'coding' ? 'Reference solution' : 'Model answer'}</h4>
           <Markdown source={exercise.modelAnswer} />
           {exercise.type === 'interview' && exercise.followUps.length > 0 && (
             <>

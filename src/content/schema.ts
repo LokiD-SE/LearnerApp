@@ -40,6 +40,10 @@ export const Id = z
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'ids are lower-case kebab-case (letters, digits, single hyphens)');
 const Markdown = z.string().trim().min(1);
 const Text = z.string().trim().min(1);
+/** A path inside a practice project: relative, forward slashes, never leaving the folder. */
+const RelativePath = z
+  .string()
+  .regex(/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[\w./-]+$/, 'a relative path inside the project, without ..');
 
 export const SectionSchema = z.strictObject({
   id: Id,
@@ -124,6 +128,25 @@ export const InterviewSchema = z.strictObject({
   followUps: z.array(Markdown).default([]),
 });
 
+/**
+ * Code the learner writes and runs on their own computer, in a practice project from the
+ * repository (`practice:` in curriculum.yaml). The project's tests check the code; the app
+ * cannot run them, so the learner self-assesses against the rubric, starting with "the tests pass".
+ */
+export const CodingSchema = z.strictObject({
+  ...ExerciseBase,
+  ...RubricFields,
+  type: z.literal('coding'),
+  /** Id of a practice project in curriculum.yaml. */
+  project: Id,
+  /** Files the learner changes, relative to the project folder. */
+  files: z.array(RelativePath).min(1),
+  /** The tests that check the work, relative to the project folder. */
+  test: RelativePath,
+  /** The command that runs those tests, from the project folder. */
+  command: Text,
+});
+
 export const ExerciseSchema = z.discriminatedUnion('type', [
   McqSchema,
   OrderSchema,
@@ -131,6 +154,7 @@ export const ExerciseSchema = z.discriminatedUnion('type', [
   ShortAnswerSchema,
   TestDesignSchema,
   InterviewSchema,
+  CodingSchema,
 ]);
 
 /**
@@ -213,6 +237,26 @@ export const CurriculumSchema = z.strictObject({
       }),
     )
     .default([]),
+  /** Practice projects in the repository that coding exercises run in. */
+  practice: z
+    .strictObject({
+      repository: z.url({ protocol: /^https$/ }),
+      branch: Text,
+      projects: z
+        .array(
+          z.strictObject({
+            id: Id,
+            title: Text,
+            /** Folder in the repository, for example practice/java. */
+            path: RelativePath,
+            summary: Text,
+            /** How to get and run the project the first time. */
+            setup: Markdown,
+          }),
+        )
+        .min(1),
+    })
+    .optional(),
 });
 
 export type Section = z.infer<typeof SectionSchema>;
@@ -220,8 +264,12 @@ export type Exercise = z.infer<typeof ExerciseSchema>;
 export type McqExercise = z.infer<typeof McqSchema>;
 export type OrderExercise = z.infer<typeof OrderSchema>;
 export type DebugExercise = z.infer<typeof DebugSchema>;
+export type CodingExercise = z.infer<typeof CodingSchema>;
 export type RubricExercise =
-  z.infer<typeof ShortAnswerSchema> | z.infer<typeof TestDesignSchema> | z.infer<typeof InterviewSchema>;
+  | z.infer<typeof ShortAnswerSchema>
+  | z.infer<typeof TestDesignSchema>
+  | z.infer<typeof InterviewSchema>
+  | CodingExercise;
 export type PlacementQuestion = z.infer<typeof PlacementQuestionSchema>;
 export type RecallCard = z.infer<typeof RecallCardSchema>;
 export type Concept = z.infer<typeof ConceptSchema>;
@@ -231,6 +279,11 @@ export type CurriculumSubject = Curriculum['subjects'][number];
 export type CurriculumModule = CurriculumSubject['modules'][number];
 export type Stage = Curriculum['stages'][number];
 export type LearningPath = Curriculum['paths'][number];
+export type Practice = NonNullable<Curriculum['practice']>;
+export type PracticeProject = Practice['projects'][number];
 
 export const isRubricExercise = (exercise: Exercise): exercise is RubricExercise =>
-  exercise.type === 'short' || exercise.type === 'testdesign' || exercise.type === 'interview';
+  exercise.type === 'short' ||
+  exercise.type === 'testdesign' ||
+  exercise.type === 'interview' ||
+  exercise.type === 'coding';

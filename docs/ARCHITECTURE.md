@@ -27,6 +27,9 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
 ```
 
 - **Content never contains UI** and the UI hard-codes no content. A new lesson is a new YAML file.
+- **Practice projects** (`practice/`) are separate builds (Maven for Java) that the app only links to. Coding
+  exercises name a project from `practice:` in the curriculum; a content test checks the named files exist,
+  and `practice/verify.sh` checks the reference solutions pass and the unsolved exercises fail.
 - **All progress changes are pure functions** in `src/store/state.ts`: `(state, input, now) → state`. The
   Preact context only holds the state and saves it after each change. That makes the rules testable without a
   browser and keeps time injectable (tests and Playwright fix the clock).

@@ -15,6 +15,9 @@ spaced repetition and a mastery model that weighs practical work over multiple c
 - **Practice that adapts.** A wrong answer points back to the sections that teach the concept and a similar
   exercise. The Practice page builds interleaved sessions from what you have studied, weakest concepts first,
   and says why each item was chosen.
+- **Code you run yourself.** Coding exercises name a file in a practice project in this repository
+  (`practice/`), the test class that checks it and the command to run. The tests are the judge; reference
+  solutions are next to the exercises.
 - **Desktop and mobile.** Responsive layout, touch-sized controls and pinch-zoom allowed everywhere. Diagrams
   have a full-size toggle.
 
@@ -41,6 +44,7 @@ deferred.
   [nvm](https://github.com/nvm-sh/nvm) run `nvm install` once, then `nvm use` in each new shell.
 - npm 10+ (bundled with Node).
 - For the end-to-end tests: Google Chrome, or Playwright's own Chromium (see below).
+- For the practice projects only: a **JDK 17+** and **Maven 3.8+** - see [practice/README.md](practice/README.md).
 
 ## Quick start
 
