@@ -36,8 +36,8 @@ describe('searchContent', () => {
     expect(searchContent(index, 'fingerprint').map((h) => h.lessonId)).toContain('idempotency-keys');
   });
   it('finds planned lessons by title', () => {
-    const hits = searchContent(index, 'reconciliation');
-    expect(hits.find((h) => h.lessonId === 'reconciliation-for-testers')?.planned).toBe(true);
+    const hits = searchContent(index, 'capstone');
+    expect(hits.find((h) => h.lessonId === 'e2e-payment-capstone')?.planned).toBe(true);
   });
   it('requires every word and ignores one-letter noise', () => {
     expect(searchContent(index, 'idempotency zebra')).toEqual([]);

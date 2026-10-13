@@ -1,0 +1,594 @@
+id: payment-api-negative-matrix
+title: A negative-test matrix for a payment API
+subject: api-testing
+module: payment-api-testing
+level: intermediate
+status: published
+estimatedMinutes: 55
+summary: Build a systematic set of negative tests for a payment API - invalid input, credentials and permissions, wrong state, idempotency conflicts, limits and failing dependencies - with one fault per test, an expected error and proof that nothing was half-done.
+tags: [api, payments, negative testing, test matrix, validation, idempotency, state, fault injection, owasp api top 10, error handling]
+
+environment: |
+  - **Standards and guidance:** status codes and error semantics from **RFC 9110** and **RFC 6585** (429); error bodies in
+    **RFC 9457** Problem Details; security cases from the **OWASP API Security Top 10 - 2023**
+    ([owasp.org/API-Security](https://owasp.org/API-Security/)), notably API1 (object-level authorization), API3
+    (property-level authorization, mass assignment), API4 (unrestricted resource consumption) and API6 (unrestricted access
+    to sensitive business flows). Idempotency-key conflicts follow the IETF HTTPAPI Internet-Draft *The Idempotency-Key HTTP
+    Header Field* - a draft; check its status and your API's documentation.
+  - **Technique:** equivalence partitioning, boundary values and decision tables from the
+    [test design techniques](#/lesson/test-design-techniques) lesson; risk-based selection from
+    [risk-based testing](#/lesson/risk-based-testing).
+  - **API-specific:** every expected status and error type below is SandPay's (fictional) documented behaviour. Real APIs
+    differ - your oracle is their documentation.
+
+prerequisites:
+  - status-codes-and-errors
+  - authentication-and-authorization
+  - idempotency-keys
+
+concepts:
+  - id: negative-test-dimensions
+    name: Dimensions of negative tests
+    summary: Faults come from the input, the caller, the resource's state, the request's history, the volume, and the dependencies - each dimension has its own partitions and expected errors.
+  - id: negative-matrix-design
+    name: Designing the negative matrix
+    summary: List each endpoint's faults per dimension, change one thing per test from a valid request, write the expected status, error type and side effects, then prioritise by risk.
+  - id: safe-failure
+    name: Failing safely
+    summary: A rejected or failed payment request must leave no partial state, charge nothing twice, leak nothing, and tell the client whether retrying can help.
+
+objectives:
+  - Enumerate negative cases for a payment endpoint across input, caller, state, history, volume and dependency dimensions.
+  - Build a negative-test matrix with one fault per row, expected status, error type and side effects.
+  - Verify that failures are safe - atomic, idempotent, non-leaking and correctly retryable.
+  - Prioritise the matrix by risk so the most damaging failures are tested first and automated.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [negative-test-dimensions]
+    title: The idea in plain language
+    body: |
+      A bank teller is tested not only by customers who fill in the form correctly. The real test is the customer who writes
+      the amount in words and digits differently, signs with the wrong name, asks to withdraw from an account that's frozen,
+      comes back twice with the same slip, or arrives when the computer system is down.
+
+      A good teller has an answer for each: refuse clearly, change nothing, and say whether coming back later will help.
+
+      A payment API needs the same discipline. Happy-path tests prove it can take money; **negative tests prove it can't take
+      the wrong money, twice, from the wrong account, in the wrong state, or halfway**. A matrix makes sure every kind of
+      wrong is tried, one at a time.
+
+  - id: what
+    kind: what
+    concepts: [negative-test-dimensions]
+    title: What the dimensions are
+    body: |
+      | Dimension | Question | Examples for `POST /v1/payments` |
+      |---|---|---|
+      | **Input** | is the request well-formed and valid? | malformed JSON, missing `amount`, `amount` as string, below minimum, above maximum, unknown currency, too many decimals for the currency, unknown fields |
+      | **Caller** | who is asking, may they? | no key, expired key, test key on live, key without the payments scope, another merchant's customer or payment method |
+      | **State** | does the resource allow this now? | capture a voided payment, refund an authorised-only one, use a deleted payment method |
+      | **History** | has this request (or a conflicting one) been seen? | same idempotency key with the same body, same key with a different body, two concurrent requests with one key |
+      | **Volume** | how much, how often? | rate limit exceeded, huge `metadata`, a list of 10,000 items, very long strings |
+      | **Dependency** | what if something behind the API fails? | PSP timeout, PSP 5xx, database unavailable, webhook endpoint down |
+
+      Each cell has an **expected status**, an **error type** (RFC 9457 `type`) and **expected side effects** - usually
+      "none".
+
+  - id: why
+    kind: why
+    concepts: [safe-failure]
+    title: Why negative tests matter most in payments
+    body: |
+      - **The damage is in the failures.** A failed refund that was half-recorded, a timeout that charged anyway, a validation
+        error that still created an order - these cost money and trust, while a successful payment rarely does.
+      - **Attackers live in the negative space.** OWASP's API Top 10 is a list of negative cases: other customers' objects,
+        fields that shouldn't be writable, endless requests, abused business flows (for example card testing with thousands of
+        tiny payments - API6).
+      - **Clients depend on correct errors.** A `500` where a `422` belongs triggers retries; a `422` where a `503` belongs makes
+        clients give up on a payment that would have worked (see [status codes and errors](#/lesson/status-codes-and-errors)).
+      - **Happy-path suites hide gaps.** Most automated API suites are 80 % positive cases. The matrix makes the missing 80 % of
+        cases visible - and sortable by risk.
+
+  - id: internals
+    kind: internals
+    concepts: [safe-failure]
+    title: What "failing safely" means, precisely
+    body: |
+      For every negative test, assert four things - not only the status code:
+
+      1. **Correct signal.** The documented status and `type`, `Content-Type: application/problem+json`, and the right
+         retryability: 4xx for "change the request", 429/503 for "try later" (with `Retry-After` where documented).
+      2. **No side effects.** Nothing created, captured, refunded, emailed or reserved; counts and balances unchanged; no
+         webhook sent for something that didn't happen.
+      3. **No leaks.** No stack traces, SQL, internal host names, other merchants' data, full card data or secrets in the body
+         or headers.
+      4. **Atomicity across systems.** If the failure happened **after** part of the work - for example the PSP charged but the
+         database write failed - the system ends in a consistent state: compensated (voided or refunded), or marked for
+         reconciliation, never "charged, no record".
+
+      Dependency failures need extra care: a **timeout** from the PSP doesn't mean "not charged". The API must treat the
+      outcome as **unknown** and resolve it (see [declines, timeouts and unknown outcomes](#/lesson/declines-timeouts-unknown-outcomes)),
+      not report "failed" and let the client pay again.
+
+  - id: visual
+    kind: visual
+    concepts: [negative-matrix-design]
+    title: "Flowchart: from endpoint to prioritised negative tests"
+    body: |
+      ```mermaid
+      flowchart TD
+          A[Pick an endpoint and a valid baseline request] --> B[For each dimension list the faults]
+          B --> C[Partition and add boundaries for each input field]
+          C --> D[One fault per row - change only one thing from the baseline]
+          D --> E[Write expected status, error type and side effects]
+          E --> F[Rate each row - likelihood and impact]
+          F --> G[Automate the high-risk rows first]
+          G --> H[Run with assertions for signal, side effects, leaks and atomicity]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [negative-matrix-design]
+    title: Step by step - building the matrix
+    body: |
+      1. **Start from a valid baseline request** that you know succeeds - every negative row is "the baseline with one change".
+      2. **Input dimension:** for each field, use the OpenAPI schema (see
+         [schema and contract validation](#/lesson/schema-and-contract-validation)): missing, null, wrong type, empty, below
+         and above the boundaries, wrong format, values not in the enum; plus malformed JSON, wrong content type, unknown fields.
+      3. **Caller dimension:** no credentials, invalid, expired, wrong environment, insufficient scope, another tenant's
+         referenced objects (customer, payment method).
+      4. **State dimension:** use the payment's state table (see [state transition testing](#/lesson/state-transition-testing)) -
+         every operation in every state where it isn't allowed.
+      5. **History dimension:** idempotency key reused with the same body (replay), with a different body (conflict), and
+         concurrently.
+      6. **Volume and abuse:** above the rate limit, oversized fields, many tiny payments from one source (card testing).
+      7. **Dependencies:** in a test environment with fault injection, make the PSP time out, return 5xx, return an
+         unexpected body; make the database or queue unavailable.
+      8. **Write the expectations** per row, **rate the risk**, and automate from the top.
+
+  - id: example
+    kind: example
+    concepts: [negative-matrix-design, negative-test-dimensions]
+    title: "Real-world example: an excerpt of the matrix"
+    body: |
+      For `POST /v1/payments` (SandPay's documented behaviour; baseline: 2500 EUR, valid customer and payment method):
+
+      | # | Dimension | Change from baseline | Expected status | Error `type` (suffix) | Side effects | Risk |
+      |---|---|---|---|---|---|---|
+      | 1 | input | `amount` missing | 422 | `validation` (pointer `#/amount`) | none | M |
+      | 2 | input | `amount` = 49 (minimum 50) | 422 | `validation` | none | M |
+      | 3 | input | `amount` = `"2500"` | 422 | `validation` | none | M |
+      | 4 | input | `currency` = `JPY`, `amount` = 1500 (valid for JPY) | 201 | - | payment created | - (control) |
+      | 5 | input | unknown field `"status": "captured"` | 422 | `unknown-field` | none - status not settable (OWASP API3) | H |
+      | 6 | caller | payment method of another customer | 404 | `not-found` | none (OWASP API1) | H |
+      | 7 | caller | key without `payments:write` | 403 | `insufficient-scope` | none | M |
+      | 8 | history | same idempotency key, same body | 201 (replayed) | - | **one** payment | H |
+      | 9 | history | same key, different amount | 422 | `idempotency-key-reused` | none | H |
+      | 10 | history | same key, two requests in parallel | one 201, one 409 or replay | `request-in-progress` | **one** payment | H |
+      | 11 | volume | 300 payments of 0.50 EUR in a minute from one customer | 429 or blocked by risk rules | `rate-limited` | further payments refused (OWASP API6) | H |
+      | 12 | dependency | PSP times out | 202 or a payment in an unknown/processing status | - | outcome resolved later, never "failed" | H |
+      | 13 | dependency | PSP returns 500 | 502 or 503 | `upstream-error` | no payment recorded as succeeded | M |
+
+      Row 4 is a **control**: a valid case near the faults proves the API still accepts what it should - an over-strict
+      validator is a defect too.
+
+  - id: code
+    kind: code
+    concepts: [safe-failure, negative-matrix-design]
+    title: A data-driven negative test with side-effect checks
+    collapsed: true
+    body: |
+      Illustrative Playwright API test in TypeScript; each matrix row is data, and every row asserts signal, side effects and
+      leaks:
+
+      ```typescript
+      import { test, expect } from '@playwright/test';
+
+      const baseline = { amount: 2500, currency: 'EUR', customer: 'cus_5Rf2', payment_method: 'pm_8Xc1' };
+
+      const rows = [
+        { name: 'amount missing', body: { ...baseline, amount: undefined }, status: 422, type: 'validation' },
+        { name: 'amount below minimum', body: { ...baseline, amount: 49 }, status: 422, type: 'validation' },
+        { name: 'amount as string', body: { ...baseline, amount: '2500' }, status: 422, type: 'validation' },
+        { name: 'status not settable', body: { ...baseline, status: 'captured' }, status: 422, type: 'unknown-field' },
+      ];
+
+      for (const row of rows) {
+        test(`POST /v1/payments rejects: ${row.name}`, async ({ request }) => {
+          const before = await countPayments(request);
+
+          const response = await request.post('/v1/payments', {
+            data: row.body,
+            headers: { 'Idempotency-Key': `neg-${row.name}-${Date.now()}` },
+          });
+
+          expect(response.status()).toBe(row.status);
+          expect(response.headers()['content-type']).toContain('application/problem+json');
+          const problem = await response.json();
+          expect(problem.type).toMatch(new RegExp(`/errors/${row.type}$`));
+          expect(JSON.stringify(problem)).not.toMatch(/Exception|at com\.|SELECT |stack/i);
+
+          expect(await countPayments(request)).toBe(before);   // no side effects
+        });
+      }
+      ```
+
+      `countPayments` is a helper that lists the test account's payments (paginated - see
+      [pagination](#/lesson/pagination-filtering-rate-limits)). The baseline is valid; each row changes one thing.
+
+  - id: tests
+    kind: tests
+    concepts: [safe-failure, negative-test-dimensions]
+    title: Negative cases for refunds and captures
+    body: |
+      The same method applied to `POST /v1/payments/{id}/capture` and `POST /v1/payments/{id}/refunds`:
+
+      | ID | Dimension | Case | Expected | Side effects asserted |
+      |---|---|---|---|---|
+      | C1 | state | capture a voided payment | 409 | status still voided |
+      | C2 | state | capture twice (new idempotency key) | 409 | one capture |
+      | C3 | input | capture amount above the authorised amount | 422 | nothing captured |
+      | R1 | state | refund an authorised-only payment | 409 (use void) | no refund |
+      | R2 | input | refund above the refundable balance | 422 | refunded total unchanged |
+      | R3 | history | two parallel refunds of 60.00 on 100.00 | one accepted | refunded = 60.00 |
+      | R4 | caller | refund another merchant's payment | 404 | their refunds unchanged |
+      | R5 | input | refund with currency different from the payment's | 422 | no refund |
+      | R6 | dependency | PSP refund call times out | refund pending, resolved later | no duplicate on retry |
+      | R7 | caller | read-only key | 403 | no refund |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [negative-matrix-design, safe-failure, negative-test-dimensions]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Several faults in one request.** The first one rejected hides the rest - one change per row.
+      - **Asserting only the status.** Assert the error type, the absence of side effects and of leaks.
+      - **No valid control cases.** Rejecting a valid JPY amount is as much a defect as accepting an invalid one.
+      - **Skipping state and history dimensions.** Input validation is the easy part; wrong-state operations and idempotency
+        conflicts cause the money defects.
+      - **Untested dependency failures.** "We can't make the PSP time out" - use the sandbox's delay methods, a fault-injecting
+        proxy or a mock.
+      - **Treating timeouts as failures.** The outcome is unknown; check the payment's real status before telling the client.
+      - **A matrix nobody prioritises.** Rate rows by risk; automate the high ones first, and keep the matrix next to the code.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Dimensions: **input, caller, state, history, volume, dependency**.
+      - Each row = **valid baseline + one change**, with expected **status, error type, side effects** - and a few valid
+        **control** rows.
+      - Fail safely: **correct signal, no side effects, no leaks, atomic across systems**; timeouts → **unknown**, not failed.
+      - Use the **schema** for input partitions, the **state table** for state faults, **idempotency** for history, **fault
+        injection** for dependencies, **OWASP API Top 10** for abuse.
+      - Prioritise by **risk**; automate the high-risk rows first.
+
+exercises:
+  - id: dimension-mcq
+    type: mcq
+    concept: negative-test-dimensions
+    skill: application
+    title: Which dimension is missing?
+    prompt: |
+      A team's negative tests for `POST /v1/payments/{id}/refunds` cover malformed JSON, missing amount, negative amount,
+      no API key and an expired key. Which important dimension is completely missing?
+    options:
+      - id: state
+        text: State - refunds on payments in states that don't allow them (authorised only, voided, fully refunded)
+        feedback: Correct - all their cases are input or caller faults; wrong-state operations are where money defects live.
+      - id: input
+        text: Input - more invalid amounts
+        feedback: Input is already the best-covered dimension here.
+      - id: caller
+        text: Caller - more key variations
+        feedback: Caller faults are partly covered (no key, expired); another merchant's payment is missing, but state is missing entirely.
+      - id: none
+        text: None - the list is complete
+        feedback: State, history (idempotency), volume and dependency faults are all absent.
+    correct: [state]
+    hints:
+      - Group their five cases by dimension.
+    solution: |
+      **State** (and history, volume and dependencies). Use the payment's state table: refund in every state where it isn't
+      allowed, and check nothing changes.
+    followUp: |
+      Add one row each for the history and dependency dimensions of the refund endpoint.
+
+  - id: one-fault
+    type: mcq
+    concept: negative-matrix-design
+    skill: analysis
+    title: The test that proves nothing
+    prompt: |
+      A negative test sends `{"amount": -5, "currency": "XYZ"}` with an expired API key and asserts `401`. It passes. What
+      does it prove?
+    options:
+      - id: auth-only
+        text: Only that expired keys are rejected - the invalid amount and currency are never validated, because authentication fails first
+        feedback: Correct - with three faults in one request, the first check to fail hides the others.
+      - id: all-three
+        text: That the API rejects negative amounts, unknown currencies and expired keys
+        feedback: The request never reached validation; the amount and currency checks weren't exercised.
+      - id: validation
+        text: That validation runs before authentication
+        feedback: A 401 suggests the opposite - authentication rejected it before anything else.
+      - id: nothing
+        text: Nothing at all
+        feedback: It does prove one thing - expired keys are refused - just not the other two.
+    correct: [auth-only]
+    hints:
+      - Which check runs first, and what happens to the request after it fails?
+    solution: |
+      **Only the expired key.** Split it into three rows, each from the valid baseline: expired key; amount -5 with a valid key;
+      currency XYZ with a valid key.
+    followUp: |
+      Write the three rows with their expected statuses and error types.
+
+  - id: debug-side-effect
+    type: debug
+    concept: safe-failure
+    skill: analysis
+    title: The error that still created an order
+    prompt: |
+      A request with an unsupported currency gets `422` - but an empty order appears in the merchant's dashboard. Click the line
+      that causes the side effect.
+    language: java
+    code: |
+      @PostMapping("/v1/payments")
+      ResponseEntity<?> create(@RequestBody PaymentRequest request, Merchant merchant) {
+          Order order = orders.create(merchant, request.reference());
+          if (!currencies.isSupported(request.currency())) {
+              return problem(422, "unsupported-currency", "Currency " + request.currency() + " is not supported");
+          }
+          if (request.amountMinor() < minimums.forCurrency(request.currency())) {
+              return problem(422, "validation", "amount below minimum");
+          }
+          Payment payment = psp.createPayment(order, request);
+          return ResponseEntity.status(201).body(PaymentView.of(payment));
+      }
+    correctLines: [3]
+    lineNotes:
+      - line: 4
+        note: Checking the currency is right - but by now the order already exists.
+      - line: 10
+        note: Creating the payment after validation is the right order.
+    hints:
+      - Which line changes state before the request has been validated?
+    solution: |
+      **Line 3.** The order is created before validation, so every rejected request leaves an empty order behind. Validate
+      first, then create - or create the order and payment in one transaction that rolls back on any error. The negative tests
+      should assert "order count unchanged" to catch it.
+    followUp: |
+      The PSP call on line 10 can time out after the order is saved. What state should the order end in, and how do you test it?
+
+  - id: matrix-design
+    type: testdesign
+    concept: negative-matrix-design
+    skill: application
+    title: Build the matrix for capture
+    prompt: |
+      Build a negative-test matrix for `POST /v1/payments/{id}/capture` (body: optional `amount` for partial capture). Cover all
+      six dimensions with at least ten rows, each with the change from a valid baseline, the expected status and error type, the
+      side effects you assert, and a risk rating. Include at least one valid control row.
+    hints:
+      - Baseline - an authorised 100.00 EUR payment of your own merchant, full capture.
+      - Which states don't allow capture? What about partial capture above the authorised amount?
+      - What does a timeout from the PSP mean here?
+    modelAnswer: |
+      Baseline: authorised payment of 100.00 EUR, own merchant, capture without amount → 200 captured.
+
+      | # | Dim. | Change | Expected | Side effects | Risk |
+      |---|---|---|---|---|---|
+      | 1 | input | amount = 100.01 | 422 validation | nothing captured | H |
+      | 2 | input | amount = 0 | 422 | nothing captured | M |
+      | 3 | input | amount = "50" | 422 | nothing captured | M |
+      | 4 | input (control) | amount = 60.00 (partial) | 200, captured 60.00 | remaining authorisation released or kept as documented | - |
+      | 5 | caller | another merchant's payment id | 404 | their payment unchanged | H |
+      | 6 | caller | key without capture scope | 403 insufficient-scope | unchanged | M |
+      | 7 | state | payment voided | 409 | still voided | H |
+      | 8 | state | payment already captured (new key) | 409 | one capture | H |
+      | 9 | state | authorisation expired | 409 authorization-expired | nothing captured | M |
+      | 10 | history | same idempotency key replayed | 200 replay | one capture | H |
+      | 11 | history | same key, different amount | 422 idempotency-key-reused | one capture at most | H |
+      | 12 | volume | 50 captures per second on one key | 429 with Retry-After | none beyond the limit | L |
+      | 13 | dependency | PSP times out | 202 or "processing", resolved later | never two captures on retry | H |
+      | 14 | dependency | PSP 500 | 502/503 | payment still authorised | M |
+
+      Every row also asserts Problem Details format and no leaks.
+    rubric:
+      - Covered all six dimensions
+      - One change from a valid baseline per row
+      - Included at least one valid control row
+      - Covered wrong states (voided, already captured, expired)
+      - Covered idempotency replay and conflict
+      - Treated a PSP timeout as an unknown outcome
+      - Named side effects to assert for every row
+      - Rated risk to prioritise
+    solution: |
+      Compare with the model answer. Rows 8, 10, 11 and 13 protect against capturing twice - automate them first.
+    followUp: |
+      How would you create the "authorisation expired" state in a sandbox without waiting days?
+
+  - id: order-negative-test
+    type: order
+    concept: safe-failure
+    skill: recall
+    title: The assertions of one negative test
+    prompt: Put the steps of a single, complete negative API test in order.
+    items:
+      - id: baseline
+        text: Start from a valid baseline request and record the current state (counts, balances)
+      - id: change
+        text: Change exactly one thing and send the request
+      - id: signal
+        text: Assert the status, Content-Type and error type
+      - id: leaks
+        text: Assert the body and headers leak nothing internal
+      - id: state
+        text: Assert the recorded state is unchanged (no side effects)
+    hints:
+      - You can't prove "unchanged" without recording the state before.
+    solution: |
+      Baseline and state before → one change → signal → no leaks → state unchanged. The before-state is what turns "no side
+      effects" into something you can assert.
+
+  - id: interview-negative
+    type: interview
+    concept: negative-test-dimensions
+    skill: application
+    title: "Interview: what negative tests would you write?"
+    prompt: |
+      *"Here's our create-payment endpoint. What negative tests would you write, and how do you decide which matter most?"*
+      Answer as you would in the interview.
+    hints:
+      - Name the dimensions, give examples of each, then explain prioritisation and assertions.
+    modelAnswer: |
+      I'd organise them by dimension. Input: missing, wrong type, empty, boundary and invalid values for each field from the
+      schema - amount below the minimum, too many decimals for the currency, unknown currency - plus malformed JSON, wrong
+      content type and unknown fields like status, which must not be settable. Caller: no key, expired, wrong environment,
+      missing scope, and other merchants' customers or payment methods. State: payment methods that are deleted or expired.
+      History: the same idempotency key replayed, reused with a different body, and sent twice in parallel. Volume and abuse:
+      rate limits and many tiny payments, which is how card testing looks. Dependencies: PSP timeouts and errors, database
+      unavailable.
+
+      Each test changes one thing from a valid baseline, and asserts more than the status: the error type, Problem Details
+      format, no leaked internals, and no side effects - no payment, order or email created. For dependency failures, the
+      important check is that a timeout isn't reported as "failed", because the customer may have been charged.
+
+      To prioritise, I'd rate each row by likelihood and impact. Anything that can charge twice, charge the wrong amount, or
+      expose another merchant's data goes first and gets automated; cosmetic validation messages come last.
+    rubric:
+      - Organised cases by dimension
+      - Gave input cases derived from the schema, including mass assignment
+      - Gave caller and cross-tenant cases
+      - Gave idempotency replay, conflict and concurrency cases
+      - Gave dependency failures with the unknown-outcome point
+      - Asserted side effects and leaks, not only status
+      - Prioritised by risk
+    followUps:
+      - How do you make the PSP time out in a test environment?
+      - What's a control case and why include it?
+      - How would you keep this matrix up to date as the API changes?
+    solution: |
+      The structure - **dimensions, one change, four assertions, risk order** - is what makes the answer memorable.
+
+  - id: explain-timeout
+    type: short
+    concept: safe-failure
+    skill: recall
+    title: A timeout is not a failure
+    prompt: In two or three sentences, explain why a payment API must not answer "payment failed" when its call to the PSP times out.
+    hints:
+      - Did the PSP receive the request?
+    modelAnswer: |
+      A timeout means the API didn't get an answer, not that the PSP didn't process the payment - the card may have been charged.
+      Answering "failed" invites the customer to pay again. The API should mark the outcome as unknown or processing, resolve it
+      by checking the PSP's status (or its webhook), and tell the client it is pending.
+    rubric:
+      - Said a timeout means no answer, not no charge
+      - Said "failed" leads to double payment
+      - Proposed an unknown or pending state resolved by a status check or webhook
+    solution: |
+      Test it with a sandbox delay method or a fault-injecting proxy, and check there is exactly one payment after the client retries.
+
+placement:
+  - id: place-dimension
+    type: mcq
+    concept: negative-test-dimensions
+    skill: application
+    title: Which dimension is this?
+    prompt: "A test sends `POST /v1/payments` twice with the same `Idempotency-Key` but a different `amount` the second time. Which dimension does it test?"
+    options:
+      - id: history
+        text: History - how the API treats a request it has seen before
+        feedback: Correct - idempotency conflicts depend on what came earlier with the same key.
+      - id: input
+        text: Input - the amount is invalid
+        feedback: Both amounts can be valid on their own; the fault is reusing the key with a different body.
+      - id: caller
+        text: Caller - the key is wrong
+        feedback: The idempotency key isn't a credential; the caller is the same and allowed.
+      - id: volume
+        text: Volume - too many requests
+        feedback: Two requests aren't a volume problem.
+    correct: [history]
+    solution: |
+      **History.** Expected: the second request is refused (for example 422 idempotency-key-reused) and only one payment exists.
+
+  - id: place-one-change
+    type: mcq
+    concept: negative-matrix-design
+    skill: application
+    title: Designing the row
+    prompt: Which is the best way to design a negative test for "amount below the minimum"?
+    options:
+      - id: baseline-one
+        text: Take a valid baseline request and change only the amount to minimum - 1
+        feedback: Correct - one change, so the expected error can only come from the amount.
+      - id: random
+        text: Send random invalid values in all fields at once
+        feedback: Fuzzing has its place, but this test can't tell which fault caused the error.
+      - id: negative
+        text: Use amount -1000000 to be sure it's invalid
+        feedback: Far from the boundary - it wouldn't catch a minimum check that's off by one.
+      - id: skip-auth
+        text: Leave out the API key so the request is quick
+        feedback: Then authentication fails first and the amount is never checked.
+    correct: [baseline-one]
+    solution: |
+      **Baseline + one change, at the boundary.** And a control row at exactly the minimum, which must succeed.
+
+  - id: place-safe
+    type: mcq
+    concept: safe-failure
+    skill: analysis
+    title: What else to assert
+    prompt: A negative test asserts `422` for an invalid currency and passes. What is the most important additional assertion?
+    options:
+      - id: no-side-effects
+        text: That nothing was created - no payment, order or reservation
+        feedback: Correct - a correct error that still leaves state behind is a failure in disguise.
+      - id: message-text
+        text: That the error message text matches exactly
+        feedback: Message text may change; the error type and side effects matter more.
+      - id: response-time
+        text: That the error came back in under 100 ms
+        feedback: Speed may matter, but correctness of state matters more for payments.
+      - id: header-order
+        text: That headers come in a fixed order
+        feedback: Header order isn't significant in HTTP.
+    correct: [no-side-effects]
+    solution: |
+      **No side effects** - record counts before, compare after. Plus error type and no leaks.
+
+recall:
+  - id: recall-dimensions
+    concept: negative-test-dimensions
+    prompt: Name the six dimensions of payment API negative tests.
+    answer: Input, caller, state, history, volume and dependency.
+  - id: recall-owasp-neg
+    concept: negative-test-dimensions
+    prompt: Which OWASP API Top 10 2023 risks map to negative test cases for a payments API?
+    answer: API1 object-level authorization, API3 property-level authorization (mass assignment), API4 unrestricted resource consumption and API6 unrestricted access to sensitive business flows such as card testing.
+  - id: recall-one-change
+    concept: negative-matrix-design
+    prompt: Why does each negative test change only one thing from a valid baseline?
+    answer: So the expected error can only come from that change - several faults let the first check hide the others.
+  - id: recall-control
+    concept: negative-matrix-design
+    prompt: What is a control row in a negative matrix?
+    answer: A valid case close to the faults - for example exactly the minimum amount - that must succeed, catching over-strict validation.
+  - id: recall-safe
+    concept: safe-failure
+    prompt: What four things does a safe failure need?
+    answer: The correct signal (status, type, retryability), no side effects, no leaks, and a consistent state across systems.
+  - id: recall-timeout-unknown
+    concept: safe-failure
+    prompt: How should a payment API treat a PSP timeout?
+    answer: As an unknown outcome - pending or processing - resolved by checking the PSP's status or webhook, never as "failed".
+
+next:
+  - payment-scenario-matrix
+  - tracing-a-payment-end-to-end

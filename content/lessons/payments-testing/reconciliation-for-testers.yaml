@@ -1,0 +1,588 @@
+id: reconciliation-for-testers
+title: Reconciliation for testers
+subject: payments-testing
+module: refunds-and-reconciliation
+level: advanced
+status: published
+estimatedMinutes: 55
+summary: How orders, PSP transactions, settlement reports and bank statements are matched, why they disagree (fees, timing, refunds, disputes, currency), how breaks are classified and investigated, and how to test a reconciliation process end to end.
+tags: [payments, reconciliation, settlement, payout, fees, matching, breaks, iso 20022, camt.053, ledger, finance]
+
+environment: |
+  - **Universal:** reconciliation - proving that two independent records of the same money agree - is standard
+    accounting practice; payment teams usually reconcile three or four sources.
+  - **Bank statements standard:** **ISO 20022** messages, in particular **camt.053** *BankToCustomerStatement* (booked
+    entries and balances for an account at a point in time) and **camt.054** *BankToCustomerDebitCreditNotification*
+    (notification of individual or batched entries) - message catalogue at [iso20022.org](https://www.iso20022.org/).
+    Banks publish usage guidelines for the versions they send (for example camt.053.001.08).
+  - **Scheme rules:** settlement as "the reporting and funds transfer of Settlement Amounts owed by one Member to
+    another ... as a result of Clearing" ([Visa Core Rules, 18 April 2026](https://usa.visa.com/dam/VCOM/download/about-visa/visa-rules-public.pdf),
+    Glossary).
+  - **Provider-specific:** the format, columns, timing and grouping of your PSP's settlement and payout reports, and how
+    fees, refunds, disputes and reserves are shown. **Fictional:** SandPay's report columns and all figures.
+
+prerequisites:
+  - payment-ecosystem-roles
+  - partial-refunds-and-invariants
+
+concepts:
+  - id: reconciliation-matching
+    name: Reconciliation matching
+    summary: Match records across sources by a shared reference - order to PSP transaction, transaction to settlement line, payout to bank statement entry - and prove the amounts agree.
+  - id: settlement-reports-and-fees
+    name: Settlement reports, fees and payouts
+    summary: A settlement report lists gross amounts, fees, refunds, disputes and adjustments per transaction; the payout is the net total, paid in batches on a schedule.
+  - id: reconciliation-breaks
+    name: Reconciliation breaks
+    summary: Unmatched or mismatched items - missing, duplicate, amount, timing, currency or unknown - each with a typical cause, an owner and an age that must be tracked.
+
+objectives:
+  - Describe the sources a payments team reconciles and the reference that links each pair.
+  - Read a settlement report and recompute the payout from gross amounts, fees, refunds and disputes.
+  - Classify reconciliation breaks, explain their typical causes and decide which are defects.
+  - Design tests for a reconciliation job, including timing differences, partial refunds, disputes and duplicates.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [reconciliation-matching]
+    title: The idea in plain language
+    body: |
+      At the end of a market day, a stallholder counts the cash box and compares it with the receipt book. If they agree,
+      good. If the box has 4.00 less, something happened - change given wrongly, a sale not written down, a note that
+      fell on the floor. **Reconciliation is that comparison, done every day, for every payment.**
+
+      In online payments there are several "boxes": the shop's orders, the PSP's transactions, the PSP's settlement
+      report, and the bank account the money finally lands in. Each is written by a different system, at a different
+      time, often in a different format. Usually they agree once you account for **fees** and **timing**. When they
+      don't, it is either a known difference - a refund paid out tomorrow - or a **break** someone must explain.
+
+      Testers matter here because reconciliation is where defects that every other test missed finally show up as
+      money.
+
+  - id: what
+    kind: what
+    concepts: [reconciliation-matching, settlement-reports-and-fees]
+    title: What gets reconciled with what
+    body: |
+      | Source | Written by | Key fields | When |
+      |---|---|---|---|
+      | **Orders** | the shop | order id, amount, currency, status, PSP payment id | at checkout and later updates |
+      | **PSP transactions** | the PSP (API, webhooks, transaction export) | payment id, merchant reference (order id), status, amounts | in real time |
+      | **Settlement report** | the PSP | per line: payment or refund id, gross, fee, net, type, payout id | per settlement batch, often daily |
+      | **Bank statement** | the merchant's bank (for example ISO 20022 camt.053) | entry amount, booking date, remittance info containing the payout id | when the payout is booked |
+      | **Ledger** | the merchant's accounting system | journal entries per order, fee, refund, payout | daily or on events |
+
+      The matching chain:
+
+      ```mermaid
+      flowchart LR
+          A[Order ORD-1042] -- PSP payment id --> B[PSP payment pay_81Fz]
+          B -- payment id --> C[Settlement line in batch po_21Ks]
+          C -- payout id --> D[Payout po_21Ks]
+          D -- remittance information --> E[Bank statement entry]
+          A -- order id --> F[Ledger entries]
+      ```
+
+      A **three-way reconciliation** (orders ↔ PSP ↔ bank) proves that every sale was charged, every charge was settled,
+      and every settlement arrived.
+
+  - id: why
+    kind: why
+    concepts: [settlement-reports-and-fees]
+    title: Why the numbers never simply match
+    body: |
+      | Reason | Example | Normal or break? |
+      |---|---|---|
+      | **Fees** | 100.00 sale, 1.65 fee, 98.35 net | normal - if the fee matches the contract |
+      | **Timing** | a payment captured at 23:58 settles in tomorrow's batch | normal - matched next day |
+      | **Refunds** | a refund of a sale from last week reduces today's payout | normal - matched to the original sale |
+      | **Disputes** | a chargeback debits the disputed amount and a dispute fee | normal - if a dispute record exists |
+      | **Currency** | a sale in USD settled in EUR at the PSP's rate | normal - if the rate and amounts are explained |
+      | **Reserves / holds** | the PSP keeps a rolling reserve | normal - if contracted |
+      | **Missing record** | a PSP payment with no order | **break** |
+      | **Duplicate** | the same payment settled twice, or two orders for one payment | **break** |
+      | **Amount mismatch** | order 49.90, PSP captured 49.00 | **break** |
+      | **Status mismatch** | order "cancelled", PSP "captured" | **break** |
+
+      A reconciliation process turns the first group into **explained differences** automatically, and puts the second
+      group in front of a person with enough data to investigate.
+
+  - id: internals
+    kind: internals
+    concepts: [settlement-reports-and-fees]
+    title: How a settlement report adds up to a payout
+    body: |
+      An excerpt of SandPay's (fictional) settlement report for payout `po_21Ks`:
+
+      | Line | Type | Reference | Gross | Fee | Net |
+      |---|---|---|---|---|---|
+      | 1 | payment | pay_81Fz (ORD-1042) | 100.00 | -1.65 | 98.35 |
+      | 2 | payment | pay_92Kd (ORD-1043) | 64.00 | -1.15 | 62.85 |
+      | 3 | refund | re_3Pq1 for pay_92Kd | -20.00 | 0.00 | -20.00 |
+      | 4 | dispute | dp_7Lw2 for pay_55Mn | -45.00 | -15.00 | -60.00 |
+      | 5 | payment | pay_66Rt (ORD-1047) | 250.00 | -3.75 | 246.25 |
+      | | **Total** | | **349.00** | **-21.55** | **327.45** |
+
+      Checks a tester makes:
+
+      1. **Each line:** net = gross + fee (fees negative here).
+      2. **Each fee:** recomputed from the contract - for example a percentage plus a fixed amount, rounded by the PSP's
+         rule. Refunds and dispute fees per contract.
+      3. **The total:** the payout amount equals the sum of nets (327.45) and appears once in the bank statement with
+         `po_21Ks` in its remittance information.
+      4. **Coverage:** every captured payment appears in exactly one batch over time; every refund and dispute links to
+         an original payment.
+      5. **Currency:** all lines in the settlement currency, with conversions explained.
+
+  - id: steps
+    kind: steps
+    concepts: [reconciliation-matching, reconciliation-breaks]
+    title: Step by step - testing a reconciliation job
+    body: |
+      1. **Get real samples** (anonymised) of every input: the PSP's settlement report format, a bank statement (camt.053
+         or the bank's CSV), the order export. Formats are the first source of defects.
+      2. **Build a fixture day** in a test environment with known content: payments, partial refunds, a dispute, a
+         payment captured just before the batch cut-off, a currency conversion, a duplicate webhook.
+      3. **Write the expected result** by hand: which items match, which are explained differences, which are breaks, and
+         the payout total.
+      4. **Run the job** and compare: matches, explained differences, breaks, and the totals.
+      5. **Run it again** on the same input: results must be identical (idempotent) - no duplicate matches or breaks.
+      6. **Run the next day** with the late items: yesterday's timing differences must now match and close.
+      7. **Break it on purpose:** a missing order, an amount off by one cent, a payout missing from the bank statement, a
+         malformed report line - each must produce a clear break with the data needed to investigate.
+      8. **Check the ageing**: open breaks show how old they are; old ones escalate.
+
+  - id: example
+    kind: example
+    concepts: [reconciliation-breaks, reconciliation-matching]
+    title: "Real-world example: 0.01 every day"
+    body: |
+      Reconciliation shows a small break every day: the bank received **0.01 to 0.04 less** than the settlement report's
+      total. Nobody worries for a month - until finance asks for the total: 11.73 in 30 days, and growing with volume.
+
+      The tester recomputes every line of three reports. Each line's net is right. The **report total**, however, is
+      calculated by the shop's reconciliation job by **summing rounded line nets**, while the PSP pays out the **rounded
+      total of unrounded fees**: fees are a percentage, the PSP keeps fractions of a cent per line and rounds once per
+      payout.
+
+      Not a PSP defect - its documentation says so - but a defect in the reconciliation job, which applied rounding at the
+      wrong level and turned an expected difference into a daily false break that people learned to ignore. Fixes: sum
+      the way the PSP documents; add a test fixture with fees that produce fractions of a cent; and treat "small breaks
+      every day" as a signal, not noise.
+
+  - id: code
+    kind: code
+    concepts: [reconciliation-matching]
+    title: A bank statement entry and the match
+    collapsed: true
+    body: |
+      A shortened ISO 20022 **camt.053** entry for the payout above (structure only; element names from the
+      BankToCustomerStatement message - your bank's usage guideline defines which are filled):
+
+      ```xml
+      <Ntry>
+        <Amt Ccy="EUR">327.45</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts><Cd>BOOK</Cd></Sts>
+        <BookgDt><Dt>2026-10-13</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Ustrd>SANDPAY PAYOUT po_21Ks</Ustrd></RmtInf>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+      ```
+
+      Notice: the amount is a **decimal with the currency attribute**, the indicator `CRDT` means money in, `BOOK` means
+      booked, and the only link to the payout is free text in the remittance information - a classic weak point when a
+      bank truncates it.
+
+      A matching rule, in pseudo-SQL:
+
+      ```sql
+      SELECT p.payout_id, p.net_total, b.amount, b.booking_date
+      FROM psp_payouts p
+      LEFT JOIN bank_entries b
+        ON b.remittance_text LIKE '%' || p.payout_id || '%'
+       AND b.currency = p.currency
+      WHERE p.expected_date <= CURRENT_DATE - 2
+        AND (b.amount IS NULL OR b.amount <> p.net_total);
+      ```
+
+      Every row is a break: a payout not received within two days, or received with a different amount.
+
+  - id: tests
+    kind: tests
+    concepts: [reconciliation-matching, settlement-reports-and-fees, reconciliation-breaks]
+    title: Positive and negative test cases
+    body: |
+      | ID | Fixture | Expected | Evidence |
+      |---|---|---|---|
+      | R1 | 5 payments, all settled, payout received | all matched; payout = sum of nets | reconciliation report |
+      | R2 | payment captured at 23:59 | timing difference today; matched tomorrow automatically | reports for both days |
+      | R3 | partial refund of last week's sale | refund line matched to the original payment and order | match record |
+      | R4 | dispute with fee | dispute and fee matched to the dispute record; not a break | match record |
+      | R5 | sale in USD, settled in EUR | conversion explained; within the documented rounding | report line |
+      | B1 | PSP payment with no order | break "missing order" with the payment id and amount | break list |
+      | B2 | order paid, payment never settled after N days | break "not settled", aged | break list with age |
+      | B3 | amount differs by 0.01 | break "amount mismatch" (unless a documented rounding rule explains it) | break details |
+      | B4 | same payment in two batches | break "duplicate settlement" | break list |
+      | B5 | payout missing from the bank statement | break "payout not received" after the expected date | break list |
+      | B6 | malformed line in the settlement file | job reports the line and continues or stops by design; never silently skips | job log |
+      | J1 | run the job twice on the same day | identical results, no duplicates | two report runs compared |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [reconciliation-breaks, settlement-reports-and-fees, reconciliation-matching]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Matching on amount alone.** Two 49.90 sales on one day swap places. Match on references, then check amounts.
+      - **Treating timing as breaks forever.** Late items must close automatically when they arrive; otherwise people stop
+        reading the break list.
+      - **Ignoring "small" breaks.** A daily cent is a systematic defect.
+      - **Recomputing fees with a different rounding than the PSP.** Follow the PSP's documented method.
+      - **Testing only with clean data.** Real files have truncated references, extra columns, new line types.
+      - **No idempotency in the job.** Re-running after a failure must not double-count.
+      - **No owner or age for breaks.** Unowned breaks never close.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [reconciliation-matching]
+    title: Reconciliation design choices
+    body: |
+      | Choice | Benefit | Cost |
+      |---|---|---|
+      | Real-time (per event) matching | breaks found within minutes | complex; must handle out-of-order events |
+      | Daily batch matching | simple; aligned with settlement batches | breaks found a day later |
+      | Strict matching (reference and amount) | few false matches | more manual work for small differences |
+      | Tolerance rules (for example ±0.01 for documented rounding) | fewer false breaks | can hide real defects - document and test each rule |
+      | PSP's reconciliation reports only | no build effort | you trust the system you are checking |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Sources: **orders, PSP transactions, settlement report, bank statement, ledger** - linked by **payment id, payout
+        id, order id**.
+      - Payout = Σ(gross + fees) over payments, refunds, disputes and adjustments in the batch.
+      - Normal differences: **fees, timing, refunds, disputes, currency, reserves**. Breaks: **missing, duplicate, amount,
+        status, not received**.
+      - Test with a **fixture day**, expected results written in advance, a **second run**, the **next day**, and broken
+        files.
+      - Bank statements: ISO 20022 **camt.053** (booked entries, balances); **camt.054** (debit/credit notifications).
+
+exercises:
+  - id: recompute-payout
+    type: mcq
+    concept: settlement-reports-and-fees
+    skill: application
+    title: What should the payout be?
+    prompt: |
+      A settlement batch contains: payment 80.00 gross with fee -1.20; payment 40.00 gross with fee -0.70; a refund of
+      -15.00 with no fee; a dispute of -30.00 with a dispute fee of -10.00. What is the payout?
+    options:
+      - id: right
+        text: "63.10"
+        feedback: Correct - (80.00 - 1.20) + (40.00 - 0.70) - 15.00 - 30.00 - 10.00 = 63.10.
+      - id: no-dispute-fee
+        text: "73.10"
+        feedback: That leaves out the 10.00 dispute fee.
+      - id: gross
+        text: "75.00"
+        feedback: That is the gross total (80 + 40 - 15 - 30) without any fees.
+      - id: sales-only
+        text: "118.10"
+        feedback: That is only the two payments' nets - refunds and disputes also reduce the payout.
+    correct: [right]
+    hints:
+      - Net each line first, then add them all.
+    solution: |
+      **63.10.** Recomputing the payout yourself from the lines - and comparing it with the bank entry - is the most basic
+      reconciliation test.
+    followUp: |
+      The bank entry says 63.09. List three possible explanations and how you would tell them apart.
+
+  - id: classify-break
+    type: mcq
+    concept: reconciliation-breaks
+    skill: analysis
+    title: Break or not?
+    prompt: Which of these is a **break** that needs investigation, rather than a normal, explained difference?
+    options:
+      - id: cancelled-captured
+        text: The order is cancelled in the shop, but the PSP shows the payment captured and settled
+        feedback: Correct - the customer was charged for a cancelled order; the records disagree on status.
+      - id: late-capture
+        text: A payment captured at 23:59 appears in tomorrow's settlement batch
+        feedback: That is a timing difference; it should match automatically tomorrow.
+      - id: fee
+        text: The payout is lower than the sum of the sales by exactly the contracted fees
+        feedback: Fees are an expected difference, as long as they match the contract.
+      - id: refund-week
+        text: Today's payout is reduced by a refund of a sale from last week
+        feedback: Refunds are netted against later payouts; that is normal if the refund links to its original payment.
+    correct: [cancelled-captured]
+    hints:
+      - Which case involves two systems disagreeing about what happened?
+    solution: |
+      **Cancelled but captured.** Typical causes: a missed void, a capture job that ignored the cancellation, or a late
+      webhook. It needs an owner, a refund decision and a defect if the system caused it.
+    followUp: |
+      Which test in the shop's own suite should have caught this before reconciliation did?
+
+  - id: debug-match-rule
+    type: debug
+    concept: reconciliation-matching
+    skill: analysis
+    title: The matching rule that swaps sales
+    prompt: Two different 49.90 EUR orders are sometimes matched to each other's payments. Click the line that causes it.
+    language: sql
+    code: |
+      SELECT o.order_id, p.payment_id
+      FROM orders o
+      JOIN psp_payments p
+        ON p.amount_minor = o.total_minor
+       AND p.currency = o.currency
+       AND p.created_date = o.created_date
+      WHERE o.status = 'paid';
+    correctLines: [4]
+    lineNotes:
+      - line: 5
+        note: Requiring the same currency is right - but it doesn't make the match unique.
+      - line: 7
+        note: Reconciling paid orders is a reasonable scope for this query.
+    hints:
+      - What uniquely identifies the payment that belongs to an order?
+    solution: |
+      **Line 4.** Matching on amount (plus currency and date) is not unique - any two sales of the same amount on the same
+      day can swap. Match on a reference both systems share: the PSP payment id stored on the order, or the merchant
+      reference (order id) stored at the PSP. Then compare amounts as a **check**, not as the key.
+    followUp: |
+      Some old orders have no PSP payment id stored. How would you match them, and how would you flag uncertain matches?
+
+  - id: recon-test-design
+    type: testdesign
+    concept: reconciliation-breaks
+    skill: application
+    title: A fixture day for the reconciliation job
+    prompt: |
+      Design a fixture day to test a daily reconciliation job that matches orders, PSP settlement lines and bank payouts.
+      List the items you put in the fixture, the expected outcome for each (matched, explained difference or break), the
+      expected payout, and what you check on a second run and on the next day.
+    hints:
+      - Include each normal difference once, and each type of break once.
+      - Put one item just before the batch cut-off.
+      - What must the second run on the same data produce?
+    modelAnswer: |
+      Fixture items:
+
+      1. Three ordinary payments → matched.
+      2. A partial refund of a payment from the previous day → matched to its original; reduces the payout.
+      3. A dispute with a fee → matched to the dispute record.
+      4. A USD sale settled in EUR → explained difference (conversion), within the documented rounding.
+      5. A payment captured at 23:59 → timing difference today; expected to match tomorrow.
+      6. A PSP payment with no order → break "missing order".
+      7. An order for 49.90 settled as 49.00 → break "amount mismatch".
+      8. A cancelled order with a captured payment → break "status mismatch".
+      9. A duplicated settlement line → break "duplicate".
+      10. A settlement line with a malformed amount → reported by the job, not skipped silently.
+
+      Expected payout: sum of the nets of items 1-4 and 7-9 as they appear in the batch, computed by hand; the bank entry
+      with the payout id in the remittance information equals it.
+
+      Second run on the same data: identical results, no duplicate matches or breaks. Next day: item 5 matches and its timing
+      difference closes; open breaks show an age of 1 day.
+    rubric:
+      - Included ordinary matches and each normal difference (refund, dispute, currency, timing)
+      - Included each kind of break (missing, amount, status, duplicate)
+      - Included a malformed input line
+      - Computed the expected payout independently
+      - Checked idempotency with a second run
+      - Checked that timing differences close the next day and that breaks age
+    solution: |
+      Compare with the model answer. The second run and the next-day run are what separate a reconciliation **test** from a
+      one-off comparison.
+    followUp: |
+      How would you anonymise a real settlement file so it can be used as a fixture without exposing customer data?
+
+  - id: order-recon-chain
+    type: order
+    concept: reconciliation-matching
+    skill: recall
+    title: Follow the money
+    prompt: Put the records in the order the money passes through them, from the sale to the bank account.
+    items:
+      - id: order
+        text: The shop's order
+      - id: payment
+        text: The PSP payment, captured
+      - id: settlement
+        text: The line in the PSP's settlement report
+      - id: payout
+        text: The payout batch
+      - id: bank
+        text: The entry in the merchant's bank statement
+    hints:
+      - The bank statement is the last place the money appears.
+    solution: |
+      Order → payment → settlement line → payout → bank entry. Each arrow needs a reference that both sides record.
+
+  - id: interview-recon
+    type: interview
+    concept: settlement-reports-and-fees
+    skill: application
+    title: "Interview: the payout is lower than expected"
+    prompt: |
+      *"Finance says yesterday's payout was 2,000 euros lower than yesterday's sales. How would you investigate?"* Answer
+      as you would in the interview.
+    hints:
+      - List the normal reasons first, then how you'd rule each in or out.
+      - Which document lets you recompute the payout line by line?
+    modelAnswer: |
+      First I'd check that we're comparing like with like: "yesterday's sales" by order date versus a payout made of
+      settlement batches with their own cut-off. Then I'd get the PSP's settlement report for that payout and recompute it
+      line by line: gross, fees, net, and the total against the bank entry.
+
+      The usual reasons a payout is lower than sales: fees; refunds and disputes from earlier sales netted against it;
+      payments captured after the cut-off that will settle tomorrow; currency conversion; reserves or holds. I'd quantify
+      each. Whatever is left is a break - for example sales that were never captured, payments missing from the batch, or
+      a duplicate refund - and I'd trace each to its order and PSP record.
+
+      As a tester, I'd also ask why the reconciliation job didn't explain this automatically, and add the missing cases to
+      its test fixtures.
+    rubric:
+      - Checked the comparison basis (order dates versus settlement batches and cut-off)
+      - Recomputed the payout from the settlement report
+      - Named fees, refunds, disputes, timing, currency and reserves
+      - Quantified each explained difference and isolated the remainder
+      - Traced remaining breaks to orders and PSP records
+      - Proposed improving the reconciliation tests
+    followUps:
+      - What would you do if the settlement report total and the bank entry differ?
+      - How would you detect payments that were authorised but never captured?
+      - Who should own breaks, and how would you report them?
+    solution: |
+      Strong answers **explain before they blame**: normal differences quantified, the residue traced, and the process
+      improved.
+
+  - id: explain-timing
+    type: short
+    concept: reconciliation-breaks
+    skill: recall
+    title: Timing differences
+    prompt: In two or three sentences, explain what a timing difference is in reconciliation and how a good process handles it.
+    hints:
+      - When does a payment captured just before midnight settle?
+    modelAnswer: |
+      A timing difference is an item recorded in one source on one day and in another source on a later day - for example a
+      payment captured just before the batch cut-off that settles in the next batch. A good process records it as an expected
+      difference, matches it automatically when it arrives, and turns it into a break only if it doesn't arrive within the
+      expected time.
+    rubric:
+      - Defined it as the same item appearing on different days in different sources
+      - Said it should match automatically later
+      - Said it becomes a break only after an expected time
+    solution: |
+      Without this, the break list fills with noise and real breaks get ignored.
+
+placement:
+  - id: place-payout
+    type: mcq
+    concept: settlement-reports-and-fees
+    skill: application
+    title: Net it out
+    prompt: A batch has two payments of 50.00 with fees of 0.90 each, and a refund of 20.00 with no fee. What is the payout?
+    options:
+      - id: right
+        text: "78.20"
+        feedback: Correct - 2 × (50.00 - 0.90) - 20.00 = 78.20.
+      - id: no-refund
+        text: "98.20"
+        feedback: The refund also reduces the payout.
+      - id: gross
+        text: "80.00"
+        feedback: That ignores the fees.
+      - id: wrong-fee
+        text: "79.10"
+        feedback: That counts only one fee.
+    correct: [right]
+    solution: |
+      **78.20.** Net each line, then sum.
+
+  - id: place-match
+    type: mcq
+    concept: reconciliation-matching
+    skill: application
+    title: The best matching key
+    prompt: What is the most reliable way to match a shop order to its PSP payment?
+    options:
+      - id: reference
+        text: A shared reference - the PSP payment id stored on the order, or the order id sent to the PSP as the merchant reference
+        feedback: Correct - a reference both systems record is unique; amounts are then checked, not used to match.
+      - id: amount
+        text: The amount and the date
+        feedback: Two sales of the same amount on the same day would match each other.
+      - id: email
+        text: The customer's email
+        feedback: Customers place many orders; email doesn't identify a payment.
+      - id: time
+        text: The nearest timestamp
+        feedback: Timestamps differ between systems and collide at busy times.
+    correct: [reference]
+    solution: |
+      **A shared reference.** Make sure it is stored on both sides from the first request - adding it later never covers old data.
+
+  - id: place-break
+    type: mcq
+    concept: reconciliation-breaks
+    skill: analysis
+    title: A cent every day
+    prompt: Reconciliation shows a break of 0.01-0.04 between the settlement total and the bank payout every day. What is the best next step?
+    options:
+      - id: investigate
+        text: Investigate it as a systematic difference - recompute fees and totals with the PSP's documented rounding
+        feedback: Correct - a small daily difference is a pattern, usually rounding applied at a different level.
+      - id: tolerance
+        text: Add a tolerance of ±0.05 so it stops appearing
+        feedback: A tolerance without an explanation hides the cause - and real breaks below the tolerance too.
+      - id: ignore
+        text: Ignore it; the amounts are too small to matter
+        feedback: Small daily amounts add up with volume, and they hide a defect that may grow.
+      - id: bank
+        text: Ask the bank to correct the payouts
+        feedback: The bank booked what the PSP sent; the difference is between your calculation and the PSP's.
+    correct: [investigate]
+    solution: |
+      **Investigate the pattern.** If a documented rounding rule explains it, encode that rule - with a test - rather than a
+      blanket tolerance.
+
+recall:
+  - id: recall-sources
+    concept: reconciliation-matching
+    prompt: Which sources does a payments team typically reconcile?
+    answer: Shop orders, PSP transactions, PSP settlement reports, the bank statement, and the ledger.
+  - id: recall-three-way
+    concept: reconciliation-matching
+    prompt: What does a three-way reconciliation prove?
+    answer: That every sale was charged at the PSP, every charge was settled, and every settlement arrived in the bank.
+  - id: recall-payout
+    concept: settlement-reports-and-fees
+    prompt: How is a payout calculated from a settlement report?
+    answer: The sum of net amounts (gross plus fees) of all lines in the batch - payments, refunds, disputes and adjustments.
+  - id: recall-normal
+    concept: settlement-reports-and-fees
+    prompt: Name four normal reasons why a payout differs from the day's sales.
+    answer: Fees, timing (cut-off), refunds and disputes netted against it, currency conversion, and reserves.
+  - id: recall-breaks
+    concept: reconciliation-breaks
+    prompt: Name four kinds of reconciliation break.
+    answer: Missing record, duplicate, amount mismatch, status mismatch - and payout not received.
+  - id: recall-camt
+    concept: reconciliation-matching
+    prompt: What is ISO 20022 camt.053?
+    answer: The BankToCustomerStatement message - booked entries and balances of an account at a point in time, used for end-of-day reconciliation.
+
+next:
+  - pci-dss-awareness
+  - inconsistent-status-incidents

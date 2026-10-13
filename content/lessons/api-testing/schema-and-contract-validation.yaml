@@ -1,0 +1,683 @@
+id: schema-and-contract-validation
+title: Schema and contract validation with JSON Schema and OpenAPI
+subject: api-testing
+module: manual-api-testing
+level: intermediate
+status: published
+estimatedMinutes: 55
+summary: Check the shape of every request and response automatically - JSON Schema for the structure, OpenAPI as the API's machine-readable contract, breaking-change detection, and consumer-driven contract tests with Pact - and know what schemas can't prove.
+tags: [api, json schema, openapi, contract testing, pact, schema validation, breaking changes, backward compatibility]
+
+environment: |
+  - **Standards:**
+    - **JSON Schema, draft 2020-12** ([json-schema.org](https://json-schema.org/)) - keywords such as `type`,
+      `properties`, `required`, `additionalProperties`, `enum`, `minimum`, `pattern`, `$ref`. In 2020-12, `format` is an
+      **annotation by default**; validators only enforce it if configured to.
+    - **OpenAPI Specification** ([spec.openapis.org](https://spec.openapis.org/oas/v3.2)) - **3.2.0** released 19 September
+      2025; **3.1** aligned its Schema Object with JSON Schema 2020-12. Many APIs still publish **3.0.x** documents, whose
+      schema dialect differs (for example `nullable`) - check the `openapi` field of the document you test.
+  - **Tool documentation:** **Pact** ([docs.pact.io](https://docs.pact.io/)) - consumer-driven, "contract by example"
+    integration testing, where "the contract is generated during the execution of the automated consumer tests".
+  - **Tool-specific:** validator libraries (for example Ajv for JavaScript, networknt json-schema-validator for Java) and
+    OpenAPI diff tools differ in supported drafts and options - check their documentation.
+  - **Fictional:** SandPay's OpenAPI document and schemas.
+
+prerequisites:
+  - http-request-response-anatomy
+  - status-codes-and-errors
+
+concepts:
+  - id: json-schema-validation
+    name: JSON Schema validation
+    summary: A JSON Schema declares types, required fields, allowed values and ranges; validating every response against it catches missing fields, wrong types and unexpected properties that example assertions miss.
+  - id: openapi-contracts
+    name: OpenAPI as the API contract
+    summary: The OpenAPI document describes every path, method, parameter, request body, response code and schema; tests validate real traffic against it, and diffs between versions reveal breaking changes.
+  - id: consumer-driven-contracts
+    name: Consumer-driven contract tests
+    summary: Consumers record the interactions they rely on as a contract (for example a Pact file); the provider verifies it in its own pipeline, so incompatible changes fail before deployment.
+
+objectives:
+  - Read and write a JSON Schema for an API response and validate responses against it.
+  - Use an OpenAPI document as a test oracle for status codes, parameters and bodies.
+  - Classify API changes as breaking or non-breaking for existing clients.
+  - Explain consumer-driven contract testing and when it adds value over schema validation.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [json-schema-validation, openapi-contracts]
+    title: The idea in plain language
+    body: |
+      A parcel locker accepts parcels of certain sizes. It doesn't care what's inside, but a parcel that's too big, or
+      without a label, is rejected at the slot. That check is quick, automatic and happens for **every** parcel.
+
+      A **schema** is the slot for data: "an object with `id` (a string starting with `pay_`), `amount` (a whole number, at
+      least 50), `currency` (three capital letters), `status` (one of these values) - and nothing else". Checking every
+      response against it catches whole classes of defects at once: a missing field, a number sent as a string, a new
+      status nobody told the clients about.
+
+      An **OpenAPI** document is the full list of slots for an API - every endpoint, every code, every body. And a
+      **contract test** asks a different question: not "does the response fit the document?" but "does it fit **what my
+      app actually uses**?"
+
+  - id: what
+    kind: what
+    concepts: [json-schema-validation]
+    title: What a JSON Schema says
+    body: |
+      A schema for SandPay's payment object (JSON Schema 2020-12):
+
+      ```json
+      {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://api.sandpay.example/schemas/payment.json",
+        "type": "object",
+        "required": ["id", "amount", "currency", "status", "created_at"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^pay_[A-Za-z0-9]{4,}$" },
+          "amount": { "type": "integer", "minimum": 50 },
+          "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+          "status": { "enum": ["requires_action", "authorized", "captured", "declined", "voided", "refunded"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      }
+      ```
+
+      | Keyword | Checks |
+      |---|---|
+      | `type` | JSON type: object, array, string, integer, number, boolean, null |
+      | `required` | listed properties must be present |
+      | `properties` | the schema of each named property |
+      | `additionalProperties: false` | no properties beyond those listed |
+      | `enum` / `const` | value from a fixed set / one fixed value |
+      | `minimum`, `maximum`, `minLength`, `pattern` | ranges and formats |
+      | `items`, `prefixItems` | array elements |
+      | `$ref`, `$defs` | reuse of sub-schemas |
+      | `oneOf`, `anyOf`, `allOf` | combinations |
+      | `format` | an **annotation by default** in 2020-12 - `"date-time"` isn't enforced unless the validator is configured to |
+
+  - id: why
+    kind: why
+    concepts: [openapi-contracts, json-schema-validation]
+    title: Why example assertions aren't enough
+    body: |
+      A test that asserts `body.status == "authorized"` and `body.amount == 2500` passes even if:
+
+      - `currency` disappeared, or became `"eur"`;
+      - `amount` became the string `"2500"` in some responses;
+      - a new field `card_number` started leaking into the response;
+      - an error response on another path stopped following the documented format.
+
+      Schema validation checks **everything the contract says, on every response**, at almost no extra cost. The OpenAPI
+      document makes it possible to do this **for every endpoint** from one source - and to compare two versions of the
+      document to see whether a release breaks existing clients before it ships.
+
+      Apps, partners and other services depend on the exact shape of responses. Changing it is one of the most common causes
+      of production incidents that every functional test missed.
+
+  - id: internals
+    kind: internals
+    concepts: [openapi-contracts]
+    title: How an OpenAPI document describes the contract
+    body: |
+      An excerpt of SandPay's OpenAPI 3.1 document:
+
+      ```yaml
+      openapi: 3.1.0
+      info:
+        title: SandPay API
+        version: 2026-10-01
+      paths:
+        /v1/payments/{id}:
+          get:
+            operationId: getPayment
+            parameters:
+              - name: id
+                in: path
+                required: true
+                schema: { type: string, pattern: '^pay_' }
+            responses:
+              '200':
+                description: The payment
+                content:
+                  application/json:
+                    schema: { $ref: '#/components/schemas/Payment' }
+              '404':
+                description: Unknown payment, or not visible to this merchant
+                content:
+                  application/problem+json:
+                    schema: { $ref: '#/components/schemas/Problem' }
+      components:
+        schemas:
+          Payment: { $ref: 'https://api.sandpay.example/schemas/payment.json' }
+      ```
+
+      What a tester gets from it:
+
+      - an **inventory** - every operation, so none is forgotten (useful for the authorization matrix in
+        [authentication and authorization](#/lesson/authentication-and-authorization));
+      - an **oracle** - for any real request, the documented status codes and the schema each response must match;
+      - **test data hints** - patterns, enums, minimums and required fields are ready-made equivalence partitions and
+        boundaries.
+
+      **Breaking or not?** Changes that typically **break** existing clients: removing or renaming a field or endpoint,
+      making an optional request field required, narrowing a type or range, adding a value to a response enum that clients
+      `switch` on without a default, changing a status code. Usually **non-breaking**: adding an optional request field,
+      adding a new endpoint, adding a response field (if clients ignore unknown fields - which itself must be tested).
+
+  - id: visual
+    kind: visual
+    concepts: [consumer-driven-contracts]
+    title: "Sequence diagram: a consumer-driven contract with Pact"
+    body: |
+      The consumer's tests create the contract; the provider's pipeline verifies it; deployment waits for both.
+
+      ```mermaid
+      sequenceDiagram
+          participant C as Consumer tests - mobile app team
+          participant M as Pact mock provider
+          participant B as Pact Broker
+          participant P as Provider pipeline - payments API
+          C->>M: GET /v1/payments/pay_81Fz expecting id, amount, status
+          M-->>C: Example response from the expectation
+          C->>B: Publish pact file - the interactions the app uses
+          P->>B: Fetch pacts for the payments API
+          P->>P: Replay each request against the real API, compare responses
+          P->>B: Publish verification results
+          C->>B: Can this app version be deployed with the API version in production?
+          B-->>C: Yes - verified, or no - contract broken
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [json-schema-validation, openapi-contracts]
+    title: Step by step - adding schema validation to an API suite
+    body: |
+      1. **Get the OpenAPI document** for the version under test, and check its `openapi` version (3.0 and 3.1 schemas
+         differ).
+      2. **Validate the document itself** with a linter or validator - an invalid contract can't be an oracle.
+      3. **Validate every response** in your existing tests against the schema for its operation and status code - one
+         shared helper, called automatically, not per test.
+      4. **Decide the strictness**: `additionalProperties: false` in test schemas finds leaked fields; decide whether to
+         enforce `format`.
+      5. **Add contract-driven negative tests** from the schemas: each `required` field missing, each `enum` with an unknown
+         value, each `minimum` minus one (see [test design techniques](#/lesson/test-design-techniques)).
+      6. **Diff the OpenAPI document** between the released version and the candidate in CI, and fail on breaking changes
+         unless versioned.
+      7. **For consumers you own** (mobile app, front end), add consumer-driven contract tests so the provider verifies what
+         they really use.
+
+  - id: example
+    kind: example
+    concepts: [openapi-contracts, json-schema-validation]
+    title: "Real-world example: the new status that crashed the app"
+    body: |
+      The payments team adds a status `pending_review` for payments held by fraud checks. All API tests pass; the release
+      goes out. Within an hour, the Android app crashes on the order history screen for some customers.
+
+      The app's code maps each `status` string to a screen state, with no default branch; `pending_review` throws. The API's
+      OpenAPI document listed the old six values as an `enum`; the new value was added to the code but not to the
+      document.
+
+      Two missing checks, two tests added:
+
+      - **Response validation against the OpenAPI schema** in the API's own suite would have failed: `pending_review` is not
+        in the enum. Fixing it means updating the document - which the CI **diff** then flags as a change to a response enum,
+        a known breaking change for strict clients.
+      - **A consumer contract test** from the app team would have recorded "status is one of the values the app handles", so
+        the provider's pipeline would have failed before deployment.
+
+      And a third, on the app side: unknown enum values must fall back to a safe default - a test the app team now has.
+
+  - id: code
+    kind: code
+    concepts: [json-schema-validation]
+    title: Validating responses with Ajv in JavaScript or TypeScript
+    collapsed: true
+    body: |
+      Illustrative; Ajv's 2020-12 build and the separate `ajv-formats` package for `format` checks (check their docs for
+      current versions):
+
+      ```javascript
+      import Ajv2020 from 'ajv/dist/2020.js';
+      import addFormats from 'ajv-formats';
+      import paymentSchema from './schemas/payment.json' with { type: 'json' };
+
+      const ajv = new Ajv2020({ allErrors: true });
+      addFormats(ajv);                       // enforce "date-time" and other formats
+      const validatePayment = ajv.compile(paymentSchema);
+
+      export function assertPayment(body) {
+        if (!validatePayment(body)) {
+          throw new Error('Payment does not match its schema: ' + ajv.errorsText(validatePayment.errors));
+        }
+      }
+      ```
+
+      A typical failure message tells you **where** and **what**:
+
+      ```plaintext
+      Payment does not match its schema: data/amount must be integer, data must NOT have additional properties
+      ```
+
+      In a Playwright API test (see [network mocking and API testing with Playwright](#/lesson/playwright-network-and-api)):
+
+      ```typescript
+      const response = await request.get(`/v1/payments/${id}`);
+      expect(response.status()).toBe(200);
+      assertPayment(await response.json());
+      ```
+
+  - id: tests
+    kind: tests
+    concepts: [json-schema-validation, openapi-contracts, consumer-driven-contracts]
+    title: Positive and negative test cases
+    body: |
+      | ID | Check | Expected | Evidence |
+      |---|---|---|---|
+      | V1 | every 2xx response in the suite against its operation's schema | valid | validator output |
+      | V2 | every error response against the Problem schema | valid, `application/problem+json` | validator output |
+      | V3 | response with a field not in the schema (strict test schema) | validation fails - possible data leak | validator error |
+      | V4 | request missing each `required` field in turn | 400/422 as documented | responses |
+      | V5 | request with an `enum` field set to an unknown value | 400/422 | response |
+      | V6 | request at `minimum` and `minimum - 1` | accepted / refused | responses |
+      | D1 | OpenAPI diff, candidate vs released | breaking changes reported and blocked unless versioned | diff report in CI |
+      | D2 | document lists every operation the API actually serves | no undocumented endpoints | route list vs document |
+      | P1 | provider verifies all consumer pacts | all verified before deployment | broker verification results |
+      | P2 | consumer handles an unknown enum value | safe default, no crash | consumer test |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [json-schema-validation, openapi-contracts, consumer-driven-contracts]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Treating a valid schema as a correct response.** A schema checks shape, not values - a valid payment can have the
+        wrong amount. Keep value assertions.
+      - **Schemas that allow anything** - no `required`, `additionalProperties` unset, every type `string`. They pass
+        everything.
+      - **Assuming `format` is enforced** - in 2020-12 it is an annotation unless the validator is configured to assert it.
+      - **Mixing OpenAPI 3.0 and 3.1 schema rules** - `nullable` exists in 3.0; 3.1 uses JSON Schema types such as
+        `["string", "null"]`.
+      - **A document that drifts from the code** - validate real responses against it in CI so drift fails a build.
+      - **Contract tests that copy the whole provider response** - a consumer contract should contain only what the consumer
+        uses, or every harmless change breaks it.
+      - **Using contract tests instead of functional tests** - contracts check compatibility, not business behaviour.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [consumer-driven-contracts, openapi-contracts]
+    title: Schema validation, provider contracts and consumer contracts
+    body: |
+      | Approach | Proves | Doesn't prove | Fits |
+      |---|---|---|---|
+      | JSON Schema validation of responses | the shape of each response | values, behaviour, what clients need | every API, cheaply |
+      | OpenAPI-based validation and diffs | the API matches its published document; changes are visible | that clients use the API as documented | public and partner APIs |
+      | Consumer-driven contracts (Pact) | the provider still satisfies each known consumer's real usage | anything for unknown consumers | many services owned by teams in one organisation |
+      | End-to-end tests | the whole journey works | which component broke, quickly | a few critical journeys |
+
+      Pact's own documentation notes that checking a provider against an OpenAPI document alone gives no test-based assurance
+      that consumers call it correctly - that is what consumer-driven contracts add.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **JSON Schema 2020-12**: `type`, `required`, `properties`, `additionalProperties`, `enum`, ranges, `pattern`, `$ref`;
+        **`format` is an annotation by default**.
+      - **OpenAPI** (3.1 aligned with JSON Schema 2020-12; 3.2.0 since September 2025): inventory, oracle and test-data
+        source; **diff versions** to catch breaking changes.
+      - Breaking: removing/renaming fields, new required request fields, narrower types, new response enum values for strict
+        clients, changed codes.
+      - **Consumer-driven contracts** (Pact): consumer tests generate the contract, provider verifies it, the broker gates
+        deployment.
+      - Schemas check **shape**, not **values** - keep functional assertions.
+
+exercises:
+  - id: schema-catches
+    type: mcq
+    concept: json-schema-validation
+    skill: application
+    title: What does the schema catch?
+    prompt: |
+      Using the payment schema in this lesson (with `additionalProperties: false` and `amount` as an integer, minimum 50),
+      which responses fail validation? Select every one that applies.
+    options:
+      - id: string-amount
+        text: '`{"id": "pay_81Fz", "amount": "2500", "currency": "EUR", "status": "captured", "created_at": "2026-10-12T09:00:00Z"}`'
+        feedback: Correct - amount must be an integer, not a string.
+      - id: extra-field
+        text: '`{"id": "pay_81Fz", "amount": 2500, "currency": "EUR", "status": "captured", "created_at": "2026-10-12T09:00:00Z", "card_number": "<redacted>"}`'
+        feedback: Correct - additionalProperties is false, so an unexpected card_number field fails (and would be a serious leak).
+      - id: wrong-amount
+        text: '`{"id": "pay_81Fz", "amount": 2600, "currency": "EUR", "status": "captured", "created_at": "2026-10-12T09:00:00Z"}` when 2500 was charged'
+        feedback: It matches the schema - 2600 is a valid integer above 50. Schemas check shape, not whether the value is the right one.
+      - id: unknown-status
+        text: '`{"id": "pay_81Fz", "amount": 2500, "currency": "EUR", "status": "pending_review", "created_at": "2026-10-12T09:00:00Z"}`'
+        feedback: Correct - pending_review isn't in the status enum.
+    correct: [string-amount, extra-field, unknown-status]
+    hints:
+      - Check each against type, additionalProperties and enum.
+      - Is there anything a schema can't know?
+    solution: |
+      **The string amount, the extra field and the unknown status** fail. The wrong amount passes - which is why value
+      assertions stay in your tests next to schema validation.
+    followUp: |
+      Which keyword would you add so that `currency` only accepts the currencies your shop supports?
+
+  - id: breaking-change
+    type: mcq
+    concept: openapi-contracts
+    skill: analysis
+    title: Breaking or not?
+    prompt: Which change to the payments API's OpenAPI document is **most likely to break** existing clients?
+    options:
+      - id: required
+        text: The optional request field `description` becomes required
+        feedback: Correct - existing clients that don't send it will now get errors.
+      - id: new-endpoint
+        text: A new endpoint `GET /v1/payouts` is added
+        feedback: New endpoints don't affect existing calls.
+      - id: optional-field
+        text: A new optional request field `statement_descriptor` is added
+        feedback: Optional request fields can be ignored by existing clients.
+      - id: doc-text
+        text: The description text of `amount` is reworded
+        feedback: Descriptions don't change behaviour.
+    correct: [required]
+    hints:
+      - Which change makes a request that worked yesterday fail today?
+    solution: |
+      **Making a field required.** Others that break: removing or renaming fields, narrowing types, changing codes, and adding
+      response enum values for clients that don't handle unknowns. An OpenAPI diff in CI catches these before release.
+    followUp: |
+      A response gets a new field `risk_level`. Under what condition does that break a client, and how would you test the
+      client for it?
+
+  - id: debug-schema
+    type: debug
+    concept: json-schema-validation
+    skill: analysis
+    title: The schema that lets everything through
+    prompt: A tester notices that responses with a leaked `card_number` field still pass validation. Click the line responsible.
+    language: json
+    code: |
+      {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["id", "amount", "currency", "status"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "amount": { "type": "integer", "minimum": 50 },
+          "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+          "status": { "type": "string" }
+        }
+      }
+    correctLines: [5]
+    lineNotes:
+      - line: 4
+        note: The required list is reasonable - it ensures the key fields are present.
+      - line: 10
+        note: A plain string status is weak (an enum would be better), but it isn't why extra fields pass.
+    hints:
+      - Which keyword decides whether properties not listed are allowed?
+    solution: |
+      **Line 5.** `additionalProperties: true` (also the default when omitted) allows any extra property, so a leaked
+      `card_number` passes. In test schemas, set it to `false` to detect unexpected fields - and also tighten `status` to an
+      `enum`.
+    followUp: |
+      The production client must tolerate new fields, but your test should detect them. How can both be true?
+
+  - id: contract-test-design
+    type: testdesign
+    concept: openapi-contracts
+    skill: application
+    title: Contract checks for a release
+    prompt: |
+      The payments API publishes an OpenAPI 3.1 document. Design the contract-related checks for its CI pipeline and test
+      suite: what is validated, against what, when the build fails, and at least four contract-driven negative tests derived
+      from the schemas.
+    hints:
+      - The document itself, the responses, and the difference between versions.
+      - Use required, enum and minimum to generate negative cases.
+    modelAnswer: |
+      Pipeline:
+
+      1. Lint and validate the OpenAPI document; fail on errors.
+      2. Validate every response produced by the API test suite against the schema for its operation and status code
+         (shared helper); fail on any mismatch, including Problem Details for errors.
+      3. Diff the candidate document against the released one; fail on breaking changes (removed or renamed fields or
+         operations, new required request fields, narrowed types, changed codes, new response enum values) unless the API
+         version is bumped.
+      4. Compare the API's real routes with the document; fail on undocumented operations.
+      5. Run provider verification of consumer pacts, if consumers publish them.
+
+      Negative tests from the schemas: each required field of `POST /v1/payments` missing in turn → documented 400/422;
+      `currency` = `"eur"` (pattern) → refused; `amount` = 49 (minimum - 1) → refused; `capture_method` = `"later"` (not in
+      enum) → refused; extra unknown request field → refused or ignored as documented.
+    rubric:
+      - Validated the document itself
+      - Validated every response, including errors, against the operation's schema
+      - Diffed versions and failed on breaking changes
+      - Compared real routes with documented operations
+      - Derived negative tests from required, pattern, minimum and enum
+      - Stated when the build fails
+    solution: |
+      Compare with the model answer. The **diff** and the **route comparison** are the checks that catch what no single test
+      would.
+    followUp: |
+      How would you handle an intentional breaking change - what has to happen besides updating the document?
+
+  - id: pact-mcq
+    type: mcq
+    concept: consumer-driven-contracts
+    skill: application
+    title: Who writes the contract?
+    prompt: In consumer-driven contract testing with Pact, where does the contract (the pact file) come from?
+    options:
+      - id: consumer-tests
+        text: It is generated while the consumer's automated tests run against Pact's mock provider
+        feedback: Correct - Pact's documentation says the contract is generated during the execution of the consumer tests.
+      - id: openapi
+        text: It is generated from the provider's OpenAPI document
+        feedback: That would describe the provider, not what the consumer actually uses - the core idea of consumer-driven contracts.
+      - id: provider
+        text: The provider team writes it by hand
+        feedback: In consumer-driven contracts, consumers define what they rely on; the provider verifies it.
+      - id: production
+        text: It is recorded from production traffic
+        feedback: Pact contracts come from consumer test code, as concrete examples, not from production recordings.
+    correct: [consumer-tests]
+    hints:
+      - The name says who drives it.
+    solution: |
+      **From the consumer's tests.** The provider then replays the recorded requests against the real API and checks the
+      responses - in its own pipeline, before deploying.
+    followUp: |
+      Why is Pact a poor fit for a public API with thousands of unknown consumers? What would you use instead?
+
+  - id: order-schema-adoption
+    type: order
+    concept: json-schema-validation
+    skill: recall
+    title: Adopting schema validation
+    prompt: Put the steps for adding schema validation to an API test suite in order.
+    items:
+      - id: get-doc
+        text: Get the OpenAPI document for the version under test and check its version
+      - id: validate-doc
+        text: Validate the document itself
+      - id: helper
+        text: Add a shared helper that validates every response against its operation's schema
+      - id: strict
+        text: Decide strictness - additionalProperties and format enforcement
+      - id: negative
+        text: Derive negative tests from required fields, enums and ranges
+      - id: diff
+        text: Diff document versions in CI to block breaking changes
+    hints:
+      - You can't use a document as an oracle before checking it is valid.
+    solution: |
+      Get → validate the document → shared response validation → strictness → negative tests → diffs in CI.
+
+  - id: interview-contracts
+    type: interview
+    concept: consumer-driven-contracts
+    skill: application
+    title: "Interview: schema validation or contract testing?"
+    prompt: |
+      *"We have an OpenAPI spec and a mobile app that uses our API. Should we do schema validation, contract testing, or
+      end-to-end tests?"* Answer as you would in the interview.
+    hints:
+      - Each answers a different question. Say which, and how they combine.
+    modelAnswer: |
+      They answer different questions, so I'd use them together. Schema validation against the OpenAPI document checks that
+      every response has the documented shape - cheap, automatic for every test, and it catches missing fields, wrong types,
+      leaked fields and undocumented enum values. Diffing the document between versions in CI catches breaking changes before
+      release.
+
+      But a document can be followed perfectly while the app still breaks, because the app relies on something specific. With
+      a mobile app we own, consumer-driven contract tests, for example with Pact, close that gap: the app's tests record the
+      interactions it uses, and the API's pipeline verifies them before deploying - and the broker can tell us whether an app
+      version and an API version are compatible.
+
+      End-to-end tests stay, but only for a few critical journeys like checkout, because they're slow and don't pinpoint which
+      side broke. And none of these replace functional assertions on values - a schema-valid response can still have the wrong
+      amount.
+    rubric:
+      - Explained what schema validation proves and its low cost
+      - Mentioned OpenAPI diffs for breaking changes
+      - Explained the gap consumer-driven contracts close
+      - Described the consumer generates and provider verifies flow
+      - Kept end-to-end tests for a few critical journeys
+      - Said schemas don't check values
+    followUps:
+      - How would you introduce Pact without blocking every team on day one?
+      - What happens to contract tests when the app has many old versions in the field?
+      - What's the difference between OpenAPI 3.0 and 3.1 schemas that trips up validators?
+    solution: |
+      The strong answer is **"they answer different questions"** - followed by which question each one answers.
+
+  - id: explain-format
+    type: short
+    concept: json-schema-validation
+    skill: recall
+    title: Why "format" didn't fail
+    prompt: |
+      In two or three sentences, explain why a response with `"created_at": "yesterday"` might pass validation against a
+      2020-12 schema with `"format": "date-time"`.
+    hints:
+      - Is format an assertion or an annotation by default in 2020-12?
+    modelAnswer: |
+      In JSON Schema 2020-12, `format` is an annotation by default, so a validator only reports it unless it has been
+      configured (or extended, for example with ajv-formats) to assert formats. To catch "yesterday", enable format assertion
+      in the validator, or add a `pattern` for the expected timestamp form.
+    rubric:
+      - Said format is an annotation by default in 2020-12
+      - Said the validator must be configured to assert formats
+      - Offered a fix (enable format checks or use a pattern)
+    solution: |
+      Test your validator set-up with a deliberately invalid date - a check that can't fail is no check.
+
+placement:
+  - id: place-schema
+    type: mcq
+    concept: json-schema-validation
+    skill: application
+    title: The missing field
+    prompt: A schema lists `currency` under `properties` but not under `required`. A response arrives without `currency`. What happens?
+    options:
+      - id: passes
+        text: It passes - properties only describe a field if it is present; required makes it mandatory
+        feedback: Correct - without required, an absent property is allowed.
+      - id: fails
+        text: It fails, because currency is described in properties
+        feedback: properties constrains the value when present; it doesn't require presence.
+      - id: error
+        text: The validator throws an error about the schema
+        feedback: The schema is valid; it simply doesn't require the field.
+      - id: default
+        text: The validator inserts a default currency
+        feedback: Validators check; they don't change the data (default is only an annotation).
+    correct: [passes]
+    solution: |
+      **It passes.** Put every field clients depend on in `required`.
+
+  - id: place-openapi
+    type: mcq
+    concept: openapi-contracts
+    skill: application
+    title: Using the document as an oracle
+    prompt: For a real `GET /v1/payments/pay_81Fz` that returned 200, what can the OpenAPI document tell your test?
+    options:
+      - id: schema
+        text: Which schema the 200 response body must match, and which content type it should have
+        feedback: Correct - the responses section maps each code and content type to a schema.
+      - id: value
+        text: The exact amount the payment should have
+        feedback: The document describes shapes and rules, not the data of a particular payment.
+      - id: performance
+        text: How fast the response must be
+        feedback: OpenAPI doesn't standardise performance targets.
+      - id: nothing
+        text: Nothing - OpenAPI is only for generating documentation
+        feedback: It is machine-readable precisely so tools and tests can use it.
+    correct: [schema]
+    solution: |
+      **The schema and content type** for that operation and status. Combine with value assertions for the specific payment.
+
+  - id: place-pact
+    type: mcq
+    concept: consumer-driven-contracts
+    skill: analysis
+    title: What contract tests add
+    prompt: An API's responses all pass validation against its OpenAPI document, yet a new release breaks the company's mobile app. Which practice is designed to catch this before deployment?
+    options:
+      - id: cdc
+        text: Consumer-driven contract tests, verified in the provider's pipeline
+        feedback: Correct - they check the provider against what this consumer actually relies on.
+      - id: more-schema
+        text: Stricter schema validation
+        feedback: The responses already match the document; the problem is the gap between the document and the app's usage.
+      - id: load
+        text: Load tests
+        feedback: Load tests check capacity, not compatibility.
+      - id: manual
+        text: Reading the release notes
+        feedback: Helpful, but not an automated check that fails before deployment.
+    correct: [cdc]
+    solution: |
+      **Consumer-driven contracts.** The app's contract records what it uses; the provider's build fails if a change breaks it.
+
+recall:
+  - id: recall-keywords
+    concept: json-schema-validation
+    prompt: Name five JSON Schema keywords and what they check.
+    answer: type (JSON type), required (presence), properties (per-field schema), additionalProperties (extra fields), enum (allowed values) - also minimum, pattern, items, $ref.
+  - id: recall-format
+    concept: json-schema-validation
+    prompt: Is format enforced in JSON Schema 2020-12?
+    answer: Not by default - it is an annotation unless the validator is configured to assert formats.
+  - id: recall-openapi-version
+    concept: openapi-contracts
+    prompt: Which OpenAPI versions align with JSON Schema 2020-12?
+    answer: OpenAPI 3.1 and later (3.2.0 was released in September 2025); 3.0 uses an older, modified schema dialect.
+  - id: recall-breaking
+    concept: openapi-contracts
+    prompt: Give three examples of breaking API changes.
+    answer: Removing or renaming a response field or endpoint, making an optional request field required, narrowing a type or range - and adding response enum values that strict clients don't handle.
+  - id: recall-pact-flow
+    concept: consumer-driven-contracts
+    prompt: How does a Pact contract flow from consumer to provider?
+    answer: Consumer tests against a mock provider generate the pact; it is published to a broker; the provider replays the interactions against the real API and publishes the verification result.
+  - id: recall-shape-value
+    concept: json-schema-validation
+    prompt: What can't schema validation prove?
+    answer: That values are correct - a response can have the right shape and the wrong amount or status.
+
+next:
+  - pagination-filtering-rate-limits
+  - payment-api-negative-matrix

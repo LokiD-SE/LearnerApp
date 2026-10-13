@@ -1,0 +1,629 @@
+id: status-codes-and-errors
+title: Status codes and error responses
+subject: api-testing
+module: api-foundations
+level: beginner
+status: published
+estimatedMinutes: 45
+summary: Choosing and checking the right status code for each situation - with the headers the standard requires - designing error bodies with RFC 9457 Problem Details, and knowing which errors a client may safely retry.
+tags: [api, http, status codes, errors, problem details, rfc 9457, rfc 9110, retry, 4xx, 5xx, retry-after]
+
+environment: |
+  - **Standards:** **RFC 9110** (HTTP Semantics), section 15 "Status Codes" - definitions quoted here; **RFC 6585**
+    section 4 for **429 Too Many Requests**; **RFC 9457** "Problem Details for HTTP APIs" (2023, replaces RFC 7807) for
+    the `application/problem+json` error format. All free at [rfc-editor.org](https://www.rfc-editor.org/).
+  - **API-specific:** which code an API uses for each business error (400 or 422 for validation, 403 or 404 for
+    resources you may not see) is part of *its* contract - the standard allows both in several cases. Check the API's
+    documentation and test against it.
+  - **Fictional:** SandPay (`https://api.sandpay.example`) and its error types (`https://docs.sandpay.example/errors/...`).
+
+prerequisites:
+  - http-request-response-anatomy
+
+concepts:
+  - id: status-code-semantics
+    name: Status code semantics
+    summary: Each code has a defined meaning and sometimes required headers - 401 with WWW-Authenticate, 405 with Allow, 429 and 503 optionally with Retry-After - and the class tells clients whether the request can succeed unchanged.
+  - id: problem-details
+    name: Problem Details error bodies
+    summary: RFC 9457 defines a JSON error object - type, title, status, detail, instance, plus extensions - served as application/problem+json, so clients can handle errors by type rather than by parsing messages.
+  - id: retryable-errors
+    name: Retryable and non-retryable errors
+    summary: Client errors such as 400 and 422 fail again unchanged; 429, 503 and network timeouts may succeed later, honouring Retry-After and, for unsafe methods, only with idempotency.
+
+objectives:
+  - Choose the correct status code for a situation and check the headers the standard requires with it.
+  - Design and test error responses with RFC 9457 Problem Details.
+  - Decide which errors a client may retry and how, and test that it does so safely.
+  - Find APIs that misuse status codes - 200 with an error, 500 for client mistakes - and report them with evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [status-code-semantics]
+    title: The idea in plain language
+    body: |
+      A parcel service returns your parcel with a sticker: "address unknown", "refused by recipient", "depot closed -
+      try tomorrow". The sticker tells you **what to do next**: fix the address, give up, or simply try again later.
+
+      HTTP status codes are those stickers. A client - an app, another service, a retry library - reads the code before it
+      reads anything else. If the sticker is wrong, everything downstream is wrong: an app that gets `500` for a typo in an
+      email address retries forever; a monitoring system that sees `200` for a failed payment reports a healthy service.
+
+      For testers, the status code and the error body are a **contract** as important as the success response.
+
+  - id: what
+    kind: what
+    concepts: [status-code-semantics]
+    title: What the codes mean - the ones APIs use most
+    body: |
+      Definitions from RFC 9110 (and RFC 6585 for 429), shortened:
+
+      | Code | Meaning | Required or useful headers |
+      |---|---|---|
+      | **400 Bad Request** | the server won't process it due to "a client error (e.g., malformed request syntax ...)" | - |
+      | **401 Unauthorized** | "lacks valid authentication credentials" | **MUST** send `WWW-Authenticate` with at least one challenge |
+      | **403 Forbidden** | "understood the request but refuses to fulfill it"; with credentials, they are "insufficient" | - |
+      | **404 Not Found** | no current representation found, **or the server is "not willing to disclose that one exists"** | - |
+      | **405 Method Not Allowed** | method known but not supported by this resource | **MUST** send `Allow` |
+      | **409 Conflict** | "a conflict with the current state of the target resource" | content explaining the conflict (SHOULD) |
+      | **412 Precondition Failed** | a condition in the request headers (for example `If-Match`) was false | - |
+      | **415 Unsupported Media Type** | the content format isn't supported | - |
+      | **422 Unprocessable Content** | content type understood, syntax correct, but "unable to process the contained instructions" | - |
+      | **429 Too Many Requests** | "too many requests in a given amount of time" | MAY send `Retry-After` |
+      | **500 Internal Server Error** | "an unexpected condition" | - |
+      | **502 / 504** | a gateway got an invalid / no timely response from upstream | - |
+      | **503 Service Unavailable** | "temporary overload or scheduled maintenance" | MAY send `Retry-After` |
+
+      The **class** carries the main message: **4xx** - the request as sent won't succeed; change something. **5xx** - the
+      server failed; the same request may work later.
+
+  - id: why
+    kind: why
+    concepts: [status-code-semantics, retryable-errors]
+    title: Why wrong codes are real defects
+    body: |
+      - **`200 OK` with `{"error": ...}`** - monitoring counts success, caches may store it, client libraries don't raise an
+        error. The failure is invisible.
+      - **`500` for a client mistake** (missing field, bad JSON) - clients and retry policies treat it as temporary and
+        retry; alerts page the on-call engineer at night for a user's typo.
+      - **`400` for a server failure** (database down) - clients give up on a request that would have worked a minute later.
+      - **`401` without `WWW-Authenticate`** - violates RFC 9110 and confuses clients that use the challenge.
+      - **`404` versus `403`** - returning `403` for another customer's payment confirms it exists. RFC 9110 explicitly allows
+        `404` for a resource the server is "not willing to disclose" - often the safer choice for ids that belong to others.
+      - **Different error formats per endpoint** - every client has to parse each one differently, and gets it wrong.
+
+  - id: internals
+    kind: internals
+    concepts: [problem-details]
+    title: How Problem Details work
+    body: |
+      RFC 9457 defines a JSON object for errors, served with `Content-Type: application/problem+json`. Its members:
+
+      | Member | Meaning |
+      |---|---|
+      | `type` | a URI identifying the problem type - the **primary identifier** clients use; defaults to `about:blank` |
+      | `title` | a short, human-readable summary of the problem **type** |
+      | `status` | the HTTP status code, for convenience (the header is authoritative) |
+      | `detail` | a human-readable explanation of **this occurrence** |
+      | `instance` | a URI identifying this occurrence |
+      | extensions | any other members the problem type defines, for example `errors` with a JSON Pointer per field |
+
+      A SandPay validation error in this format:
+
+      ```http
+      HTTP/1.1 422 Unprocessable Content
+      Content-Type: application/problem+json
+
+      {
+        "type": "https://docs.sandpay.example/errors/validation",
+        "title": "The request has invalid fields.",
+        "status": 422,
+        "detail": "2 fields are invalid.",
+        "instance": "/v1/payments/requests/req_7Hq2",
+        "errors": [
+          {"pointer": "#/amount", "detail": "must be at least 50"},
+          {"pointer": "#/currency", "detail": "must be an ISO 4217 code"}
+        ]
+      }
+      ```
+
+      Clients branch on `type` (a stable identifier), show `detail` to developers, and use `pointer` to mark the field.
+      They should **not** parse `title` or `detail` text - those may be translated or reworded.
+
+  - id: visual
+    kind: visual
+    concepts: [retryable-errors]
+    title: "Flowchart: should the client retry?"
+    body: |
+      A typical client policy, built from the status classes and headers. Unsafe methods (`POST`) are retried only with an
+      idempotency key - see [idempotency keys](#/lesson/idempotency-keys).
+
+      ```mermaid
+      flowchart TD
+          A[Response or failure] --> B{No response at all - timeout or connection error?}
+          B -- Yes --> C{Method idempotent or request has an idempotency key?}
+          C -- Yes --> R[Retry with backoff]
+          C -- No --> S[Do not retry blindly - check the status first]
+          B -- No --> D{Status code?}
+          D -- 2xx --> OK[Success]
+          D -- 429 or 503 --> E[Wait Retry-After if present, then retry with backoff]
+          D -- 502 or 504 --> C
+          D -- 400, 401, 403, 404, 409, 422 --> F[Do not retry unchanged - fix the request or report]
+          D -- 500 --> G[Retry a limited number of times if idempotent, then report]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [status-code-semantics, problem-details]
+    title: Step by step - testing an API's error contract
+    body: |
+      1. **List the error situations** from the API documentation: malformed body, missing or invalid field, missing or
+         expired credentials, insufficient permission, unknown id, someone else's id, wrong state, duplicate, unsupported
+         method, unsupported media type, rate limit, dependency down.
+      2. **Write the expected status, headers and error `type`** for each - from the documentation, and from RFC 9110 where
+         the documentation is silent.
+      3. **Trigger each one** with a single change from a valid request (one invalid thing per test).
+      4. **Assert the status code first, then the required headers** (`WWW-Authenticate`, `Allow`, `Retry-After`), then the
+         body: `Content-Type: application/problem+json`, a known `type`, a useful `detail`, pointers to the right fields.
+      5. **Assert what must not be there:** stack traces, SQL, internal host names, other customers' data.
+      6. **Check consistency** across endpoints - the same situation gets the same code and `type` everywhere.
+      7. **Check side effects:** an error response must leave nothing half-created.
+
+  - id: example
+    kind: example
+    concepts: [status-code-semantics, retryable-errors]
+    title: "Real-world example: the retry storm"
+    body: |
+      After a release, the payment API's error rate jumps and its database nearly falls over - but traffic hasn't grown.
+
+      The tester looks at the logs: thousands of `POST /v1/payments` requests per minute from a partner's server, all
+      failing with **`500`**. The partner's integration sends an amount as a string (`"25.00"`) - a client mistake. The
+      new version's validation layer throws an unhandled type error for it, so the API answers `500` instead of `422`.
+
+      The partner's HTTP client follows a common policy: retry `5xx` with backoff. Each of their failed requests becomes
+      five. With every partner doing the same, a validation bug turns into an outage.
+
+      Fixes: return `422` with a Problem Details body pointing at `#/amount`; add a test per field type ("string where a
+      number is expected") asserting a 4xx, never a 5xx; and add an alert on the ratio of 5xx caused by request content.
+
+  - id: code
+    kind: code
+    concepts: [status-code-semantics, problem-details]
+    title: Checking error responses with curl
+    collapsed: true
+    body: |
+      Missing credentials - expect `401` **with** a `WWW-Authenticate` header:
+
+      ```bash
+      curl -si https://api.sandpay.example/v1/payments/pay_81Fz | head -5
+      ```
+
+      ```http
+      HTTP/1.1 401 Unauthorized
+      WWW-Authenticate: Bearer realm="sandpay"
+      Content-Type: application/problem+json
+      ```
+
+      Unsupported method - expect `405` **with** `Allow`:
+
+      ```bash
+      curl -si -X DELETE https://api.sandpay.example/v1/payments \
+        -H "Authorization: Bearer $SANDPAY_KEY" | head -3
+      ```
+
+      ```http
+      HTTP/1.1 405 Method Not Allowed
+      Allow: GET, POST
+      ```
+
+      Validation error - expect `422` and Problem Details:
+
+      ```bash
+      curl -s https://api.sandpay.example/v1/payments \
+        -H "Authorization: Bearer $SANDPAY_KEY" \
+        -H "Content-Type: application/json" \
+        -d '{"amount": "25.00", "currency": "EUR"}' -w "\nstatus %{http_code}\n"
+      ```
+
+      The `-w` option prints the status after the body; `-i` prints the response headers. Exact headers and bodies are
+      SandPay's - real APIs document their own.
+
+  - id: tests
+    kind: tests
+    concepts: [status-code-semantics, problem-details, retryable-errors]
+    title: Positive and negative test cases
+    body: |
+      For `POST /v1/payments` and `GET /v1/payments/{id}`. Expected codes follow SandPay's documentation.
+
+      | ID | Request | Expected status | Also assert |
+      |---|---|---|---|
+      | E1 | malformed JSON | 400 | Problem Details `type` validation or malformed-body; nothing created |
+      | E2 | amount as a string | 422 | `errors[0].pointer` = `#/amount` |
+      | E3 | no `Authorization` | 401 | `WWW-Authenticate` present; no data in body |
+      | E4 | valid key, no permission for refunds | 403 | `type` names the missing permission |
+      | E5 | another merchant's payment id | 404 (as documented) | body identical to a truly unknown id |
+      | E6 | `DELETE /v1/payments` | 405 | `Allow` lists the supported methods |
+      | E7 | `Content-Type: text/plain` | 415 | nothing created |
+      | E8 | capture an already captured payment | 409 | `detail` explains the state conflict |
+      | E9 | 100 requests in one second | 429 | `Retry-After` present (if documented); later request succeeds |
+      | E10 | dependency down (test environment switch) | 503 | `Retry-After` if documented; no partial payment |
+      | E11 | any error | - | `Content-Type: application/problem+json`; no stack trace, SQL or host names |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [status-code-semantics, problem-details, retryable-errors]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Asserting only "not 200".** Assert the exact code - 400, 401 and 422 lead to different client behaviour.
+      - **Ignoring required headers** - `WWW-Authenticate` on 401, `Allow` on 405.
+      - **Testing error messages by text.** Assert `type` and pointers; text changes and gets translated.
+      - **Accepting 500 for bad input.** Any 5xx caused by request content is a defect.
+      - **Leaking existence.** Another customer's resource: same response as an unknown id (often 404).
+      - **Retrying non-idempotent requests on timeouts.** Only with an idempotency key.
+      - **Inconsistent formats.** One error format for the whole API.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [status-code-semantics]
+    title: Choices the standard leaves open
+    body: |
+      | Situation | Options | Consideration |
+      |---|---|---|
+      | Field validation fails | 400 or 422 | 422 says "understood, but semantically wrong"; many APIs use 400 for everything - be consistent |
+      | Resource of another customer | 403 or 404 | 404 doesn't reveal that it exists |
+      | Business rule refuses the action (insufficient funds) | 402, 409, 422 or a 200 with a declined status | payments APIs often return **200/201 with a "declined" payment** - the request succeeded, the payment didn't; document it |
+      | Overload | 429 (per client) or 503 (whole service) | 429 when the client exceeded its limit; 503 when the server can't cope |
+
+      The test oracle is the **API's documented contract**, checked against RFC 9110's meanings - not a personal preference.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **4xx** - change the request; **5xx** - the server failed, may work later.
+      - Required headers: **401 → WWW-Authenticate**, **405 → Allow**; **429 / 503 → Retry-After** (optional).
+      - **404** may hide resources the server won't disclose; **409** state conflict; **422** semantically invalid content.
+      - Errors as **RFC 9457 Problem Details**: `type`, `title`, `status`, `detail`, `instance`, extensions;
+        `application/problem+json`; clients branch on `type`.
+      - Retry only **429, 503, 502/504 and timeouts**, with backoff, honouring Retry-After - and POST only with an
+        idempotency key.
+      - Never **200 with an error** or **500 for bad input**.
+
+exercises:
+  - id: pick-code
+    type: mcq
+    concept: status-code-semantics
+    skill: application
+    title: Capture twice
+    prompt: A client sends `POST /v1/payments/pay_81Fz/capture` for a payment that is already captured. Which status code fits RFC 9110 best?
+    options:
+      - id: conflict
+        text: 409 Conflict
+        feedback: Correct - the request conflicts with the current state of the resource; the body should say why.
+      - id: bad-request
+        text: 400 Bad Request
+        feedback: The request is well formed; the problem is the resource's state, which 409 describes precisely.
+      - id: not-found
+        text: 404 Not Found
+        feedback: The payment exists and is visible to this client; 404 would mislead it.
+      - id: server-error
+        text: 500 Internal Server Error
+        feedback: Nothing unexpected happened on the server; a 5xx would make clients retry a request that can never succeed.
+    correct: [conflict]
+    hints:
+      - Is the request malformed, or does it clash with what the resource currently is?
+    solution: |
+      **409 Conflict**, with a Problem Details body such as `type: .../errors/payment-already-captured`. Some APIs use 400
+      or 422 - acceptable if documented and consistent; 500 never is.
+    followUp: |
+      The same capture request is retried with the same idempotency key after a timeout. Should it get 409 too? Look at what
+      [idempotency keys](#/lesson/idempotency-keys) say about replaying the first response.
+
+  - id: required-header
+    type: mcq
+    concept: status-code-semantics
+    skill: recognition
+    title: The header a 401 must have
+    prompt: According to RFC 9110, what must a server send with a `401 Unauthorized` response?
+    options:
+      - id: www-auth
+        text: A WWW-Authenticate header with at least one challenge
+        feedback: Correct - RFC 9110 section 15.5.2 says the server MUST send it.
+      - id: allow
+        text: An Allow header
+        feedback: Allow is required with 405 Method Not Allowed.
+      - id: retry-after
+        text: A Retry-After header
+        feedback: Retry-After is optional with 429 and 503.
+      - id: location
+        text: A Location header pointing to a login page
+        feedback: Location belongs to redirects and 201 Created. APIs answer 401 with a challenge, not a redirect.
+    correct: [www-auth]
+    hints:
+      - The client needs to know how it is expected to authenticate.
+    solution: |
+      **WWW-Authenticate.** For bearer tokens it looks like `WWW-Authenticate: Bearer realm="..."` (RFC 6750 adds `error`
+      attributes such as `invalid_token`). Assert it in your 401 tests.
+    followUp: |
+      Which header must accompany a 405, and what should it contain for `/v1/payments`?
+
+  - id: debug-error-body
+    type: debug
+    concept: problem-details
+    skill: analysis
+    title: What's wrong with this error?
+    prompt: Click the line that makes this error response a defect, in an API that documents RFC 9457 Problem Details.
+    language: http
+    code: |
+      HTTP/1.1 422 Unprocessable Content
+      Content-Type: application/problem+json
+
+      {
+        "type": "https://docs.sandpay.example/errors/validation",
+        "title": "The request has invalid fields.",
+        "status": 422,
+        "detail": "amount must be at least 50",
+        "trace": "java.lang.IllegalArgumentException at com.sandpay.api.PaymentValidator.validate(PaymentValidator.java:88)"
+      }
+    correctLines: [9]
+    lineNotes:
+      - line: 2
+        note: The media type is the one RFC 9457 defines.
+      - line: 5
+        note: A stable type URI is exactly what clients should branch on.
+    hints:
+      - Which line tells an attacker something about the implementation?
+    solution: |
+      **Line 9.** A stack trace leaks class names, package structure and line numbers - useful to attackers and useless to
+      clients. Report it as a security defect; internal details belong in server logs, linked by an id such as `instance`.
+    followUp: |
+      Write the assertion that would catch any stack trace in any error response of the API.
+
+  - id: retry-decision
+    type: mcq
+    concept: retryable-errors
+    skill: application
+    title: Which one should the client retry?
+    prompt: A payment client receives these responses to `POST /v1/payments` requests that carried an idempotency key. Which should it retry automatically?
+    options:
+      - id: r503
+        text: 503 Service Unavailable with Retry-After 30
+        feedback: Correct - a temporary condition; wait 30 seconds and retry with the same idempotency key.
+      - id: r422
+        text: 422 with "amount must be at least 50"
+        feedback: The same request will fail again; the client must change the amount.
+      - id: r401
+        text: 401 Unauthorized
+        feedback: Retrying with the same credentials won't help; the client needs new or valid credentials.
+      - id: r409
+        text: 409 because the idempotency key was reused with a different body
+        feedback: That is a client defect - same key, different request. Retrying repeats the conflict.
+    correct: [r503]
+    hints:
+      - Which response says "temporary"?
+    solution: |
+      **503 with Retry-After.** Respect the wait, use backoff, keep the same idempotency key, and cap the attempts. 4xx
+      responses need a change, not a retry.
+    followUp: |
+      The client gets a timeout with no response at all. What should it do, and why does the idempotency key matter most here?
+
+  - id: error-contract-tests
+    type: testdesign
+    concept: problem-details
+    skill: application
+    title: Test the error contract
+    prompt: |
+      Design tests for the error contract of `POST /v1/refunds` (body: payment id, amount). The API documents RFC 9457
+      Problem Details. Give at least seven cases with the request, expected status, required headers and what you assert in
+      the error body - and one check that applies to every error.
+    hints:
+      - Malformed, invalid, unauthorised, forbidden, unknown, someone else's, wrong state, too many.
+      - What must never appear in any error body?
+    modelAnswer: |
+      1. Malformed JSON → 400; Problem Details with a malformed-body type; no refund created.
+      2. Amount missing → 422 (or documented 400); `errors` pointer `#/amount`.
+      3. Amount above the refundable balance → 422 or 409 as documented; `type` names the rule; `detail` gives the
+         refundable amount.
+      4. No credentials → 401 with `WWW-Authenticate`.
+      5. Key without refund permission → 403; `type` names the permission.
+      6. Unknown payment id → 404; another merchant's payment id → identical 404 response.
+      7. Payment not captured yet → 409 with a type pointing to "use void".
+      8. Over the rate limit → 429 with `Retry-After` if documented.
+      9. `Content-Type: text/plain` → 415.
+
+      For every error: `Content-Type: application/problem+json`, `status` equals the HTTP status, a documented `type`, no
+      stack traces, SQL, internal names or other customers' data, and no refund created.
+    rubric:
+      - Covered malformed and semantically invalid bodies
+      - Covered missing credentials with the WWW-Authenticate check
+      - Covered insufficient permission
+      - Covered unknown and other-merchant ids with identical responses
+      - Covered a state conflict
+      - Covered rate limiting or unsupported media type
+      - Had a universal check for format, type and leaks
+      - Checked that no side effect happened on errors
+    solution: |
+      Compare with the model answer. The **identical 404** for another merchant's id and the **universal leak check** are the
+      two that protect data.
+    followUp: |
+      How would you automate the universal check so every existing API test applies it without being rewritten?
+
+  - id: order-assert
+    type: order
+    concept: status-code-semantics
+    skill: recall
+    title: The order of assertions
+    prompt: Put the checks for an error response in the order you would assert them.
+    items:
+      - id: status
+        text: The status code
+      - id: headers
+        text: Required headers (WWW-Authenticate, Allow, Retry-After) and Content-Type
+      - id: type
+        text: The problem type and field pointers
+      - id: leaks
+        text: No internal details or other customers' data in the body
+      - id: side-effects
+        text: No side effects - nothing created or changed
+    hints:
+      - Clients read the status first.
+    solution: |
+      Status → headers → type and pointers → no leaks → no side effects. Asserting the status first gives the clearest failure
+      message when it is wrong.
+
+  - id: interview-errors
+    type: interview
+    concept: retryable-errors
+    skill: application
+    title: "Interview: 400 or 500?"
+    prompt: |
+      *"Why does it matter whether an API returns 400 or 500 for a bad request? How would you test error handling?"* Answer
+      as you would in the interview.
+    hints:
+      - What do clients, retry policies and monitoring do with each class?
+    modelAnswer: |
+      The status class drives behaviour. A 4xx tells the client the request itself is wrong, so it should fix it rather
+      than retry; a 5xx says the server failed, so retry policies try again and monitoring raises alerts. A 500 for bad
+      input causes retry storms and false alerts; a 400 for a real outage makes clients give up on requests that would
+      work later. Some codes also carry required headers - 401 needs WWW-Authenticate, 405 needs Allow.
+
+      To test it, I list every error situation from the documentation, change one thing per test from a valid request, and
+      assert the exact status, the required headers, a consistent error format - ideally RFC 9457 Problem Details with a
+      stable type and field pointers - and that nothing was created. I check that errors never leak stack traces or other
+      customers' data, that someone else's resource looks the same as an unknown one, and that bad input never produces a
+      5xx. I'd also test the client side: that it retries only 429, 503 and timeouts, honours Retry-After, and retries POSTs
+      only with an idempotency key.
+    rubric:
+      - Explained client and monitoring behaviour for 4xx versus 5xx
+      - Gave a concrete consequence of a wrong class (retry storm or false alerts)
+      - Mentioned required headers for some codes
+      - Changed one thing per negative test and asserted exact codes
+      - Mentioned a consistent error format such as Problem Details
+      - Checked for leaks and side effects
+      - Covered client retry behaviour
+    followUps:
+      - When would you return 404 instead of 403?
+      - What should a payment API return when the card is declined?
+      - How would you test Retry-After handling in a client?
+    solution: |
+      Interviewers want to hear **consequences** - not a list of codes, but what goes wrong when they're misused.
+
+  - id: explain-404-403
+    type: short
+    concept: status-code-semantics
+    skill: recall
+    title: 404 for someone else's resource
+    prompt: In two or three sentences, explain why an API might answer 404 rather than 403 when a client asks for another customer's payment.
+    hints:
+      - What does a 403 confirm?
+    modelAnswer: |
+      A 403 confirms that the resource exists but the client may not see it, which leaks information - an attacker can probe
+      ids to learn which exist. RFC 9110 allows 404 when the server is not willing to disclose that a resource exists, so
+      answering exactly as for an unknown id hides it.
+    rubric:
+      - Said 403 confirms existence
+      - Said this lets attackers probe ids
+      - Said RFC 9110 allows 404 for resources the server won't disclose
+    solution: |
+      Test it by comparing the full responses - status, headers and body - for another customer's id and for a random id.
+
+placement:
+  - id: place-405
+    type: mcq
+    concept: status-code-semantics
+    skill: application
+    title: 405 without Allow
+    prompt: An API answers `405 Method Not Allowed` with no `Allow` header. What is true?
+    options:
+      - id: violation
+        text: It violates RFC 9110, which requires an Allow header listing the supported methods
+        feedback: Correct - the origin server MUST generate Allow in a 405 response.
+      - id: fine
+        text: It is fine; Allow is optional
+        feedback: For 405 the standard says MUST.
+      - id: should-be-404
+        text: It should have been a 404
+        feedback: 405 is correct when the method is known but not supported by the resource; the missing header is the defect.
+      - id: retry
+        text: The client should retry with POST
+        feedback: The client can't know which method works - that is exactly what the Allow header would tell it.
+    correct: [violation]
+    solution: |
+      **A violation.** A small defect, but an easy, objective one to report - and a sign that error paths aren't tested.
+
+  - id: place-problem
+    type: mcq
+    concept: problem-details
+    skill: application
+    title: What should a client branch on?
+    prompt: In an RFC 9457 Problem Details response, which member should client code use to decide how to handle the error?
+    options:
+      - id: type
+        text: type
+        feedback: Correct - the type URI is the problem's primary identifier.
+      - id: title
+        text: title
+        feedback: The title is for humans and may be translated or reworded.
+      - id: detail
+        text: detail
+        feedback: detail describes this occurrence for humans; parsing it is fragile.
+      - id: instance
+        text: instance
+        feedback: instance identifies the occurrence (useful for support), not the kind of problem.
+    correct: [type]
+    solution: |
+      **type.** Tests should assert it, and the documentation should list every type an endpoint can return.
+
+  - id: place-retry
+    type: mcq
+    concept: retryable-errors
+    skill: analysis
+    title: Retry or not?
+    prompt: Which response is it safe and sensible for a client to retry automatically, without changing the request?
+    options:
+      - id: r429
+        text: 429 Too Many Requests with Retry-After 5
+        feedback: Correct - wait 5 seconds and retry; the request itself was fine.
+      - id: r400
+        text: 400 Bad Request
+        feedback: The same request will be rejected again.
+      - id: r403
+        text: 403 Forbidden
+        feedback: The credentials are insufficient; retrying with the same ones won't change that.
+      - id: r422
+        text: 422 Unprocessable Content
+        feedback: The content is semantically invalid; it needs to change.
+    correct: [r429]
+    solution: |
+      **429 with Retry-After.** For a POST, keep the same idempotency key.
+
+recall:
+  - id: recall-classes
+    concept: status-code-semantics
+    prompt: What do 4xx and 5xx tell a client to do?
+    answer: 4xx - the request as sent won't succeed; change it. 5xx - the server failed; the same request may succeed later.
+  - id: recall-headers
+    concept: status-code-semantics
+    prompt: Which headers does RFC 9110 require with 401 and with 405?
+    answer: WWW-Authenticate with 401; Allow with 405.
+  - id: recall-422
+    concept: status-code-semantics
+    prompt: When is 422 more precise than 400?
+    answer: When the content type is supported and the syntax is valid, but the content can't be processed - for example a field value that breaks a rule.
+  - id: recall-problem
+    concept: problem-details
+    prompt: Name the standard members of an RFC 9457 Problem Details object.
+    answer: type, title, status, detail and instance - plus any extension members the problem type defines.
+  - id: recall-media
+    concept: problem-details
+    prompt: Which media type identifies Problem Details in JSON?
+    answer: application/problem+json
+  - id: recall-retry
+    concept: retryable-errors
+    prompt: Which failures may a client retry, and what makes retrying a POST safe?
+    answer: 429, 503, 502 or 504 and timeouts, with backoff and Retry-After; a POST only with an idempotency key.
+
+next:
+  - authentication-and-authorization
+  - payment-api-negative-matrix

@@ -69,8 +69,8 @@ fields, so the template is complete without separate sections for them.
 
 ### Markdown in bodies
 
-GitHub-flavoured Markdown: tables, lists, fenced code with a language (`java`, `json`, `http`, `bash`, `yaml`,
-`xml`, `sql`, `javascript`, `typescript`) and fenced `mermaid` diagrams. Raw HTML is escaped, so don't use it.
+GitHub-flavoured Markdown: tables, lists, fenced code with a language (`java`, `kotlin`, `swift`, `json`, `http`,
+`bash`, `yaml`, `xml`, `sql`, `javascript`, `typescript`, `plaintext`) and fenced `mermaid` diagrams. Raw HTML is escaped, so don't use it.
 Link to another lesson with `[text](#/lesson/<id>)`, and to the practice shop with `[text](shop/index.html)`.
 
 ## Exercise types

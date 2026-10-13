@@ -1,0 +1,582 @@
+id: inconsistent-status-incidents
+title: Inconsistent payment status incidents
+subject: payment-architecture
+module: observability-and-rca
+level: advanced
+status: published
+estimatedMinutes: 55
+summary: When the shop, the PSP, the ledger and the customer disagree about a payment - paid but pending, refunded but captured, two payments one order - how such divergence arises, how to find every affected payment, repair the data safely, and run a blameless postmortem that leaves tests and monitoring behind.
+tags: [payments, incident, inconsistent status, source of truth, data repair, reconciliation, postmortem, blameless, regression, monitoring]
+
+environment: |
+  - **Sources:** the **Google SRE book**, chapter "Postmortem Culture: Learning from Failure" - a postmortem is "a written
+    record of an incident, its impact, the actions taken to mitigate or resolve it", plus root causes and follow-up actions;
+    blameless postmortems identify contributing causes without indicting individuals; triggers include user-visible
+    degradation, data loss and monitoring failures ([sre.google](https://sre.google/sre-book/postmortem-culture/)).
+  - **Related lessons:** [webhooks and asynchronous status](#/lesson/webhooks-and-async-status),
+    [synchronous versus asynchronous payments](#/lesson/sync-vs-async-payments),
+    [reconciliation for testers](#/lesson/reconciliation-for-testers).
+  - **Organisation-specific:** incident severity levels, who may change production data, and customer-communication rules are
+    set by your organisation - follow its process.
+  - **Fictional:** the demo shop's services, SandPay and the incident.
+
+prerequisites:
+  - sync-vs-async-payments
+  - reconciliation-for-testers
+  - defect-isolation-decision-trees
+
+concepts:
+  - id: status-divergence
+    name: How payment statuses diverge
+    summary: Timeouts, lost or rejected webhooks, out-of-order events, partial failures and manual changes leave copies of a payment's status disagreeing; each data item needs a declared source of truth.
+  - id: incident-scoping-and-repair
+    name: Scoping and repairing an incident
+    summary: Find every affected payment with a query against the source of truth, contain the cause, repair data with a reviewed, idempotent, logged procedure, and make customers whole.
+  - id: blameless-postmortems
+    name: Blameless postmortems and prevention
+    summary: A written record of impact, timeline, contributing causes and follow-up actions, without blame - turned into regression tests, invariant checks and alerts so the same divergence is caught next time.
+
+objectives:
+  - Explain the common mechanisms that make payment statuses diverge between systems.
+  - Scope an incident - write the query that finds every affected payment from the source of truth.
+  - Plan and test a safe data repair, including dry runs, idempotency and verification.
+  - Write a blameless postmortem whose action items include tests, invariants and monitoring.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [status-divergence]
+    title: The idea in plain language
+    body: |
+      A family shares a calendar on paper on the fridge **and** on everyone's phones. Dad changes dinner to 8 pm on the paper;
+      Mum's phone still says 7 pm. Nobody is wrong on purpose - an update simply didn't reach every copy. Now someone has to ask:
+      **which calendar is the real one?** and **who else has the wrong time?**
+
+      Payment systems keep many copies of a payment's status - the PSP's, the shop's order, the ledger's, the customer's email,
+      the support tool's. Most of the time updates flow between them. When one doesn't - a webhook rejected, an event processed
+      twice, a timeout treated as a failure - the copies disagree, and real people are affected: charged without goods, goods
+      without payment, refunded twice.
+
+      These incidents are a tester's territory: finding the mechanism, finding **every** affected payment, checking the repair, and
+      making sure the next one is caught by a test or an alert instead of a customer.
+
+  - id: what
+    kind: what
+    concepts: [status-divergence]
+    title: What inconsistent statuses look like
+    body: |
+      | Divergence | PSP says | Shop says | Customer impact | Typical mechanism |
+      |---|---|---|---|---|
+      | **Paid, shown unpaid** | succeeded | awaiting payment / cancelled | charged, no goods | timeout treated as failure; webhook rejected or dropped |
+      | **Unpaid, shown paid** | failed / declined | paid | goods without payment | trusting the return URL; error mapped to success |
+      | **Refunded, shown captured** | refunded | paid | correct money, wrong records, maybe goods shipped | out-of-order events; refund made in the PSP dashboard directly |
+      | **Two payments, one order** | 2 × succeeded | paid once | charged twice | new idempotency key per retry |
+      | **Captured, order cancelled** | captured | cancelled | charged for a cancelled order | void not sent; capture job ignored cancellation |
+      | **Ledger mismatch** | succeeded | paid | none directly; finance is wrong | ledger consumer failed; dual write without an outbox |
+
+      **Source of truth.** For each item, declare which system is authoritative: usually the **PSP for money movements**
+      (authorised, captured, refunded), the **shop for order and fulfilment**, the **ledger for accounting**. Repairs move the
+      other copies towards the source of truth - never the reverse without a reason.
+
+  - id: why
+    kind: why
+    concepts: [incident-scoping-and-repair]
+    title: Why these incidents are hard
+    body: |
+      - **They're silent.** No error page, no 500 - just a status that's wrong. They're found by customers, support or finance,
+        often days later.
+      - **They're partial.** Usually a small share of payments, under specific timing - not reproducible on demand without
+        understanding the mechanism.
+      - **Scope is the hardest question.** "Which other customers?" needs a query over all payments in the period, comparing
+        systems - not a search for complaints.
+      - **Repairs are risky.** A careless fix script can refund twice, email thousands of customers, or overwrite correct data. A
+        repair is a change to production money data and deserves the same rigour as a release.
+      - **The cause is usually several things.** A timeout **and** a rejected webhook **and** no reconciliation alert - fixing only
+        one leaves the next incident waiting.
+
+  - id: internals
+    kind: internals
+    concepts: [incident-scoping-and-repair]
+    title: How to scope and repair safely
+    body: |
+      **Scoping query.** Compare the source of truth with the copies, for the whole affected period plus a margin:
+
+      ```sql
+      -- payments the PSP says succeeded, whose orders aren't paid (from the PSP export loaded into a reporting table)
+      SELECT p.psp_payment_id, p.reference AS order_id, p.amount_minor, p.currency, p.succeeded_at, o.status
+      FROM psp_payments p
+      LEFT JOIN orders o ON o.id = p.reference
+      WHERE p.status = 'succeeded'
+        AND p.succeeded_at >= TIMESTAMP '2026-10-05 00:00:00'
+        AND (o.id IS NULL OR o.status <> 'paid');
+      ```
+
+      Also check the **reverse** direction (orders paid without a succeeded payment) and **duplicates** (orders with two succeeded
+      payments).
+
+      **Repair procedure** - what testers review and verify:
+
+      1. **Contain first** - stop new cases (fix or disable the faulty path, pause a job) before repairing old ones.
+      2. **Decide the correct end state per case** - fulfil or refund? A rule agreed with the product owner and finance.
+      3. **Dry run** - the script lists what it *would* change; review the list against the scoping query.
+      4. **Idempotent** - running it twice changes nothing the second time (check the current state before each change).
+      5. **Logged** - every change recorded with before and after values, case id and the operator.
+      6. **Small batch first**, verify, then the rest.
+      7. **Verify** - re-run the scoping query: zero rows. Re-run invariant checks (see
+         [partial refunds and invariants](#/lesson/partial-refunds-and-invariants)).
+      8. **Customer communication** - who is told what, once, after the repair.
+
+  - id: visual
+    kind: visual
+    concepts: [incident-scoping-and-repair, blameless-postmortems]
+    title: "Flowchart: from first report to prevention"
+    body: |
+      ```mermaid
+      flowchart TD
+          A[Report - customer, support or finance] --> B[Confirm one case with a full timeline]
+          B --> C[Find the mechanism - first divergence]
+          C --> D[Contain - stop new cases]
+          D --> E[Scope - query all payments against the source of truth]
+          E --> F[Decide the correct end state per case]
+          F --> G[Repair - dry run, small batch, idempotent, logged]
+          G --> H[Verify - scoping query returns zero, invariants hold]
+          H --> I[Communicate to affected customers]
+          I --> J[Blameless postmortem - timeline, contributing causes, actions]
+          J --> K[Actions become tests, invariant checks and alerts]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [blameless-postmortems]
+    title: Step by step - a postmortem that prevents the next one
+    body: |
+      A postmortem (SRE book: "a written record of an incident, its impact, the actions taken to mitigate or resolve it", with root
+      causes and follow-ups) for a payment status incident contains:
+
+      1. **Summary** - what happened in two sentences.
+      2. **Impact** - number of payments and customers, money affected, duration, how it was detected.
+      3. **Timeline** - in UTC, from the first faulty event to the last repair, including when it was detected and by whom.
+      4. **Contributing causes** - all of them, technical and process: the defect, the missing test, the missing alert, the
+         deployment step that let it through. **Blameless**: describe what the system and process allowed, not who made a mistake.
+      5. **What went well** and **what went badly** in the response.
+      6. **Action items** - each with an owner and a date, of three kinds:
+         - **prevent** - fix the defect and its class (for example all webhook secrets loaded from one place);
+         - **detect** - an alert or reconciliation check that would have caught it within minutes;
+         - **test** - regression tests that reproduce the mechanism.
+      7. **Follow-up review** - the actions are checked off; the regression tests run in CI.
+
+  - id: example
+    kind: example
+    concepts: [status-divergence, incident-scoping-and-repair, blameless-postmortems]
+    title: "Real-world example: 214 paid orders shown as cancelled"
+    body: |
+      **Detected:** day 4, by finance - settlement reports contain payments for orders the shop shows as cancelled.
+
+      **Mechanism (after building timelines for three cases):** a secret rotation on day 1 updated the webhook secret in the PSP
+      dashboard and in one of two order-service instances. Webhooks reaching the other instance were rejected with 401. Payments
+      whose checkout call had **timed out** had been marked "awaiting payment", and a cleanup job cancelled them after 30 minutes. Their
+      only path to "paid" was the rejected webhook.
+
+      **Scope:** the scoping query found **214** succeeded payments with cancelled orders between day 1 09:12 and day 4 16:40; the
+      reverse and duplicate queries found none.
+
+      **Repair:** contain (fix the secret, pause the cleanup job); decision (fulfil where stock exists, otherwise refund - 187 fulfilled,
+      27 refunded); dry-run list reviewed against the query; 10 orders first, verified, then the rest; scoping query re-run - zero rows.
+
+      **Blameless contributing causes:** secrets deployed per instance by a manual step; webhook rejections not alerted; the cleanup job
+      cancelled orders whose PSP status was never checked; no daily reconciliation between PSP and orders.
+
+      **Actions:** secrets from a single store (prevent); alert on webhook 4xx rate and on PSP-succeeded-but-order-not-paid count
+      (detect); regression tests for "timeout then webhook", "webhook rejected then retried after fix", and "cleanup job checks the PSP
+      before cancelling" (test).
+
+  - id: code
+    kind: code
+    concepts: [incident-scoping-and-repair]
+    title: A safe repair script, in outline
+    collapsed: true
+    body: |
+      Illustrative Java outline of the properties a reviewer and tester check - dry run, idempotency, current-state checks against
+      the source of truth, logging and batching:
+
+      ```java
+      void repair(List<String> pspPaymentIds, boolean dryRun, int batchSize) {
+          for (List<String> batch : partition(pspPaymentIds, batchSize)) {
+              for (String id : batch) {
+                  PspPayment truth = psp.getPayment(id);                  // source of truth, read now
+                  Order order = orders.find(truth.reference());
+                  if (!"succeeded".equals(truth.status()) || order.isPaid()) {
+                      audit.log(id, "skip", order.status(), order.status());  // already fine - idempotent
+                      continue;
+                  }
+                  Decision decision = decide(order, truth);                 // fulfil or refund, by the agreed rule
+                  audit.log(id, decision.name(), order.status(), decision.targetStatus());
+                  if (!dryRun) {
+                      apply(order, truth, decision);                         // refunds use an idempotency key per case
+                  }
+              }
+              if (!dryRun) {
+                  verifyBatch(batch);                                         // re-read and assert the end state
+              }
+          }
+      }
+      ```
+
+      Tests for the script itself, in a copy of production-like data: dry run changes nothing; run twice gives the same end state;
+      an order already fixed by hand is skipped; a refund that fails is retried with the same idempotency key; the audit log has a
+      line per case.
+
+  - id: tests
+    kind: tests
+    concepts: [status-divergence, blameless-postmortems]
+    title: Regression tests and checks after an incident
+    body: |
+      | ID | Mechanism | Test or check | Expected |
+      |---|---|---|---|
+      | X1 | timeout at checkout, then webhook | PSP sandbox delay method, then webhook delivered | order paid via the webhook |
+      | X2 | webhook rejected, then fixed | webhook with a wrong secret, then the PSP retries after the fix | order paid on a retry; rejections alerted |
+      | X3 | cleanup job vs pending payment | order awaiting payment for 30 min with a succeeded PSP payment | job checks the PSP and doesn't cancel |
+      | X4 | out-of-order events | refunded before captured | final status refunded |
+      | X5 | refund made in the PSP dashboard | dashboard refund webhook | order and ledger updated |
+      | M1 | daily reconciliation | PSP succeeded vs orders paid | alert when the count of mismatches > 0 |
+      | M2 | webhook health | 4xx rate on the webhook endpoint | alert above a small threshold |
+      | M3 | stuck payments | orders awaiting payment > 1 h with a succeeded PSP payment | alert and report |
+      | R1 | repair script | dry run, double run, already-fixed case, failure retry | as in the code section |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [incident-scoping-and-repair, blameless-postmortems, status-divergence]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Fixing the complaining customers only.** Scope with a query - the silent ones are the majority.
+      - **Repairing before containing.** New cases keep arriving while you fix old ones.
+      - **Repairing towards the wrong copy.** Move copies towards the declared source of truth.
+      - **Untested repair scripts.** Dry run, idempotency and a small batch first - a repair is a release.
+      - **Blame in the postmortem.** It stops people sharing what really happened, and the systemic causes stay.
+      - **Action items without detection.** If the next divergence would again be found by finance on day 4, the postmortem isn't done.
+      - **Closing without regression tests.** The mechanism must be reproduced in a test that runs in CI.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Divergences: paid-shown-unpaid, unpaid-shown-paid, refunded-shown-captured, two payments one order, captured-but-cancelled,
+        ledger mismatch.
+      - Declare the **source of truth** per item - usually the **PSP for money**, the **shop for orders**, the **ledger for accounting**.
+      - Incident flow: confirm → mechanism → **contain** → **scope by query** → decide end states → **repair** (dry run, idempotent,
+        logged, batched) → **verify** → communicate.
+      - **Blameless postmortem** (Google SRE book): impact, timeline, contributing causes, actions to **prevent, detect, test**.
+
+exercises:
+  - id: source-of-truth
+    type: mcq
+    concept: status-divergence
+    skill: application
+    title: Which copy is right?
+    prompt: The PSP shows a payment `refunded`; the shop's order shows `paid`; no refund was made in the shop. Which system is normally the source of truth for whether money was refunded?
+    options:
+      - id: psp
+        text: The PSP - it records the money movements
+        feedback: Correct - the shop's copy must be updated to reflect the refund, and the cause of the missed update found.
+      - id: shop
+        text: The shop - it holds the order
+        feedback: The shop is authoritative for the order and fulfilment, not for whether money moved at the PSP.
+      - id: customer
+        text: The customer's email confirmation
+        feedback: Emails are notifications, not records.
+      - id: support
+        text: Whichever the support agent saw first
+        feedback: Repairs follow a declared source of truth, not the first screen someone looked at.
+    correct: [psp]
+    hints:
+      - Who actually moved the money?
+    solution: |
+      **The PSP.** Then ask how a refund happened without the shop knowing - often a refund made directly in the PSP dashboard whose
+      webhook wasn't handled.
+    followUp: |
+      Write the test that would catch "refund made in the PSP dashboard isn't reflected in the order".
+
+  - id: scope-mcq
+    type: mcq
+    concept: incident-scoping-and-repair
+    skill: analysis
+    title: How many are affected?
+    prompt: Twelve customers have complained about being charged for cancelled orders. What is the best way to find all affected payments?
+    options:
+      - id: query
+        text: Query the PSP's succeeded payments for the period against the shop's orders, including the reverse direction and duplicates
+        feedback: Correct - the source of truth compared with the copy finds every case, complaining or not.
+      - id: complaints
+        text: Fix the twelve complaints - those are the affected customers
+        feedback: Complaints are a fraction of the impact; most affected customers never write in.
+      - id: logs-search
+        text: Search the logs for errors around the complaint times
+        feedback: Useful for the mechanism, but logs miss cases where nothing was logged.
+      - id: wait
+        text: Wait a week for more complaints
+        feedback: Customers stay charged without goods for another week.
+    correct: [query]
+    hints:
+      - Which data covers every payment, not only those someone noticed?
+    solution: |
+      **Query against the source of truth.** Run it for the suspected period plus a margin, and in both directions.
+    followUp: |
+      The query returns 214 rows, but your mechanism only explains 190 of them. What do you do?
+
+  - id: debug-repair
+    type: debug
+    concept: incident-scoping-and-repair
+    skill: analysis
+    title: The repair script that refunds twice
+    prompt: A repair script refunds orders that were charged after cancellation. Click the line that makes running it twice dangerous.
+    language: java
+    code: |
+      for (String paymentId : affectedPaymentIds) {
+          PspPayment truth = psp.getPayment(paymentId);
+          Order order = orders.find(truth.reference());
+          audit.log(paymentId, "refund", order.status(), "refunded");
+          if (!dryRun) {
+              psp.refund(paymentId, truth.capturedMinor(), "repair-" + UUID.randomUUID());
+              order.setStatus(OrderStatus.REFUNDED);
+              orders.save(order);
+          }
+      }
+    correctLines: [6]
+    lineNotes:
+      - line: 2
+        note: Reading the PSP's current state is right - but the script never uses it to skip payments already refunded.
+      - line: 4
+        note: Logging every case before acting is good practice.
+    hints:
+      - What makes two refunds of the same payment look different to the PSP?
+    solution: |
+      **Line 6.** A random idempotency key per run means a second run - after a crash, or by a colleague - refunds again. Use a stable
+      key per case (`"repair-" + incidentId + "-" + paymentId`) **and** skip payments whose PSP status is already refunded (line 2 has
+      the data). Test by running the script twice.
+    followUp: |
+      Which other check would you add so the script never refunds an order that was fulfilled by hand in the meantime?
+
+  - id: repair-plan-design
+    type: testdesign
+    concept: incident-scoping-and-repair
+    skill: application
+    title: Plan and test a repair
+    prompt: |
+      An incident left 214 orders cancelled although their payments succeeded. The agreed rule: fulfil if stock exists, otherwise
+      refund. Write the repair plan and the tests for the repair script - containment, scoping, decision, dry run, batching,
+      verification and communication.
+    hints:
+      - What must stop before you repair?
+      - What proves the script is safe before it touches production?
+      - How do you know you're done?
+    modelAnswer: |
+      Plan:
+
+      1. Contain: deploy the webhook-secret fix; pause the cleanup job until it checks the PSP status.
+      2. Scope: run the scoping query (PSP succeeded vs orders not paid) for the period plus a day; save the list (214).
+      3. Decide per case: stock available → reopen and fulfil; otherwise → refund with a stable idempotency key per case.
+      4. Dry run in production: the script outputs each case and its decision without changing anything; compare with the scoping list
+         (same 214) and with finance.
+      5. Batch: 10 cases, verify, then 50, then the rest.
+      6. Verify: scoping query returns zero rows; invariants hold (refunded ≤ captured; orders and PSP agree); refunds show succeeded
+         at the PSP.
+      7. Communicate: one message per customer after their case is repaired - fulfilled with a dispatch date, or refunded with the
+         expected timeline.
+
+      Script tests (production-like copy): dry run changes nothing; running twice gives the same end state and no second refund; a case
+      fixed by hand meanwhile is skipped; a failed refund is retried with the same key; out-of-stock and in-stock cases take the
+      right branch; every case has an audit line with before and after.
+    rubric:
+      - Contained the cause before repairing
+      - Scoped with a query against the source of truth
+      - Applied an agreed decision rule per case
+      - Used a dry run reviewed against the scope
+      - Repaired in small batches with verification
+      - Verified with the scoping query and invariants
+      - Tested idempotency, skipping already-fixed cases and failure retries
+      - Planned customer communication
+    solution: |
+      Compare with the model answer. **Containment first** and the **double-run test** are the two most often missed.
+    followUp: |
+      Which parts of this plan would you turn into a reusable runbook for the next status incident?
+
+  - id: order-postmortem
+    type: order
+    concept: blameless-postmortems
+    skill: recall
+    title: Sections of a postmortem
+    prompt: Put the sections of a payment-incident postmortem in a sensible order.
+    items:
+      - id: summary
+        text: Summary
+      - id: impact
+        text: Impact - payments, customers, money, duration, detection
+      - id: timeline
+        text: Timeline in UTC
+      - id: causes
+        text: Contributing causes, without blame
+      - id: actions
+        text: Action items to prevent, detect and test, with owners and dates
+    hints:
+      - Readers need to know what happened before why.
+    solution: |
+      Summary → impact → timeline → contributing causes → actions. Then a follow-up review checks the actions are done.
+
+  - id: interview-incident
+    type: interview
+    concept: blameless-postmortems
+    skill: application
+    title: "Interview: a production incident you learned from"
+    prompt: |
+      *"Tell me about a production incident involving payments or orders - what happened, what you did, and what changed afterwards."*
+      Answer as you would in the interview, using the STAR structure. If you have no real incident, use the 214-orders example from
+      this lesson as if you had been the tester involved.
+    hints:
+      - Situation, Task, Action, Result - and what you learned.
+      - Show the method - timeline, scope, safe repair, prevention.
+    modelAnswer: |
+      Situation: finance noticed settlement payments for orders our shop showed as cancelled. Task: as the payments tester I was asked
+      to find out why and how many customers were affected.
+
+      Action: I built timelines for three cases from our logs, the PSP's payment and webhook delivery records, and found that a secret
+      rotation had left one order-service instance rejecting webhooks; payments that had timed out at checkout were cancelled by a
+      cleanup job before any webhook could mark them paid. I wrote the scoping query against the PSP data - 214 orders, nothing in the
+      reverse direction. With the developers we contained it - fixed the secret, paused the job - and I reviewed and tested the repair
+      script: dry run, idempotency with stable keys, batches, verification by re-running the query.
+
+      Result: all 214 were fulfilled or refunded within a day, with one message per customer. In the blameless postmortem we listed the
+      contributing causes - manual secret deployment, no alert on webhook rejections, the cleanup job not checking the PSP, no daily
+      reconciliation - and I owned the regression tests and the reconciliation alert. Since then mismatches are alerted within the hour.
+    rubric:
+      - Used a clear situation-task-action-result structure
+      - Described a method (timelines, first divergence) rather than a lucky guess
+      - Scoped all affected cases with a query
+      - Contained before repairing and tested the repair
+      - Described measurable results
+      - Named blameless, systemic causes and preventive actions
+      - Showed personal ownership of follow-ups
+    followUps:
+      - What would you do differently next time?
+      - How did you make sure the repair didn't refund anyone twice?
+      - How did you communicate with the affected customers?
+    solution: |
+      Interviewers listen for **method and ownership** - and for a blameless tone about colleagues.
+
+  - id: explain-blameless
+    type: short
+    concept: blameless-postmortems
+    skill: recall
+    title: Why blameless?
+    prompt: In two or three sentences, explain why payment-incident postmortems should be blameless.
+    hints:
+      - What do people do if they expect to be blamed?
+    modelAnswer: |
+      If people expect blame, they hide details and the postmortem misses what really happened. A blameless postmortem assumes people
+      acted sensibly with the information they had and asks what the system and process allowed - such as manual secret deployment or a
+      missing alert - which produces fixes that prevent the class of incident, not just one person's mistake.
+    rubric:
+      - Said blame leads to hidden information
+      - Said the focus is on systems and processes
+      - Said this produces preventive, systemic fixes
+    solution: |
+      The SRE book's definition: contributing causes are identified without indicting any individual or team.
+
+placement:
+  - id: place-divergence
+    type: mcq
+    concept: status-divergence
+    skill: application
+    title: The mechanism
+    prompt: Orders whose checkout call timed out are later cancelled automatically, although the PSP shows their payments succeeded a few seconds after the timeout. What is the most likely missing piece?
+    options:
+      - id: webhook
+        text: The success never reached the order - the webhook was rejected or not processed, and the cleanup job didn't check the PSP
+        feedback: Correct - after a timeout, the webhook (or a status check) is the only path to "paid"; if it fails, the order is cancelled.
+      - id: psp-wrong
+        text: The PSP's status is wrong
+        feedback: The PSP is the source of truth for money; its record is supported by settlement.
+      - id: customer
+        text: The customers cancelled the orders themselves
+        feedback: The cancellations come from an automatic job.
+      - id: timeout-too-long
+        text: The checkout timeout is too long
+        feedback: A longer timeout might reduce cases, but the defect is that the success never updates the order.
+    correct: [webhook]
+    solution: |
+      **The back channel failed and nothing checked.** Test "timeout then webhook" and "cleanup checks the PSP before cancelling".
+
+  - id: place-repair
+    type: mcq
+    concept: incident-scoping-and-repair
+    skill: application
+    title: Before running the repair
+    prompt: What must happen before a repair script changes production data?
+    options:
+      - id: contain-dry
+        text: The cause is contained and a dry run's output has been reviewed against the scoping query
+        feedback: Correct - otherwise new cases keep appearing and mistakes in the script go straight to production.
+      - id: run-all
+        text: Nothing - run it on all cases at once to finish quickly
+        feedback: Speed without a dry run and batches risks a second incident.
+      - id: email
+        text: Email all customers first
+        feedback: Communicate after the repair, with the actual outcome for each customer.
+      - id: delete-logs
+        text: Clear the audit logs to keep the run clean
+        feedback: Audit logs are essential evidence of what the repair changed.
+    correct: [contain-dry]
+    solution: |
+      **Contain and dry-run.** Then small batches, verification, and a second run that changes nothing.
+
+  - id: place-postmortem
+    type: mcq
+    concept: blameless-postmortems
+    skill: analysis
+    title: A complete action list?
+    prompt: A postmortem's action items are "fix the webhook secret" and "remind engineers to update both instances". What is most clearly missing?
+    options:
+      - id: detect-test
+        text: Detection and testing - an alert or reconciliation check, and regression tests for the mechanism
+        feedback: Correct - without them, the next divergence is again found days later by finance.
+      - id: blame
+        text: Naming the engineer who made the mistake
+        feedback: Blameless postmortems avoid that - and a reminder doesn't fix the process anyway.
+      - id: nothing
+        text: Nothing - the cause is fixed
+        feedback: The specific cause is fixed; the class of incident and its detection aren't.
+      - id: rollback
+        text: A rollback of all releases from that week
+        feedback: Not related to preventing or detecting this divergence.
+    correct: [detect-test]
+    solution: |
+      **Detect and test.** Also replace the "reminder" with a systemic fix - secrets from a single store.
+
+recall:
+  - id: recall-divergences
+    concept: status-divergence
+    prompt: Name four kinds of payment status divergence.
+    answer: Paid but shown unpaid, unpaid but shown paid, refunded but shown captured, two payments for one order - also captured but cancelled, and ledger mismatches.
+  - id: recall-truth
+    concept: status-divergence
+    prompt: Which system is usually the source of truth for money movements, orders and accounting?
+    answer: The PSP for money movements, the shop for orders and fulfilment, the ledger for accounting.
+  - id: recall-scope
+    concept: incident-scoping-and-repair
+    prompt: How do you find every payment affected by a status incident?
+    answer: Query the source of truth against the copy for the period plus a margin, in both directions, and check for duplicates.
+  - id: recall-repair
+    concept: incident-scoping-and-repair
+    prompt: Name four properties of a safe repair.
+    answer: Run after containment, dry run reviewed first, idempotent with stable keys, logged per case, batched, and verified afterwards.
+  - id: recall-postmortem
+    concept: blameless-postmortems
+    prompt: What does a postmortem record, according to the SRE book?
+    answer: The incident, its impact, the actions taken to mitigate or resolve it, the root causes and the follow-up actions.
+  - id: recall-actions
+    concept: blameless-postmortems
+    prompt: What three kinds of action items should a payment incident postmortem have?
+    answer: Prevent (fix the class of defect), detect (alerts or reconciliation checks) and test (regression tests for the mechanism).
+
+next:
+  - reconciliation-for-testers
+  - mock-interview-payments-qa

@@ -1,0 +1,573 @@
+id: logs-metrics-traces
+title: Logs, metrics and traces for testers
+subject: payment-architecture
+module: observability-and-rca
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: What each observability signal answers - logs (what happened), metrics (how much, how often, how fast), traces (where the time went) - the four golden signals and SLOs for a payment service, payment-specific metrics, and how testers use and test them.
+tags: [payments, observability, logs, metrics, traces, golden signals, sli, slo, percentiles, opentelemetry, monitoring, alerts]
+
+environment: |
+  - **Sources:**
+    - **Google SRE book**, chapter "Monitoring Distributed Systems" - the **four golden signals** ("Latency: The time it
+      takes to service a request", traffic, errors, saturation), "what's broken, and why?", and alerting on symptoms
+      ([sre.google](https://sre.google/sre-book/monitoring-distributed-systems/)); chapter "Service Level Objectives" -
+      SLI, SLO and SLA definitions and "We generally prefer to work with percentiles rather than the mean"
+      ([sre.google](https://sre.google/sre-book/service-level-objectives/)).
+    - **OpenTelemetry** signals - traces, metrics, logs, baggage ([opentelemetry.io](https://opentelemetry.io/docs/concepts/signals/)).
+  - **Tool-specific:** query languages and dashboards differ (Prometheus, Grafana, Datadog, Elastic, CloudWatch and others);
+    queries here are pseudo-queries.
+  - **Fictional:** the demo shop's services, metric names and figures.
+
+prerequisites:
+  - tracing-a-payment-end-to-end
+
+concepts:
+  - id: observability-signals
+    name: Logs, metrics and traces
+    summary: Logs record individual events with context, metrics aggregate numbers over time cheaply, traces show one request's path and timing - each answers different questions and they link through ids.
+  - id: golden-signals-and-slos
+    name: Golden signals and SLOs
+    summary: Latency, traffic, errors and saturation describe a service's health; SLIs measure them, SLOs set targets, and percentiles - not averages - describe latency.
+  - id: observability-in-testing
+    name: Using and testing observability
+    summary: Testers use signals as oracles during tests and test the signals themselves - that metrics count correctly, dashboards show failures, and alerts fire on symptoms.
+
+objectives:
+  - Choose the right signal - logs, metrics or traces - to answer a given question about a payment system.
+  - Define golden-signal SLIs and an SLO for a payment endpoint, using percentiles for latency.
+  - Name payment-specific metrics and what a sudden change in each suggests.
+  - Use observability data as evidence in tests, and test that metrics, dashboards and alerts work.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [observability-signals]
+    title: The idea in plain language
+    body: |
+      A hospital has three ways of knowing about patients:
+
+      - the **patient file** - a detailed record of each event: "10:42, blood pressure taken, 140/90" (**logs**);
+      - the **ward board** - counts and trends: beds occupied, average waiting time, how many arrived this hour (**metrics**);
+      - the **patient's journey** through the building - reception, triage, X-ray, ward, with the time spent at each
+        (**traces**).
+
+      The board tells you **something is wrong** (waiting times doubled); the journeys tell you **where** (everyone waits at
+      X-ray); the files tell you **why** for one patient (the X-ray machine rebooted at 10:40).
+
+      A tester uses all three: as **evidence** when a test fails, as **oracles** during load and resilience tests, and as
+      **test objects** - because a dashboard that stays green during an outage is a defect too.
+
+  - id: what
+    kind: what
+    concepts: [observability-signals]
+    title: What each signal is good at
+    body: |
+      | Signal | Unit | Answers | Cost and limits |
+      |---|---|---|---|
+      | **Logs** | one event, with fields | "what exactly happened to ORD-1042 at 10:02?" | storage grows with volume; useless without ids and structure |
+      | **Metrics** | a number over time (counter, gauge, histogram) | "how many payments failed per minute? what is p99 latency?" | cheap to keep for long; lose individual detail; labels with too many values (high cardinality) explode cost |
+      | **Traces** | one request as a tree of timed spans | "where did the 4 seconds of this checkout go?" | often sampled; only cover instrumented services |
+
+      They link up: a metric spike → filter traces in that minute → open a slow trace → jump to its logs by trace id (see
+      [tracing a payment end to end](#/lesson/tracing-a-payment-end-to-end)).
+
+      **Metric types** you will meet: **counters** (only go up - payments created), **gauges** (go up and down - queue depth),
+      **histograms** (distributions - request duration, from which percentiles are computed).
+
+  - id: internals
+    kind: internals
+    concepts: [golden-signals-and-slos]
+    title: Golden signals, SLIs and SLOs
+    body: |
+      The SRE book's **four golden signals**:
+
+      | Signal | SRE book | For `POST /v1/payments` |
+      |---|---|---|
+      | **Latency** | "The time it takes to service a request" - and "distinguish between the latency of successful requests and the latency of failed requests" | p50, p95, p99 duration, separately for 2xx and errors |
+      | **Traffic** | "how much demand is being placed on your system" | payment requests per second |
+      | **Errors** | "the rate of requests that fail, either explicitly (e.g., HTTP 500s), implicitly..." | 5xx rate; also implicit failures such as 200 with a wrong body |
+      | **Saturation** | how "full" the service is, emphasising the most constrained resources | connection pool usage, queue depth, CPU |
+
+      **SLI** - "a carefully defined quantitative measure of some aspect of the level of service". **SLO** - "a target value or
+      range of values for a service level that is measured by an SLI". **SLA** - "an explicit or implicit contract with your
+      users", usually with consequences.
+
+      Example for the payment API: *SLI* = share of `POST /v1/payments` requests answered without a 5xx in under 2 seconds;
+      *SLO* = 99.9 % over 30 days.
+
+      **Percentiles, not averages.** An average of 300 ms can hide 1 % of customers waiting 8 seconds. p99 = 8 s says it plainly;
+      the SRE book prefers percentiles because "most metrics are better thought of as distributions".
+
+      **Payment-specific metrics** that matter more than CPU:
+
+      | Metric | A sudden change suggests |
+      |---|---|
+      | authorisation (approval) rate | issuer or PSP problem, risk-rule change, wrong data sent |
+      | declines by reason and source | one reason spiking points at its owner (see [ecosystem roles](#/lesson/payment-ecosystem-roles)) |
+      | 3-D Secure challenge and completion rates | a broken return flow or an issuer outage |
+      | webhook processing lag and rejection rate | signature or secret problem, consumer down |
+      | payments stuck in pending longer than N minutes | lost events, reconciliation needed |
+      | refunds and disputes per day | process defect, fraud |
+
+  - id: visual
+    kind: visual
+    concepts: [observability-signals]
+    title: "Flowchart: from symptom to cause with three signals"
+    body: |
+      The SRE book's two questions - "what's broken, and why?" - map onto the signals.
+
+      ```mermaid
+      flowchart TD
+          A[Alert - checkout error rate above SLO] --> B[Metrics - which endpoint, which status, since when]
+          B --> C{Errors from one dependency?}
+          C -- Yes --> D[Traces in that window - find the failing span]
+          C -- No --> E[Metrics by version, region, payment method]
+          D --> F[Logs for that trace id - the exact error and ids]
+          E --> F
+          F --> G[Cause confirmed - fix, then verify the metric returns to normal]
+      ```
+
+  - id: why
+    kind: why
+    concepts: [observability-in-testing]
+    title: Why testers should care
+    body: |
+      - **Evidence for defects.** "Payments are slow" becomes "p99 of `POST /v1/payments` rose from 900 ms to 6 s at 14:05, all
+        in the span `psp.create_payment`" - a report that routes itself.
+      - **Oracles for tests that have no single answer.** In a load test, the pass criterion is an SLO: "p99 under 2 s and error
+        rate under 0.1 % at 50 payments per second". In a resilience test: "when the email service is down, checkout's error rate
+        stays at zero".
+      - **Observability can be wrong.** A counter that isn't incremented on one error path, a dashboard averaging away the slow
+        tail, an alert that never fires - all are defects, found only if someone tests them.
+      - **Releases are verified in production by signals.** After a deployment, the authorisation rate and error rates tell you
+        within minutes whether to roll back.
+
+  - id: steps
+    kind: steps
+    concepts: [observability-in-testing]
+    title: Step by step - testing the observability of a payment feature
+    body: |
+      1. **List the questions** support and on-call will ask about the feature ("how many failed? why? for whom?").
+      2. **Map each to a signal** - a metric for counts and rates, logs with ids for individual cases, traces for timing.
+      3. **Trigger known events** in a test environment: 10 approvals, 3 declines with different reasons, 2 timeouts, 1 rejected
+         webhook.
+      4. **Check the metrics count exactly that** - per label (status, reason, method) - not "roughly".
+      5. **Check the logs** for each event - structured, with ids, without secrets.
+      6. **Check traces** - spans for the PSP call, with the error status on the timeouts.
+      7. **Test the alert**: create the symptom (for example raise the error rate above the threshold with a fault-injecting
+         stub) and check the alert fires, reaches the right channel, and resolves when the symptom stops.
+      8. **Check the dashboard** shows the failure during the test, with percentiles, not only averages.
+
+  - id: example
+    kind: example
+    concepts: [golden-signals-and-slos, observability-in-testing]
+    title: "Real-world example: the dashboard that stayed green"
+    body: |
+      For 40 minutes, 4 % of checkouts take more than 10 seconds and many customers give up. The team's dashboard shows
+      **average** latency at 450 ms - "fine" - and the error rate at 0 %, because the slow requests eventually succeed or the
+      customer closes the tab (which the server never sees as an error).
+
+      Afterwards, the tester replays the period's data:
+
+      - **p99 latency** of `POST /checkout/pay` was 14 s during the incident - the average hid it completely.
+      - **Traces** of slow requests all spend their time in `psp.create_payment`, but only for one payment method.
+      - **Business metric**: completed checkouts per minute dropped by 30 % - a symptom nobody alerted on.
+
+      Changes: latency panels show p50/p95/p99 per payment method; an SLO alert on "checkouts completed in under 3 s" and on a drop
+      in completed checkouts compared with the same time last week; a test in the release pipeline that injects a 10-second PSP
+      delay for one method and checks the alert fires.
+
+  - id: code
+    kind: code
+    concepts: [golden-signals-and-slos, observability-signals]
+    title: Queries a tester can read
+    collapsed: true
+    body: |
+      Pseudo-queries; your platform's syntax differs, the ideas don't.
+
+      Error rate of the payment endpoint (share of 5xx):
+
+      ```plaintext
+      sum(rate(http_requests_total{route="/v1/payments", status=~"5.."}[5m]))
+        / sum(rate(http_requests_total{route="/v1/payments"}[5m]))
+      ```
+
+      p99 latency from a histogram, successful requests only:
+
+      ```plaintext
+      histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{route="/v1/payments", status=~"2.."}[5m])))
+      ```
+
+      Approval rate per payment method:
+
+      ```plaintext
+      sum by (method) (rate(payments_total{outcome="authorized"}[15m]))
+        / sum by (method) (rate(payments_total[15m]))
+      ```
+
+      Logs for a test run's declines, grouped by reason:
+
+      ```plaintext
+      service:"payment-service" AND msg:"payment declined" AND test_run:"run-2026-10-12-01" | count by decline_reason
+      ```
+
+      The first two use the style of PromQL (Prometheus's query language) - check your platform's documentation.
+
+  - id: tests
+    kind: tests
+    concepts: [observability-in-testing, golden-signals-and-slos]
+    title: Positive and negative checks of observability
+    body: |
+      | ID | Trigger | Expected signal | Evidence |
+      |---|---|---|---|
+      | O1 | 10 approvals, 3 declines (2 reasons), 2 timeouts | `payments_total` counts 10 / 3 / 2 with the right labels | metric query |
+      | O2 | a decline | one structured log line with ids and reason, no card data | log search |
+      | O3 | a PSP timeout | span `psp.create_payment` with error status and duration ≈ the timeout | trace |
+      | O4 | inject 5 % 5xx for 10 minutes | error-rate alert fires within the documented time, resolves after | alert history |
+      | O5 | inject a 10 s delay for one payment method | p99 panel shows it; average alone would not | dashboard screenshot |
+      | O6 | stop the webhook consumer | webhook lag metric rises; alert fires | metric, alert |
+      | O7 | payment stuck pending > 30 min | appears in the "stuck payments" metric or report | report |
+      | O8 | normal traffic for an hour | no alerts (no false positives) | alert history |
+      | O9 | new label value per request id | refused or not used - avoid high-cardinality labels | metric metadata |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [golden-signals-and-slos, observability-signals, observability-in-testing]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Averages for latency.** Use p95/p99, and separate successes from failures.
+      - **Only technical metrics.** CPU can be fine while approvals collapse - watch business signals.
+      - **Alerting on causes instead of symptoms.** "CPU high" pages people for nothing; "checkouts failing" pages them for the
+        right reason (the SRE book's advice).
+      - **Unique ids as metric labels.** Order or request ids in labels create unbounded series; put them in logs and traces.
+      - **Untested alerts.** An alert that has never fired in a test may never fire in an incident.
+      - **Logs without ids or with secrets.** See [tracing a payment](#/lesson/tracing-a-payment-end-to-end) and
+        [PCI DSS awareness](#/lesson/pci-dss-awareness).
+      - **Ignoring implicit errors.** A 200 with a wrong status, a payment stuck pending - count them too.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Logs** = individual events with ids; **metrics** = cheap aggregates over time; **traces** = one request's timed path.
+      - **Golden signals**: latency, traffic, errors, saturation (Google SRE book). **SLI** measures, **SLO** targets, **SLA**
+        contracts.
+      - **Percentiles, not averages**; separate success and failure latency.
+      - Payment metrics: **approval rate, declines by reason, 3DS completion, webhook lag, stuck pending, refunds and disputes**.
+      - Testers use signals as **evidence and oracles**, and **test** counts, dashboards and alerts.
+
+exercises:
+  - id: which-signal
+    type: mcq
+    concept: observability-signals
+    skill: application
+    title: Which signal answers it?
+    prompt: Which signal is the best first choice for "how did the approval rate of UPI payments change over the last 24 hours?"
+    options:
+      - id: metrics
+        text: Metrics - a rate over time, by payment method
+        feedback: Correct - counting and rates over time are exactly what metrics are for.
+      - id: logs
+        text: Logs - read every payment's log line
+        feedback: Possible but slow and expensive; metrics give the trend directly. Logs help afterwards for individual cases.
+      - id: traces
+        text: Traces - open each payment's trace
+        feedback: Traces show one request's timing; they're often sampled and not meant for counting.
+      - id: database
+        text: None - query the production database
+        feedback: Sometimes useful, but it puts load on production and doesn't give a ready time series.
+    correct: [metrics]
+    hints:
+      - The question is about a rate over time.
+    solution: |
+      **Metrics.** If the rate dropped, filter traces and logs for the drop's window and method to find out why.
+    followUp: |
+      Which signal would you use next to find out why the rate dropped?
+
+  - id: average-p99
+    type: mcq
+    concept: golden-signals-and-slos
+    skill: analysis
+    title: What the average hides
+    prompt: |
+      Checkout latency: average 420 ms, p50 300 ms, p99 9.8 s. The team says "latency is fine". What is the best response?
+    options:
+      - id: p99
+        text: One in a hundred checkouts takes almost 10 seconds - for a payment that is a real problem; investigate the slow tail
+        feedback: Correct - percentiles show the experience of the slowest customers, which the average hides.
+      - id: fine
+        text: Agree - the average is well under a second
+        feedback: The average mixes the fast majority with the slow tail; it says nothing about the 1 % waiting ~10 s.
+      - id: p50
+        text: Agree - the median is 300 ms
+        feedback: The median describes the typical request, not the slowest ones, which are the ones customers abandon.
+      - id: noise
+        text: The p99 is noise and can be ignored
+        feedback: At thousands of checkouts a day, 1 % is many customers - and slow tails often point at a real dependency problem.
+    correct: [p99]
+    hints:
+      - What does p99 = 9.8 s mean for one customer in a hundred?
+    solution: |
+      **Investigate the tail.** Split p99 by payment method, region and dependency (traces of slow requests) - it usually narrows
+      to one cause quickly.
+    followUp: |
+      Write an SLO for checkout latency that would have made this a breach.
+
+  - id: debug-counter
+    type: debug
+    concept: observability-in-testing
+    skill: analysis
+    title: The metric that undercounts declines
+    prompt: |
+      In a test run with 3 declines, the `payments_total{outcome="declined"}` metric shows 2. Click the line responsible.
+    language: java
+    code: |
+      PaymentResult create(PaymentRequest request) {
+          try {
+              PspResponse response = psp.createPayment(request);
+              if (response.approved()) {
+                  metrics.count("payments_total", "outcome", "authorized");
+                  return PaymentResult.approved(response);
+              }
+              if (response.declineSource().equals("issuer")) {
+                  metrics.count("payments_total", "outcome", "declined");
+              }
+              return PaymentResult.declined(response);
+          } catch (PspTimeoutException e) {
+              metrics.count("payments_total", "outcome", "unknown");
+              throw e;
+          }
+      }
+    correctLines: [8]
+    lineNotes:
+      - line: 5
+        note: Approvals are counted correctly.
+      - line: 13
+        note: Timeouts are counted as unknown - a sensible separate outcome.
+    hints:
+      - Which declines skip the counter?
+    solution: |
+      **Line 8.** Only issuer declines are counted; declines from the PSP's risk rules return without incrementing. Count every
+      decline, with the source as a label (`outcome="declined", source="psp_risk"`), so the metric is complete and still
+      separable. The test that found it: trigger declines from each source and compare counts exactly.
+    followUp: |
+      Which other labels would make this metric useful during an incident without creating high cardinality?
+
+  - id: observability-test-design
+    type: testdesign
+    concept: observability-in-testing
+    skill: application
+    title: Test the dashboard and alerts of a new payment method
+    prompt: |
+      A new payment method (bank transfer via open banking) is launched. Design tests that prove its observability is ready:
+      which events you trigger, which metric values, logs, traces, dashboard panels and alerts you expect, and how you prove
+      alerts don't fire falsely.
+    hints:
+      - Questions on-call will ask; then one trigger per question.
+      - Include pending payments - this method is asynchronous.
+    modelAnswer: |
+      Triggers in the test environment (with a fault-injecting stub for the bank): 20 successes, 5 customer cancellations at the
+      bank, 3 bank rejections, 2 timeouts, 4 pending payments that never complete, a stopped webhook consumer for 15 minutes.
+
+      Expected:
+
+      1. `payments_total{method="open_banking"}` counts 20 authorized, 8 declined (source label: customer 5, bank 3), 2 unknown.
+      2. A "pending longer than 30 minutes" metric shows 4 after 30 minutes; the stuck-payments report lists them with order ids.
+      3. Each event has one structured log line with order id, attempt id, PSP payment id and reason; no account numbers or tokens.
+      4. Traces show the redirect and the PSP spans; timeouts marked as errors.
+      5. Dashboard: approval rate, declines by reason, p95/p99 latency, pending count and webhook lag for the method.
+      6. Alerts: approval rate below threshold, webhook lag above 5 minutes (fires during the consumer stop, resolves after),
+         pending count above N.
+      7. False positives: one hour of normal simulated traffic - no alerts.
+    rubric:
+      - Triggered each outcome deliberately, including pending and timeouts
+      - Expected exact metric counts with sensible labels
+      - Checked logs for ids and absence of sensitive data
+      - Checked traces for error status
+      - Checked dashboard panels including percentiles and pending
+      - Tested alerts firing and resolving
+      - Tested for false positives
+    solution: |
+      Compare with the model answer. The **pending** and **webhook lag** checks are what make it fit an asynchronous method - a
+      card-style dashboard would miss them.
+    followUp: |
+      Which of these checks would you keep running after launch as synthetic monitoring?
+
+  - id: order-incident-signals
+    type: order
+    concept: observability-signals
+    skill: recall
+    title: From alert to cause
+    prompt: Put the steps of investigating an alert with the three signals in order.
+    items:
+      - id: alert
+        text: An alert fires on a symptom (error rate above the SLO)
+      - id: metrics
+        text: Use metrics to see which endpoint, status and time window
+      - id: traces
+        text: Open traces from that window to find the failing or slow span
+      - id: logs
+        text: Read the logs for those trace ids for the exact error and ids
+      - id: verify
+        text: Fix, then confirm the metric returns to normal
+    hints:
+      - Go from the aggregate to the individual.
+    solution: |
+      Alert → metrics (where, when) → traces (which hop) → logs (exactly what) → fix and verify with the same metric.
+
+  - id: interview-observability
+    type: interview
+    concept: golden-signals-and-slos
+    skill: application
+    title: "Interview: how do you know the payment service is healthy?"
+    prompt: |
+      *"How would you know, in production, that our payment service is healthy - and how would you test that monitoring?"*
+      Answer as you would in the interview.
+    hints:
+      - Golden signals, business signals, SLOs, then testing the monitoring itself.
+    modelAnswer: |
+      I'd start with the four golden signals from Google's SRE book for the main endpoints: latency as percentiles - p95 and p99,
+      separately for successful and failed requests - traffic, error rate including implicit errors, and saturation of the
+      tightest resources like connection pools and queues. On top I'd watch payment business signals: approval rate by method and
+      issuer region, declines by reason and source, 3-D Secure completion, webhook lag and payments stuck in pending. Then I'd turn
+      the most important into SLOs - for example 99.9 % of payment requests answered without a 5xx in under 2 seconds - and alert on
+      symptoms like failing checkouts, not on causes like CPU.
+
+      To test it, I'd trigger known events in a test environment and check the metrics count them exactly, with the right labels;
+      check logs and traces for the same events; inject faults - a slow PSP, a 5 % error rate, a stopped webhook consumer - and
+      confirm the alerts fire, reach the right people and resolve; and run normal traffic to confirm they don't fire falsely.
+    rubric:
+      - Named the four golden signals
+      - Used percentiles and separated success and failure latency
+      - Added payment-specific business metrics
+      - Defined SLOs
+      - Preferred symptom-based alerts
+      - Tested metric accuracy with known events
+      - Tested alerts firing, resolving and not firing falsely
+    followUps:
+      - What's the difference between an SLO and an SLA?
+      - Why shouldn't order ids be metric labels?
+      - How would you detect a silent drop in approvals for one bank?
+    solution: |
+      The answer stands out when it includes **business signals** and **testing the alerts** - not just "we have Grafana".
+
+  - id: explain-symptoms
+    type: short
+    concept: golden-signals-and-slos
+    skill: recall
+    title: Symptoms, not causes
+    prompt: In two or three sentences, explain why the SRE book recommends alerting on symptoms rather than causes.
+    hints:
+      - What does a customer notice - high CPU, or failed payments?
+    modelAnswer: |
+      Symptoms - what's broken for users, such as failing or slow checkouts - are what matter and are relatively few, while
+      possible causes are many and often harmless on their own (a CPU spike may not hurt anyone). Paging on symptoms means people
+      are woken for real problems; cause-based signals are kept for debugging once a symptom alert has fired.
+    rubric:
+      - Said symptoms reflect user impact
+      - Said cause alerts are numerous or often harmless
+      - Said cause signals are used for debugging rather than paging
+    solution: |
+      The SRE book frames it as two questions: "what's broken, and why?" - alert on the first, investigate the second.
+
+placement:
+  - id: place-signal
+    type: mcq
+    concept: observability-signals
+    skill: application
+    title: Where did the time go?
+    prompt: One checkout took 7 seconds. Which signal shows best which service or call used the time?
+    options:
+      - id: trace
+        text: Its trace - the spans show each operation's duration
+        feedback: Correct - traces are built for "where did the time go in this request".
+      - id: metric
+        text: The p99 latency metric
+        feedback: Metrics show that slow requests exist, not where one request spent its time.
+      - id: log
+        text: The access log line for the request
+        feedback: It gives the total duration, but not the breakdown across services.
+      - id: dashboard
+        text: The CPU dashboard
+        feedback: CPU may or may not be related; it won't show this request's path.
+    correct: [trace]
+    solution: |
+      **The trace.** Then the slow span's logs tell you why.
+
+  - id: place-slo
+    type: mcq
+    concept: golden-signals-and-slos
+    skill: application
+    title: Which is an SLO?
+    prompt: Which of these is a service level objective?
+    options:
+      - id: slo
+        text: 99.9 % of payment requests answered without a 5xx in under 2 seconds, over 30 days
+        feedback: Correct - a target measured by an SLI over a period.
+      - id: sli
+        text: The share of payment requests answered without a 5xx in under 2 seconds
+        feedback: That is the indicator (SLI) - the measurement, without a target.
+      - id: sla
+        text: A contract that refunds fees if availability drops below 99.5 %
+        feedback: That is an SLA - an agreement with consequences.
+      - id: metric
+        text: The number of payment requests per second
+        feedback: That is a traffic metric, not an objective.
+    correct: [slo]
+    solution: |
+      **The target over a period.** SLI measures, SLO targets, SLA contracts.
+
+  - id: place-testing
+    type: mcq
+    concept: observability-in-testing
+    skill: analysis
+    title: Testing an alert
+    prompt: What is the best evidence that the "checkout error rate" alert works?
+    options:
+      - id: inject
+        text: Inject errors above the threshold in a test environment and see the alert fire, reach the channel, and resolve afterwards
+        feedback: Correct - the alert is exercised end to end, including resolution.
+      - id: config
+        text: Read the alert's configuration
+        feedback: Configuration can be wrong in ways reading doesn't reveal - wrong metric name, wrong label, wrong channel.
+      - id: no-alerts
+        text: No alerts fired last month
+        feedback: That shows no false positives, or that it is broken - you can't tell which.
+      - id: dashboard
+        text: The dashboard shows the error rate
+        feedback: A visible metric doesn't prove the alert on it fires.
+    correct: [inject]
+    solution: |
+      **Inject and observe.** Also check it doesn't fire during normal traffic.
+
+recall:
+  - id: recall-signals
+    concept: observability-signals
+    prompt: What does each observability signal answer best?
+    answer: Logs - what exactly happened in one event; metrics - how much, how often, how fast over time; traces - where one request's time went.
+  - id: recall-metric-types
+    concept: observability-signals
+    prompt: Name three metric types.
+    answer: Counters (only increase), gauges (go up and down) and histograms (distributions, used for percentiles).
+  - id: recall-golden
+    concept: golden-signals-and-slos
+    prompt: What are the four golden signals?
+    answer: Latency, traffic, errors and saturation.
+  - id: recall-sli-slo
+    concept: golden-signals-and-slos
+    prompt: What is the difference between an SLI, an SLO and an SLA?
+    answer: An SLI is the measurement, an SLO the target for it, and an SLA a contract with users, usually with consequences.
+  - id: recall-payment-metrics
+    concept: observability-in-testing
+    prompt: Name four payment-specific metrics worth monitoring.
+    answer: Approval rate, declines by reason and source, 3-D Secure completion rate, webhook lag, payments stuck pending, refunds and disputes.
+  - id: recall-test-alerts
+    concept: observability-in-testing
+    prompt: How do you test an alert?
+    answer: Create the symptom in a test environment, check the alert fires and reaches the right channel, resolves when the symptom stops, and doesn't fire on normal traffic.
+
+next:
+  - defect-isolation-decision-trees
+  - inconsistent-status-incidents

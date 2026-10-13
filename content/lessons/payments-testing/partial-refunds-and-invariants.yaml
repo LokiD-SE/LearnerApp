@@ -1,0 +1,603 @@
+id: partial-refunds-and-invariants
+title: Partial refunds and financial invariants
+subject: payments-testing
+module: refunds-and-reconciliation
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: The totals that must always hold - captured never above authorised, refunds never above captured, ledgers that balance - and how to prove them with sequences, concurrency tests and property-based tests rather than a handful of examples.
+tags: [payments, partial refund, partial capture, invariants, ledger, double entry, concurrency, race condition, property-based testing, jqwik]
+
+environment: |
+  - **Universal:** financial invariants and double-entry bookkeeping (every movement recorded as equal debits and
+    credits) apply to any payment system.
+  - **Scheme rules:** whether partial captures, multiple captures and partial refunds are allowed, and their limits,
+    are set by networks and PSPs - for example the Visa rules define partial authorisation and refunds as credit
+    transactions ([Visa Core Rules, 18 April 2026](https://usa.visa.com/dam/VCOM/download/about-visa/visa-rules-public.pdf)).
+    Check your PSP's documentation for what it supports.
+  - **Testing tool:** property-based testing with **jqwik 1.10** on the JUnit Platform
+    ([jqwik user guide](https://jqwik.net/docs/current/user-guide.html)) - `@Property`, `@ForAll`, generators built with
+    `Arbitraries`, 1000 tries per property by default, and **shrinking** of failing examples. The Java code here is
+    illustrative.
+  - **Fictional:** SandPay's payment fields (`authorized_amount`, `captured_amount`, `refunded_amount`).
+
+prerequisites:
+  - void-reversal-refund-chargeback
+  - amounts-currency-rounding
+
+concepts:
+  - id: financial-invariants
+    name: Financial invariants
+    summary: Rules that must hold after every operation - refunded ≤ captured ≤ authorised, balances never negative, the order's totals equal the PSP's, and every ledger entry balances.
+  - id: concurrent-money-operations
+    name: Concurrent money operations
+    summary: Two refunds, captures or webhooks at the same moment can each pass a check that only one of them should pass; locks, atomic conditional updates and idempotency stop it.
+  - id: invariant-based-testing
+    name: Invariant-based and property-based testing
+    summary: Instead of checking a few examples, generate many sequences of operations and amounts and assert the invariants after every step; shrinking reduces a failure to a minimal case.
+
+objectives:
+  - List the invariants of a payment with partial captures and refunds, and check them against a system's data.
+  - Design tests for sequences of partial operations, including boundaries and currency effects.
+  - Explain how concurrent refunds break invariants and design a test that proves the protection works.
+  - Write a property-based test that generates operation sequences and asserts the invariants.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [financial-invariants]
+    title: The idea in plain language
+    body: |
+      A shared bottle of 1 litre of water: people pour glasses out of it. Whatever happens - small glasses, big
+      glasses, two people pouring at once - **you can never pour out more than a litre**. If the glasses add up to
+      1.2 litres, something is wrong, however each single pour looked.
+
+      Money in a payment works the same way. A customer was charged 100.00; refunds can come out of it in pieces -
+      30.00 today, 50.00 next week. Whatever the order, the timing or the number of pieces, **refunds can never add
+      up to more than was charged**. That rule is an **invariant**.
+
+      Invariants are a tester's best friend: you don't need to predict every scenario. You state what must **always**
+      be true, and then try very hard - with many sequences and with simultaneous operations - to make it false.
+
+  - id: what
+    kind: what
+    concepts: [financial-invariants]
+    title: What the invariants of a payment are
+    body: |
+      For a card payment with partial capture and partial refunds (amounts in minor units, one currency):
+
+      | # | Invariant | Breaks when |
+      |---|---|---|
+      | I1 | `0 ≤ captured ≤ authorised` | a capture above the authorisation, or a second capture of the same amount |
+      | I2 | `0 ≤ refunded ≤ captured` | refunds add up to more than was captured |
+      | I3 | `refundable = captured − refunded ≥ 0` | the displayed refundable amount is computed differently in two places |
+      | I4 | sum of refund records = `refunded` | a refund recorded twice, or a failed refund counted |
+      | I5 | the order's totals = the PSP's totals | the shop and the PSP disagree after a retry or a missed webhook |
+      | I6 | every ledger entry balances (debits = credits) | a refund booked to one account but not the other |
+      | I7 | status matches the amounts (`refunded` status ⇔ `refunded = captured`) | a fully refunded payment still shown as `captured` |
+      | I8 | everything in the payment's currency | a refund in another currency mixed into the sums |
+
+      **Partial capture** (capturing less than authorised, for example when one item is out of stock) and **multiple
+      captures** (capturing per shipment) are supported by some PSPs and not others - check yours; the invariants
+      still hold.
+
+  - id: why
+    kind: why
+    concepts: [financial-invariants, concurrent-money-operations]
+    title: Why examples aren't enough
+    body: |
+      A typical test suite has "refund 100 %", "refund 50 %", "refund too much". All pass - and production still
+      over-refunds, because the defects live in **combinations and timing**:
+
+      - **Sequences:** refund 30, refund 70, then a retry of the first refund with a new key - 130 refunded.
+      - **Rounding:** three partial refunds of a third each, rounded up - one cent more than captured.
+      - **Status drift:** a failed refund is counted in `refunded`, so the customer can't get the money they're owed.
+      - **Concurrency:** two support agents click "refund 60" on a 100.00 payment at the same moment; both checks see
+        "refundable 100.00", both pass - 120.00 refunded.
+      - **Asynchrony:** a refund webhook arrives twice, or before the API response, and the shop counts it twice.
+
+      Each of these breaks an invariant that a simple example test never looks at. Asserting the invariants **after
+      every operation in every test** catches them all.
+
+  - id: internals
+    kind: internals
+    concepts: [concurrent-money-operations]
+    title: How concurrent refunds break the rule - and how systems prevent it
+    body: |
+      The naive check-then-act code:
+
+      ```java
+      long refundable = payment.capturedMinor() - payment.refundedMinor();   // both requests read 10000
+      if (amountMinor <= refundable) {                                       // both pass with 6000
+          psp.refund(payment.id(), amountMinor);                              // both refund
+          payment.addRefunded(amountMinor);                                   // 12000 refunded
+      }
+      ```
+
+      Between the read and the write, the other request runs the same read. Ways systems prevent it:
+
+      | Technique | Idea |
+      |---|---|
+      | **Row lock** (`SELECT ... FOR UPDATE`) | the second request waits until the first has finished and then sees 4000 refundable |
+      | **Atomic conditional update** | `UPDATE payments SET refunded = refunded + :amt WHERE id = :id AND refunded + :amt <= captured` - only one succeeds |
+      | **Optimistic locking** | a version number; the second write fails and is retried with fresh data |
+      | **Single writer per payment** | refunds for one payment are processed one at a time from a queue |
+      | **PSP as the final guard** | the PSP refuses a refund above the refundable amount - but your records must still agree |
+
+      As a tester you don't need to choose the technique - you need to **prove the invariant holds under real
+      parallelism**, which a sequential test never does.
+
+  - id: visual
+    kind: visual
+    concepts: [concurrent-money-operations]
+    title: "Sequence diagram: the race and the guard"
+    body: |
+      Two refund requests for the same 100.00 payment. With an atomic conditional update, the second one fails cleanly.
+
+      ```mermaid
+      sequenceDiagram
+          participant A as Agent A
+          participant B as Agent B
+          participant S as Refund service
+          participant DB as Database
+          participant P as PSP
+          A->>S: Refund 60.00
+          B->>S: Refund 60.00
+          S->>DB: refunded + 6000 if not above captured - for A
+          DB-->>S: 1 row updated
+          S->>DB: refunded + 6000 if not above captured - for B
+          DB-->>S: 0 rows updated
+          S->>P: Refund 60.00, key from A's request
+          P-->>S: Refund pending
+          S-->>A: Refund accepted
+          S-->>B: Refused - only 40.00 refundable
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [invariant-based-testing, financial-invariants]
+    title: Step by step - testing with invariants
+    body: |
+      1. **Write the invariants down** for your system - start from the table above, add your own (fees, ledgers,
+         currency).
+      2. **Make them checkable**: a helper that reads the payment from the PSP API, the order from the shop, and the
+         ledger entries, and asserts all invariants at once.
+      3. **Call the helper after every operation** in every test - not only at the end.
+      4. **Test sequences**, not single steps: capture part, refund part, refund the rest, retry, refund again. Use the
+         [state transition](#/lesson/state-transition-testing) model to choose them.
+      5. **Test boundaries**: refund exactly the refundable amount, one minor unit more, one less; a refund of the
+         smallest unit; many tiny refunds.
+      6. **Test concurrency**: start two or more refund requests at the same moment (a test with a latch or a
+         start barrier, or a load tool), many times, and assert the invariants afterwards.
+      7. **Generate sequences** with property-based testing (below) to explore far more combinations than you would
+         write by hand.
+      8. **Run the checker against production data** as a monitoring job - invariants that fail there are incidents.
+
+  - id: example
+    kind: example
+    concepts: [concurrent-money-operations, financial-invariants]
+    title: "Real-world example: the support team's double refund"
+    body: |
+      Finance finds 37 payments last quarter with **refunds above the captured amount** - always by exactly the same
+      refund amount, always two refunds within one second, created by two different support agents.
+
+      The story: a customer complains in chat **and** by email; two agents handle it at once and both press "Refund
+      full amount". The back office checked the refundable amount and then called the PSP; the PSP accepted both
+      because the merchant had enabled "allow refunds above the original" for a gift-card feature.
+
+      Two defects, two invariants:
+
+      - I2 (`refunded ≤ captured`) was never enforced atomically - fixed with a conditional update.
+      - The PSP setting removed the last guard - reviewed and limited to the gift-card account.
+
+      The new test starts 10 parallel "refund full amount" requests for one payment, 50 times over, and asserts exactly
+      one succeeds each time. A nightly job now checks I2 and I5 across all payments.
+
+  - id: code
+    kind: code
+    concepts: [invariant-based-testing]
+    title: A property-based test of refund sequences (jqwik, illustrative)
+    collapsed: true
+    body: |
+      The property: **for any captured amount and any sequence of refund requests, the refunded total never exceeds the
+      captured amount, and accepted refunds add up to it.** jqwik generates 1000 cases by default and shrinks a failure
+      to a minimal one.
+
+      ```java
+      import java.util.List;
+      import net.jqwik.api.*;
+      import net.jqwik.api.constraints.*;
+      import org.assertj.core.api.Assertions;
+
+      class RefundProperties {
+
+          @Property
+          void refundsNeverExceedCaptured(
+                  @ForAll @LongRange(min = 1, max = 1_000_000) long capturedMinor,
+                  @ForAll @Size(max = 20) List<@LongRange(min = 1, max = 1_000_000) Long> requests) {
+
+              Payment payment = Payment.captured(capturedMinor, "EUR");
+              RefundService service = new RefundService(new InMemoryPsp());
+              long accepted = 0;
+
+              for (long amount : requests) {
+                  if (service.refund(payment, amount).accepted()) accepted += amount;
+                  // the invariants after EVERY step
+                  Assertions.assertThat(payment.refundedMinor()).isLessThanOrEqualTo(payment.capturedMinor());
+                  Assertions.assertThat(payment.refundedMinor()).isEqualTo(accepted);
+              }
+          }
+      }
+      ```
+
+      If the service had an off-by-one in its check (`<` instead of `<=` somewhere), jqwik would report a shrunk example
+      such as `capturedMinor = 1, requests = [1]` - the smallest case that still fails, ready for a bug report.
+
+      (Assertions here use AssertJ; jqwik's own `Assume` and `Statistics` features help control and inspect the
+      generated data - see the user guide.)
+
+  - id: tests
+    kind: tests
+    concepts: [financial-invariants, concurrent-money-operations, invariant-based-testing]
+    title: Positive and negative test cases
+    body: |
+      Payment authorised and captured 100.00 EUR unless stated. Assert all invariants after each step.
+
+      | ID | Sequence | Expected | Evidence |
+      |---|---|---|---|
+      | S1 | refund 30.00, refund 70.00 | both accepted; refunded 100.00; status `refunded` | PSP payment, refunds, order |
+      | S2 | refund 30.00, refund 70.01 | second refused; refunded 30.00 | API error, refund list |
+      | S3 | refund 33.33 three times | accepted; refunded 99.99; refundable 0.01; status still partially refunded | payment, order |
+      | S4 | refund 0.01 (smallest unit) | accepted | refund object |
+      | S5 | refund fails at the PSP (sandbox failure method) | `refunded` unchanged; refundable unchanged; customer not told it succeeded | refund status, order |
+      | S6 | refund webhook delivered twice | refunded counted once | order totals, event log |
+      | C1 | 10 parallel "refund 60.00" requests | exactly one accepted | refund list, response codes |
+      | C2 | parallel refund and capture on a partially captured payment | invariants I1 and I2 hold | payment |
+      | P1 | partial capture 70.00 of 100.00 authorised, refund 70.00 | accepted; refund 70.01 refused | payment |
+      | L1 | after S1 | ledger: debits = credits for every entry | ledger export |
+      | G1 | property test: 1000 generated sequences | no invariant broken | test report |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [financial-invariants, concurrent-money-operations, invariant-based-testing]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Checking totals only at the end.** An invariant broken and "repaired" mid-sequence is still a defect -
+        assert after every step.
+      - **Counting pending or failed refunds as refunded.** Define which statuses count, and test the failure path.
+      - **Sequential tests for a concurrency rule.** Only real parallel requests prove a lock or conditional update.
+      - **Relying on the PSP as the only guard.** Your records must agree with the PSP's - and PSP settings change.
+      - **Ignoring rounding in partial refunds.** Thirds and percentages create remainders; the sum rule still applies.
+      - **Property tests that check nothing.** A generated test is only as good as its assertions - assert invariants,
+        not "no exception".
+      - **No production check.** Run the invariant checker as monitoring; data drifts for reasons tests never imagine.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Invariants: **refunded ≤ captured ≤ authorised**, sums of records match totals, order = PSP, ledgers balance,
+        status matches amounts, one currency.
+      - Assert them **after every operation**, in every test, and in production monitoring.
+      - Test **sequences, boundaries, failures, duplicates and parallel requests**.
+      - Concurrency guards: row locks, **atomic conditional updates**, optimistic locking, single writer.
+      - Property-based testing (jqwik): generate sequences, assert invariants, let **shrinking** find the minimal case.
+
+exercises:
+  - id: which-invariant
+    type: mcq
+    concept: financial-invariants
+    skill: application
+    title: Which numbers are impossible?
+    prompt: |
+      A payment record shows: authorised 100.00, captured 80.00, refunded 85.00, status `partially_refunded`. Which
+      statements are true? Select every one that applies.
+    options:
+      - id: refund-over
+        text: Refunded is above captured - an invariant is broken.
+        feedback: Correct - refunds can't exceed the captured amount (I2).
+      - id: capture-ok
+        text: Captured below authorised is fine - it can be a partial capture.
+        feedback: Correct - capturing less than authorised is allowed where the PSP supports partial capture.
+      - id: status-ok
+        text: The status is consistent with the amounts.
+        feedback: With refunded ≥ captured the payment can't be "partially" refunded - the status disagrees with the amounts (I7) as well.
+      - id: all-fine
+        text: Everything is fine, because the refund is still below the authorised amount.
+        feedback: Refunds are limited by what was captured, not by what was authorised.
+    correct: [refund-over, capture-ok]
+    hints:
+      - Which amount limits refunds - authorised or captured?
+    solution: |
+      **Refunded 85.00 > captured 80.00 breaks I2**, and the status is wrong too. Partial capture itself is fine. Next
+      step: list the refund records and their creation times to find how the extra 5.00 got in.
+    followUp: |
+      The refund records add up to 80.00, but `refunded` says 85.00. Which invariant tells you where to look?
+
+  - id: debug-check-then-act
+    type: debug
+    concept: concurrent-money-operations
+    skill: analysis
+    title: Where the race happens
+    prompt: Parallel refund requests sometimes over-refund. Click the line where the check and the update stop being one atomic step.
+    language: java
+    code: |
+      @Transactional
+      RefundResult refund(String paymentId, long amountMinor) {
+          Payment p = payments.findById(paymentId);
+          long refundable = p.capturedMinor() - p.refundedMinor();
+          if (amountMinor > refundable) {
+              return RefundResult.refused("exceeds_refundable");
+          }
+          p.setRefundedMinor(p.refundedMinor() + amountMinor);
+          payments.save(p);
+          return RefundResult.accepted(psp.refund(paymentId, amountMinor));
+      }
+    correctLines: [3]
+    lineNotes:
+      - line: 5
+        note: The comparison itself is right - an amount equal to the refundable balance is allowed.
+      - line: 10
+        note: Calling the PSP after recording the refund is a design choice; the race comes from how the payment is read.
+    hints:
+      - Two requests run this method at the same time. What does each of them read?
+    solution: |
+      **Line 3.** The payment is read without a lock, so two transactions read the same refunded amount, both pass the
+      check and both save. Fix: read with a lock (`findByIdForUpdate`, i.e. `SELECT ... FOR UPDATE`), or replace lines
+      3-9 with one conditional update that only succeeds while `refunded + amount <= captured`. Then prove it with a
+      parallel test.
+    followUp: |
+      Write the parallel test: how many requests, how do you start them at the same moment, how many repetitions, and
+      what do you assert?
+
+  - id: sequence-design
+    type: testdesign
+    concept: invariant-based-testing
+    skill: application
+    title: Sequences that try to break the totals
+    prompt: |
+      A shop supports partial capture (per shipment) and partial refunds. Design at least eight sequences of operations
+      that try to break the invariants, including failures, retries, duplicates and one parallel case. For each, say
+      which invariant it attacks and what you assert.
+    hints:
+      - Mix captures and refunds; include failed and duplicated steps.
+      - Think about rounding - percentages and thirds.
+      - Which sequence needs real parallelism?
+    modelAnswer: |
+      Authorised 100.00 unless stated.
+
+      1. Capture 60, capture 40, refund 100 → I1, I2: captured 100, refunded 100, status refunded.
+      2. Capture 60, refund 60, capture 40, refund 40.01 → I2: last refund refused.
+      3. Capture 100, refund 33.33 three times, refund 0.02 → I2 with rounding: last refused (only 0.01 left).
+      4. Capture 70 (partial), then capture 31 → I1: second capture refused (only 30 left to capture).
+      5. Refund 50 with a sandbox failure → I4: refunded unchanged; retry succeeds once.
+      6. Refund 50, retry with the same idempotency key → I4: one refund.
+      7. Refund webhook delivered twice and out of order with the API response → I4, I5: counted once; order = PSP.
+      8. Ten parallel refunds of 60 after capture 100 → I2: exactly one accepted, repeated 50 times.
+      9. Full refund, then dispute arrives → ledger and order still balance (I6); no extra refund possible.
+
+      After every step: assert refunded ≤ captured ≤ authorised, records sum to totals, order equals PSP, status matches.
+    rubric:
+      - Combined captures and refunds in sequences
+      - Included a rounding sequence (thirds or percentages)
+      - Included a failed refund and a retry
+      - Included duplicate events or an idempotent retry
+      - Included a real parallel case repeated many times
+      - Named the invariant each sequence attacks
+      - Asserted invariants after every step
+    solution: |
+      Compare with the model answer. Sequence 8 is the one only a deliberate parallel test can catch; sequence 3 is the one
+      rounding defects hide in.
+    followUp: |
+      Turn sequences 1-7 into a single property-based test: what would you generate, and what would you assert?
+
+  - id: concurrency-mcq
+    type: mcq
+    concept: concurrent-money-operations
+    skill: application
+    title: Proving the lock works
+    prompt: Which test gives the strongest evidence that two simultaneous refunds can't over-refund a payment?
+    options:
+      - id: parallel-repeat
+        text: Start 10 refund requests for the same payment at the same moment, repeat 50 times, and assert exactly one is accepted each time
+        feedback: Correct - real parallelism, repeated enough times to hit the timing window, with a precise assertion.
+      - id: sequential
+        text: Send two refund requests one after another and check the second is refused
+        feedback: That tests the amount check, not the race - the second request always sees the first one's update.
+      - id: code-review
+        text: Read the code and confirm it uses a transaction
+        feedback: A transaction alone doesn't prevent two transactions reading the same value; the test must prove it.
+      - id: one-parallel
+        text: Send two parallel requests once
+        feedback: A single run may simply not hit the race window; a pass proves little.
+    correct: [parallel-repeat]
+    hints:
+      - How often does a race show up in one run?
+    solution: |
+      **Many parallel requests, many times, exact assertion.** Use a start barrier (for example a `CountDownLatch`) so
+      the requests really start together - see [concurrency basics](#/lesson/java-concurrency-basics).
+    followUp: |
+      The test passes on your laptop but the defect still appears in production. What might be different there?
+
+  - id: order-invariant-checker
+    type: order
+    concept: invariant-based-testing
+    skill: recall
+    title: Building an invariant checker
+    prompt: Put the steps for adding invariant checks to a payment test suite in order.
+    items:
+      - id: list
+        text: Write down the invariants for your system
+      - id: helper
+        text: Build a helper that reads PSP, shop and ledger data and asserts them all
+      - id: every-step
+        text: Call the helper after every operation in every test
+      - id: generate
+        text: Add generated sequences with property-based tests
+      - id: monitor
+        text: Run the same checks against production data as monitoring
+    hints:
+      - You can't check what you haven't written down.
+    solution: |
+      List → helper → after every step → generated sequences → production monitoring. The same checks serve tests and
+      monitoring.
+
+  - id: interview-invariants
+    type: interview
+    concept: financial-invariants
+    skill: application
+    title: "Interview: how do you know refunds are correct?"
+    prompt: |
+      *"We support partial refunds. How would you convince yourself - and us - that refunds can never exceed what the
+      customer paid?"* Answer as you would in the interview.
+    hints:
+      - Name the invariant, then the ways it can break, then how you'd test each.
+    modelAnswer: |
+      I'd state the invariant precisely - refunded is never more than captured, in the payment's currency, and the
+      refund records add up to the refunded total - plus the related ones: the shop's totals equal the PSP's, and the
+      status matches the amounts.
+
+      Then I'd attack it the ways it breaks in practice. Sequences: several partial refunds, refunds that hit the limit
+      exactly and by one cent more, rounding with thirds. Failures and duplicates: failed refunds not counted, retries with
+      the same idempotency key, duplicate or out-of-order webhooks. Concurrency: many parallel refund requests for one
+      payment, repeated many times, asserting exactly one wins - because check-then-update code passes every sequential
+      test.
+
+      I'd assert the invariants after every step, add a property-based test that generates thousands of sequences, and
+      finally run the same invariant checks nightly against production data so any break becomes an alert, not a
+      quarterly finance finding.
+    rubric:
+      - Stated the invariant precisely, including currency and record sums
+      - Tested sequences and boundaries, including rounding
+      - Tested failed refunds, retries and duplicate events
+      - Tested real concurrency repeatedly
+      - Asserted invariants after every step
+      - Mentioned property-based testing
+      - Proposed production monitoring of the invariants
+    followUps:
+      - What would you do if the PSP allows refunds above the original amount?
+      - How would you test multiple partial captures?
+      - What does shrinking give you when a property test fails?
+    solution: |
+      The answer that impresses is one that **turns a rule into evidence** - sequences, concurrency, generation and
+      monitoring.
+
+  - id: explain-shrinking
+    type: short
+    concept: invariant-based-testing
+    skill: recall
+    title: Why shrinking helps
+    prompt: In two or three sentences, explain what shrinking does in a property-based test and why it helps a bug report.
+    hints:
+      - What does the first failing generated example usually look like?
+    modelAnswer: |
+      When a generated example fails, the tool tries smaller or simpler inputs that still fail and reports the minimal
+      one. The first failing case is often large and noisy (20 refunds of random sizes); the shrunk case - say, one refund
+      of 1 cent on a 1-cent payment - shows the essence of the defect and is easy to reproduce.
+    rubric:
+      - Said shrinking searches for a smaller input that still fails
+      - Said the first failure is usually large or noisy
+      - Said the minimal case makes reproduction and diagnosis easier
+    solution: |
+      jqwik reports it as the "Shrunk Sample" next to the original failing sample.
+
+placement:
+  - id: place-invariant
+    type: mcq
+    concept: financial-invariants
+    skill: application
+    title: The refund limit
+    prompt: A payment was authorised for 120.00 and captured for 90.00 (one item was out of stock). What is the most that can be refunded in total?
+    options:
+      - id: ninety
+        text: "90.00"
+        feedback: Correct - refunds are limited by the captured amount.
+      - id: onetwenty
+        text: "120.00"
+        feedback: The extra 30.00 was never captured, so there is nothing to refund there - the uncaptured part is released, not refunded.
+      - id: thirty
+        text: "30.00"
+        feedback: 30.00 is the uncaptured difference; it is released, and the 90.00 that was captured can be refunded.
+      - id: zero
+        text: Nothing - partially captured payments can't be refunded
+        feedback: Captured money can be refunded, partially or fully.
+    correct: [ninety]
+    solution: |
+      **90.00** - refunded ≤ captured ≤ authorised.
+
+  - id: place-race
+    type: mcq
+    concept: concurrent-money-operations
+    skill: analysis
+    title: Two refunds at once
+    prompt: Two parallel requests each refund 60.00 of a 100.00 payment. The code reads the refundable amount, checks it, then updates. Without a lock, what can happen?
+    options:
+      - id: both
+        text: Both read 100.00 refundable, both pass the check, and 120.00 is refunded
+        feedback: Correct - the classic check-then-act race.
+      - id: one
+        text: Exactly one always succeeds, because databases run requests in order
+        feedback: Without a lock or conditional update, the two reads can happen before either write.
+      - id: none
+        text: Both always fail
+        feedback: Each check passes on the value it read; nothing makes them fail.
+      - id: error
+        text: The database always throws a deadlock error
+        feedback: Plain reads and writes without locks don't deadlock; they just overwrite each other.
+    correct: [both]
+    solution: |
+      **Both succeed.** Prevent it with a row lock, an atomic conditional update or optimistic locking - and prove it with
+      repeated parallel tests.
+
+  - id: place-property
+    type: mcq
+    concept: invariant-based-testing
+    skill: application
+    title: What makes a property test useful?
+    prompt: Which property is the most useful for a refund service?
+    options:
+      - id: invariant
+        text: For any captured amount and any sequence of refunds, refunded never exceeds captured and equals the sum of accepted refunds
+        feedback: Correct - it states an invariant that must hold for every generated case.
+      - id: no-exception
+        text: For any input, the refund method doesn't throw an exception
+        feedback: A method can over-refund without throwing - this property misses the real risk.
+      - id: example
+        text: Refunding 50.00 of 100.00 leaves 50.00 refundable
+        feedback: That is a single example, not a property over generated inputs.
+      - id: fast
+        text: Each refund completes in under 100 ms
+        feedback: Performance matters, but it isn't the correctness property you most need here.
+    correct: [invariant]
+    solution: |
+      **The invariant over all sequences.** Generators find the sequences you didn't think of; shrinking makes failures small.
+
+recall:
+  - id: recall-core
+    concept: financial-invariants
+    prompt: What is the core invariant of partial captures and refunds?
+    answer: 0 ≤ refunded ≤ captured ≤ authorised, in the payment's currency.
+  - id: recall-sums
+    concept: financial-invariants
+    prompt: Besides the amount limits, which invariants link records and systems?
+    answer: Refund records add up to the refunded total, the shop's totals equal the PSP's, ledger entries balance, and the status matches the amounts.
+  - id: recall-race
+    concept: concurrent-money-operations
+    prompt: What is a check-then-act race in refunds?
+    answer: Two requests read the same refundable amount, both pass the check, and both refund - exceeding the captured amount.
+  - id: recall-guards
+    concept: concurrent-money-operations
+    prompt: Name three ways to prevent concurrent over-refunds.
+    answer: A row lock (SELECT ... FOR UPDATE), an atomic conditional update, optimistic locking - or a single writer per payment.
+  - id: recall-property
+    concept: invariant-based-testing
+    prompt: What does a property-based test do differently from an example test?
+    answer: It generates many inputs or sequences and asserts a property that must hold for all of them, then shrinks any failure to a minimal case.
+  - id: recall-monitor
+    concept: invariant-based-testing
+    prompt: Why run invariant checks against production data?
+    answer: Data drifts for reasons no test imagined; a broken invariant in production should be an alert, not a later finance finding.
+
+next:
+  - reconciliation-for-testers
+  - java-concurrency-basics

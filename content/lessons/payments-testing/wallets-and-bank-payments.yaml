@@ -1,0 +1,653 @@
+id: wallets-and-bank-payments
+title: Wallets and bank payments
+subject: payments-testing
+module: checkout-and-methods
+level: intermediate
+status: published
+estimatedMinutes: 55
+summary: How mobile wallets (Apple Pay, Google Pay) and bank-based methods (UPI, SEPA transfers and direct debits, open-banking payments) differ from card payments - device tokens, push versus pull, pending states that resolve later - and how to test confirmations, timeouts and late outcomes.
+tags: [payments, wallets, apple pay, google pay, upi, sepa, direct debit, instant payments, open banking, pending, asynchronous]
+
+environment: |
+  - **Wallets (vendor documentation):** Apple Pay - [developer.apple.com/apple-pay](https://developer.apple.com/apple-pay/);
+    Google Pay API - [developers.google.com/pay/api](https://developers.google.com/pay/api). Wallet payments use
+    **device tokens** issued under the EMV Payment Tokenisation framework
+    ([EMVCo](https://www.emvco.com/emv-technologies/payment-tokenisation/)).
+  - **UPI (India, region-specific):** run by the **National Payments Corporation of India (NPCI)**
+    ([npci.org.in](https://www.npci.org.in/)). NPCI changes UPI rules by **circulars** - for example the circular of
+    29 July 2025 ending person-to-person collect requests from 1 October 2025, and later circulars limiting how
+    often banks and PSPs may call the check-status API. PSPs announced the phase-out of merchant collect flows in
+    favour of intent and QR during 2026. **Check the current NPCI circulars and your PSP's notices** before relying
+    on any flow, limit or date.
+  - **SEPA (EU/EEA, region-specific):** the European Payments Council's rulebooks for SEPA Credit Transfer (SCT),
+    SEPA Instant Credit Transfer (SCT Inst) and SEPA Direct Debit (SDD) -
+    [europeanpaymentscouncil.eu](https://www.europeanpaymentscouncil.eu/); payment initiation services are defined
+    in PSD2 (Directive (EU) 2015/2366).
+  - **Fictional:** SandPay's endpoints, statuses (`pending`, `succeeded`, `failed`, `expired`) and test methods.
+
+prerequisites:
+  - payment-lifecycle-overview
+  - card-payments-and-tokenisation
+
+concepts:
+  - id: wallet-payments
+    name: Wallet payments
+    summary: Apple Pay and Google Pay hand the merchant a device token with a per-payment cryptogram after the customer authenticates on their device; the integration, domain and environment set-up are where tests fail.
+  - id: bank-payment-methods
+    name: Bank-based payment methods
+    summary: Push methods (credit transfers, UPI, open-banking payments) are approved by the payer in their bank app; pull methods (direct debits) collect under a mandate and can be returned later.
+  - id: pending-payment-outcomes
+    name: Pending outcomes that resolve later
+    summary: Many bank payments are pending at first and become succeeded, failed or expired minutes to days later; the merchant must wait, check status within limits, and handle late successes and returns.
+
+objectives:
+  - Explain how wallet payments differ from typing a card, and what the merchant receives.
+  - Distinguish push from pull bank payments and name the extra risks of each.
+  - Design tests for pending payments, including late success, expiry, timeouts and returned direct debits.
+  - Know which rules are scheme- or country-specific and where to check them.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [bank-payment-methods, pending-payment-outcomes]
+    title: The idea in plain language
+    body: |
+      Paying by card is like **asking a shop assistant to fetch money from your account** - the shop asks, the bank
+      answers in seconds.
+
+      Paying by bank transfer or UPI is like **sending the money yourself** from your banking app - the shop waits to
+      see it arrive. A direct debit is like **giving the shop a signed permission slip** to collect from your account,
+      which you can later contest.
+
+      And a mobile wallet is like **handing over a single-use voucher** your phone printed after checking your face or
+      fingerprint - the card number stays on the phone.
+
+      For testers, the big shift is **time**. A card says yes or no now. Many bank payments say **"pending"** - and the
+      real answer comes in seconds, hours or days. The checkout must stay honest while it waits.
+
+  - id: what
+    kind: what
+    concepts: [wallet-payments, bank-payment-methods]
+    title: What the methods are
+    body: |
+      | Method | Push or pull | Customer approves in | Final answer usually | Can be reversed later by the payer |
+      |---|---|---|---|---|
+      | **Apple Pay / Google Pay** (card in a wallet) | pull (it is a card payment) | the device - face, fingerprint or device code | seconds | yes, through card disputes |
+      | **UPI** (India) | push from the payer's bank | the payer's UPI app, with their UPI PIN | seconds, sometimes **pending** | through UPI dispute processes |
+      | **SEPA Credit Transfer** | push | online banking | the next business day typically | not by the payer alone |
+      | **SEPA Instant (SCT Inst)** | push | online banking | within seconds | not by the payer alone |
+      | **Open-banking payment** (PSD2 payment initiation) | push, started by the PSP | the bank's page or app (with SCA) | seconds to a day, depends on the scheme behind it | depends on the underlying transfer |
+      | **SEPA Direct Debit (SDD)** | **pull** under a **mandate** | signing the mandate once | days | **yes** - for SDD Core a refund can be requested within 8 weeks of the debit, and longer for an unauthorised one |
+
+      **UPI flows:** **intent** (the shop opens the customer's UPI app on the same phone), **QR** (the customer scans
+      a code - common on desktop), and **collect** (the shop sends a request to the customer's UPI ID). NPCI ended
+      person-to-person collect from 1 October 2025 and PSPs have been moving merchants from collect to intent and QR -
+      check what your PSP supports today.
+
+  - id: internals
+    kind: internals
+    concepts: [wallet-payments]
+    title: How a wallet payment works
+    body: |
+      1. The customer taps **Apple Pay** or **Google Pay** in the checkout. The wallet shows its payment sheet.
+      2. The customer authenticates **on the device** (face, fingerprint, device passcode).
+      3. The wallet returns an **encrypted payment token** to the merchant's page or app - containing a **device
+         token** (not the real card number) and, for device-token payments, a **cryptogram** valid for that payment.
+      4. The merchant passes the token to its PSP, which decrypts or forwards it and authorises like a card payment.
+
+      Things that are specific to wallets and often break:
+
+      - **Domain and merchant set-up.** Apple Pay on the web needs the merchant's domain verified - a file served at
+        `/.well-known/apple-developer-merchantid-domain-association` - and HTTPS. A new subdomain without the file
+        hides the button or fails.
+      - **Environments.** Google Pay has a `TEST` environment that returns test tokens; production needs approval
+        and the `PRODUCTION` environment. Apple Pay testing uses Apple's sandbox tester accounts with test cards in
+        Wallet.
+      - **Auth methods.** The Google Pay API distinguishes `PAN_ONLY` (a card stored in the Google account, which may
+        need 3-D Secure) from `CRYPTOGRAM_3DS` (a device token with a cryptogram). The PSP must support what the
+        checkout allows.
+      - **Button availability.** The button should only appear if the device and browser can pay - test on devices
+        without a wallet set up.
+
+  - id: why
+    kind: why
+    concepts: [pending-payment-outcomes]
+    title: Why bank payments need different tests
+    body: |
+      - **"Pending" is a normal answer.** A UPI payment can stay pending while banks respond; an open-banking payment
+        can be accepted by the bank but not yet settled; a direct debit takes days. Treating pending as failed loses
+        orders; treating it as paid ships goods for money that never arrives.
+      - **Late successes happen.** The customer gives up, the checkout says "failed", and minutes later the money
+        arrives. Without handling it, the customer is charged with no order - the most common complaint for these
+        methods.
+      - **Status checks are limited.** You can't poll a bank every second. For UPI, NPCI circulars in 2025 limited
+        how soon and how often banks and PSPs may call the check-status API; your PSP's documentation tells you what
+        it does on your behalf and what you may call.
+      - **Pull payments come back.** A direct debit can be returned or refunded weeks later - the order may already be
+        shipped. Testing must include returns, not only collection.
+
+  - id: visual
+    kind: visual
+    concepts: [pending-payment-outcomes]
+    title: "State diagram: a bank payment that starts pending"
+    body: |
+      SandPay's fictional statuses for a bank or UPI payment. Notice the arrows **out of the final-looking states**
+      - a "failed" in the shop's eyes can still meet a late success, and a succeeded direct debit can be returned.
+
+      ```mermaid
+      stateDiagram-v2
+          [*] --> pending: customer approves in bank or UPI app
+          pending --> succeeded: bank confirms
+          pending --> failed: bank rejects or customer declines
+          pending --> expired: no answer before the deadline
+          expired --> succeeded: late confirmation - refund or fulfil
+          succeeded --> returned: direct debit returned or refunded later
+          succeeded --> [*]
+          failed --> [*]
+          returned --> [*]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [pending-payment-outcomes, bank-payment-methods]
+    title: Step by step - testing a pending payment
+    body: |
+      1. **Learn the timings** from the PSP and scheme documentation: how long a payment may stay pending, when the
+         PSP marks it expired, how webhooks report the final state, and the status-check rules.
+      2. **Decide what the customer sees while pending** - and what the order system does (reserve stock? wait?
+         cancel after N minutes?). Write it down as expected results.
+      3. **Simulate each outcome** with the sandbox's test methods or test UPI IDs: immediate success, immediate
+         failure, pending then success, pending then failure, pending then expiry, and expiry **then** a late success.
+      4. **Check the waiting screen:** it updates by itself (polling your own server, not the bank), survives a reload,
+         and gives a sensible message after a long wait.
+      5. **Check the late success:** the order is completed or the money refunded automatically - never charged with
+         no order.
+      6. **For direct debits, test the mandate and the return:** mandate signed and stored, first collection, a
+         returned collection after the order shipped, and the customer's notification.
+      7. **Check the evidence:** the payment's status history, webhooks received and their order, the order's status,
+         and the refunds issued.
+
+  - id: example
+    kind: example
+    concepts: [pending-payment-outcomes, bank-payment-methods]
+    title: "Real-world example: \"failed\" orders that were paid"
+    body: |
+      Support receives complaints every day: "UPI debited my account, but your app says the payment failed." Finance
+      sees money in settlement reports that matches **no paid order**.
+
+      The tester's investigation:
+
+      1. The app treats any payment still pending after 60 seconds as **failed**, cancels the order and releases the
+         stock.
+      2. The PSP's webhooks show many of those payments becoming `succeeded` 2 to 10 minutes later.
+      3. The webhook handler only updates orders in status `awaiting_payment`; cancelled orders are ignored - so the
+         late success is silently dropped.
+
+      Fixes: show "We're waiting for your bank - this can take a few minutes" instead of "failed"; keep the order open
+      until the PSP marks the payment final (succeeded, failed or expired); and for a success that arrives after the
+      order was cancelled, **refund automatically and tell the customer**. New tests: pending → succeeded after 5
+      minutes; expired → succeeded (late); webhook for a cancelled order.
+
+  - id: code
+    kind: code
+    concepts: [wallet-payments, pending-payment-outcomes]
+    title: Wallet and bank-payment requests (fictional SandPay API)
+    collapsed: true
+    body: |
+      A Google Pay payment request in the browser (illustrative excerpt of the Google Pay API's request object;
+      `TEST` environment, gateway values from your PSP's documentation):
+
+      ```javascript
+      const paymentsClient = new google.payments.api.PaymentsClient({ environment: 'TEST' });
+
+      const request = {
+        apiVersion: 2,
+        apiVersionMinor: 0,
+        allowedPaymentMethods: [{
+          type: 'CARD',
+          parameters: {
+            allowedAuthMethods: ['PAN_ONLY', 'CRYPTOGRAM_3DS'],
+            allowedCardNetworks: ['MASTERCARD', 'VISA'],
+          },
+          tokenizationSpecification: {
+            type: 'PAYMENT_GATEWAY',
+            parameters: { gateway: '<your PSP>', gatewayMerchantId: '<your merchant id at the PSP>' },
+          },
+        }],
+        merchantInfo: { merchantName: 'SandPay Demo Shop' },
+        transactionInfo: { totalPriceStatus: 'FINAL', totalPrice: '24.90', currencyCode: 'EUR', countryCode: 'DE' },
+      };
+      ```
+
+      A UPI payment through SandPay, which answers **pending** and tells the app how to open the customer's UPI app:
+
+      ```http
+      POST /v1/payments HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      Content-Type: application/json
+      Idempotency-Key: ORD-4410
+
+      {"amount": 49900, "currency": "INR", "payment_method": {"type": "upi", "flow": "intent"}}
+      ```
+
+      ```json
+      {
+        "id": "pay_3Lx9",
+        "status": "pending",
+        "next_action": {"type": "open_upi_app", "intent_url": "upi://pay?<parameters from the PSP>"},
+        "expires_at": "2026-10-12T10:15:00Z"
+      }
+      ```
+
+      The final result arrives as a webhook (`payment.succeeded`, `payment.failed`, `payment.expired`). Amounts are in
+      minor units: 49900 paise = 499.00 INR.
+
+  - id: tests
+    kind: tests
+    concepts: [wallet-payments, bank-payment-methods, pending-payment-outcomes]
+    title: Positive and negative test cases
+    body: |
+      | ID | Method and scenario | Expected | Evidence |
+      |---|---|---|---|
+      | W1 | Google Pay, TEST environment, approve | payment authorised; order paid | PSP payment, order |
+      | W2 | Apple Pay on a new subdomain | button shown only after domain verification; payment works | button visibility, payment |
+      | W3 | device without a wallet set up | wallet button hidden, other methods offered | screenshot |
+      | W4 | customer cancels the wallet sheet | back to checkout, nothing charged | payment list |
+      | U1 | UPI intent, approve in the app | pending → succeeded; order paid; screen updates by itself | status history, order |
+      | U2 | UPI, customer declines in the app | failed; clear message; can retry | status, screen |
+      | U3 | UPI pending, then success after 5 minutes | order completed (or kept open and completed) | webhook time, order |
+      | U4 | pending, PSP expires it, then late success | automatic refund **or** fulfilment as designed; customer told | refund object, email |
+      | U5 | customer closes the app while pending | order still completes on the webhook | webhook, order |
+      | U6 | webhook delivered twice | one order update, one email | event log |
+      | D1 | SEPA direct debit, mandate signed | mandate stored with reference; first collection pending → succeeded | mandate, payment |
+      | D2 | direct debit returned after shipping | order flagged, customer contacted, no automatic re-debit without a rule | return event, order |
+      | B1 | SEPA Instant via open banking, bank page abandoned | order unpaid, no money moved | payment status |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [pending-payment-outcomes, wallet-payments, bank-payment-methods]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Treating pending as failed** after a short timer - customers pay with no order.
+      - **Dropping late webhooks** for cancelled orders. Refund or fulfil, and tell the customer.
+      - **Polling the bank too often.** Use your PSP's webhooks and respect status-check limits (for UPI, NPCI's).
+      - **Forgetting direct-debit returns.** A succeeded debit isn't final money for weeks.
+      - **Testing wallets only in one browser.** Apple Pay on the web needs Safari or a supported Apple device; Google
+        Pay behaves differently in Chrome and other browsers.
+      - **Production-only wallet set-up.** Domain verification, merchant ids and environment switches go wrong at
+        go-live - include them in the release checklist.
+      - **Quoting UPI or SEPA rules from memory.** They change by circular and rulebook versions - cite the current one.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [bank-payment-methods]
+    title: Choosing what to offer - trade-offs that change tests
+    body: |
+      | Method | Merchant benefit | Merchant risk | Extra tests |
+      |---|---|---|---|
+      | Wallets | fast checkout, device authentication | set-up per platform, availability checks | domain set-up, environments, cancel, no-wallet devices |
+      | UPI | very common in India, low cost | pending outcomes, app switching | pending, late success, app closed, status-check limits |
+      | Instant credit transfer | money within seconds, no chargebacks | customer must leave for the bank | abandonment, bank page errors |
+      | Standard credit transfer | cheap | slow; customer may pay the wrong amount or reference | matching, partial and over-payments |
+      | Direct debit | good for subscriptions | returns weeks later | mandates, returns, re-presentment rules |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Wallets** = a card payment with a **device token + cryptogram** after device authentication; test domain
+        set-up, environments (`TEST` / `PRODUCTION`), cancel and no-wallet devices.
+      - **Push** (UPI, credit transfers, open banking) vs **pull** (direct debit with a mandate - returnable later).
+      - **UPI** flows: intent, QR, collect (being phased out per NPCI); statuses can be **pending**.
+      - **Pending → succeeded / failed / expired**, and **late success after expiry**: never charge without an order.
+      - Respect **status-check limits**; rely on webhooks; check current **NPCI circulars** and **EPC rulebooks**.
+
+exercises:
+  - id: wallet-receives
+    type: mcq
+    concept: wallet-payments
+    skill: recognition
+    title: What does the merchant get?
+    prompt: When a customer pays with Apple Pay or Google Pay using a device token, what does the merchant receive from the wallet?
+    options:
+      - id: token
+        text: An encrypted payment token containing a device token and a one-time cryptogram, which it passes to its PSP
+        feedback: Correct - the real card number stays on the device; the merchant forwards the token for authorisation.
+      - id: pan
+        text: The customer's card number and expiry date
+        feedback: That is exactly what wallets avoid - the merchant never sees the real PAN.
+      - id: approval
+        text: A final approval from the issuer
+        feedback: The wallet only authenticates the customer and hands over a token; the issuer's approval still comes through authorisation.
+      - id: password
+        text: The customer's Apple or Google password
+        feedback: Device authentication happens on the device; nothing like that is shared with the merchant.
+    correct: [token]
+    hints:
+      - What did the device authentication protect?
+    solution: |
+      **An encrypted token with a device token and cryptogram.** The PSP then authorises it like a card payment - so
+      card declines, refunds and disputes still apply.
+    followUp: |
+      Which of your card-payment tests still apply to wallet payments, and which become unnecessary?
+
+  - id: push-or-pull
+    type: mcq
+    concept: bank-payment-methods
+    skill: application
+    title: Which one can come back weeks later?
+    prompt: Which of these payments can the **payer** most easily have reversed weeks after it succeeded?
+    options:
+      - id: sdd
+        text: A SEPA Core direct debit collected under a mandate
+        feedback: Correct - SDD Core gives the payer a right to a refund within 8 weeks of the debit (longer if unauthorised).
+      - id: sct-inst
+        text: A SEPA Instant credit transfer the payer sent
+        feedback: The payer pushed the money themselves; there is no equivalent no-questions refund right.
+      - id: upi
+        text: A UPI payment approved with the payer's PIN
+        feedback: UPI has dispute processes, but the payer pushed the payment and can't simply reverse it weeks later.
+      - id: sct
+        text: A standard SEPA credit transfer
+        feedback: Like other push payments, the payer can't reverse it by themselves.
+    correct: [sdd]
+    hints:
+      - Who pulled the money - the payer or the merchant?
+    solution: |
+      **The direct debit.** Pull payments carry return risk - test returns after shipping, notifications and what the
+      order system does next.
+    followUp: |
+      Design the test for a direct debit returned after the goods have shipped. What should the merchant's system do?
+
+  - id: late-success
+    type: mcq
+    concept: pending-payment-outcomes
+    skill: analysis
+    title: The money arrived after "failed"
+    prompt: |
+      A UPI payment stayed pending, the shop marked the order cancelled after 3 minutes, and a `payment.succeeded`
+      webhook arrives 6 minutes after the payment started. What should the system do?
+    options:
+      - id: refund-or-fulfil
+        text: Either reopen and fulfil the order or refund automatically - as designed - and tell the customer
+        feedback: Correct - the customer has paid; the system must never keep money without an order.
+      - id: ignore
+        text: Ignore the webhook - the order is cancelled
+        feedback: Then the customer is charged with no order and no refund - the classic complaint for pending methods.
+      - id: new-order
+        text: Create a duplicate order automatically
+        feedback: A new order might ship goods the customer no longer wants and complicates reconciliation. Follow a deliberate rule instead.
+      - id: retry
+        text: Ask the customer to pay again
+        feedback: They have already paid - asking again risks a double payment.
+    correct: [refund-or-fulfil]
+    hints:
+      - Whose money is it now, and what does the customer believe happened?
+    solution: |
+      **Refund or fulfil, and tell the customer.** Better still: don't cancel while the PSP still says pending - show a
+      waiting message and let the final status decide.
+    followUp: |
+      Write the test case for this, including how you create the late success in the sandbox and the evidence you keep.
+
+  - id: debug-pending-handler
+    type: debug
+    concept: pending-payment-outcomes
+    skill: analysis
+    title: The webhook that drops late payments
+    prompt: Customers are charged for cancelled orders. Click the line in the webhook handler that drops late successes.
+    language: java
+    code: |
+      void onPaymentSucceeded(PaymentEvent event) {
+          Order order = orders.findByPayment(event.paymentId());
+          if (order == null) {
+              alerts.raise("payment without order", event.paymentId());
+              return;
+          }
+          if (order.status() != OrderStatus.AWAITING_PAYMENT) {
+              return;
+          }
+          order.markPaid(event.amountMinor());
+          emails.sendConfirmation(order);
+      }
+    correctLines: [8]
+    lineNotes:
+      - line: 4
+        note: Raising an alert for a payment with no order is good - someone can investigate.
+      - line: 10
+        note: Marking the order paid with the amount from the event is fine for the normal case.
+    hints:
+      - What happens if the order was already cancelled when the success arrives?
+    solution: |
+      **Line 8.** For any order not awaiting payment - including a cancelled one - the handler silently returns. A late
+      success for a cancelled order must trigger the designed recovery (refund or reopen) and an alert. A success for an
+      **already paid** order should be ignored as a duplicate - so the branch needs to tell those cases apart.
+    followUp: |
+      Rewrite the branch so duplicates are ignored but late successes for cancelled orders are refunded.
+
+  - id: pending-test-design
+    type: testdesign
+    concept: pending-payment-outcomes
+    skill: application
+    title: Test the waiting screen and what comes after
+    prompt: |
+      Design tests for a UPI checkout where payments can stay pending. Cover what the customer sees while waiting and
+      every way the payment can end - including late outcomes and duplicate webhooks. Give preconditions, steps,
+      expected results and evidence.
+    hints:
+      - List the final states, then the timings that lead to each.
+      - What can the customer do while waiting - reload, close the app, pay again?
+      - How do you prove the customer was never charged without an order?
+    modelAnswer: |
+      1. Approve quickly → pending → succeeded within seconds; screen moves to confirmation by itself. Evidence: status
+         history, order paid.
+      2. Decline in the UPI app → failed; message with a retry option. Evidence: status, screen.
+      3. Pending → succeeded after 5 minutes → waiting screen meanwhile with a clear message; order paid on the
+         webhook. Evidence: webhook timestamp, order.
+      4. Pending → expired → no order paid; customer told; cart kept. Evidence: status, order, cart.
+      5. Expired → late success → automatic refund or fulfilment as designed; customer notified. Evidence: refund or
+         order, email.
+      6. Reload the waiting page → still waiting, no new payment created. Evidence: payment list.
+      7. Close the UPI app and the shop app while pending → order completes on the webhook; email sent. Evidence:
+         webhook, email.
+      8. Customer starts a second payment while the first is pending → warned, or the first is cancelled first; never two
+         successes for one order. Evidence: payment list.
+      9. Webhook delivered twice → one update, one email. Evidence: event log.
+    rubric:
+      - Covered immediate success and decline
+      - Covered pending then success after a delay
+      - Covered expiry and a late success after expiry
+      - Covered reload and closing the apps while pending
+      - Covered a second payment attempt while the first is pending
+      - Covered duplicate webhooks
+      - Evidence proves no charge without an order (payments, refunds, orders compared)
+    solution: |
+      Compare with the model answer. Tests 5 and 8 are the ones that prevent the "charged but no order" and "charged
+      twice" complaints.
+    followUp: |
+      Which of these would you turn into monitoring in production, and what would the alert condition be?
+
+  - id: order-wallet-flow
+    type: order
+    concept: wallet-payments
+    skill: recall
+    title: A wallet payment, step by step
+    prompt: Put the steps of a Google Pay or Apple Pay payment in order.
+    items:
+      - id: button
+        text: The checkout shows the wallet button because the device can pay
+      - id: sheet
+        text: The customer taps it and the wallet's payment sheet opens
+      - id: device-auth
+        text: The customer authenticates on the device
+      - id: token
+        text: The wallet returns an encrypted payment token to the checkout
+      - id: psp
+        text: The merchant sends the token to its PSP
+      - id: authorise
+        text: The PSP authorises the payment through the card network and issuer
+    hints:
+      - The button should only appear if a payment is possible.
+    solution: |
+      Button (if available) → sheet → device authentication → token → PSP → authorisation. Authorisation can still be
+      declined after a successful device authentication.
+
+  - id: interview-upi
+    type: interview
+    concept: bank-payment-methods
+    skill: application
+    title: "Interview: testing UPI payments"
+    prompt: |
+      *"We're adding UPI to our checkout. What would you test, and what makes it different from cards?"* Answer as you
+      would in the interview.
+    hints:
+      - Push versus pull; pending outcomes; app switching.
+      - Where would you check the current rules?
+    modelAnswer: |
+      UPI is a push payment: the customer approves in their own UPI app with their PIN, so we don't handle any
+      credentials - but we also don't control the approval step, and the result can be pending. I'd check our PSP's
+      supported flows - intent on mobile and QR on desktop, since NPCI has been phasing out collect requests - and read
+      the current NPCI circulars and the PSP's documentation for timeouts and status-check rules.
+
+      Tests: intent opens the right UPI app with the right amount; QR on desktop; approve, decline and cancel in the
+      app; pending that becomes success after minutes, failure, or expiry; a late success after expiry, with refund or
+      fulfilment; the customer closing the apps while pending; reloads not creating new payments; duplicate and
+      out-of-order webhooks; refunds; and amounts in paise.
+
+      The key difference from cards is time: I make sure pending is never shown as failed, nobody is charged without an
+      order, and we rely on webhooks rather than polling the bank.
+    rubric:
+      - Explained push versus card pull and the customer's approval in their own app
+      - Named intent and QR flows and the collect phase-out
+      - Said to check current NPCI circulars and PSP documentation
+      - Covered pending outcomes, expiry and late success
+      - Covered app switching and closing the apps
+      - Covered duplicate webhooks and refunds
+      - Stressed never charging without an order
+    followUps:
+      - How would you test UPI on a desktop browser?
+      - What would you do if many payments stay pending for more than ten minutes?
+      - How do UPI refunds differ from card refunds for the customer?
+    solution: |
+      Interviewers listen for **pending handling and current rules** - testers who treat UPI like cards miss the main
+      risks.
+
+  - id: explain-domain-verification
+    type: short
+    concept: wallet-payments
+    skill: analysis
+    title: Why the Apple Pay button disappeared
+    prompt: In two or three sentences, explain why the Apple Pay button might not appear on a new subdomain of a working shop, and how a tester checks it.
+    hints:
+      - What does Apple require for each domain that shows Apple Pay on the web?
+    modelAnswer: |
+      Apple Pay on the web only works on domains the merchant has verified with Apple, by serving the domain-association
+      file at `/.well-known/apple-developer-merchantid-domain-association` over HTTPS. A new subdomain needs its own
+      verification, so the tester checks that the file is reachable on that domain and that the domain is registered for
+      the merchant id.
+    rubric:
+      - Named domain verification as the cause
+      - Mentioned the well-known file or registering the domain
+      - Said each domain needs it and gave a way to check
+    solution: |
+      Put "wallet domains verified" in the release checklist for every new domain.
+
+placement:
+  - id: place-wallet
+    type: mcq
+    concept: wallet-payments
+    skill: application
+    title: Still a card payment?
+    prompt: A customer pays with a card stored in Google Pay. The payment is later disputed. What applies?
+    options:
+      - id: card-rules
+        text: Card network rules - it was authorised as a card payment, so card disputes apply
+        feedback: Correct - wallets change how the card is presented, not the card network's rules.
+      - id: google
+        text: Only Google's own refund policy
+        feedback: Google Pay's role is the wallet; the dispute goes through the card's issuer and network.
+      - id: none
+        text: Nothing - wallet payments can't be disputed
+        feedback: They can - the underlying payment is a card payment.
+      - id: upi
+        text: UPI dispute rules
+        feedback: A card in Google Pay is a card payment, not UPI, even though Google Pay also offers UPI in India.
+    correct: [card-rules]
+    solution: |
+      **Card rules.** Test refunds and disputes for wallet payments like card payments.
+
+  - id: place-pull
+    type: mcq
+    concept: bank-payment-methods
+    skill: application
+    title: What does a mandate allow?
+    prompt: What does a direct-debit mandate give the merchant?
+    options:
+      - id: collect
+        text: Permission to collect payments from the customer's account under the agreed terms
+        feedback: Correct - direct debit is a pull method; the mandate is the payer's authorisation.
+      - id: push
+        text: The ability for the customer to push money instantly
+        feedback: That describes a credit transfer, not a direct debit.
+      - id: no-returns
+        text: A guarantee that collections can't be returned
+        feedback: Direct debits can be returned - for SDD Core the payer can request a refund within 8 weeks.
+      - id: card-data
+        text: The right to store the customer's card details
+        feedback: Mandates concern bank accounts, not cards.
+    correct: [collect]
+    solution: |
+      **Permission to collect.** And because it is a pull, returns are possible later - test them.
+
+  - id: place-pending
+    type: mcq
+    concept: pending-payment-outcomes
+    skill: analysis
+    title: Two minutes of pending
+    prompt: A bank payment has been `pending` for two minutes, within the time the PSP documents. What should the checkout show?
+    options:
+      - id: waiting
+        text: A waiting message that updates by itself when the final status arrives
+        feedback: Correct - pending is a normal state; the screen should wait honestly and update.
+      - id: failed
+        text: "\"Payment failed - please try again\""
+        feedback: The payment may still succeed; inviting a retry risks a double payment.
+      - id: success
+        text: "\"Payment successful\""
+        feedback: Nothing is confirmed yet - the payment may still fail or expire.
+      - id: reload
+        text: A prompt to reload the page every 10 seconds
+        feedback: The page should update itself; asking the customer to reload is poor and may create new requests.
+    correct: [waiting]
+    solution: |
+      **Wait honestly and update automatically** - from your own server, which receives the PSP's webhook.
+
+recall:
+  - id: recall-wallet-token
+    concept: wallet-payments
+    prompt: What protects the card number in a mobile-wallet payment?
+    answer: The wallet sends a device token with a per-payment cryptogram after device authentication, so the real PAN stays on the device.
+  - id: recall-wallet-setup
+    concept: wallet-payments
+    prompt: Name two set-up items that commonly break wallet payments at go-live.
+    answer: Apple Pay domain verification for each domain, and switching Google Pay from the TEST to the PRODUCTION environment with the right merchant ids.
+  - id: recall-push-pull
+    concept: bank-payment-methods
+    prompt: What is the difference between push and pull bank payments?
+    answer: In a push payment the payer sends the money (credit transfer, UPI); in a pull payment the merchant collects under a mandate (direct debit), which can be returned later.
+  - id: recall-upi-flows
+    concept: bank-payment-methods
+    prompt: What are the UPI payment flows a merchant may offer?
+    answer: Intent (open the UPI app on the same phone), QR (scan a code) and collect (a request to the UPI ID), which NPCI has been phasing out.
+  - id: recall-late-success
+    concept: pending-payment-outcomes
+    prompt: What must happen when a payment succeeds after the order was cancelled?
+    answer: The designed recovery - refund automatically or reopen and fulfil - and a message to the customer; never keep the money without an order.
+  - id: recall-status-limits
+    concept: pending-payment-outcomes
+    prompt: Why can't a merchant simply poll the bank every few seconds for a pending UPI payment?
+    answer: Status checks are rate-limited by NPCI rules and PSPs; rely on webhooks and the PSP's documented checks.
+
+next:
+  - amounts-currency-rounding
+  - mobile-payment-interruptions

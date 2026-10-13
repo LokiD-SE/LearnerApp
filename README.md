@@ -96,7 +96,8 @@ documentation, Pro Git and Andreas Zeller's work on systematic debugging (each l
 **Interview practice** (`#/interview`) covers every path and track: six company profiles, 14 round types and
 about 100 interview questions, alongside the exercises of the chosen course.
 
-The other 31 lessons are listed as _planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
+The other 4 lessons (Track G: parallel runs, CI quality gates, the capstone and the mock interview) are listed as
+_planned_. See [docs/PLAN.md](docs/PLAN.md) for the roadmap and what is
 deferred.
 
 ## Requirements
@@ -202,7 +203,7 @@ Interview questions go in `content/interviews/questions/*.yaml` and company prof
 
 ## Known limitations
 
-- **36 complete lessons.** The other 31 are planned entries on the map.
+- **63 complete lessons.** The other 4 are planned entries on the map.
 - **Free-text answers are self-assessed** against a model answer and rubric. They are not auto-graded, and
   the mastery model gives them slightly less weight (see [docs/MASTERY_MODEL.md](docs/MASTERY_MODEL.md)).
 - **Progress is per browser.** Use export/import to move it; there is no sync.

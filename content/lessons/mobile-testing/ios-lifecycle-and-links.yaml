@@ -1,0 +1,595 @@
+id: ios-lifecycle-and-links
+title: iOS lifecycle, universal links and URL schemes
+subject: mobile-testing
+module: ios-testing
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: How an iOS app moves between active, inactive, background and suspended - and gets terminated - what that means for state and in-progress work, how universal links and custom URL schemes route users into the app (and back from banking apps), and the Simulator and device tools testers use for both.
+tags: [mobile, ios, scene lifecycle, background, suspended, universal links, apple-app-site-association, url schemes, simctl, testflight, deep links, app links]
+
+environment: |
+  - **Platform documentation (Apple):** [Managing your app's life cycle](https://developer.apple.com/documentation/uikit/managing-your-app-s-life-cycle)
+    (scene states: unattached, foreground inactive, foreground active, background, suspended); [Supporting associated
+    domains](https://developer.apple.com/documentation/xcode/supporting-associated-domains) (universal links, the
+    `apple-app-site-association` file); Simulator and `xcrun simctl` in Xcode. Apple's documentation pages need a browser with
+    JavaScript - read them there; details change with each iOS and Xcode release.
+  - **Android equivalent:** Android App Links with `/.well-known/assetlinks.json`
+    ([developer.android.com](https://developer.android.com/training/app-links)); on Android 12 and later
+    `adb shell pm get-app-links <package>` shows the verification state.
+  - **Version-specific:** iOS releases (now numbered by year, for example iOS 26) change background execution, privacy prompts and link
+    behaviour - check the release notes for the versions in your matrix.
+  - **Fictional:** the demo shop app (`com.sandpay.demoshop`, team id `ABCDE12345`) and `shop.example.com`.
+
+prerequisites:
+  - interruptions-and-lifecycle
+
+concepts:
+  - id: ios-scene-lifecycle
+    name: The iOS scene lifecycle
+    summary: Scenes move between foreground active, foreground inactive, background and suspended; suspended apps can be terminated without notice, so state must be saved when entering the background and restored on return.
+  - id: universal-links-and-url-schemes
+    name: Universal links and URL schemes
+    summary: Universal links are HTTPS links the app has proven it owns through the apple-app-site-association file, falling back to the website; custom URL schemes are app-defined and any app can claim the same one.
+  - id: ios-testing-tools
+    name: iOS testing tools
+    summary: xcrun simctl opens URLs, sends push notifications and sets privacy permissions on the Simulator; TestFlight distributes builds to real devices; the Console app and Xcode show device logs.
+
+objectives:
+  - Describe the iOS scene states and what an app must do when entering the background.
+  - Test state restoration after suspension and termination, and in-progress work across app switches.
+  - Test universal links and custom URL schemes, including fallbacks and returns from other apps.
+  - Use the Simulator tooling and device logs to reproduce and report iOS defects.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [ios-scene-lifecycle]
+    title: The idea in plain language
+    body: |
+      iOS treats apps you're not looking at like a hotel treats a guest who stepped out: the room is kept for a while (**background**),
+      then the lights and heating are switched off (**suspended**) - and if the hotel is full, the room may be **given away**
+      (terminated) without asking you. When you come back, a well-run hotel has noted where your things were and puts them back.
+
+      And iOS links are like **addresses with a verified owner**: a link to `https://shop.example.com/orders/1042` opens the shop's app
+      only if the website has published a note saying "yes, this app belongs to me" - otherwise the link opens the website. That's a
+      **universal link**. A **custom scheme** like `demoshop://orders/1042` is more like a nickname - any app could claim the same one.
+
+      Both matter most for payments: the customer leaves for a banking app or 3-D Secure, iOS may suspend or terminate the shop app, and
+      a link or app switch must bring them back to the right screen with the true result.
+
+  - id: what
+    kind: what
+    concepts: [ios-scene-lifecycle]
+    title: What the scene states mean
+    body: |
+      | State | Meaning | What the app may do |
+      |---|---|---|
+      | **Unattached** | the scene isn't connected yet (before launch, or discarded) | - |
+      | **Foreground inactive** | visible but not receiving events - during transitions, an incoming call overlay, the app switcher | pause timers and animations |
+      | **Foreground active** | visible and receiving events - normal use | everything |
+      | **Background** | not visible; can still run code, for a limited time | save state, finish short tasks |
+      | **Suspended** | in memory but not running code | nothing - and the system can terminate it at any time without notice to free memory |
+
+      Key consequences:
+
+      - An app gets **no warning** before a suspended app is terminated - it must save what it needs **when entering the background**.
+      - **Background time is limited**; apps request extra time for essential work (a background task) and must finish or be stopped.
+      - When the user returns to a terminated app, it is **launched again** - restoring the UI from saved state is the app's job.
+
+      Compared with Android (see [Android lifecycle and process death](#/lesson/android-lifecycle-and-process-death)): rotation doesn't
+      recreate the screen on iOS, but suspension and termination play the role of Android's process death.
+
+  - id: why
+    kind: why
+    concepts: [universal-links-and-url-schemes, ios-scene-lifecycle]
+    title: Why iOS lifecycle and links need deliberate tests
+    body: |
+      - **Payments leave the app.** 3-D Secure in a banking app, UPI or wallet apps, an OTP in Messages: the shop app is backgrounded and
+        may be terminated while the outcome is decided elsewhere.
+      - **Returns come by link.** Banks and PSPs send the customer back with a return URL - a universal link or custom scheme. If routing
+        fails, the customer lands in Safari or on the home screen without the result.
+      - **Universal links fail silently.** A missing or misconfigured `apple-app-site-association` file simply makes links open the website
+        - no error anywhere.
+      - **Custom schemes can be hijacked.** Any app can register `demoshop://`; sensitive data (tokens, payment results) must not travel
+        in scheme URLs.
+      - **Simulators hide real behaviour.** The Simulator suspends and terminates differently from a busy real phone; real-device tests are
+        needed for P1 journeys.
+
+  - id: internals
+    kind: internals
+    concepts: [universal-links-and-url-schemes]
+    title: How universal links and custom schemes work
+    body: |
+      **Universal links** need two sides:
+
+      1. The **app** declares the domain in its **Associated Domains** entitlement - for example `applinks:shop.example.com`.
+      2. The **website** serves the `apple-app-site-association` (AASA) file at
+         `https://shop.example.com/.well-known/apple-app-site-association` - over **HTTPS**, **without redirects**, as JSON - listing which
+         paths belong to which app:
+
+      ```json
+      {
+        "applinks": {
+          "details": [
+            {
+              "appIDs": ["ABCDE12345.com.sandpay.demoshop"],
+              "components": [
+                { "/": "/orders/*" },
+                { "/": "/checkout/return*" },
+                { "/": "/account/*", "exclude": true }
+              ]
+            }
+          ]
+        }
+      }
+      ```
+
+      iOS fetches the file through Apple's content delivery network after the app is installed or updated, so **changes don't apply
+      instantly**; for development, an entitlement in **alternate (developer) mode** - `applinks:shop.example.com?mode=developer` - makes the
+      device fetch it directly. When everything matches, tapping the link opens the app; otherwise **Safari opens the website** - which must
+      therefore handle the same URLs.
+
+      **Custom URL schemes** (`demoshop://orders/1042`) are declared in the app's Info.plist. They work without a website, but any app can
+      declare the same scheme, there's no fallback if the app isn't installed, and the system may ask the user before opening. Use them only
+      for non-sensitive routing.
+
+      **Android's equivalent** - App Links - uses `https://shop.example.com/.well-known/assetlinks.json` and verified intent filters; on
+      Android 12 and later, `adb shell pm get-app-links com.sandpay.demoshop` shows whether each domain is verified.
+
+  - id: visual
+    kind: visual
+    concepts: [universal-links-and-url-schemes, ios-scene-lifecycle]
+    title: "Sequence diagram: returning from the bank by universal link"
+    body: |
+      The shop app may have been terminated while the customer was in the banking app. The universal link launches it fresh - it must
+      route to the order and re-check the result.
+
+      ```mermaid
+      sequenceDiagram
+          participant U as Customer
+          participant A as Shop app
+          participant B as Banking app
+          participant OS as iOS
+          participant S as Shop server
+          U->>A: Pay ORD-1042
+          A->>B: Open bank app to approve
+          Note over A: background, then suspended - possibly terminated
+          U->>B: Approves
+          B->>OS: Open https://shop.example.com/checkout/return?order=ORD-1042
+          OS->>OS: Domain verified via the AASA file
+          OS->>A: Launch or resume with the link
+          A->>S: GET status of ORD-1042
+          S-->>A: paid
+          A->>U: Order confirmed
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [ios-testing-tools, universal-links-and-url-schemes]
+    title: Step by step - testing links and lifecycle on iOS
+    body: |
+      **Universal links:**
+
+      1. Check the AASA file: `curl -si https://shop.example.com/.well-known/apple-app-site-association` → `200`, no redirect, JSON body, the
+         right `appIDs` and paths.
+      2. On a real device with the app installed, tap the link from Notes, Messages or Mail (links typed into Safari's address bar don't
+         open the app, by design).
+      3. On the Simulator: `xcrun simctl openurl booted "https://shop.example.com/orders/ORD-1042"`.
+      4. Test **excluded paths** open the website, and **unknown ids** show a proper error in the app.
+      5. Uninstall the app and tap the link - the website must handle it.
+
+      **Lifecycle:**
+
+      6. Start a checkout, switch to another app, wait, return - the screen and input remain.
+      7. Force termination while backgrounded: on the Simulator or a debug build, stop the app from Xcode while it is in the background;
+         on a real device, swipe it away in the app switcher (note: that is a **user** termination, which may legitimately discard state -
+         compare with the design).
+      8. Return through the link after termination - the app routes to the order and re-checks the server.
+
+      **Evidence:** Simulator screenshots and recordings (`xcrun simctl io booted screenshot shot.png`,
+      `xcrun simctl io booted recordVideo run.mp4`), device logs from the **Console** app on a Mac or Xcode's devices window.
+
+  - id: example
+    kind: example
+    concepts: [universal-links-and-url-schemes]
+    title: "Real-world example: the return link that opened Safari"
+    body: |
+      After a website migration, iOS customers returning from 3-D Secure land in **Safari** on a "Continue in the app" page instead of in the
+      app. Android is fine. Payments succeed, but many customers think they failed and pay again.
+
+      The tester checks the AASA file:
+
+      ```bash
+      curl -si https://shop.example.com/.well-known/apple-app-site-association | head -5
+      ```
+
+      ```http
+      HTTP/2 301
+      location: https://www.shop.example.com/.well-known/apple-app-site-association
+      ```
+
+      The migration added a redirect from the bare domain to `www`. The AASA file must be served **without redirects**, so iOS treats
+      `shop.example.com` as not associated - and opens the return link in Safari. The app's entitlement only listed `shop.example.com`.
+
+      Fixes: serve the file on `shop.example.com` without a redirect (and add `www` if needed); make the website's return page show the real
+      payment status and a clear button into the app; release-checklist item: AASA check for every domain. Regression test: the `curl`
+      check in CI plus a real-device tap test of the return link.
+
+  - id: code
+    kind: code
+    concepts: [ios-testing-tools]
+    title: Simulator commands for testers
+    collapsed: true
+    body: |
+      From Xcode's command-line tools (`xcrun simctl help` lists them all; options change between Xcode versions):
+
+      ```bash
+      # list simulators and their states
+      xcrun simctl list devices
+
+      # open a universal link or custom scheme in the booted simulator
+      xcrun simctl openurl booted "https://shop.example.com/orders/ORD-1042"
+      xcrun simctl openurl booted "demoshop://orders/ORD-1042"
+
+      # send a push notification from a JSON payload file
+      xcrun simctl push booted com.sandpay.demoshop payload.json
+
+      # set or reset privacy permissions (for example camera, photos, location)
+      xcrun simctl privacy booted grant photos com.sandpay.demoshop
+      xcrun simctl privacy booted reset all com.sandpay.demoshop
+
+      # screenshots and recordings
+      xcrun simctl io booted screenshot checkout.png
+      xcrun simctl io booted recordVideo checkout.mp4
+
+      # uninstall to test first launch and link fallbacks
+      xcrun simctl uninstall booted com.sandpay.demoshop
+      ```
+
+      A minimal `payload.json` for the push command:
+
+      ```json
+      {"aps": {"alert": {"title": "Payment received", "body": "Order ORD-1042 is confirmed"}}, "order": "ORD-1042"}
+      ```
+
+  - id: tests
+    kind: tests
+    concepts: [universal-links-and-url-schemes, ios-scene-lifecycle, ios-testing-tools]
+    title: Positive and negative test cases
+    body: |
+      | ID | Set-up | Action | Expected | Evidence |
+      |---|---|---|---|---|
+      | U1 | app installed | tap `https://shop.example.com/orders/ORD-1042` in Notes | app opens on that order | recording |
+      | U2 | app installed | open an excluded path (`/account/...`) | Safari opens the website | recording |
+      | U3 | app not installed | tap an order link | website shows the order (after sign-in) | screenshot |
+      | U4 | AASA check | `curl -si` on every associated domain | 200, no redirect, JSON, correct app id | curl output |
+      | U5 | signed out | open an order link | sign-in, then the order | recording |
+      | U6 | unknown or another customer's order id | open link | clear error, no data | screenshot |
+      | S1 | custom scheme | `demoshop://orders/ORD-1042` | routes to the order; no tokens or payment results in the URL | URL inspected |
+      | L1 | checkout, app switched for 5 minutes | return | same screen and input | recording |
+      | L2 | checkout, app terminated while backgrounded | return via the return link | routes to the order, re-checks the server, shows the true result | recording, server log |
+      | L3 | push notification for a paid order | tap it while the app is terminated | app launches on that order | recording |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [universal-links-and-url-schemes, ios-scene-lifecycle]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Redirects or the wrong content type on the AASA file.** Check it with `curl` for every domain, in CI.
+      - **Testing links by typing them into Safari's address bar.** That opens the website by design - tap links from another app.
+      - **Expecting AASA changes to apply instantly.** Apple's CDN caches the file; use developer mode for development and plan releases.
+      - **Sensitive data in custom-scheme URLs.** Another app can register the same scheme - pass only ids, then fetch from the server.
+      - **No website fallback.** Every universal-link URL must also work in the browser.
+      - **Saving state too late.** Save when entering the background - a suspended app can be terminated without warning.
+      - **Simulator only.** Test P1 journeys and app switches on real devices.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Scene states: **unattached, foreground inactive, foreground active, background, suspended** - suspended apps can be terminated
+        without notice; save state when entering the background, restore on launch.
+      - **Universal links**: Associated Domains entitlement `applinks:<domain>` + AASA at `/.well-known/apple-app-site-association` over
+        HTTPS, **no redirects**, JSON; cached by Apple's CDN; falls back to the website.
+      - **Custom schemes**: no ownership, no fallback - non-sensitive routing only. Android: **App Links** with `assetlinks.json`.
+      - Tools: `xcrun simctl openurl / push / privacy / io`, TestFlight for devices, Console or Xcode for logs.
+
+exercises:
+  - id: suspended-terminated
+    type: mcq
+    concept: ios-scene-lifecycle
+    skill: application
+    title: When to save
+    prompt: When should an iOS app save the state it needs to restore a checkout?
+    options:
+      - id: background
+        text: When the scene enters the background, because a suspended app can be terminated without notice
+        feedback: Correct - there's no reliable warning before termination of a suspended app.
+      - id: termination
+        text: When the system tells the app it is about to be terminated
+        feedback: A suspended app is terminated without being told, so it never gets that chance.
+      - id: launch
+        text: On the next launch
+        feedback: By then the in-memory state is already gone.
+      - id: never
+        text: Never - iOS keeps apps in memory forever
+        feedback: iOS reclaims memory by terminating suspended apps.
+    correct: [background]
+    hints:
+      - What does a suspended app get before it is terminated?
+    solution: |
+      **When entering the background.** Test it by terminating the backgrounded app and returning.
+    followUp: |
+      Which in-progress operation in a checkout should also be re-checked with the server after a relaunch?
+
+  - id: aasa-check
+    type: mcq
+    concept: universal-links-and-url-schemes
+    skill: analysis
+    title: Why do links open Safari?
+    prompt: |
+      Universal links to `https://shop.example.com/orders/...` stopped opening the app on iOS after a website change. `curl -si` for the AASA
+      file returns `301` to `https://www.shop.example.com/...`. What is the most likely cause?
+    options:
+      - id: redirect
+        text: The AASA file must be served without redirects, so iOS no longer treats the domain as associated with the app
+        feedback: Correct - a redirect breaks the association, and links fall back to the website.
+      - id: app-bug
+        text: A bug in the app's routing code
+        feedback: If the association were valid, the app would at least open; the links open Safari instead.
+      - id: cache
+        text: The user's Safari cache
+        feedback: Clearing Safari's cache doesn't change the domain association.
+      - id: android
+        text: The assetlinks.json file is missing
+        feedback: That file is for Android App Links, not iOS universal links.
+    correct: [redirect]
+    hints:
+      - Read the AASA requirements in the "How" section.
+    solution: |
+      **The redirect.** Serve the file on the exact domain the entitlement lists, with 200 and JSON. Remember Apple's CDN caches the file, so
+      the fix may take a while to reach devices.
+    followUp: |
+      Write the CI check that would have caught this before the website change went live.
+
+  - id: debug-scheme
+    type: debug
+    concept: universal-links-and-url-schemes
+    skill: analysis
+    title: The unsafe return URL
+    prompt: The PSP returns the customer to the app with one of these URLs. Click the line that is a security problem.
+    language: plaintext
+    code: |
+      https://shop.example.com/checkout/return?order=ORD-1042
+      https://shop.example.com/checkout/return?order=ORD-1042&sig=7f3c9a
+      demoshop://checkout/return?order=ORD-1042
+      demoshop://checkout/return?order=ORD-1042&session_token=eyJhbGciOi...
+    correctLines: [4]
+    lineNotes:
+      - line: 3
+        note: A custom scheme with only an order id is acceptable - the app fetches the status from the server.
+      - line: 2
+        note: A signed order reference on a universal link is a good pattern.
+    hints:
+      - Which data would be valuable to another app that registered the same scheme?
+    solution: |
+      **Line 4.** A session token in a custom-scheme URL can be captured by any app that registers `demoshop://`. Return URLs should carry only
+      references (ideally signed) and the app should fetch the result and keep sessions in the Keychain.
+    followUp: |
+      Why is line 1 still not enough on its own to show "payment successful"?
+
+  - id: link-tests
+    type: testdesign
+    concept: universal-links-and-url-schemes
+    skill: application
+    title: Test the payment return link
+    prompt: |
+      The PSP returns iOS customers to `https://shop.example.com/checkout/return?order={id}&sig={signature}` after 3-D Secure. Design tests
+      for this link: the AASA set-up, app installed and not, app running, backgrounded and terminated, signed in and out, and tampered
+      parameters. Give the steps, expected result and evidence.
+    hints:
+      - Check the website side first, then each app state.
+      - The link can arrive when the app has been terminated - what must it do?
+    modelAnswer: |
+      1. `curl -si https://shop.example.com/.well-known/apple-app-site-association` → 200, no redirect, JSON, app id and `/checkout/return*`
+         included. Evidence: curl output.
+      2. App installed and running, tap the return link from Notes → app opens the order and shows the server's status. Evidence: recording.
+      3. App backgrounded during 3-D Secure, then returned via the link → same. Evidence: recording, server status request in logs.
+      4. App terminated while in the bank app (stop it from Xcode on a debug build), then the link → app launches, routes to the order,
+         re-checks the server. Evidence: recording.
+      5. App not installed → website return page shows the real status and a link to install or open the app. Evidence: screenshot.
+      6. Signed out (session expired) → sign-in, then the order. Evidence: recording.
+      7. Tampered `order` or wrong `sig` → refused, no data shown. Evidence: screenshot.
+      8. Simulator: `xcrun simctl openurl booted "<return URL>"` for quick regression of routing. Evidence: screenshot.
+    rubric:
+      - Checked the AASA file over HTTPS without redirects
+      - Tested app running, backgrounded and terminated
+      - Re-checked the payment status with the server on return
+      - Covered app not installed (website fallback)
+      - Covered signed-out returns
+      - Covered tampered parameters
+      - Used simctl openurl for quick checks and real devices for the journey
+    solution: |
+      Compare with the model answer. Test 4 - the **terminated** app receiving the link - is the one that loses payments in production.
+    followUp: |
+      How would the same tests look for Android App Links?
+
+  - id: order-states
+    type: order
+    concept: ios-scene-lifecycle
+    skill: recall
+    title: Leaving the app
+    prompt: Put the scene states in the order an app passes through them when the user goes to the home screen and stays away for a long time.
+    items:
+      - id: active
+        text: Foreground active
+      - id: inactive
+        text: Foreground inactive
+      - id: background
+        text: Background
+      - id: suspended
+        text: Suspended
+      - id: terminated
+        text: Terminated by the system (if memory is needed)
+    hints:
+      - The app first stops receiving events, then stops being visible, then stops running code.
+    solution: |
+      Active → inactive → background → suspended → (terminated). Save state at the background step - there's no later chance.
+
+  - id: interview-ios-links
+    type: interview
+    concept: ios-testing-tools
+    skill: application
+    title: "Interview: testing deep links on iOS"
+    prompt: |
+      *"How would you test deep links into our iOS app, for example links in emails and the return from a payment?"* Answer as you would in the
+      interview.
+    hints:
+      - Universal links versus schemes, the website side, the app states, tools.
+    modelAnswer: |
+      I'd first check which links are universal links and which use a custom scheme. For universal links, I'd verify the website side: the
+      apple-app-site-association file on every associated domain, served over HTTPS with no redirects, as JSON, listing our app id and the right
+      paths - a quick curl check I'd also put in CI. Then on a real device I'd tap links from Mail, Messages or Notes - typing into Safari doesn't
+      trigger them - checking routing to the right screen, excluded paths opening the website, unknown or someone else's ids, signed-out users,
+      and the website fallback when the app isn't installed.
+
+      For the payment return I'd test the app running, backgrounded and terminated while the customer is in the bank or 3-D Secure, making sure
+      the app routes to the order and asks the server for the true status rather than trusting the link. For custom schemes I'd check no tokens
+      or sensitive data travel in the URL, because any app can register the same scheme.
+
+      Tools: xcrun simctl openurl on the Simulator for fast routing checks, push notifications with simctl push, TestFlight builds on real devices,
+      and device logs from the Console app as evidence.
+    rubric:
+      - Distinguished universal links from custom schemes
+      - Checked the AASA file requirements, including no redirects
+      - Tested on real devices by tapping links from other apps
+      - Covered fallbacks, excluded paths, unknown ids and signed-out users
+      - Covered the payment return with the app terminated and a server re-check
+      - Checked custom-scheme URLs for sensitive data
+      - Named simctl and device-log tools
+    followUps:
+      - Why might a fix to the AASA file not take effect immediately?
+      - How would you test Android App Links differently?
+      - What should the website do when the app isn't installed?
+    solution: |
+      Strong answers start from the **website side** of universal links - where most failures are - and end with the **terminated app** case.
+
+  - id: explain-scheme-risk
+    type: short
+    concept: universal-links-and-url-schemes
+    skill: recall
+    title: Universal link or custom scheme?
+    prompt: In two or three sentences, explain why universal links are preferred over custom URL schemes for payment returns.
+    hints:
+      - Who can claim a custom scheme, and what happens when the app isn't installed?
+    modelAnswer: |
+      A universal link is an HTTPS URL that the app has proven it owns through the AASA file on the domain, so no other app can claim it, and if
+      the app isn't installed it opens the website instead. A custom scheme can be registered by any app and has no fallback, so payment returns
+      could be intercepted or lost.
+    rubric:
+      - Said universal links prove domain ownership
+      - Said custom schemes can be claimed by any app
+      - Mentioned the website fallback
+    solution: |
+      Android App Links offer the same guarantees through `assetlinks.json`.
+
+placement:
+  - id: place-states
+    type: mcq
+    concept: ios-scene-lifecycle
+    skill: application
+    title: Can the app run code?
+    prompt: In which state does an iOS app stay in memory but run no code - and can be terminated without notice?
+    options:
+      - id: suspended
+        text: Suspended
+        feedback: Correct - in memory, not executing, and terminable to free memory.
+      - id: background
+        text: Background
+        feedback: In the background an app can still run code for a limited time.
+      - id: inactive
+        text: Foreground inactive
+        feedback: The app is visible but not receiving events - it is still running.
+      - id: active
+        text: Foreground active
+        feedback: That is normal use.
+    correct: [suspended]
+    solution: |
+      **Suspended.** Which is why state is saved on entering the background.
+
+  - id: place-aasa
+    type: mcq
+    concept: universal-links-and-url-schemes
+    skill: application
+    title: Where the file lives
+    prompt: Where must the apple-app-site-association file for `shop.example.com` be served?
+    options:
+      - id: well-known
+        text: https://shop.example.com/.well-known/apple-app-site-association, over HTTPS, without redirects
+        feedback: Correct - iOS checks that exact location for the associated domain.
+      - id: app-bundle
+        text: Inside the app bundle
+        feedback: The app declares the domain; the file proving the association lives on the website.
+      - id: http
+        text: http://shop.example.com/apple-app-site-association.json
+        feedback: It must be HTTPS, at the well-known path, without an extension.
+      - id: redirect
+        text: Anywhere, as long as shop.example.com redirects to it
+        feedback: Redirects break the association.
+    correct: [well-known]
+    solution: |
+      **The well-known path, HTTPS, no redirects.** Check it with curl for every domain the app lists.
+
+  - id: place-tools
+    type: mcq
+    concept: ios-testing-tools
+    skill: application
+    title: Quick routing check
+    prompt: Which command opens a universal link in the booted iOS Simulator for a quick routing test?
+    options:
+      - id: openurl
+        text: xcrun simctl openurl booted "https://shop.example.com/orders/ORD-1042"
+        feedback: Correct - simctl openurl opens a URL as if from another app.
+      - id: adb
+        text: adb shell am start -a android.intent.action.VIEW -d "https://shop.example.com/orders/ORD-1042"
+        feedback: That is the Android equivalent, for devices connected with adb.
+      - id: curl
+        text: curl https://shop.example.com/orders/ORD-1042
+        feedback: That fetches the web page; it doesn't open the app.
+      - id: safari
+        text: Type the URL into Safari's address bar on the Simulator
+        feedback: Typing into Safari's address bar opens the website by design.
+    correct: [openurl]
+    solution: |
+      **`xcrun simctl openurl booted <url>`.** Then confirm on a real device by tapping the link from another app.
+
+recall:
+  - id: recall-ios-states
+    concept: ios-scene-lifecycle
+    prompt: What are the iOS scene states?
+    answer: Unattached, foreground inactive, foreground active, background and suspended.
+  - id: recall-terminate
+    concept: ios-scene-lifecycle
+    prompt: What can happen to a suspended iOS app, and what follows for testers?
+    answer: The system can terminate it without notice to free memory; test that the app saves state on entering the background and restores it on relaunch.
+  - id: recall-universal
+    concept: universal-links-and-url-schemes
+    prompt: What two parts make a universal link work?
+    answer: The app's Associated Domains entitlement (applinks:domain) and the apple-app-site-association file on the domain at /.well-known/, served over HTTPS without redirects.
+  - id: recall-fallback
+    concept: universal-links-and-url-schemes
+    prompt: What happens when a universal link's app isn't installed or the association fails?
+    answer: The link opens the website in Safari - so the website must handle the same URLs.
+  - id: recall-simctl
+    concept: ios-testing-tools
+    prompt: Name three xcrun simctl commands useful to testers.
+    answer: openurl to open links, push to send notifications, privacy to grant or reset permissions - plus io for screenshots and recordings.
+  - id: recall-app-links
+    concept: ios-testing-tools
+    prompt: What is Android's equivalent of the AASA file?
+    answer: assetlinks.json at /.well-known/ on the domain, used by Android App Links.
+
+next:
+  - mobile-payment-interruptions
+  - three-d-secure-and-redirects

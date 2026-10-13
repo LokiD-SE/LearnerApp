@@ -1,0 +1,600 @@
+id: sync-vs-async-payments
+title: Synchronous versus asynchronous payments
+subject: payment-architecture
+module: payment-request-flow
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: Why some payments answer immediately and others "later" - 202 Accepted, polling, webhooks and queues - what eventual consistency means for orders and screens, and how at-least-once delivery forces idempotent consumers, ordering checks and dead-letter handling.
+tags: [payments, architecture, asynchronous, "202", polling, webhooks, message queue, eventual consistency, at-least-once, outbox, dead letter]
+
+environment: |
+  - **Standards:** **RFC 9110**, section 15.3.3 **202 Accepted** - "accepted for processing, but the processing has not been
+    completed"; the response "ought to describe the request's current status and point to (or embed) a status monitor"
+    ([rfc-editor.org](https://www.rfc-editor.org/rfc/rfc9110.html)).
+  - **Universal patterns:** request-response versus asynchronous messaging, at-least-once delivery, idempotent consumers, the
+    transactional outbox and dead-letter queues are architecture patterns, not standards; brokers (for example Kafka,
+    RabbitMQ, Amazon SQS) document their own delivery and ordering guarantees - check the one you use.
+  - **Provider-specific:** which PSP operations are synchronous, the PSP's webhook retry schedule and ordering guarantees.
+    See [webhooks, signatures and asynchronous status](#/lesson/webhooks-and-async-status) for webhook security.
+  - **Fictional:** the demo shop's services and queues, SandPay.
+
+prerequisites:
+  - webhooks-and-async-status
+  - tracing-a-payment-end-to-end
+
+concepts:
+  - id: sync-and-async-flows
+    name: Synchronous and asynchronous flows
+    summary: A synchronous call returns the outcome in the response; an asynchronous one returns "accepted" (often 202 or a pending status) and delivers the outcome later by polling, webhook or message.
+  - id: eventual-consistency
+    name: Eventual consistency
+    summary: In an asynchronous system, the order, payment, ledger and screen can disagree for a while; tests must define how long, what each shows meanwhile, and that they converge.
+  - id: at-least-once-delivery
+    name: At-least-once delivery and idempotent consumers
+    summary: Queues and webhooks redeliver until acknowledged, so consumers see duplicates and out-of-order messages; they must deduplicate, tolerate reordering and park poison messages in a dead-letter queue.
+
+objectives:
+  - Distinguish synchronous from asynchronous payment flows and identify which one an API uses.
+  - Design tests for 202 Accepted and pending states, including polling and webhook completion.
+  - Define and test eventual-consistency expectations - what each system shows and how long until they agree.
+  - Test consumers for duplicates, out-of-order delivery, failures and dead-lettering.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sync-and-async-flows]
+    title: The idea in plain language
+    body: |
+      At a café counter you order, pay and **wait** for your coffee - that's **synchronous**: you leave with the result.
+
+      At a restaurant you order and **sit down**; the waiter says "it's being prepared" and brings it later. That's
+      **asynchronous**: you get a receipt for the order now, and the result arrives when it's ready. Meanwhile, your table,
+      the kitchen and the bill may briefly disagree about where your order is.
+
+      Payments work both ways. A card authorisation usually answers within seconds. Bank transfers, UPI that stays pending,
+      fraud reviews, payouts and refunds often answer **later**. And inside the shop, many steps after a payment - the order
+      update, the ledger entry, the email - run asynchronously through queues even when the payment itself was synchronous.
+
+      Testing asynchronous systems means testing **time**: what is true now, what will be true later, and what happens if a
+      message arrives twice, late, or out of order.
+
+  - id: what
+    kind: what
+    concepts: [sync-and-async-flows]
+    title: What the patterns look like
+    body: |
+      | Pattern | The client gets now | The outcome arrives | Examples |
+      |---|---|---|---|
+      | **Synchronous request-response** | the result | in the same response | card authorisation (usually) |
+      | **202 Accepted + status resource** | "accepted", a link to a status resource | client **polls** the status | bulk refunds, exports, some payouts |
+      | **Pending status + webhook** | a resource in a `pending` / `processing` status | server **pushes** a webhook | bank payments, UPI, 3-D Secure completion |
+      | **Queue between services** | an acknowledgement that the message was queued | a consumer processes it later | order update, ledger, email after payment |
+
+      RFC 9110 calls 202 "intentionally noncommittal": the request "might or might not eventually be acted upon". The
+      response should describe the current status and point to a status monitor:
+
+      ```http
+      HTTP/1.1 202 Accepted
+      Location: /v1/refund-batches/rb_4Kq2
+      Content-Type: application/json
+
+      {"id": "rb_4Kq2", "status": "processing", "accepted": 120}
+      ```
+
+  - id: why
+    kind: why
+    concepts: [eventual-consistency, at-least-once-delivery]
+    title: Why asynchronous flows break in new ways
+    body: |
+      - **Two truths at once.** The PSP says `succeeded`; the shop's order still says `awaiting payment` until the webhook is
+        processed. Is a support agent who refunds during that window doing something wrong? The design must say.
+      - **Duplicates are normal.** Webhooks and most message brokers deliver **at least once**: a message whose
+        acknowledgement was lost is delivered again. A consumer that isn't idempotent sends two emails, books two ledger entries
+        or ships twice.
+      - **Order isn't guaranteed.** `payment.refunded` can arrive before `payment.captured` if the first delivery failed and was
+        retried. A consumer that blindly applies events in arrival order ends in the wrong state.
+      - **Failures go quiet.** A message that always fails (a "poison message") blocks a queue or is retried forever; one that is
+        dropped leaves an order stuck with no error anywhere visible.
+      - **Tests that sleep are flaky.** `sleep(5)` and hope - the slow run fails, the fast run wastes time.
+
+  - id: internals
+    kind: internals
+    concepts: [at-least-once-delivery, eventual-consistency]
+    title: How reliable asynchronous processing works
+    body: |
+      **At-least-once delivery.** The broker or PSP keeps delivering a message until the consumer **acknowledges** it. If the
+      consumer processes the message and crashes before acknowledging, the message comes again. So:
+
+      - **Idempotent consumers** - store the ids of processed events (or make the effect naturally idempotent, such as "set
+        status to captured") and skip repeats.
+      - **Ordering tolerance** - compare an event's own version or timestamp with the current state, and ignore events that
+        would move the state backwards (`captured` after `refunded`), or fetch the current state from the source instead.
+      - **Retries with backoff and a dead-letter queue (DLQ)** - after N failures, move the message aside, alert, and let a
+        person or a repair job handle it.
+
+      **The dual-write problem.** A service that saves the payment to its database *and* publishes "payment captured" to a
+      queue can fail between the two - one happens, the other doesn't. The **transactional outbox** pattern writes the event
+      into an outbox table **in the same database transaction** as the state change; a relay then publishes it. Either both
+      happen or neither does.
+
+      **Eventual consistency** is the promise that, once messages stop arriving, all copies converge. A testable promise also
+      says **how soon** (for example "order status within 60 seconds of the PSP's webhook, 99 % of the time") and **what each
+      screen shows meanwhile**.
+
+  - id: visual
+    kind: visual
+    concepts: [at-least-once-delivery]
+    title: "Sequence diagram: a duplicate delivery handled safely"
+    body: |
+      The consumer processed the first delivery but crashed before acknowledging. The broker redelivers; the consumer
+      recognises the event id and only acknowledges.
+
+      ```mermaid
+      sequenceDiagram
+          participant P as payment-service
+          participant Q as Queue
+          participant O as order-service
+          participant DB as Orders database
+          P->>Q: publish payment.captured evt_9Ab1 via outbox
+          Q->>O: deliver evt_9Ab1 - attempt 1
+          O->>DB: mark ORD-1042 paid, record evt_9Ab1 processed
+          Note over O: crash before acknowledging
+          Q->>O: deliver evt_9Ab1 - attempt 2
+          O->>DB: has evt_9Ab1 been processed?
+          DB-->>O: yes
+          O->>Q: acknowledge - no second update, no second email
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [sync-and-async-flows, eventual-consistency]
+    title: Step by step - testing an asynchronous flow
+    body: |
+      1. **Draw the flow** - which steps are synchronous, which go through webhooks or queues, and who owns each status.
+      2. **Write the consistency expectations**: what the customer, the support tool and finance see at each moment, and the
+         maximum time until they agree.
+      3. **Wait for conditions, not for time.** Poll the observable state (API, database, UI) until it reaches the expected
+         value or a timeout - see the code section. No fixed sleeps.
+      4. **Test the in-between**: the pending screen, actions allowed while pending (cancel? refund? pay again?), and what
+         happens if the user acts in the window.
+      5. **Test delivery faults** in a test environment: duplicate messages, out-of-order messages, a consumer that crashes
+         mid-processing, a message that always fails (does it reach the DLQ and alert?), a consumer that is down for an hour
+         (does it catch up?).
+      6. **Test 202 flows**: the status resource exists immediately, moves through its states, and reports partial failures
+         (for example 118 of 120 refunds succeeded).
+      7. **Check convergence**: after all messages, the order, the PSP, the ledger and the email log agree - the invariants from
+         [partial refunds and invariants](#/lesson/partial-refunds-and-invariants) still hold.
+
+  - id: example
+    kind: example
+    concepts: [at-least-once-delivery, eventual-consistency]
+    title: "Real-world example: two confirmation emails and a refunded order shown as paid"
+    body: |
+      After moving the order update to a queue, two kinds of complaints arrive: some customers get **two** confirmation emails;
+      a few refunded orders show as **paid** again a minute after the refund.
+
+      The tester reproduces both in the test environment:
+
+      - **Duplicate emails.** The email consumer sends the email, then acknowledges. Under load, acknowledgements time out, the
+        broker redelivers, and the email is sent again. The consumer had no record of processed event ids.
+      - **Paid after refunded.** `payment.captured` failed once (a database lock) and was retried 60 seconds later -
+        **after** `payment.refunded` had been processed. The consumer applied events in arrival order and set the status back
+        to `paid`.
+
+      Fixes: a processed-events table checked before sending; status changes guarded by a state machine that refuses backwards
+      moves (or re-reads the payment from the PSP); a DLQ with an alert. Tests: deliver every event twice; deliver `captured`
+      after `refunded`; kill the consumer between processing and acknowledging.
+
+  - id: code
+    kind: code
+    concepts: [eventual-consistency, sync-and-async-flows]
+    title: Waiting for a condition instead of sleeping
+    collapsed: true
+    body: |
+      A small polling helper for API tests (TypeScript, illustrative):
+
+      ```typescript
+      async function waitFor<T>(
+        read: () => Promise<T>,
+        done: (value: T) => boolean,
+        { timeoutMs = 60_000, intervalMs = 1_000 } = {},
+      ): Promise<T> {
+        const deadline = Date.now() + timeoutMs;
+        let last: T;
+        do {
+          last = await read();
+          if (done(last)) return last;
+          await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        } while (Date.now() < deadline);
+        throw new Error(`condition not met within ${timeoutMs} ms; last value: ${JSON.stringify(last)}`);
+      }
+
+      // the order must become paid within the documented 60 seconds of the PSP's webhook
+      const order = await waitFor(
+        async () => (await request.get('/orders/ORD-1042')).json(),
+        (o) => o.status === 'paid',
+      );
+      ```
+
+      Playwright Test has the same idea built in: `await expect.poll(() => getStatus()).toBe('paid')` and web-first assertions
+      such as `await expect(page.getByTestId('order-status')).toHaveText('SUCCEEDED')` - see
+      [Playwright locators, auto-waiting and web-first assertions](#/lesson/playwright-locators-and-assertions).
+
+      The timeout is the **documented consistency promise**, not a guess - if it is exceeded, that is a finding.
+
+  - id: tests
+    kind: tests
+    concepts: [at-least-once-delivery, eventual-consistency, sync-and-async-flows]
+    title: Positive and negative test cases
+    body: |
+      | ID | Scenario | Expected | Evidence |
+      |---|---|---|---|
+      | A1 | bank payment, webhook after 30 s | order pending, then paid within the promised time | status history with times |
+      | A2 | same webhook or message delivered twice | one status change, one email, one ledger entry | event log, email log, ledger |
+      | A3 | `refunded` processed before a late `captured` | final status refunded | order history |
+      | A4 | consumer crashes after processing, before acknowledging | redelivery recognised; no duplicate effect | logs, effects counted |
+      | A5 | message that always fails | moved to the DLQ after N attempts; alert raised | DLQ contents, alert |
+      | A6 | consumer down for 30 minutes, then restarted | backlog processed in order of design; all orders converge | queue depth over time, orders |
+      | A7 | `POST /v1/refund-batches` | 202 with a status resource; status moves to completed; partial failures reported per item | status resource snapshots |
+      | A8 | support agent refunds while the order still shows pending | behaviour as designed (blocked or allowed with the PSP as source of truth) | UI, PSP |
+      | A9 | service saves state, then the broker is unavailable | event published later via the outbox; nothing lost | outbox table, queue |
+      | A10 | after a test run | order, PSP, ledger and emails agree | reconciliation query |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [at-least-once-delivery, eventual-consistency]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Fixed sleeps in tests.** Wait for conditions, with a timeout equal to the documented promise.
+      - **Assuming exactly-once delivery.** Assume at least once; test duplicates.
+      - **Assuming arrival order is event order.** Test out-of-order delivery.
+      - **Acknowledging before processing.** If processing then fails, the message is lost - acknowledge after the effect is
+        safely recorded.
+      - **Dual writes without an outbox.** Database and queue can disagree; test a broker outage after the save.
+      - **Silent DLQs.** A dead-letter queue nobody watches is a lost-message queue. Test the alert.
+      - **Undefined "eventually".** Without a time and a meanwhile-behaviour, there is nothing to test.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sync-and-async-flows]
+    title: When to be synchronous and when not
+    body: |
+      | | Synchronous | Asynchronous |
+      |---|---|---|
+      | Customer experience | immediate answer | "processing" states to design and explain |
+      | Coupling | caller waits for every dependency | services can be down briefly without losing work |
+      | Peak load | requests pile up and time out | queues absorb bursts |
+      | Failure handling | in the request, visible to the caller | retries, DLQs, monitoring |
+      | Testing | simpler - one response to assert | time, duplicates, order, convergence |
+
+      Most payment systems mix both: authorise synchronously so the customer gets an answer, then update orders, ledgers and
+      notifications asynchronously so a slow email service can't break checkout.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Synchronous** = outcome in the response; **asynchronous** = accepted now, outcome later (polling, webhook, queue).
+      - **202 Accepted** (RFC 9110): processing not completed; return a status resource to poll.
+      - **Eventual consistency** needs a **time bound** and defined **meanwhile** behaviour - test both.
+      - **At-least-once** delivery → **idempotent consumers**, **ordering tolerance**, **retries + DLQ with alerts**.
+      - **Outbox** solves the database-plus-queue dual write.
+      - In tests, **wait for conditions**, never fixed sleeps.
+
+exercises:
+  - id: sync-or-async
+    type: mcq
+    concept: sync-and-async-flows
+    skill: application
+    title: What does 202 promise?
+    prompt: "`POST /v1/refund-batches` answers `202 Accepted` with `Location: /v1/refund-batches/rb_4Kq2`. What has the server promised?"
+    options:
+      - id: accepted
+        text: Only that the request was accepted for processing - the outcome is unknown until the status resource says so
+        feedback: Correct - RFC 9110 calls 202 intentionally noncommittal; the request might or might not eventually be acted upon.
+      - id: done
+        text: That all refunds in the batch have been made
+        feedback: That would be a 200 or 201 with the results; 202 explicitly means processing isn't complete.
+      - id: will-succeed
+        text: That every refund will succeed eventually
+        feedback: 202 makes no promise about success - individual refunds may still fail.
+      - id: error
+        text: That something went wrong and the client should retry
+        feedback: 202 is a success code - the request was accepted.
+    correct: [accepted]
+    hints:
+      - Read RFC 9110's description of 202 - "noncommittal".
+    solution: |
+      **Accepted, not done.** Test the status resource: it exists immediately, moves through its states, and reports which
+      items succeeded or failed.
+    followUp: |
+      Which tests would you write for the status resource of a batch with 120 refunds, two of which fail?
+
+  - id: duplicate-message
+    type: mcq
+    concept: at-least-once-delivery
+    skill: analysis
+    title: The second email
+    prompt: |
+      The email consumer sends a confirmation email and then acknowledges the message. Under load, some customers receive two
+      identical emails. What is the most likely cause?
+    options:
+      - id: redelivery
+        text: The acknowledgement didn't reach the broker in time, so the message was redelivered and processed again
+        feedback: Correct - at-least-once delivery redelivers unacknowledged messages; a consumer without deduplication repeats the effect.
+      - id: publisher
+        text: The publisher always sends every message twice
+        feedback: Possible in theory, but then every customer would get two emails, not only some under load.
+      - id: email-provider
+        text: The email provider duplicates messages
+        feedback: Email providers rarely duplicate; the pattern "under load" points at acknowledgement timeouts.
+      - id: customer
+        text: The customer clicked "resend"
+        feedback: There's no evidence of customer action, and the pattern correlates with load.
+    correct: [redelivery]
+    hints:
+      - What does an at-least-once broker do with a message it never saw acknowledged?
+    solution: |
+      **Redelivery without deduplication.** Record processed event ids (or the email's idempotency key) before sending, and test
+      by delivering every message twice.
+    followUp: |
+      Acknowledging **before** sending would stop the duplicates. Why is that worse?
+
+  - id: debug-out-of-order
+    type: debug
+    concept: at-least-once-delivery
+    skill: analysis
+    title: The status that went backwards
+    prompt: A refunded order shows as paid again after a delayed `payment.captured` message. Click the line that allows it.
+    language: java
+    code: |
+      void on(PaymentEvent event) {
+          if (processedEvents.contains(event.id())) {
+              return;
+          }
+          Order order = orders.findByPayment(event.paymentId());
+          switch (event.type()) {
+              case "payment.captured" -> order.setStatus(OrderStatus.PAID);
+              case "payment.refunded" -> order.setStatus(OrderStatus.REFUNDED);
+              default -> log.info("ignored {}", event.type());
+          }
+          orders.save(order);
+          processedEvents.add(event.id());
+      }
+    correctLines: [7]
+    lineNotes:
+      - line: 2
+        note: Skipping already-processed events handles duplicates correctly.
+      - line: 12
+        note: Recording the event as processed after saving is the right order.
+    hints:
+      - Which transition should never happen, whatever order the events arrive in?
+    solution: |
+      **Line 7.** It sets PAID unconditionally, even if the order is already REFUNDED. Guard transitions with the order's state
+      machine (only AWAITING_PAYMENT → PAID), or compare the event's version or time with the order's, or re-read the payment's
+      current status from the PSP. Test: deliver `refunded`, then `captured`.
+    followUp: |
+      Lines 11 and 12 run separately. What could still go wrong between them, and how would you make it atomic?
+
+  - id: async-test-design
+    type: testdesign
+    concept: eventual-consistency
+    skill: application
+    title: Define and test "eventually"
+    prompt: |
+      After a successful payment, order-service updates the order via a queue, the ledger books it via a second consumer, and
+      an email is sent by a third. Write the consistency expectations (what each system shows and by when), then at least seven
+      tests including duplicates, reordering, a crash, a poison message and an outage.
+    hints:
+      - Expectations first - with numbers.
+      - Each consumer has the same fault list.
+      - How do you assert "eventually" without sleeping?
+    modelAnswer: |
+      Expectations: within 60 s of the PSP's confirmation - order `paid`, ledger entry booked, one confirmation email.
+      Meanwhile the order page shows "payment received, confirming"; support sees PSP status `succeeded` and order `awaiting`.
+
+      Tests (each waits for conditions with a 60 s timeout, then checks counts):
+
+      1. Normal flow → all three effects within 60 s, exactly once.
+      2. Every message delivered twice → still one status change, one ledger entry, one email.
+      3. `refunded` delivered before a delayed `captured` → final state refunded everywhere.
+      4. Ledger consumer killed after booking, before acknowledging → no duplicate entry after restart.
+      5. Poison message (malformed event) → DLQ after N attempts, alert raised, other messages keep flowing.
+      6. Email consumer down 30 min → emails sent after restart; no duplicates; order and ledger unaffected meanwhile.
+      7. Broker unavailable right after payment-service saves → event published later from the outbox; all effects arrive.
+      8. After the run: reconciliation query shows order, PSP, ledger and email log agree.
+    rubric:
+      - Wrote consistency expectations with a time bound and meanwhile behaviour
+      - Waited for conditions with a timeout rather than sleeping
+      - Tested duplicate delivery for each consumer
+      - Tested out-of-order delivery
+      - Tested a crash between processing and acknowledging
+      - Tested a poison message reaching the DLQ with an alert
+      - Tested an outage and catch-up, and the outbox
+      - Checked final convergence across systems
+    solution: |
+      Compare with the model answer. Without the **numbers** in the expectations, none of the tests has a pass criterion.
+    followUp: |
+      How would you produce the "consumer killed between processing and acknowledging" situation reliably in a test?
+
+  - id: order-reliable-consumer
+    type: order
+    concept: at-least-once-delivery
+    skill: recall
+    title: A reliable consumer, step by step
+    prompt: Put the steps a reliable message consumer takes for each message in order.
+    items:
+      - id: receive
+        text: Receive the message
+      - id: dedupe
+        text: Check whether its id has already been processed
+      - id: guard
+        text: Check the transition is valid for the current state
+      - id: apply
+        text: Apply the effect and record the id as processed, atomically
+      - id: ack
+        text: Acknowledge the message
+    hints:
+      - Acknowledge only once the effect is safely recorded.
+    solution: |
+      Receive → dedupe → guard → apply and record atomically → acknowledge. On repeated failure, the broker's retry policy moves
+      the message to the DLQ.
+
+  - id: interview-async
+    type: interview
+    concept: eventual-consistency
+    skill: application
+    title: "Interview: testing an event-driven payment flow"
+    prompt: |
+      *"Our order updates after payment go through a message queue. How would you test that?"* Answer as you would in the
+      interview.
+    hints:
+      - Expectations, waiting, faults, convergence.
+    modelAnswer: |
+      First I'd pin down what "eventually" means: which systems update, how soon - say the order is paid within 60 seconds of the
+      payment - and what each screen shows meanwhile. Without that there's no pass criterion.
+
+      In tests I'd never sleep for a fixed time; I'd poll the observable state until it reaches the expected value or the
+      documented timeout, which makes tests both fast and stable.
+
+      Then the faults that queues bring. Delivery is usually at least once, so I'd deliver every message twice and check there's
+      one effect - one status change, one email, one ledger entry. I'd deliver events out of order, like refunded before a late
+      captured, and check the state never moves backwards. I'd kill the consumer between processing and acknowledging, send a
+      poison message and check it lands in the dead-letter queue with an alert, stop a consumer for a while and check it catches
+      up, and make the broker unavailable after the payment is saved to check the outbox republishes. At the end I'd run a
+      reconciliation check that the order, the PSP, the ledger and the emails all agree.
+    rubric:
+      - Defined consistency expectations with a time bound
+      - Waited for conditions instead of fixed sleeps
+      - Tested duplicates against at-least-once delivery
+      - Tested out-of-order events
+      - Tested crashes, poison messages and the DLQ alert
+      - Tested an outage and catch-up or the outbox
+      - Checked final convergence
+    followUps:
+      - What's the dual-write problem and how does an outbox solve it?
+      - Why is acknowledging before processing dangerous?
+      - How do you test ordering if the broker guarantees order per key?
+    solution: |
+      Strong answers turn "eventually" into **numbers** and then attack the queue's **guarantees**.
+
+  - id: explain-outbox
+    type: short
+    concept: at-least-once-delivery
+    skill: recall
+    title: Why an outbox
+    prompt: In two or three sentences, explain the dual-write problem and how the transactional outbox pattern solves it.
+    hints:
+      - What can fail between saving to the database and publishing to the queue?
+    modelAnswer: |
+      If a service saves a state change to its database and then publishes an event to a queue, a crash or broker outage between
+      the two leaves them inconsistent - saved but never announced, or announced but not saved. The outbox writes the event into a
+      table in the same database transaction as the state change, and a separate relay publishes it afterwards, so both happen or
+      neither does.
+    rubric:
+      - Described the gap between the database write and the publish
+      - Said the event is written in the same transaction as the state change
+      - Said a relay publishes it later
+    solution: |
+      The relay itself publishes at least once - so consumers still need to be idempotent.
+
+placement:
+  - id: place-202
+    type: mcq
+    concept: sync-and-async-flows
+    skill: application
+    title: Testing a 202
+    prompt: An API answers `202 Accepted`. What must a test do to confirm the operation succeeded?
+    options:
+      - id: poll
+        text: Follow the status resource (or wait for the documented webhook) until it reports a final outcome
+        feedback: Correct - 202 only means accepted; the outcome comes later.
+      - id: stop
+        text: Nothing more - 202 is a success code
+        feedback: It is a success for accepting the request, not for completing it.
+      - id: retry
+        text: Send the request again until it returns 201
+        feedback: That could create duplicates; the first request is already being processed.
+      - id: sleep
+        text: Sleep 10 seconds and assume it's done
+        feedback: Fixed sleeps are flaky and prove nothing about the outcome.
+    correct: [poll]
+    solution: |
+      **Follow the status to a final outcome**, with a timeout equal to the documented processing time.
+
+  - id: place-consistency
+    type: mcq
+    concept: eventual-consistency
+    skill: analysis
+    title: Defect or expected?
+    prompt: Two seconds after a payment, the PSP dashboard shows `succeeded` but the shop's order shows `awaiting payment`. The design promises consistency within 60 seconds. What is it?
+    options:
+      - id: expected
+        text: Expected for now - check that the order becomes paid within 60 seconds
+        feedback: Correct - within the promised window the systems may disagree; the test checks convergence on time.
+      - id: defect
+        text: A defect - the systems must always agree
+        feedback: An asynchronous design accepts temporary disagreement; it becomes a defect if the promise is broken.
+      - id: refund
+        text: A reason to refund the customer
+        feedback: The payment succeeded and the order will follow; refunding now would be wrong.
+      - id: retry
+        text: A reason for the customer to pay again
+        feedback: That would charge twice.
+    correct: [expected]
+    solution: |
+      **Expected - within the window.** The finding would be "not paid after 60 s", or a screen that tells the customer it failed.
+
+  - id: place-duplicate
+    type: mcq
+    concept: at-least-once-delivery
+    skill: application
+    title: Designing the consumer test
+    prompt: A queue guarantees at-least-once delivery. Which test is essential for every consumer?
+    options:
+      - id: twice
+        text: Deliver the same message twice and assert the effect happens once
+        feedback: Correct - duplicates are part of the guarantee, so consumers must be idempotent.
+      - id: once
+        text: Deliver each message once and assert the effect
+        feedback: Necessary, but it doesn't test the behaviour the guarantee forces on consumers.
+      - id: never
+        text: Assert messages are never redelivered
+        feedback: At-least-once delivery means redelivery can and will happen.
+      - id: order-only
+        text: Assert messages arrive in publishing order
+        feedback: Ordering is a separate (and often weaker) guarantee; duplicates are the essential case.
+    correct: [twice]
+    solution: |
+      **Deliver twice, expect one effect.** Then add reordering and crash tests.
+
+recall:
+  - id: recall-sync-async
+    concept: sync-and-async-flows
+    prompt: What is the difference between a synchronous and an asynchronous payment flow?
+    answer: Synchronous returns the outcome in the response; asynchronous accepts the request now and delivers the outcome later through polling, webhooks or messages.
+  - id: recall-202
+    concept: sync-and-async-flows
+    prompt: What does RFC 9110 say a 202 Accepted response should contain?
+    answer: A description of the request's current status and a pointer to (or embedded) status monitor; the outcome isn't known yet.
+  - id: recall-eventual
+    concept: eventual-consistency
+    prompt: What makes "eventual consistency" testable?
+    answer: A time bound for convergence and defined behaviour for every system and screen in the meantime.
+  - id: recall-wait
+    concept: eventual-consistency
+    prompt: How should tests wait for asynchronous results?
+    answer: Poll the observable state until it matches or a timeout equal to the documented promise expires - never a fixed sleep.
+  - id: recall-at-least-once
+    concept: at-least-once-delivery
+    prompt: What three things must a consumer handle under at-least-once delivery?
+    answer: Duplicates (idempotency), out-of-order messages (state guards), and repeated failures (retries with a dead-letter queue and alerts).
+  - id: recall-outbox
+    concept: at-least-once-delivery
+    prompt: What problem does the transactional outbox solve?
+    answer: The dual write - saving state and publishing an event atomically, by writing the event in the same transaction and publishing it later.
+
+next:
+  - logs-metrics-traces
+  - inconsistent-status-incidents

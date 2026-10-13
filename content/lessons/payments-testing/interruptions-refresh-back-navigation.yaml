@@ -1,0 +1,574 @@
+id: interruptions-refresh-back-navigation
+title: Refresh, back navigation, session expiry and interruptions
+subject: payments-testing
+module: payment-failure-modes
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: What happens to a payment when the customer double-clicks, refreshes, presses Back, opens a second tab, lets the session expire or loses the network - and the patterns (idempotency, post-redirect-get, server-side state) that keep it to one charge and one order.
+tags: [payments, double submit, refresh, back button, bfcache, post redirect get, "303", session expiry, multiple tabs, network loss, idempotency]
+
+environment: |
+  - **Standards and references:**
+    - **RFC 9110** (HTTP Semantics), section 15.4.4 **303 See Other** - "primarily used to allow the output of a POST
+      action to redirect the user agent to a different resource"; section 9.2.2 on idempotent methods.
+    - **Back/forward cache (bfcache)** - [web.dev: Back/forward cache](https://web.dev/articles/bfcache): pages can be
+      restored from memory on Back or Forward; `pageshow` with `event.persisted` tells you it happened; Chrome DevTools
+      has an **Application → Back-forward Cache** panel to test it. Browser behaviour differs and changes - test in the
+      browsers you support.
+  - **Universal:** double-submission and resubmission problems happen in every web and mobile checkout.
+  - **Provider-specific:** session lifetimes, PSP payment-session expiry, and how your PSP deduplicates retries
+    (idempotency keys - see [idempotency keys](#/lesson/idempotency-keys)).
+  - **Fictional:** the demo shop's checkout endpoints and SandPay.
+
+prerequisites:
+  - idempotency-keys
+  - declines-timeouts-unknown-outcomes
+
+concepts:
+  - id: double-submission-protection
+    name: Double-submission protection
+    summary: Repeated clicks, retries and resubmissions must lead to one payment - by disabling the button for feedback and, decisively, by one server-side checkout attempt with one idempotency key.
+  - id: post-redirect-get
+    name: Post/Redirect/Get and history
+    summary: After a POST, redirect with 303 to a GET of the result, so refresh and Back show the result instead of resending the payment; pages restored from the back/forward cache must refresh their state.
+  - id: session-and-interruption-handling
+    name: Sessions, tabs and interruptions
+    summary: Session expiry, a second tab, a closed laptop or a lost network must never lose a paid order or create a second payment; state lives on the server and is checked again on return.
+
+objectives:
+  - Explain why disabling the pay button is not enough, and how server-side attempts and idempotency keys prevent double charges.
+  - Apply Post/Redirect/Get with 303 and handle pages restored from the back/forward cache.
+  - Design tests for refresh, Back, multiple tabs, session expiry and network loss at each step of checkout.
+  - Diagnose a double charge or a lost order from request logs.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [double-submission-protection]
+    title: The idea in plain language
+    body: |
+      At a ticket machine, you press "Pay" and nothing seems to happen, so you press it again. A well-built machine
+      ignores the second press - it knows **it is already working on your ticket**. A badly built one sells you two
+      tickets.
+
+      Web and mobile checkouts face the same impatient finger, plus more: the **refresh** button that resends the last
+      form, the **Back** button that shows the payment page again, a **second tab** with the same cart, a session that
+      **times out** while the customer looks for their card, a phone that **loses signal** halfway.
+
+      The protection can't live only in the page - pages can be reloaded, copied into another tab or restored from
+      memory. It has to live on the **server**: "this checkout attempt is already being paid", answered the same way
+      however many times the question arrives.
+
+  - id: what
+    kind: what
+    concepts: [double-submission-protection, post-redirect-get, session-and-interruption-handling]
+    title: What can go wrong - the interruption catalogue
+    body: |
+      | Interruption | What the browser or app does | Risk |
+      |---|---|---|
+      | **Double click / double tap** | sends the form or API call twice | two payments |
+      | **Refresh after paying** | may resend the last POST (browsers usually warn first) | second payment |
+      | **Back after paying** | shows the payment page again - from the network, the HTTP cache or the **back/forward cache** | customer pays again; stale "Pay" button works |
+      | **Second tab** | two checkouts for one cart | two payments, or an order with the wrong total |
+      | **Session expiry** | the shop no longer knows who the customer is | paid order not linked; customer sees "please log in" after paying |
+      | **Network loss after "Pay"** | the request may or may not have reached the server | unknown outcome; retry may double-charge |
+      | **App or tab closed / laptop lid shut** | the page stops; the server carries on | order paid but never shown; or never finished |
+      | **Slow response** | customer gives up, starts again | two attempts in flight |
+
+      The technical tools that address them:
+
+      - **Idempotency** - one checkout attempt id, one idempotency key, and the server replays the first result for any
+        repeat (see [idempotency keys](#/lesson/idempotency-keys)).
+      - **Post/Redirect/Get (PRG)** - after the POST, answer **303 See Other** to a result page such as
+        `/orders/ORD-1042`, so Refresh and Back show the result.
+      - **Server-side state** - the order and payment status live on the server; every page shows what the server says.
+
+  - id: why
+    kind: why
+    concepts: [double-submission-protection]
+    title: Why "just disable the button" isn't enough
+    body: |
+      Disabling the button after the first click is good **feedback** - but it protects only that one page instance:
+
+      - A **refresh** builds a new page with a working button.
+      - **Back** may restore the page from the back/forward cache with the button as it was - or reload it fresh.
+      - A **second tab** has its own button.
+      - **Network retries** by the browser, a proxy or the app's HTTP client resend the request without any click.
+      - A **double tap** on a slow phone can fire before the script disables the button.
+
+      Only the server sees every attempt. So the rule is: **the client avoids sending twice; the server makes sending
+      twice harmless.** Testers attack both - and especially the second.
+
+  - id: internals
+    kind: internals
+    concepts: [post-redirect-get]
+    title: How Post/Redirect/Get and the back/forward cache work
+    body: |
+      **Post/Redirect/Get** in HTTP terms:
+
+      ```http
+      POST /checkout/ORD-1042/pay HTTP/1.1
+      Host: shop.example.com
+      Content-Type: application/x-www-form-urlencoded
+
+      attempt=att_9Qe2
+      ```
+
+      ```http
+      HTTP/1.1 303 See Other
+      Location: /orders/ORD-1042
+      ```
+
+      The browser then sends `GET /orders/ORD-1042` and shows the result. RFC 9110 describes 303 as "primarily used to
+      allow the output of a POST action to redirect the user agent to a different resource". Now **Refresh** repeats the
+      harmless GET, and **Back** returns to the checkout page, not to "resend payment?".
+
+      **The back/forward cache** keeps a page in memory with its JavaScript paused, so Back and Forward are instant.
+      A checkout page restored this way still shows what it showed before - perhaps an enabled "Pay" button for a cart
+      that is already paid. The page should listen for `pageshow` and check `event.persisted`:
+
+      ```javascript
+      window.addEventListener('pageshow', (event) => {
+        if (event.persisted) refreshCheckoutStatusFromServer();
+      });
+      ```
+
+      Pages sent with `Cache-Control: no-store` "may not be eligible" for bfcache (web.dev), and browsers keep changing
+      the details - so the server-side protection must hold either way. Chrome DevTools' **Application → Back-forward
+      Cache** panel runs a test and tells you whether a page was restored and, if not, why.
+
+  - id: visual
+    kind: visual
+    concepts: [double-submission-protection, post-redirect-get]
+    title: "Sequence diagram: a double click that charges once"
+    body: |
+      Both clicks carry the **same attempt id**, created when the checkout page was rendered. The server and the PSP
+      both deduplicate.
+
+      ```mermaid
+      sequenceDiagram
+          participant B as Browser
+          participant S as Shop server
+          participant P as PSP
+          B->>S: POST pay, attempt att_9Qe2 - first click
+          S->>S: Lock attempt att_9Qe2, status paying
+          S->>P: Create payment, Idempotency-Key att_9Qe2
+          B->>S: POST pay, attempt att_9Qe2 - second click
+          S-->>B: 303 to the order page - attempt already in progress
+          P-->>S: authorized
+          S->>S: Attempt paid, order confirmed
+          S-->>B: 303 See Other to /orders/ORD-1042
+          B->>S: GET /orders/ORD-1042
+          S-->>B: Order confirmed
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [session-and-interruption-handling, double-submission-protection]
+    title: Step by step - an interruption test session
+    body: |
+      Prepare a sandbox checkout with a **slow** test method (for example a processing delay) so you have time to
+      interrupt.
+
+      1. **Map the checkout steps**: cart → address → payment page → "Pay" pressed → waiting → result page.
+      2. **At each step, apply each interruption**: double click, refresh, Back, Forward, a second tab with the same
+         cart, close and reopen, session expiry (shorten it in the test environment or delete the session cookie in
+         DevTools), network offline and back (DevTools throttling or flight mode).
+      3. **Count after each test**: payments at the PSP, orders in the shop, emails sent - expected **one** of each (or
+         zero if the customer never paid).
+      4. **Compare amounts**: if the cart changed in another tab, the charged amount must match the order that was
+         confirmed.
+      5. **Check what the customer sees on return**: the true status from the server, not a stale page.
+      6. **Record the request sequence** in the Network panel (Preserve log on) for any failure - it is the evidence a
+         developer needs.
+
+  - id: example
+    kind: example
+    concepts: [double-submission-protection, session-and-interruption-handling]
+    title: "Real-world example: charged twice on the slow evening"
+    body: |
+      Every evening at peak time a handful of customers are charged twice; the shop has one order for each. Daytime
+      tests never reproduce it.
+
+      The tester uses throttling and the sandbox's processing-delay method to make the payment take 8 seconds, and
+      reproduces it in two ways:
+
+      1. **Refresh while waiting.** The waiting page is the response to the POST; Refresh re-sends the POST, the browser's
+         "confirm resubmission" dialog is accepted, and the server creates a **new idempotency key per request**.
+      2. **Second tab.** The customer opens the order history in a new tab, sees "awaiting payment", goes back to the cart
+         and pays again.
+
+      Evidence: two `POST /pay` requests, 6 seconds apart, with different `Idempotency-Key` values, both authorised.
+
+      Fixes: generate the **attempt id when the checkout page is created** and send it with every pay request; key the
+      PSP call on it; answer every pay request with a 303 to the order page; and block a new attempt for a cart whose
+      previous attempt is still in progress. Regression tests: refresh while waiting, second tab while waiting, double
+      click with a 5-second delay.
+
+  - id: tests
+    kind: tests
+    concepts: [double-submission-protection, post-redirect-get, session-and-interruption-handling]
+    title: Positive and negative test cases
+    body: |
+      | ID | Interruption | Expected | Evidence |
+      |---|---|---|---|
+      | I1 | double click on "Pay" (slow method) | one payment, one order | PSP payment list, order list |
+      | I2 | refresh while the payment is processing | no new payment; page shows progress or the result | request log, payments |
+      | I3 | refresh on the result page | same result, no request to the PSP | request log |
+      | I4 | Back from the result page | checkout shows "already paid" (after a bfcache restore too) | screenshot, DevTools bfcache panel |
+      | I5 | second tab, pay in both | one payment; the second tab is told the cart is paid or in progress | payments, messages |
+      | I6 | cart changed in tab 2 while tab 1 pays | charged amount equals the confirmed order's total | PSP amount, order total |
+      | I7 | session expires on the payment page, then "Pay" | asked to sign in again **before** paying, cart kept | screenshot, no payment |
+      | I8 | session expires **during** a 3-D Secure challenge | payment and order still linked; result shown after sign-in | order, payment |
+      | I9 | network offline right after "Pay", then back | status checked; no second payment on retry | request log, payments |
+      | I10 | close the tab while processing, reopen the order link later | true final status shown; confirmation email sent | email, order |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [double-submission-protection, post-redirect-get, session-and-interruption-handling]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Only disabling the button.** Necessary feedback, insufficient protection.
+      - **A new idempotency key per request.** The key must identify the **attempt**, created once.
+      - **Returning the result page as the POST response.** Use 303 to a GET; otherwise Refresh resubmits.
+      - **Trusting a page restored from the bfcache.** Re-check the status on `pageshow` with `persisted`.
+      - **Keeping checkout state only in the browser.** Tabs and restores diverge; the server is the source of truth.
+      - **Testing on a fast network only.** Interruptions need a slow payment - use throttling and delay test methods.
+      - **Counting only orders.** Count PSP payments too - double charges with one order are the worst kind.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [double-submission-protection]
+    title: Protection options and their costs
+    body: |
+      | Protection | Stops | Doesn't stop | Cost |
+      |---|---|---|---|
+      | Disable button / spinner | accidental double clicks in one page | refresh, tabs, retries | trivial |
+      | PRG with 303 | refresh and Back resubmitting | double clicks before the redirect, other tabs | small |
+      | Attempt id + idempotency key | repeats of the same attempt everywhere | a genuinely new attempt for the same cart | moderate - must be stored |
+      | One active attempt per cart / order | second tab, impatient restarts | - | needs a rule for abandoned attempts (timeouts) |
+      | Status re-check on return | stale pages, bfcache restores | - | small |
+
+      Most checkouts need **all of them**; each covers the gap of another.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Client avoids sending twice; **server makes sending twice harmless**.
+      - One **attempt id** per checkout, used as the **idempotency key**; one active attempt per cart.
+      - **POST → 303 See Other → GET** result page (RFC 9110 15.4.4); Refresh and Back become harmless.
+      - **bfcache**: re-check status on `pageshow` when `event.persisted`; test with DevTools' Back-forward Cache panel.
+      - Test double click, refresh, Back, second tab, session expiry, offline, closed tab - with a **slow** method, and
+        count **payments, orders and emails**.
+
+exercises:
+  - id: button-enough
+    type: mcq
+    concept: double-submission-protection
+    skill: analysis
+    title: Is a disabled button enough?
+    prompt: The developer says "double charges are impossible - the Pay button is disabled after the first click". Which case still produces a double charge if that is the only protection?
+    options:
+      - id: second-tab
+        text: The customer opens the checkout in a second tab and pays there too
+        feedback: Correct - each tab has its own button. Only the server can see that the cart is already being paid.
+      - id: double-click-same
+        text: A double click in the same page after the script ran
+        feedback: That is the one case a disabled button does handle.
+      - id: decline
+        text: A declined payment followed by a retry with another card
+        feedback: A new attempt after a decline is legitimate - it doesn't create a double charge.
+      - id: result-page
+        text: Viewing the result page twice
+        feedback: Viewing a result is a GET and doesn't charge anything, if the result page is a separate resource.
+    correct: [second-tab]
+    hints:
+      - Which protection exists per page, and which per checkout?
+    solution: |
+      **The second tab** (and refresh, retries, bfcache restores). Server-side: one attempt id used as the idempotency key,
+      and one active attempt per cart.
+    followUp: |
+      Name two more cases the disabled button can't handle, and the server-side protection for each.
+
+  - id: prg-status
+    type: mcq
+    concept: post-redirect-get
+    skill: application
+    title: The right response to a successful POST
+    prompt: After a successful `POST /checkout/ORD-1042/pay`, which response best prevents a resubmission when the customer refreshes?
+    options:
+      - id: see-other
+        text: "303 See Other with Location: /orders/ORD-1042"
+        feedback: Correct - the browser follows with a GET; Refresh repeats the GET, not the payment.
+      - id: ok-page
+        text: 200 OK with the confirmation page as the body
+        feedback: The page is the response to the POST, so Refresh offers to resend the POST - the classic double charge.
+      - id: temporary
+        text: "307 Temporary Redirect with Location: /orders/ORD-1042"
+        feedback: 307 tells the browser to repeat the same method - it would POST to the order page.
+      - id: no-content
+        text: 204 No Content
+        feedback: The browser stays on the current page; nothing shows the result, and a refresh can still resubmit.
+    correct: [see-other]
+    hints:
+      - Which redirect changes the method to GET?
+    solution: |
+      **303 See Other.** RFC 9110 describes exactly this use. 307 and 308 keep the method, which is wrong here.
+    followUp: |
+      The checkout is a single-page app calling a JSON API. What is the equivalent of PRG there?
+
+  - id: debug-attempt-key
+    type: debug
+    concept: double-submission-protection
+    skill: analysis
+    title: The key that changes every time
+    prompt: Refreshing while the payment is processing creates a second charge. Click the line responsible.
+    language: java
+    code: |
+      Response pay(String orderId, HttpRequest request) {
+          Order order = orders.find(orderId);
+          if (order.isPaid()) {
+              return Response.seeOther("/orders/" + orderId);
+          }
+          String key = "pay-" + orderId + "-" + UUID.randomUUID();
+          psp.createPayment(order.totalMinor(), order.currency(), key);
+          return Response.seeOther("/orders/" + orderId);
+      }
+    correctLines: [6]
+    lineNotes:
+      - line: 3
+        note: Checking for a paid order helps once the first payment has finished - but not while it is still processing.
+      - line: 8
+        note: Answering with 303 to the order page is correct Post/Redirect/Get.
+    hints:
+      - What makes two requests "the same" for the PSP?
+    solution: |
+      **Line 6.** A random part makes every request's idempotency key unique, so the PSP sees two different payments. The
+      key must come from the **checkout attempt** created when the page was rendered (sent with the form), for example
+      `"pay-" + attemptId`. Line 3 also misses attempts that are still processing - add an "attempt in progress" check.
+    followUp: |
+      Write the two tests that prove the fix - one for refresh while processing, one for a second tab.
+
+  - id: interruption-tests
+    type: testdesign
+    concept: session-and-interruption-handling
+    skill: application
+    title: Interrupt the checkout
+    prompt: |
+      Design an interruption test session for a web checkout. Use a slow sandbox payment method. Cover at least eight
+      interruptions at different steps and, for each, the expected numbers of payments, orders and emails, and the
+      evidence.
+    hints:
+      - Go step by step - payment page, waiting, result page.
+      - Include the browser's own features (refresh, Back, tabs) and the environment (session, network).
+      - What do you count after every test?
+    modelAnswer: |
+      Set-up: sandbox processing-delay method (about 8 s), DevTools open with Preserve log.
+
+      1. Double click Pay → 1 payment, 1 order, 1 email.
+      2. Refresh while waiting → 1 / 1 / 1; page shows progress or result.
+      3. Refresh on the result page → no PSP request; same result.
+      4. Back from the result page (and check the bfcache panel) → "already paid"; Pay not possible → 1 / 1 / 1.
+      5. Second tab, Pay in both → 1 payment; tab 2 told the cart is paid or in progress.
+      6. Change the cart in tab 2 while tab 1 pays → charged amount = confirmed order total.
+      7. Delete the session cookie on the payment page, then Pay → sign-in first, cart kept, 0 payments until then.
+      8. Offline right after Pay, online after 20 s → status checked; 1 payment.
+      9. Close the tab while waiting; open the order link from the email or history → final status correct.
+      10. Session expires during a 3-D Secure challenge → payment linked to the order after sign-in.
+
+      Evidence for each: PSP payment list, shop order list, sent emails, and the request log.
+    rubric:
+      - Used a slow payment method to create time to interrupt
+      - Covered double click, refresh while waiting, and Back after paying
+      - Covered a second tab, including a cart change
+      - Covered session expiry before and during payment
+      - Covered network loss after Pay
+      - Covered closing the tab and returning later
+      - Counted PSP payments, orders and emails for each test
+    solution: |
+      Compare with the model answer. Counting **PSP payments** - not just orders - is what turns these from UI checks into
+      double-charge tests.
+    followUp: |
+      Which of these would you automate first, and how would you create the session expiry in an automated test?
+
+  - id: order-prg
+    type: order
+    concept: post-redirect-get
+    skill: recall
+    title: Post, redirect, get
+    prompt: Put the steps of a Post/Redirect/Get payment flow in order.
+    items:
+      - id: post
+        text: The browser sends POST /checkout/ORD-1042/pay with the attempt id
+      - id: process
+        text: The server processes the payment, keyed on the attempt id
+      - id: redirect
+        text: The server answers 303 See Other with Location /orders/ORD-1042
+      - id: get
+        text: The browser sends GET /orders/ORD-1042
+      - id: show
+        text: The server returns the order page with the current status
+    hints:
+      - The redirect comes before the browser asks for the result page.
+    solution: |
+      POST → process → 303 → GET → result. Refresh now repeats only the last GET.
+
+  - id: interview-double-charge
+    type: interview
+    concept: double-submission-protection
+    skill: application
+    title: "Interview: some customers are charged twice"
+    prompt: |
+      *"A few customers are charged twice, mostly in the evening. We have one order for each. How would you investigate
+      and what would you test?"* Answer as you would in the interview.
+    hints:
+      - What does "evening" suggest about timing?
+      - Which evidence tells two payments apart from one payment shown twice?
+    modelAnswer: |
+      Evening suggests load - slower payments give customers time to refresh, press Back, double-tap or open another tab.
+      I'd start with evidence: for affected customers, the PSP's payment records with their creation times and
+      idempotency keys, and our request logs for the pay endpoint. If the two payments have different keys, our side
+      created two attempts; if one key, the PSP or our handling of its response is at fault.
+
+      Then I'd reproduce with a slow sandbox method and throttling: double click, refresh while waiting, Back and pay again,
+      second tab, offline and retry - counting PSP payments, orders and emails each time.
+
+      Typical causes and fixes: a new idempotency key per request instead of per attempt; the waiting page being the POST
+      response, so Refresh resubmits - fix with 303 to a GET; no "attempt in progress" lock per cart; stale pages from the
+      back/forward cache. Then regression tests for each, and monitoring that alerts on two successful payments for one order.
+    rubric:
+      - Connected the evening pattern to slow payments and impatient customers
+      - Used PSP records and idempotency keys as evidence
+      - Reproduced with a slow method and throttling
+      - Covered refresh, double click, Back, second tab and retries
+      - Named server-side fixes (attempt key, PRG, one active attempt per cart)
+      - Proposed monitoring for duplicate payments
+    followUps:
+      - How would you refund the affected customers safely?
+      - What if the two payments have the same idempotency key?
+      - How do you test this in a mobile app rather than a browser?
+    solution: |
+      Strong answers start from **evidence** (keys and timestamps), reproduce with **slowness**, and end with **server-side**
+      fixes and monitoring.
+
+  - id: explain-bfcache
+    type: short
+    concept: post-redirect-get
+    skill: recall
+    title: The page that came back from memory
+    prompt: In two or three sentences, explain what the back/forward cache is and what a checkout page should do when it is restored from it.
+    hints:
+      - Which event and property tell the page it was restored?
+    modelAnswer: |
+      The back/forward cache keeps a page in memory with its scripts paused, so Back and Forward show it instantly without
+      reloading. A restored checkout page may show stale state - such as an enabled Pay button for a cart that is now paid -
+      so it should listen for `pageshow` and, when `event.persisted` is true, fetch the current status from the server.
+    rubric:
+      - Described the bfcache as an in-memory copy restored on Back or Forward
+      - Said the restored page can show stale state
+      - Named pageshow with event.persisted and refreshing state from the server
+    solution: |
+      Test it with Chrome DevTools' Application → Back-forward Cache panel.
+
+placement:
+  - id: place-key
+    type: mcq
+    concept: double-submission-protection
+    skill: application
+    title: What should the idempotency key identify?
+    prompt: For a checkout's payment request, what should the idempotency key identify?
+    options:
+      - id: attempt
+        text: The checkout attempt - created once and sent with every repeat of that payment request
+        feedback: Correct - repeats of the same attempt must carry the same key, so the PSP returns the first result.
+      - id: request
+        text: Each HTTP request - a new random value every time
+        feedback: Then every repeat looks new, and the PSP charges again.
+      - id: customer
+        text: The customer - one key per customer
+        feedback: Then a customer's second, genuine purchase would be treated as a repeat of the first.
+      - id: day
+        text: The calendar day
+        feedback: Unrelated purchases on the same day would collide.
+    correct: [attempt]
+    solution: |
+      **The attempt.** Create it when the checkout is rendered (or the API call is first prepared) and reuse it for retries.
+
+  - id: place-prg
+    type: mcq
+    concept: post-redirect-get
+    skill: application
+    title: Refresh after paying
+    prompt: After paying, the customer refreshes the confirmation page and the browser asks "Confirm form resubmission?". What does that tell you?
+    options:
+      - id: post-response
+        text: The confirmation page is the direct response to the payment POST - the flow should redirect with 303 to a GET
+        feedback: Correct - the warning appears because Refresh would repeat the POST.
+      - id: cache
+        text: The page is cached and will be shown from the cache
+        feedback: The resubmission dialog is about repeating a POST, not about caching.
+      - id: fine
+        text: Nothing - every confirmation page shows that dialog
+        feedback: With Post/Redirect/Get the confirmation is a GET and refreshes without any dialog.
+      - id: session
+        text: The session has expired
+        feedback: Session expiry would show a sign-in page, not a resubmission prompt.
+    correct: [post-response]
+    solution: |
+      **The page is the POST's response.** Fix with PRG - and make the server idempotent in case a customer confirms anyway.
+
+  - id: place-session
+    type: mcq
+    concept: session-and-interruption-handling
+    skill: analysis
+    title: Paid, then "please sign in"
+    prompt: A customer pays successfully, but because their session expired during the 3-D Secure challenge, they land on "Please sign in". What must be true after they sign in?
+    options:
+      - id: linked
+        text: The paid order is linked to their account and shown as paid, with no second payment requested
+        feedback: Correct - the server-side order and payment are the truth; the session only identifies the customer.
+      - id: repay
+        text: They are asked to pay again because the session that started the payment is gone
+        feedback: That would charge twice - the payment is already authorised.
+      - id: lost
+        text: The order is lost, but the payment is refunded automatically
+        feedback: There is no reason to lose a paid order; link it instead.
+      - id: support
+        text: They must contact support to confirm the order
+        feedback: The system has everything it needs; making the customer call is a defect.
+    correct: [linked]
+    solution: |
+      **Linked and shown as paid.** Keep the order reference outside the session (for example in a signed return URL), and
+      read status from the server.
+
+recall:
+  - id: recall-server-side
+    concept: double-submission-protection
+    prompt: Why must double-submission protection live on the server?
+    answer: Only the server sees every attempt - refreshes, other tabs, restores and network retries all bypass protections inside one page.
+  - id: recall-attempt-key
+    concept: double-submission-protection
+    prompt: When should the idempotency key for a checkout payment be created?
+    answer: Once per checkout attempt, before the first request, and reused for every repeat of that attempt.
+  - id: recall-303
+    concept: post-redirect-get
+    prompt: Which status code does Post/Redirect/Get use, and why not 307?
+    answer: 303 See Other, which makes the browser fetch the result with GET; 307 keeps the original method and would repeat the POST.
+  - id: recall-pageshow
+    concept: post-redirect-get
+    prompt: How does a page know it was restored from the back/forward cache?
+    answer: The pageshow event fires with event.persisted set to true.
+  - id: recall-count
+    concept: session-and-interruption-handling
+    prompt: What should you count after every interruption test?
+    answer: Payments at the PSP, orders in the shop and confirmation emails - one of each, or none if nothing was paid.
+  - id: recall-slow
+    concept: session-and-interruption-handling
+    prompt: Why use a slow payment method for interruption tests?
+    answer: Interruptions only matter while a payment is in progress; a delay gives you time to refresh, go back, open tabs or cut the network.
+
+next:
+  - partial-refunds-and-invariants
+  - mobile-payment-interruptions

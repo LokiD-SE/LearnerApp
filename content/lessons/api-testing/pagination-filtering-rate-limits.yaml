@@ -1,0 +1,652 @@
+id: pagination-filtering-rate-limits
+title: Pagination, filtering, sorting and rate limits
+subject: api-testing
+module: manual-api-testing
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: How list endpoints split results into pages (offset or cursor, Link headers), why items go missing or repeat when data changes between pages, how to test filters and sort order, and how rate limits respond with 429 and Retry-After - and how clients must react.
+tags: [api, pagination, cursor, offset, link header, filtering, sorting, rate limiting, "429", retry-after, backoff]
+
+environment: |
+  - **Standards:** **RFC 8288** (Web Linking) - the `Link` header with relations such as `rel="next"`; **RFC 6585**
+    section 4 - **429 Too Many Requests** ("too many requests in a given amount of time"), which MAY include
+    `Retry-After`; **RFC 9110** section 10.2.3 - `Retry-After` as an HTTP-date or a number of seconds
+    (`Retry-After: 120`). At [rfc-editor.org](https://www.rfc-editor.org/).
+  - **Draft, not a standard:** the IETF HTTPAPI working group's *RateLimit header fields for HTTP* Internet-Draft
+    (`RateLimit-Policy`, `RateLimit`) - check its current status; many APIs use their own `X-RateLimit-*` headers instead.
+  - **API-specific:** page sizes, cursor formats, filter syntax and rate-limit policies are each API's own design - test
+    against its documentation.
+  - **Fictional:** SandPay's list endpoint `GET /v1/payments` with `limit`, `starting_after`, `status` and `created[gte]`.
+
+prerequisites:
+  - status-codes-and-errors
+
+concepts:
+  - id: pagination-strategies
+    name: Pagination strategies
+    summary: Offset pagination (page or offset plus limit) is simple but skips or repeats items when data changes; cursor pagination continues after the last item seen and stays stable; Link headers or next tokens tell the client where to go.
+  - id: filtering-and-sorting
+    name: Filtering and sorting
+    summary: Filters must return exactly the matching items and combine as documented; sort order needs a unique tie-breaker to be stable across pages; invalid filter values must be refused, not ignored.
+  - id: rate-limiting
+    name: Rate limiting
+    summary: APIs cap requests per client and time window and answer 429, optionally with Retry-After and limit headers; clients must back off and retry later, and limits must apply per client, not globally.
+
+objectives:
+  - Compare offset and cursor pagination and predict when each skips or repeats items.
+  - Design tests that walk every page and prove no item is missing or duplicated, including while data changes.
+  - Test filters and sort order, including combinations, boundaries, ties and invalid values.
+  - Test rate limiting from both sides - the API's 429 responses and the client's back-off behaviour.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [pagination-strategies]
+    title: The idea in plain language
+    body: |
+      Reading a long guest list page by page is easy - until someone adds a name at the top while you're on page 2. Now
+      every name shifts down by one: the first name you see on page 3 is one you already read at the bottom of page 2.
+      Or someone is crossed out, and one name slides up onto page 2 after you've moved on - you **never see it**.
+
+      That is **offset pagination** ("give me items 21-40") with changing data. **Cursor pagination** ("give me the 20 after
+      *this* guest") doesn't care what was added above - it continues from where you were.
+
+      List endpoints also **filter** ("only captured payments from last week") and **sort**, and protect themselves with
+      **rate limits** ("no more than 100 requests a second"). All three are easy to get mostly right - and the gaps show up
+      as missing money in reports, slow exports and clients locked out at the worst moment.
+
+  - id: what
+    kind: what
+    concepts: [pagination-strategies, rate-limiting]
+    title: What the mechanisms look like on the wire
+    body: |
+      **Offset pagination:**
+
+      ```http
+      GET /v1/payments?limit=20&offset=40 HTTP/1.1
+      ```
+
+      **Cursor pagination** (SandPay - continue after a known id):
+
+      ```http
+      GET /v1/payments?limit=20&starting_after=pay_7Hn3 HTTP/1.1
+      ```
+
+      ```json
+      {"data": [{"id": "pay_7Hm9"}, {"id": "pay_7Hl2"}], "has_more": true, "next_cursor": "pay_7Hl2"}
+      ```
+
+      **Link header** (RFC 8288) - the server tells the client the next URL instead of the client building it:
+
+      ```http
+      Link: <https://api.sandpay.example/v1/payments?limit=20&starting_after=pay_7Hl2>; rel="next"
+      ```
+
+      **Rate limiting** - RFC 6585's 429 with RFC 9110's `Retry-After`:
+
+      ```http
+      HTTP/1.1 429 Too Many Requests
+      Retry-After: 30
+      Content-Type: application/problem+json
+
+      {"type": "https://docs.sandpay.example/errors/rate-limited", "title": "Too many requests", "status": 429}
+      ```
+
+      `Retry-After` is either a number of **seconds** or an **HTTP-date**. Some APIs add limit headers - their own
+      `X-RateLimit-Remaining`, or the fields of the IETF RateLimit draft.
+
+  - id: why
+    kind: why
+    concepts: [pagination-strategies, filtering-and-sorting]
+    title: Why list endpoints hide expensive defects
+    body: |
+      - **Reports and exports page through everything.** A finance export that walks `GET /payments` page by page, with offset
+        pagination and new payments arriving, can **skip** some and **double-count** others - and the totals are wrong.
+      - **Unstable sort order** - sorting by `created_at` when several payments share a timestamp lets the database return ties
+        in any order, so the same item can appear on two pages, or none.
+      - **Ignored filters** - `?status=captured` misspelled as `?state=captured` is often silently ignored, returning **every**
+        payment. A client acting on that list (for example capturing each one) does real damage.
+      - **Unbounded pages** - `limit=1000000` without a maximum makes one request scan a whole table.
+      - **Global rate limits** - one noisy client exhausts a limit shared by everyone; or a limit nobody tested locks out the
+        batch job at month end.
+
+  - id: internals
+    kind: internals
+    concepts: [pagination-strategies, filtering-and-sorting]
+    title: How offset and cursor pagination behave under change
+    body: |
+      Payments sorted newest first, page size 3. Between page 1 and page 2, a new payment **N** arrives.
+
+      | | Page 1 | (N inserted at the top) | Page 2 |
+      |---|---|---|---|
+      | Offset (`offset=3`) | P9, P8, P7 | N, P9, P8, P7, P6, P5... | **P7**, P6, P5 - P7 repeated |
+      | Cursor (`starting_after=P7`) | P9, P8, P7 | N, P9, P8, P7, P6, P5... | P6, P5, P4 - nothing repeated |
+
+      And if **P8 is deleted** instead: offset page 2 starts at P5 - **P6 is skipped**; the cursor page still starts at P6.
+
+      A cursor works because it encodes a **position in a stable order**. That order must be **total**: sorting by
+      `created_at` alone is not, because ties exist. Sort by `(created_at, id)` - a unique tie-breaker - and the cursor
+      encodes both.
+
+      Filters belong **inside** the paginated query: the cursor continues within the filtered, sorted result set. A filter
+      applied after pagination (in the client, or in a later layer) gives pages with fewer items than `limit` and makes
+      `has_more` lie.
+
+  - id: visual
+    kind: visual
+    concepts: [rate-limiting]
+    title: "Sequence diagram: a client that respects the rate limit"
+    body: |
+      The limit is per API key. The well-behaved client waits for `Retry-After`, then continues; it doesn't retry in a tight
+      loop.
+
+      ```mermaid
+      sequenceDiagram
+          participant C as Export job
+          participant A as SandPay API
+          C->>A: GET /v1/payments?limit=100 - page 1
+          A-->>C: 200 with next cursor
+          C->>A: GET page 2 ... page 40 in quick succession
+          A-->>C: 429 Too Many Requests, Retry-After 30
+          Note over C: Wait 30 seconds, no other requests on this key
+          C->>A: GET page 41 - same cursor as the refused request
+          A-->>C: 200 with next cursor
+          C->>A: GET last page
+          A-->>C: 200, has_more false
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [pagination-strategies, filtering-and-sorting]
+    title: Step by step - testing a list endpoint
+    body: |
+      1. **Create known data** in a test account: for example 53 payments with controlled statuses, amounts and timestamps,
+         including several with the **same** timestamp.
+      2. **Walk all pages** with the documented page size and collect every id: expect exactly 53, **no duplicates**, the
+         documented order, and `has_more: false` (or no `next` link) on the last page.
+      3. **Boundaries of `limit`**: 1, the default, the documented maximum, maximum + 1 (refused or capped as documented),
+         0 and negative (refused).
+      4. **Change data while walking**: insert and delete items between pages; with cursor pagination, nothing already-seen
+         repeats and nothing that existed throughout is skipped.
+      5. **Filters**: each filter alone, combinations, ranges at their boundaries (`created[gte]` exactly at a timestamp),
+         values with no matches (empty `data`, not an error), invalid values and **misspelled parameter names** (should be
+         refused, not ignored).
+      6. **Sorting**: ascending and descending, ties, and that the sort is the same on every page.
+      7. **Rate limits**: send requests above the documented rate and check 429, `Retry-After`, that other keys are
+         unaffected, and that requests succeed after the wait.
+      8. **Authorization**: list endpoints must only list the caller's own items (see
+         [authentication and authorization](#/lesson/authentication-and-authorization)).
+
+  - id: example
+    kind: example
+    concepts: [pagination-strategies, filtering-and-sorting]
+    title: "Real-world example: the export that lost payments"
+    body: |
+      Finance's monthly export of captured payments never quite matches the PSP's settlement totals - always a few payments
+      short, a different few each month.
+
+      The export walks `GET /internal/payments?status=captured&page=N&size=500` sorted by `created_at`. The tester recreates
+      it with 2,000 test payments and a script that keeps creating payments while the export runs:
+
+      - With **no** concurrent writes the export is complete.
+      - With concurrent writes, **offset pages shift** - new captured payments at the top push older ones down a page; payments
+        whose status changes to captured during the run move into the filtered set and shift others.
+      - Even without writes, 37 payments created in the same second appear in an unpredictable order: two runs give different
+        pages - and in one run, one payment appears twice and another not at all.
+
+      Fixes: cursor pagination on `(created_at, id)`; the export filters by a fixed time window (`created[lt]` = start of the
+      run) so new payments don't enter the set; a reconciliation step compares the count and sum with a single aggregate
+      query. Tests: walk with concurrent inserts; ties on timestamps; count and sum checks.
+
+  - id: code
+    kind: code
+    concepts: [pagination-strategies, rate-limiting]
+    title: A script that walks every page and checks it
+    collapsed: true
+    body: |
+      Illustrative TypeScript for Node.js 22+ (built-in `fetch`), against SandPay's fictional API:
+
+      ```typescript
+      const base = 'https://api.sandpay.example/v1/payments';
+      const headers = { Authorization: `Bearer ${process.env.SANDPAY_KEY}` };
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+
+      for (;;) {
+        const url = new URL(base);
+        url.searchParams.set('limit', '100');
+        if (cursor) url.searchParams.set('starting_after', cursor);
+
+        const response = await fetch(url, { headers });
+        if (response.status === 429) {
+          const wait = Number(response.headers.get('Retry-After') ?? '1');
+          await sleep(wait * 1000);   // seconds form; an HTTP-date would need Date.parse
+          continue;                    // retry the same page
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const page = await response.json();
+        for (const payment of page.data) {
+          if (seen.has(payment.id)) throw new Error(`duplicate ${payment.id}`);
+          seen.add(payment.id);
+        }
+        if (!page.has_more) break;
+        cursor = page.data.at(-1).id;
+      }
+
+      console.log(`${seen.size} payments, no duplicates`);
+      ```
+
+      Compare `seen.size` with the number of payments you created, and the order with the documented sort.
+
+  - id: tests
+    kind: tests
+    concepts: [pagination-strategies, filtering-and-sorting, rate-limiting]
+    title: Positive and negative test cases
+    body: |
+      Test account with 53 known payments.
+
+      | ID | Request | Expected | Evidence |
+      |---|---|---|---|
+      | G1 | walk all pages, `limit=20` | 53 ids, no duplicates, 3 pages, last `has_more: false` | collected ids |
+      | G2 | `limit=` documented maximum, and maximum + 1 | max accepted; max + 1 refused or capped as documented | responses |
+      | G3 | `limit=0`, `limit=-1`, `limit=abc` | 400/422 | responses |
+      | G4 | insert 5 and delete 3 payments while walking | no repeats; nothing that existed throughout is missing | ids, timestamps |
+      | G5 | 10 payments with the same `created_at` | same order on every run; none duplicated or skipped across pages | two walks compared |
+      | F1 | `status=captured` | only captured, all of them | ids vs fixture |
+      | F2 | `status=captured&created[gte]=<T>` | both filters applied; item at exactly T included | ids |
+      | F3 | filter with no matches | 200, empty `data`, `has_more: false` | response |
+      | F4 | `state=captured` (unknown parameter) | refused - not silently ignored | response |
+      | F5 | `status=unknown_status` | 400/422 | response |
+      | R1 | requests above the documented rate | 429, `Retry-After`, Problem Details body | responses |
+      | R2 | after waiting `Retry-After` | requests succeed again | responses |
+      | R3 | key A rate-limited | key B unaffected | responses for both keys |
+      | A1 | merchant B lists payments | none of merchant A's | ids |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [pagination-strategies, filtering-and-sorting, rate-limiting]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Testing pagination with static data only.** Insert and delete between pages.
+      - **Checking only the first page.** Walk to the end; check counts and duplicates.
+      - **Sorting by a non-unique field.** Ask for (and test) a unique tie-breaker.
+      - **Accepting ignored parameters.** A misspelled filter that returns everything is dangerous.
+      - **No maximum page size.** Test `limit` above the maximum.
+      - **Clients that retry 429 immediately.** They extend the outage - honour `Retry-After` and back off.
+      - **Limits that are global instead of per client.** One client shouldn't lock out all others.
+      - **Building next URLs by hand when a Link header or cursor is provided.** Follow what the server gives you.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [pagination-strategies]
+    title: Offset or cursor?
+    body: |
+      | | Offset / page number | Cursor |
+      |---|---|---|
+      | Jump to page 7 | yes | no - only next and previous |
+      | Total count and "page 3 of 10" | easy | expensive or unavailable |
+      | Stability while data changes | skips and repeats | stable |
+      | Performance on deep pages | degrades (the database skips offset rows) | constant |
+      | Typical use | admin screens with small data | APIs, exports, feeds, large data |
+
+      Many APIs offer cursors for integrations and offsets for UIs. Whatever the choice, the documentation must say what
+      happens when data changes - and the tests must check it.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Offset** skips or repeats items when data changes; **cursor** continues after the last item seen.
+      - Follow the server's **Link `rel="next"`** (RFC 8288) or cursor; check `has_more` / last page.
+      - Sort by a **unique tie-breaker** (`created_at`, `id`); filter inside the paginated query.
+      - Test: walk **all** pages, no duplicates, counts match, data changing during the walk, `limit` boundaries, ties.
+      - Filters: each, combined, boundaries, empty results, **invalid and misspelled** parameters refused.
+      - Rate limits: **429** (RFC 6585) + **Retry-After** (seconds or HTTP-date); per client; clients back off.
+
+exercises:
+  - id: offset-repeat
+    type: mcq
+    concept: pagination-strategies
+    skill: analysis
+    title: Why did the item appear twice?
+    prompt: |
+      A client reads newest-first with `offset` pagination, 20 per page. Page 2's first item is the same as page 1's last
+      item. Nothing else is wrong. What most likely happened?
+    options:
+      - id: insert
+        text: A new item was created between the two requests, shifting every item down by one
+        feedback: Correct - with newest-first offset pagination, one insert at the top pushes the boundary item onto the next page.
+      - id: delete
+        text: An item was deleted between the two requests
+        feedback: A deletion shifts items up, which causes a skipped item, not a repeated one.
+      - id: cache
+        text: The client cached page 1
+        feedback: Caching page 1 wouldn't make page 2 include page 1's last item.
+      - id: limit
+        text: The limit was ignored by the server
+        feedback: Then pages would have the wrong size; here only the boundary item repeats.
+    correct: [insert]
+    hints:
+      - Which change makes items move down, and which up?
+    solution: |
+      **An insert.** Cursor pagination (`starting_after` the last item seen) avoids it. Test it by inserting between page
+      requests.
+    followUp: |
+      What would you expect to see if an item on page 1 were deleted between the requests?
+
+  - id: tie-breaker
+    type: mcq
+    concept: filtering-and-sorting
+    skill: application
+    title: The unstable order
+    prompt: |
+      Payments are paginated by cursor, sorted by `created_at`. Twelve payments were created in the same second. What must the
+      sort include so pages stay correct?
+    options:
+      - id: unique
+        text: A unique tie-breaker such as the id - sort by (created_at, id)
+        feedback: Correct - a total order makes every position unique, so the cursor knows exactly where to continue.
+      - id: desc
+        text: Descending instead of ascending
+        feedback: The direction doesn't resolve ties.
+      - id: smaller-pages
+        text: A smaller page size
+        feedback: Ties can still straddle page boundaries at any size.
+      - id: amount
+        text: The amount, as a second sort key
+        feedback: Amounts can also tie; only a unique field guarantees a total order.
+    correct: [unique]
+    hints:
+      - What makes two items' positions distinguishable when their timestamps are equal?
+    solution: |
+      **A unique tie-breaker.** Test it with deliberately tied timestamps and two walks that must give identical, complete
+      results.
+    followUp: |
+      Write the test data for this case - how many items, which timestamps, which page size?
+
+  - id: debug-rate-client
+    type: debug
+    concept: rate-limiting
+    skill: analysis
+    title: The client that makes it worse
+    prompt: The export job keeps the API in a rate-limited state for minutes. Click the line in its retry logic that causes it.
+    language: typescript
+    code: |
+      async function getPage(url: string): Promise<Response> {
+        for (let attempt = 1; attempt <= 50; attempt++) {
+          const response = await fetch(url, { headers });
+          if (response.status !== 429) return response;
+          const retryAfter = response.headers.get('Retry-After');
+          console.warn(`rate limited, Retry-After ${retryAfter}, attempt ${attempt}`);
+          await sleep(10);
+        }
+        throw new Error('still rate limited after 50 attempts');
+      }
+    correctLines: [7]
+    lineNotes:
+      - line: 4
+        note: Returning anything that isn't a 429 is reasonable for this helper.
+      - line: 5
+        note: Reading Retry-After is right - but the value is never used.
+    hints:
+      - How long does the client wait between attempts, and how long did the server ask it to wait?
+    solution: |
+      **Line 7.** The client waits 10 ms whatever `Retry-After` says, so it sends dozens of requests per second while limited -
+      each one counting against the limit. It must wait the `Retry-After` value (seconds or an HTTP-date) and back off
+      exponentially when the header is absent.
+    followUp: |
+      How would you test the client's back-off behaviour without a real rate-limited API?
+
+  - id: list-tests
+    type: testdesign
+    concept: pagination-strategies
+    skill: application
+    title: Test a list endpoint thoroughly
+    prompt: |
+      Design tests for `GET /v1/refunds` (cursor pagination with `limit` and `starting_after`, filters `status` and
+      `created[gte]`/`created[lt]`, sorted newest first). Describe the test data you create, then at least eight cases covering
+      pagination, filters, sorting and invalid input, with expected results.
+    hints:
+      - Control the data - statuses, timestamps, ties.
+      - Change data during a walk.
+      - Which invalid inputs are easy to miss?
+    modelAnswer: |
+      Test data: 45 refunds in a fresh test account - 30 succeeded, 10 pending, 5 failed - across three days, with 6 sharing one
+      exact timestamp; a second merchant with 5 refunds.
+
+      1. Walk with `limit=10` → 45 ids, no duplicates, 5 pages, newest first, last page `has_more: false`.
+      2. `limit` = max and max + 1 → accepted / refused or capped as documented; `limit=0` → refused.
+      3. Walk while creating 3 new refunds and changing 3 pending refunds to succeeded → no repeats; every refund that existed
+         throughout the walk is seen.
+      4. Two walks over the tied timestamps → identical order, nothing missing.
+      5. `status=pending` → exactly the 10 pending.
+      6. `status=succeeded&created[gte]=<day 2 00:00>&created[lt]=<day 3 00:00>` → exactly the day-2 succeeded refunds; a refund at
+         exactly 00:00 of day 2 included, of day 3 excluded.
+      7. Filter with no matches → 200, empty data.
+      8. `status=refunded` (not a refund status) → 400/422; `stauts=pending` (misspelled) → refused, not all refunds.
+      9. `starting_after` with another merchant's refund id → refused or empty, never their data.
+      10. Second merchant's walk → only its 5 refunds.
+    rubric:
+      - Created controlled test data including ties
+      - Walked all pages and checked count, duplicates and order
+      - Tested limit boundaries and invalid limits
+      - Changed data during a walk
+      - Tested filters alone, combined and at range boundaries
+      - Tested empty results and invalid or misspelled parameters
+      - Tested that cursors and lists respect the caller's ownership
+    solution: |
+      Compare with the model answer. The **misspelled parameter** and the **foreign cursor** are the cases most suites miss.
+    followUp: |
+      How would you automate the "change data during a walk" case so it is deterministic?
+
+  - id: retry-after-mcq
+    type: mcq
+    concept: rate-limiting
+    skill: recognition
+    title: Reading Retry-After
+    prompt: "A 429 response carries `Retry-After: Fri, 13 Nov 2026 09:00:00 GMT`. What does that mean?"
+    options:
+      - id: date
+        text: The client should wait until that date and time before retrying
+        feedback: Correct - RFC 9110 allows Retry-After as an HTTP-date or a number of seconds.
+      - id: invalid
+        text: It is invalid - Retry-After must be a number of seconds
+        feedback: The HTTP-date form is equally valid; clients must handle both.
+      - id: expiry
+        text: The API key expires at that time
+        feedback: Retry-After is about when to try again, not about credentials.
+      - id: cache
+        text: The response may be cached until then
+        feedback: Caching is controlled by Cache-Control and related headers.
+    correct: [date]
+    hints:
+      - RFC 9110 defines two forms for this header.
+    solution: |
+      **Wait until that time.** A client that only parses numbers would treat this as `NaN` - a good test case for client code.
+    followUp: |
+      Write the client logic that handles both forms of Retry-After safely, including a missing header.
+
+  - id: order-walk
+    type: order
+    concept: pagination-strategies
+    skill: recall
+    title: Walking a cursor-paginated list
+    prompt: Put the steps for reading every item of a cursor-paginated list in order.
+    items:
+      - id: first
+        text: Request the first page with a limit
+      - id: collect
+        text: Collect the items on the page
+      - id: check-more
+        text: Check whether there are more pages (has_more or a next link)
+      - id: next
+        text: Request the next page using the cursor or next link the server gave
+      - id: stop
+        text: Stop when the server says there are no more pages
+    hints:
+      - The server, not the client, decides where the next page starts.
+    solution: |
+      First page → collect → more? → next with the server's cursor → stop. In a test, add: no duplicates, count equals the fixture.
+
+  - id: interview-pagination
+    type: interview
+    concept: filtering-and-sorting
+    skill: application
+    title: "Interview: testing a list API"
+    prompt: |
+      *"How would you test an API endpoint that returns a paginated, filterable list of transactions?"* Answer as you would in
+      the interview.
+    hints:
+      - Data first; then pages, changes, filters, sorting, limits, security.
+    modelAnswer: |
+      I'd start by creating known data in a fresh test account - a few pages' worth, with controlled statuses and timestamps,
+      including ties - and a second account, so I know exactly what each request should return.
+
+      Pagination: walk every page and check the total count, no duplicates, the documented order and a correct last page; test
+      limit at 1, the default, the maximum and above it, and invalid values. Then the realistic part - insert and change items
+      while walking, which is where offset pagination skips or repeats and where cursors should stay stable. For sort order I'd
+      check that ties have a stable tie-breaker so pages don't overlap.
+
+      Filters: each alone and combined, date ranges exactly at their boundaries, no-match results, invalid values, and
+      misspelled parameter names, which must be refused rather than silently ignored. Security: only the caller's own items,
+      including when a cursor from another account is used. And rate limits: above the documented rate I expect 429 with
+      Retry-After, other clients unaffected, and service again after the wait - plus a check that our own clients back off
+      instead of hammering the API.
+    rubric:
+      - Created controlled test data including ties and a second account
+      - Walked all pages checking count, duplicates and order
+      - Tested limit boundaries and invalid values
+      - Tested data changing during pagination
+      - Tested filters including boundaries, empty results and misspelled parameters
+      - Tested ownership of listed items
+      - Tested rate limiting and client back-off
+    followUps:
+      - When would you choose offset over cursor pagination?
+      - How would you test a total count field?
+      - What happens to a cursor if the item it points to is deleted?
+    solution: |
+      Interviewers listen for **data that changes during the walk** - it separates real list testing from checking page one.
+
+  - id: explain-ignored-filter
+    type: short
+    concept: filtering-and-sorting
+    skill: recall
+    title: Why an ignored filter is dangerous
+    prompt: In two or three sentences, explain why a list API should reject unknown query parameters instead of ignoring them.
+    hints:
+      - What does the client do with the list it gets back?
+    modelAnswer: |
+      If a misspelled filter such as `stauts=pending` is ignored, the API returns the unfiltered list, and the client acts on
+      items it never meant to select - exporting, refunding or capturing all of them. Rejecting unknown parameters with a 400
+      makes the mistake visible immediately instead of causing silent damage.
+    rubric:
+      - Said an ignored filter returns the unfiltered list
+      - Said the client may act on the wrong items
+      - Recommended rejecting unknown parameters with a 4xx
+    solution: |
+      If an API deliberately ignores unknown parameters (for forward compatibility), that must be documented - and clients
+      tested against it.
+
+placement:
+  - id: place-cursor
+    type: mcq
+    concept: pagination-strategies
+    skill: application
+    title: Stable pages while data changes
+    prompt: Which pagination style keeps a client from skipping or repeating items when new items arrive between page requests?
+    options:
+      - id: cursor
+        text: Cursor pagination - continue after the last item seen, in a stable order
+        feedback: Correct - inserts and deletes elsewhere don't move the client's position.
+      - id: offset
+        text: Offset pagination with a larger page size
+        feedback: Larger pages make it rarer, but any insert or delete still shifts the boundaries.
+      - id: page-number
+        text: Page numbers instead of offsets
+        feedback: Page numbers are offsets in disguise - same problem.
+      - id: no-sort
+        text: Removing the sort order
+        feedback: Without a defined order pagination can't be stable at all.
+    correct: [cursor]
+    solution: |
+      **Cursor pagination** on a total order such as `(created_at, id)`.
+
+  - id: place-filter
+    type: mcq
+    concept: filtering-and-sorting
+    skill: analysis
+    title: The filter that returned everything
+    prompt: "`GET /v1/payments?stauts=failed` (misspelled) returns all 5,000 payments with 200 OK. What is the best assessment?"
+    options:
+      - id: defect
+        text: A defect (or at least a risk) - unknown parameters should be rejected so client mistakes surface
+        feedback: Correct - silently ignoring it hides the client's mistake and returns far more than intended.
+      - id: correct
+        text: Correct behaviour - unknown parameters are always ignored
+        feedback: Some APIs choose that, but it must be deliberate and documented; it is dangerous for filters.
+      - id: client-only
+        text: Only a client defect - the API is fine
+        feedback: The client made the typo, but the API's choice turns it into silent damage.
+      - id: performance
+        text: Only a performance issue
+        feedback: It is also a correctness issue - the client gets the wrong set of items.
+    correct: [defect]
+    solution: |
+      **A defect or a documented risk.** Test it and raise it; a 400 naming the unknown parameter is the safer design.
+
+  - id: place-429
+    type: mcq
+    concept: rate-limiting
+    skill: application
+    title: After a 429
+    prompt: "A client receives `429 Too Many Requests` with `Retry-After: 20`. What should it do?"
+    options:
+      - id: wait
+        text: Wait at least 20 seconds, then retry the same request
+        feedback: Correct - the request was fine; the client sent too many too fast.
+      - id: immediate
+        text: Retry immediately
+        feedback: That adds to the overload and the limit stays exceeded.
+      - id: new-key
+        text: Switch to another API key and continue
+        feedback: That circumvents the limit and may break the terms of use.
+      - id: abort
+        text: Give up permanently
+        feedback: 429 is temporary - the same request can succeed after the wait.
+    correct: [wait]
+    solution: |
+      **Wait, then retry.** Without a Retry-After header, back off exponentially with jitter.
+
+recall:
+  - id: recall-offset-cursor
+    concept: pagination-strategies
+    prompt: Why does offset pagination skip or repeat items when data changes?
+    answer: An insert or delete before the current offset shifts every later item, so the next page's boundary moves by one or more items.
+  - id: recall-link
+    concept: pagination-strategies
+    prompt: Which standard header can tell a client the URL of the next page?
+    answer: The Link header from RFC 8288, with rel="next".
+  - id: recall-tiebreak
+    concept: filtering-and-sorting
+    prompt: What makes a sort order safe for pagination?
+    answer: A total order - the sort key ends with a unique field such as the id, so ties have a fixed order.
+  - id: recall-filter-tests
+    concept: filtering-and-sorting
+    prompt: Name four kinds of filter tests.
+    answer: Each filter alone, combinations, range boundaries, no-match results, and invalid or misspelled parameters.
+  - id: recall-429
+    concept: rate-limiting
+    prompt: Which RFCs define 429 and Retry-After, and what forms can Retry-After take?
+    answer: RFC 6585 defines 429; RFC 9110 defines Retry-After, as an HTTP-date or a number of seconds.
+  - id: recall-per-client
+    concept: rate-limiting
+    prompt: What should you check about the scope of a rate limit?
+    answer: That it applies per client or key, so one client's excess doesn't lock out others.
+
+next:
+  - payment-api-negative-matrix
+  - reconciliation-for-testers

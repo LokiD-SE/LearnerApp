@@ -1,0 +1,647 @@
+id: amounts-currency-rounding
+title: Amounts, currencies, rounding and minor units
+subject: payments-testing
+module: payment-failure-modes
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: Why payment amounts travel as whole numbers of minor units, why currencies have 0, 2, 3 or 4 decimals, where rounding happens and which rule applies, and how to test conversions, taxes, fees and splits at their boundaries.
+tags: [payments, amounts, currency, iso 4217, minor units, rounding, bigdecimal, half even, fx, tax, fees, boundaries]
+
+environment: |
+  - **Standard:** **ISO 4217** currency codes and their **minor units** (number of decimals). The list is maintained
+    for ISO by SIX ([ISO 4217 lists](https://www.six-group.com/en/products-services/financial-information/data-standards.html));
+    figures in this lesson are from the list published **17 September 2026**: for example EUR, USD, INR 2; JPY, KRW,
+    CLP, ISK, VND 0; BHD, IQD, JOD, KWD, LYD, OMR, TND 3; CLF and UYW 4.
+  - **Java:** `java.math.BigDecimal`, `java.math.RoundingMode` and `java.util.Currency`
+    ([Java SE 17 API](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/math/BigDecimal.html)).
+    All Java output shown was produced on **JDK 17**. The JDK's currency data is updated with JDK releases and can lag
+    behind the latest ISO list.
+  - **Provider-specific:** how your PSP expects amounts (most use integer minor units; some exceptions exist for
+    zero-decimal currencies), which currencies it supports, and its FX and rounding rules. **Tax rules are
+    country-specific** - the VAT figures here are illustrations, not tax advice.
+  - **Fictional:** SandPay and the shop's prices and rates.
+
+prerequisites:
+  - payment-lifecycle-overview
+  - test-design-techniques
+
+concepts:
+  - id: minor-units-and-currencies
+    name: Minor units and currency exponents
+    summary: An amount is a whole number of the currency's minor unit; ISO 4217 says how many decimals each currency has, so 1000 means 10.00 EUR but 1000 JPY or 1.000 KWD.
+  - id: rounding-rules
+    name: Rounding rules
+    summary: Rounding must happen in a defined place with a defined mode (half-up, half-even, down); binary floating point can't represent most decimal amounts and must never hold money.
+  - id: money-boundaries-and-conversion
+    name: Conversions, splits and boundaries
+    summary: Currency conversion, tax, fees and splitting an amount each create rounding remainders that must add back up; test limits in every currency's own minor units.
+
+objectives:
+  - Convert between display amounts and minor units for currencies with 0, 2, 3 and 4 decimals.
+  - Explain why floating-point numbers break money calculations and choose a correct representation.
+  - Identify where rounding happens in a payment flow and which mode applies, and test it at the half-way cases.
+  - Design tests for conversion, tax, fees and splits that prove the parts always add up to the total.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [minor-units-and-currencies, rounding-rules]
+    title: The idea in plain language
+    body: |
+      Cashiers don't count money in "euros and a bit". They count **coins**: 10.00 EUR is 1,000 cents. A Japanese
+      cashier counts yen - there is no smaller coin, so 1,000 JPY is just 1,000. A cashier in Kuwait counts **fils**:
+      one dinar is 1,000 fils.
+
+      Payment systems do the same: they store and send amounts as **whole numbers of the smallest unit**, and a
+      separate field says which currency that unit belongs to. Most money bugs come from forgetting one of those two
+      things - treating 1000 as 10.00 when the currency is JPY, or doing arithmetic on numbers that aren't whole.
+
+      And whenever money is **divided** - a discount of 15 %, a bill split three ways, a conversion to another
+      currency - there is a leftover fraction of a coin. Someone must decide where it goes. Testers check that the
+      decision is written down, applied consistently, and that **the parts always add up to the whole**.
+
+  - id: what
+    kind: what
+    concepts: [minor-units-and-currencies]
+    title: What minor units are
+    body: |
+      ISO 4217 gives each currency a three-letter code, a number, and its **minor unit** - how many decimals it has:
+
+      | Currency | Minor unit | 12 units of the major currency in minor units |
+      |---|---|---|
+      | EUR, USD, GBP, INR | 2 | 1200 |
+      | JPY, KRW, CLP, ISK, VND | 0 | 12 |
+      | KWD, BHD, JOD, OMR, TND, IQD, LYD | 3 | 12000 |
+      | CLF, UYW (units of account) | 4 | 120000 |
+
+      Rules that follow:
+
+      - **amount_minor = amount × 10^(minor unit)**, always an integer.
+      - The **currency travels with the amount** - an amount without a currency is meaningless.
+      - **Display formatting** is separate: `12.00 €`, `€12.00`, `12,00 €` and `₹12.00` are the same data, formatted
+        for a locale.
+      - Java's `Currency.getInstance("JPY").getDefaultFractionDigits()` returns 0, and for `KWD` returns 3 (JDK 17) -
+        but check your PSP's list too: some providers treat certain currencies differently from ISO.
+
+  - id: why
+    kind: why
+    concepts: [rounding-rules]
+    title: Why floating point and loose rounding break money
+    body: |
+      Binary floating point (`double`, `float`, JavaScript `number`) can't represent most decimal fractions exactly.
+      On JDK 17:
+
+      ```java
+      System.out.println(new BigDecimal(0.1));   // the double closest to 0.1
+      System.out.println(BigDecimal.valueOf(0.1));
+      ```
+
+      ```plaintext
+      0.1000000000000000055511151231257827021181583404541015625
+      0.1
+      ```
+
+      And `0.1 + 0.2` in a `double` is not exactly `0.3` - it prints a long value ending in `...04`. Add up thousands
+      of such values and the totals drift by cents. Correct representations:
+
+      - **integers of minor units** (`long` in Java, `bigint` or safe integers in JavaScript) for stored and transmitted
+        amounts;
+      - **decimal types** (`BigDecimal` from a **string**, SQL `DECIMAL(p, s)`) for calculations with explicit scale
+        and rounding.
+
+      Rounding then has to be a **decision**, not an accident:
+
+      | Mode (Java `RoundingMode`) | 2.345 → | 2.355 → | -2.345 → | Typical use |
+      |---|---|---|---|---|
+      | `HALF_UP` | 2.35 | 2.36 | -2.35 | common commercial rounding ("half away from zero") |
+      | `HALF_EVEN` (banker's rounding) | 2.34 | 2.36 | -2.34 | reduces bias over many roundings; common in finance |
+      | `DOWN` (truncate) | 2.34 | 2.35 | -2.34 | some fee or tax rules, interest |
+
+      (Real JDK 17 output.) Which mode is **right** depends on the business rule, the law of the country and the PSP -
+      the tester's job is to find out which one is specified, and to test the half-way values that tell the modes apart.
+
+  - id: internals
+    kind: internals
+    concepts: [money-boundaries-and-conversion, rounding-rules]
+    title: Where rounding happens in a payment
+    body: |
+      | Step | Example | Rounding question |
+      |---|---|---|
+      | Unit price × quantity | 3 × 0.33 | none if prices are in minor units |
+      | Discount | 15 % off 19.99 | round the discount or the discounted price? per line or per order? |
+      | Tax | 19 % VAT on 0.99 = 0.1881 | round per line or on the total? (country rules differ) |
+      | Currency conversion | 25.00 EUR at rate 89.4371 INR/EUR = 2,235.9275 INR | which rate, which direction, which mode, which scale? |
+      | Fees | 1.4 % + 0.25 of 33.33 | rounded by the PSP - can you reproduce it? |
+      | Splits and instalments | 100.00 in 3 parts | who gets the extra cent? |
+      | Refund of a converted payment | refund 10.00 EUR of an INR payment | at the original rate or today's? |
+
+      **Splitting with remainders** is the classic test. Dividing 100.00 by 3 with `BigDecimal` and `HALF_EVEN` gives
+      33.33 - and 3 × 33.33 = 99.99. The cent must go somewhere. A common allocation in minor units (JDK 17):
+
+      ```java
+      long total = 10000; int n = 3;
+      long[] parts = new long[n];
+      Arrays.fill(parts, total / n);
+      for (int i = 0; i < total % n; i++) parts[i]++;
+      // [3334, 3333, 3333] - the parts add up to 10000
+      ```
+
+      And dividing without a scale fails loudly - good, because it forces a decision:
+
+      ```plaintext
+      new BigDecimal("100.00").divide(new BigDecimal("3"))
+      → ArithmeticException: Non-terminating decimal expansion; no exact representable decimal result.
+      ```
+
+  - id: visual
+    kind: visual
+    concepts: [rounding-rules, money-boundaries-and-conversion]
+    title: "Flowchart: from a price to the amount sent to the PSP"
+    body: |
+      Each diamond is a rounding decision that must be specified - and tested at its half-way values.
+
+      ```mermaid
+      flowchart TD
+          A[Line prices in minor units] --> B[Apply discounts]
+          B --> C{Rounding per line or per order?}
+          C --> D[Add tax - country rule]
+          D --> E{Round tax per line or on the total?}
+          E --> F{Customer pays in another currency?}
+          F -- Yes --> G[Convert with a stated rate, mode and scale]
+          F -- No --> H[Total in minor units]
+          G --> H
+          H --> I[Send integer amount and ISO currency code to the PSP]
+          I --> J[Store the same amount and currency on the order]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [money-boundaries-and-conversion]
+    title: Step by step - testing money calculations
+    body: |
+      1. **Collect the rules**: which currencies, their minor units (ISO and your PSP), rounding mode and place for
+         discounts, tax and conversion, fee formulas, and limits (minimum and maximum amounts per currency).
+      2. **Write an oracle** - a spreadsheet or small program with decimal arithmetic - that computes the expected
+         results independently of the system under test.
+      3. **Pick values that distinguish rounding modes**: exact half-way values (x.xx5), values just above and below,
+         negative amounts (refunds), and amounts that don't divide evenly.
+      4. **Test each currency type**: a 2-decimal, a 0-decimal and a 3-decimal currency at least - many systems are only
+         ever tested in EUR or USD.
+      5. **Test the invariants**: lines + tax + shipping − discounts = total; parts of a split = total; refunds ≤
+         captured; converted amount × rate within one minor unit of the original.
+      6. **Check every place the amount appears**: UI, order record, PSP request, PSP response, receipt, settlement
+         report. They must agree.
+      7. **Test boundaries in minor units**: the minimum and maximum amounts the PSP accepts, per currency (see
+         [test design techniques](#/lesson/test-design-techniques)).
+
+  - id: example
+    kind: example
+    concepts: [minor-units-and-currencies]
+    title: "Real-world example: the 100× overcharge"
+    body: |
+      The demo shop launches in Japan. The first customer buys a 1,500 JPY tote bag - and their bank shows a payment
+      of **150,000 JPY**.
+
+      The tester traces the amount through the system:
+
+      1. Prices are stored as decimals: `1500.00` for the bag.
+      2. The checkout converts to minor units with a hard-coded `× 100` - correct for EUR, wrong for JPY - and sends
+         `150000` with currency `JPY`.
+      3. The PSP, correctly, treats `150000` as 150,000 yen.
+
+      The test suite had 300 payment tests, all in EUR. Fixes: compute minor units from the currency's exponent (ISO
+      4217 / the PSP's list); add a test currency matrix with JPY, KWD and EUR to every amount test; add a monitoring
+      alert when an order's charged amount differs from its display total. The incident also needed refunds - for the
+      difference, in JPY, as integers.
+
+  - id: code
+    kind: code
+    concepts: [minor-units-and-currencies, rounding-rules]
+    title: Money in Java - minor units from the currency
+    collapsed: true
+    body: |
+      Converting a display amount to minor units using the currency's exponent, and refusing values that need
+      rounding (JDK 17):
+
+      ```java
+      import java.math.BigDecimal;
+      import java.util.Currency;
+
+      final class MinorUnits {
+          static long toMinor(String amount, String currencyCode) {
+              int digits = Currency.getInstance(currencyCode).getDefaultFractionDigits();
+              return new BigDecimal(amount)
+                  .movePointRight(digits)
+                  .longValueExact();   // throws if the amount has more decimals than the currency allows
+          }
+      }
+      ```
+
+      `toMinor("12.00", "EUR")` → 1200; `toMinor("1500", "JPY")` → 1500; `toMinor("1.250", "KWD")` → 1250;
+      `toMinor("12.345", "EUR")` throws `ArithmeticException` - better than silently rounding an input.
+
+      Two `BigDecimal` traps worth a test each:
+
+      ```java
+      new BigDecimal("2.50").equals(new BigDecimal("2.5"));          // false - equals compares scale too
+      new BigDecimal("2.50").compareTo(new BigDecimal("2.5")) == 0;  // true  - compare values with compareTo
+      ```
+
+      (Both results from JDK 17.) Use `compareTo` to compare amounts, and never build a `BigDecimal` from a `double`.
+
+  - id: tests
+    kind: tests
+    concepts: [minor-units-and-currencies, rounding-rules, money-boundaries-and-conversion]
+    title: Positive and negative test cases
+    body: |
+      | ID | Input | Expected | Evidence |
+      |---|---|---|---|
+      | C1 | 12.00 EUR | PSP request amount 1200, currency EUR | PSP request log |
+      | C2 | 1,500 JPY | amount 1500, JPY | PSP request |
+      | C3 | 1.250 KWD | amount 1250, KWD | PSP request |
+      | C4 | 12.345 EUR typed into an amount field | rejected or rounded **by the specified rule** - never sent as 12345 | UI, request |
+      | R1 | discount producing x.xx5 | the specified mode applied (half-up gives .xx+1, half-even depends on the digit) | order lines vs oracle |
+      | R2 | 19 % tax on lines of 0.99 × 3 | per-line or per-total rounding as specified; receipt matches order | receipt, order |
+      | S1 | split 100.00 EUR into 3 instalments | 33.34 + 33.33 + 33.33 = 100.00 | instalment schedule |
+      | S2 | split 100 JPY into 3 | 34 + 33 + 33 = 100 | schedule |
+      | F1 | converted payment 25.00 EUR → INR at the quoted rate | charged amount equals the quote shown to the customer | quote, PSP request, receipt |
+      | F2 | partial refund of a converted payment | rule for the rate applied; total refunds never exceed the original in the charged currency | refund objects |
+      | B1 | below the PSP's minimum per currency (for example 0.49 EUR if the minimum is 0.50) | refused with a clear message | API error |
+      | B2 | maximum amount in a 0-decimal currency | accepted / refused exactly at the documented limit | API responses |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [minor-units-and-currencies, rounding-rules, money-boundaries-and-conversion]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **`double` for money** - use integers of minor units, or decimals built from strings.
+      - **Hard-coded `× 100`** - the exponent depends on the currency.
+      - **Rounding in several places** - round once, at the specified step, with the specified mode.
+      - **Testing only EUR or USD** - always include a 0-decimal and a 3-decimal currency.
+      - **Comparing `BigDecimal` with `equals`** - 2.50 and 2.5 are "different"; use `compareTo`.
+      - **Splits that lose or invent cents** - assert that the parts add up to the total.
+      - **Different amounts in different places** - UI, order, PSP and receipt must agree to the minor unit.
+      - **Assuming FX is reversible** - converting there and back rarely gives the original; specify which amount is
+        authoritative for refunds.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [rounding-rules]
+    title: Representation and rounding choices
+    body: |
+      | Choice | Pros | Cons |
+      |---|---|---|
+      | Integer minor units everywhere | exact, simple, what PSPs expect | needs the currency's exponent for every conversion; calculations like 19 % still need a decimal step |
+      | Decimal type (BigDecimal, SQL DECIMAL) | exact decimal arithmetic, explicit scale | easy to misuse (`equals`, constructing from `double`); slower |
+      | Money library (for example a JSR 354 / JavaMoney implementation) | currency-aware amounts and rounding | another dependency; rules still have to be configured |
+      | Round per line | each line on the receipt is exact | totals can differ from rounding the total |
+      | Round on the total | total exact | line amounts may not add up visibly |
+
+      Whatever the choice, **write it down** - tests can only check a rule that exists.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Amount = **integer minor units + ISO 4217 currency code**. Exponents: **2** (EUR, INR), **0** (JPY, KRW),
+        **3** (KWD, BHD), **4** (CLF).
+      - Never `double`; `BigDecimal` from **strings**; compare with **`compareTo`**.
+      - Rounding modes: **HALF_UP**, **HALF_EVEN** (banker's), **DOWN** - test at x.xx5 and negatives.
+      - Every division leaves a **remainder**: splits, tax, discounts, FX - the parts must add up.
+      - Test a 0-, 2- and 3-decimal currency; check UI, order, PSP request and receipt agree.
+      - Sources: ISO 4217 list (SIX, 17 September 2026); Java SE 17 API.
+
+exercises:
+  - id: minor-units-mcq
+    type: mcq
+    concept: minor-units-and-currencies
+    skill: application
+    title: The amount field
+    prompt: A PSP expects amounts in minor units. Which request charges exactly **12 Kuwaiti dinars (KWD)**?
+    options:
+      - id: twelve-thousand
+        text: "amount: 12000, currency: KWD"
+        feedback: Correct - KWD has 3 decimals (ISO 4217), so 12.000 KWD is 12000 fils.
+      - id: twelve-hundred
+        text: "amount: 1200, currency: KWD"
+        feedback: That applies the 2-decimal rule of EUR or USD - it would charge 1.200 KWD, a tenth of the intended amount.
+      - id: twelve
+        text: "amount: 12, currency: KWD"
+        feedback: That treats KWD as a 0-decimal currency like JPY - 12 fils, a thousandth of the amount.
+      - id: decimal
+        text: "amount: 12.000, currency: KWD"
+        feedback: A minor-units API expects an integer; a decimal value may be rejected or misread.
+    correct: [twelve-thousand]
+    hints:
+      - How many decimals does ISO 4217 give KWD?
+    solution: |
+      **12000.** KWD's minor unit is 3, so multiply by 10³. Test every currency type: 0, 2 and 3 decimals.
+    followUp: |
+      Write the same request for 12 JPY and 12 INR. Which value is most likely to be wrong in a system only tested in EUR?
+
+  - id: rounding-mode-mcq
+    type: mcq
+    concept: rounding-rules
+    skill: application
+    title: Which mode was used?
+    prompt: |
+      A discount calculation produces 2.345 EUR and the system shows **2.34**. For 2.355 it shows **2.36**. Which
+      rounding mode is the system most likely using?
+    options:
+      - id: half-even
+        text: HALF_EVEN (banker's rounding)
+        feedback: Correct - half-way values round to the even neighbour - 2.345 → 2.34 (4 is even), 2.355 → 2.36 (6 is even).
+      - id: half-up
+        text: HALF_UP
+        feedback: HALF_UP would give 2.35 for 2.345 - away from zero at the half-way point.
+      - id: down
+        text: DOWN (truncation)
+        feedback: Truncation would give 2.35 for 2.355, not 2.36.
+      - id: up
+        text: UP (away from zero always)
+        feedback: UP would give 2.35 for 2.345 and 2.36 for 2.355 - the first result doesn't match.
+    correct: [half-even]
+    hints:
+      - Look at the digit before the 5 in each case.
+    solution: |
+      **HALF_EVEN.** Exactly these half-way pairs tell the modes apart - which is why they belong in your test data.
+      Whether HALF_EVEN is *correct* depends on the specified rule.
+    followUp: |
+      What would HALF_UP and HALF_EVEN give for -2.345 (a refund)? Check your answer against the table in this lesson.
+
+  - id: debug-hundred
+    type: debug
+    concept: minor-units-and-currencies
+    skill: analysis
+    title: The Japanese overcharge
+    prompt: A 1,500 JPY order is charged 150,000 JPY. Click the line that causes it.
+    language: java
+    code: |
+      PaymentRequest toRequest(Order order) {
+          BigDecimal total = order.total();               // 1500 for JPY, 12.00 for EUR
+          String currency = order.currency();             // "JPY"
+          long minor = total.multiply(BigDecimal.valueOf(100)).longValueExact();
+          return PaymentRequest.builder()
+              .amountMinor(minor)
+              .currency(currency)
+              .idempotencyKey(order.id())
+              .build();
+      }
+    correctLines: [4]
+    lineNotes:
+      - line: 2
+        note: The order total itself is right - 1500 yen.
+      - line: 7
+        note: The currency code is passed correctly; the PSP rightly reads the amount as yen.
+    hints:
+      - How many decimals does JPY have?
+    solution: |
+      **Line 4.** It always multiplies by 100. The factor must come from the currency's exponent - for example
+      `total.movePointRight(Currency.getInstance(currency).getDefaultFractionDigits())` - or from the PSP's own list of
+      minor units if it differs from the JDK's data.
+    followUp: |
+      Which three currencies would you add to the test data so this defect is caught before release?
+
+  - id: split-tests
+    type: testdesign
+    concept: money-boundaries-and-conversion
+    skill: application
+    title: Instalments that add up
+    prompt: |
+      The shop adds "pay in 3 instalments". Design tests that prove the instalments always add up to the order total,
+      across currencies and odd amounts, and that refunds work. Give inputs, expected results and evidence.
+    hints:
+      - Pick totals that don't divide by 3, in currencies with 0, 2 and 3 decimals.
+      - Who gets the leftover minor unit - and is that specified?
+      - What happens if the customer returns part of the order after the first instalment?
+    modelAnswer: |
+      1. 100.00 EUR → 33.34 + 33.33 + 33.33 (or the specified allocation); sum 100.00. Evidence: schedule, PSP
+         requests.
+      2. 100 JPY → 34 + 33 + 33; sum 100; no decimal amounts sent. Evidence: requests.
+      3. 10.000 KWD → 3.334 + 3.333 + 3.333; sum 10.000. Evidence: requests.
+      4. 0.02 EUR (smaller than the number of instalments) → refused or a single payment, as specified. Evidence:
+         error or schedule.
+      5. Total at the PSP's minimum per instalment (for example each part must be at least 1.00) → boundary just
+         above and below. Evidence: responses.
+      6. Partial refund of 40.00 after the first instalment → remaining instalments reduced by the specified rule;
+         total charged − refunded = new total. Evidence: schedule before and after, refund object.
+      7. All amounts agree between UI, schedule, PSP requests and the receipt. Evidence: side-by-side comparison.
+    rubric:
+      - Used totals that don't divide evenly
+      - Covered at least a 0-decimal and a 3-decimal currency besides EUR
+      - Asserted that the parts add up exactly to the total
+      - Asked or checked who gets the remainder
+      - Covered a boundary (minimum instalment or a tiny total)
+      - Covered a refund after some instalments
+      - Compared amounts across UI, schedule, PSP and receipt
+    solution: |
+      Compare with the model answer. The invariant **sum of parts = total** is the heart of it - assert it in every
+      test, not just once.
+    followUp: |
+      How would you turn the invariant into a property-based test that tries thousands of totals automatically?
+
+  - id: fx-mcq
+    type: mcq
+    concept: money-boundaries-and-conversion
+    skill: analysis
+    title: The refund doesn't match
+    prompt: |
+      A customer paid 2,236 INR for a 25.00 EUR item (converted at checkout). A week later the shop refunds 25.00 EUR,
+      and the customer receives 2,198 INR. They complain. What is the most likely cause?
+    options:
+      - id: rate
+        text: The refund was converted at a different (later) exchange rate than the payment
+        feedback: Correct - converting the EUR amount again at a new rate gives a different INR amount. The rule for refund rates must be specified and tested.
+      - id: rounding
+        text: A rounding error of a few paise
+        feedback: Rounding differences are at most a minor unit or so; 38 INR is far too large.
+      - id: fee
+        text: The PSP kept its fee
+        feedback: Possible in some contracts, but the pattern - EUR refunded, converted again - points to the exchange rate.
+      - id: minor
+        text: The shop used the wrong minor units for INR
+        feedback: A minor-unit error would be off by a factor of 10 or 100, not a few percent.
+    correct: [rate]
+    hints:
+      - Which currency was the refund calculated in, and what changed in a week?
+    solution: |
+      **A different rate.** Decide which amount is authoritative for refunds - often the amount charged in the
+      customer's currency - and test a refund after the rate has moved.
+    followUp: |
+      Write the expected result for this refund under a rule of "refund the amount charged in the customer's currency".
+
+  - id: order-money-pipeline
+    type: order
+    concept: rounding-rules
+    skill: recall
+    title: From price to PSP
+    prompt: Put the steps of computing a checkout total in a typical order.
+    items:
+      - id: lines
+        text: Multiply unit prices by quantities, in minor units
+      - id: discounts
+        text: Apply discounts with the specified rounding
+      - id: tax
+        text: Calculate tax per the country's rule (per line or on the total)
+      - id: convert
+        text: Convert to the customer's currency, if different, with a stated rate and rounding
+      - id: send
+        text: Send the integer amount and currency code to the PSP
+    hints:
+      - Tax is usually calculated on the discounted price.
+    solution: |
+      Lines → discounts → tax → conversion → send. Your project's rules may differ (for example tax-inclusive prices) -
+      the point is that the order and each rounding step are specified and tested.
+
+  - id: interview-floats
+    type: interview
+    concept: rounding-rules
+    skill: application
+    title: "Interview: why not double?"
+    prompt: |
+      *"Why shouldn't we store prices as `double`, and how would you test money calculations?"* Answer as you would in
+      the interview.
+    hints:
+      - Representation first, then rounding, then testing.
+    modelAnswer: |
+      A `double` is binary floating point; most decimal amounts like 0.1 can't be represented exactly, so sums drift -
+      `0.1 + 0.2` isn't exactly 0.3 - and comparisons fail. For money I'd use integers of minor units, with the
+      currency's exponent from ISO 4217, for storage and APIs, and a decimal type like `BigDecimal` built from strings
+      for calculations, with an explicit scale and rounding mode.
+
+      To test it, I'd first get the rules written down: which rounding mode and where - discounts, tax per line or
+      total, conversion, fees. I'd build an independent oracle in a spreadsheet or a small program, and choose data that
+      distinguishes modes - half-way values, negatives for refunds, amounts that don't divide evenly. I'd test a 0-, 2-
+      and 3-decimal currency, check invariants like "parts add up to the total" and "refunds never exceed the charge", and
+      compare the amount in the UI, the order, the PSP request and the receipt.
+    rubric:
+      - Explained why binary floating point can't represent decimals exactly
+      - Proposed integer minor units and or a decimal type
+      - Mentioned currency exponents (ISO 4217) and non-2-decimal currencies
+      - Said rounding mode and place must be specified
+      - Used half-way values and negatives to distinguish modes
+      - Checked invariants and consistency across systems
+    followUps:
+      - What does BigDecimal's equals do with 2.50 and 2.5?
+      - Where would you put the leftover cent when splitting 100.00 into three?
+      - How do you test a currency conversion when the rate changes every minute?
+    solution: |
+      Strong answers go beyond "use BigDecimal" to **rules, oracles and invariants**.
+
+  - id: explain-equals
+    type: short
+    concept: rounding-rules
+    skill: recall
+    title: equals or compareTo?
+    prompt: In two sentences, explain why `new BigDecimal("2.50").equals(new BigDecimal("2.5"))` is false and what to use instead.
+    hints:
+      - What else besides the value does a BigDecimal carry?
+    modelAnswer: |
+      `equals` compares both the value and the scale, and 2.50 has scale 2 while 2.5 has scale 1, so they aren't
+      "equal". To compare amounts, use `compareTo(...) == 0`, which compares only the numeric value.
+    rubric:
+      - Said equals compares scale as well as value
+      - Recommended compareTo for comparing amounts
+    solution: |
+      The same trap appears in collections - `HashSet<BigDecimal>` treats 2.50 and 2.5 as different elements.
+
+placement:
+  - id: place-minor
+    type: mcq
+    concept: minor-units-and-currencies
+    skill: application
+    title: 2,500 JPY
+    prompt: In a minor-units API, which amount charges 2,500 Japanese yen?
+    options:
+      - id: jpy
+        text: "2500"
+        feedback: Correct - JPY has no minor unit (ISO 4217 exponent 0).
+      - id: jpy-100
+        text: "250000"
+        feedback: That multiplies by 100 as for a 2-decimal currency and charges 100 times too much.
+      - id: jpy-1000
+        text: "2500000"
+        feedback: That treats JPY as a 3-decimal currency.
+      - id: jpy-25
+        text: "25"
+        feedback: That divides by 100 - it would charge 25 yen.
+    correct: [jpy]
+    solution: |
+      **2500.** Zero-decimal currencies are the classic source of 100× errors.
+
+  - id: place-rounding
+    type: mcq
+    concept: rounding-rules
+    skill: application
+    title: Half-up or half-even?
+    prompt: What does 0.125 EUR round to at 2 decimals with HALF_EVEN?
+    options:
+      - id: twelve
+        text: "0.12"
+        feedback: Correct - at the half-way point HALF_EVEN picks the even neighbour, and 2 is even.
+      - id: thirteen
+        text: "0.13"
+        feedback: That is HALF_UP. HALF_EVEN goes to the even digit.
+      - id: one-three
+        text: "0.1 or 0.13 depending on the platform"
+        feedback: The mode is deterministic - the same input always gives the same result.
+      - id: error
+        text: An error, because the value is exactly half-way
+        feedback: Rounding modes exist precisely to handle half-way values.
+    correct: [twelve]
+    solution: |
+      **0.12.** HALF_UP would give 0.13 - so 0.125 is a good test value to find out which mode a system uses.
+
+  - id: place-split
+    type: mcq
+    concept: money-boundaries-and-conversion
+    skill: analysis
+    title: The missing cent
+    prompt: A bill of 10.00 EUR is split between 3 people and each is charged 3.33 EUR. What is wrong?
+    options:
+      - id: cent
+        text: The parts add up to 9.99 - one cent is lost; one person should pay 3.34
+        feedback: Correct - splits must allocate the remainder so the parts add up to the total.
+      - id: nothing
+        text: Nothing - 10.00 / 3 = 3.33
+        feedback: Rounded, yes - but 3 × 3.33 = 9.99, so the merchant is short one cent per split.
+      - id: rounding-mode
+        text: The rounding mode should have been HALF_UP
+        feedback: 3.3333... rounds to 3.33 in every common mode; the problem is the remainder, not the mode.
+      - id: float
+        text: The system must be using double
+        feedback: This happens with exact decimals too - any split needs a remainder rule.
+    correct: [cent]
+    solution: |
+      **One cent is lost.** Allocate the remainder (for example 3.34 + 3.33 + 3.33) and assert the sum in tests.
+
+recall:
+  - id: recall-minor
+    concept: minor-units-and-currencies
+    prompt: How do you convert a display amount into minor units?
+    answer: Multiply by 10 to the power of the currency's ISO 4217 minor unit - 100 for EUR, 1 for JPY, 1000 for KWD - and keep it an integer.
+  - id: recall-zero-three
+    concept: minor-units-and-currencies
+    prompt: Name a 0-decimal and a 3-decimal currency.
+    answer: 0 decimals - JPY, KRW, CLP, ISK, VND. 3 decimals - KWD, BHD, JOD, OMR, TND, IQD, LYD.
+  - id: recall-float
+    concept: rounding-rules
+    prompt: Why must money never be stored in a double?
+    answer: Binary floating point can't represent most decimal fractions exactly, so amounts drift and comparisons fail.
+  - id: recall-modes
+    concept: rounding-rules
+    prompt: How do HALF_UP and HALF_EVEN differ?
+    answer: At exactly half-way, HALF_UP rounds away from zero; HALF_EVEN rounds to the neighbour whose last digit is even.
+  - id: recall-split
+    concept: money-boundaries-and-conversion
+    prompt: What invariant must every split, tax or allocation keep?
+    answer: The parts must add up exactly to the total, in minor units.
+  - id: recall-fx-refund
+    concept: money-boundaries-and-conversion
+    prompt: Why can a refund of a converted payment differ from what the customer paid?
+    answer: If the refund is converted again at a later rate, the amount in the customer's currency changes; the rule for which amount is authoritative must be specified.
+
+next:
+  - partial-refunds-and-invariants
+  - interruptions-refresh-back-navigation

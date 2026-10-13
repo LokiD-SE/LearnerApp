@@ -1,0 +1,547 @@
+id: defect-isolation-decision-trees
+title: Defect isolation with decision trees
+subject: payment-architecture
+module: observability-and-rca
+level: advanced
+status: published
+estimatedMinutes: 50
+summary: Prove which component is at fault in a payment failure - client, network, gateway, your services, the PSP or downstream parties, data or configuration - with decision trees that ask one evidence-backed question at a time and control experiments that rule layers in or out.
+tags: [payments, defect isolation, root cause analysis, decision tree, divide and conquer, control experiment, evidence, troubleshooting]
+
+environment: |
+  - **Method:** the scientific method for debugging and isolation techniques from Andreas Zeller's *Why Programs Fail* (2nd
+    ed., 2009, chapter 6) and *The Debugging Book* ([debuggingbook.org](https://www.debuggingbook.org/)) - see
+    [scientific debugging](#/lesson/scientific-debugging); root cause as defined in the **ISTQB CTFL syllabus v4.0.1**,
+    section 1.2.3.
+  - **Status codes and layers:** RFC 9110 (status codes, 502/504 from gateways), RFC 8446 (TLS); see
+    [from a click to a response](#/lesson/client-server-request-flow).
+  - **Universal:** decision trees are a general troubleshooting tool; the trees here are examples for a typical web shop with
+    a PSP, not a standard.
+  - **Fictional:** the demo shop's architecture, SandPay and all incidents.
+
+prerequisites:
+  - scientific-debugging
+  - logs-metrics-traces
+
+concepts:
+  - id: layered-isolation
+    name: Layered isolation
+    summary: A payment passes client, network, edge, your services, the PSP and the parties behind it, and data and configuration; isolation splits that chain and proves where the first wrong state appears.
+  - id: payment-decision-trees
+    name: Decision trees for payment symptoms
+    summary: Each common symptom - declines, timeouts, duplicates, missing orders, wrong amounts - has a tree of questions whose answers come from specific evidence and lead to an owner.
+  - id: control-experiments
+    name: Control experiments
+    summary: Change one factor while holding the rest - another card, another browser, a direct API call, the previous build - so the result proves a layer innocent or guilty instead of plausible.
+
+objectives:
+  - Split a payment failure into layers and identify the first layer where the state is wrong.
+  - Follow and build decision trees for declines, timeouts, duplicates and missing orders.
+  - Design control experiments that rule a component in or out with evidence.
+  - Write an isolation conclusion that names the component, the evidence and the confidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [layered-isolation]
+    title: The idea in plain language
+    body: |
+      When a room's light doesn't work, an electrician doesn't rewire the house. They ask: **is it the bulb?** Swap it with a
+      known good one. **The switch?** Try another lamp on the same circuit. **The fuse?** Check the board. Each test **rules out
+      a whole part** of the system, and they stop at the first part that is proven faulty.
+
+      Payment failures need the same discipline. The chain is long - phone, network, CDN, API gateway, checkout service, payment
+      service, PSP, acquirer, card network, issuer, webhook, order service, database, configuration - and each team suspects the
+      others. A **decision tree** is a written-down version of the electrician's questions: one question at a time, each answered
+      by **evidence**, each answer cutting the search space, ending at a component and an owner.
+
+  - id: what
+    kind: what
+    concepts: [layered-isolation]
+    title: What the layers are and what evidence each gives
+    body: |
+      | Layer | Typical faults | Evidence that implicates or clears it |
+      |---|---|---|
+      | **Client** (browser, app, version) | script error, wrong request built, old app version | DevTools console and network, app logs, does another client work? |
+      | **Network and edge** (DNS, TLS, CDN, WAF, gateway) | blocked request, 502/504, certificate | curl from inside and outside, gateway logs, status source |
+      | **Your services** | logic defect, timeout too short, wrong mapping | service logs and traces by id, unit of change (deploy) |
+      | **Data and configuration** | wrong secret, feature flag, missing record, stale cache | config diff, flag state, the record itself |
+      | **PSP** | outage, risk rules, API change | PSP status page, PSP request log or dashboard, decline source field |
+      | **Acquirer, network, issuer** | issuer down, specific decline codes | decline codes and source, spread across issuers or one bank |
+      | **Async back channel** (webhooks, queues) | rejected, lost, duplicated or reordered events | PSP delivery attempts, consumer logs, DLQ |
+
+      The question at each step is not "could this layer cause it?" (usually yes) but **"does the evidence show the state is
+      already wrong when it leaves this layer?"**
+
+  - id: why
+    kind: why
+    concepts: [control-experiments]
+    title: Why intuition and blame don't isolate defects
+    body: |
+      - **Every team has a plausible story.** "The PSP is slow", "the app sends rubbish", "it's the network". Plausible is not
+        proven - [scientific debugging](#/lesson/scientific-debugging) explains the difference.
+      - **Symptoms appear far from causes.** A wrong webhook secret shows up as "orders stuck in awaiting payment"; an app
+        version that sends amounts in the wrong unit shows up as "PSP declines".
+      - **Escalations cost days.** Sending a ticket to the PSP for a defect in your own mapping wastes their time and yours.
+      - **Isolation evidence is what makes a defect report actionable.** "Fails in app 4.2 only; the same request via curl
+        succeeds; the 4.2 request has `amount: 25.00` as a string" goes straight to the right team.
+
+  - id: visual
+    kind: visual
+    concepts: [payment-decision-trees]
+    title: "Decision tree: \"payments are being declined\""
+    body: |
+      Each question has an evidence source. Follow it until a leaf names an owner.
+
+      ```mermaid
+      flowchart TD
+          A[Declines higher than usual] --> B{Decline source field?}
+          B -- PSP risk --> R[PSP risk rules or data sent to them - compare request fields with a normal day]
+          B -- Network or issuer --> C{Spread across many issuers?}
+          C -- One issuer or BIN range --> I[That issuer - PSP and acquirer escalate; nothing to fix in your code]
+          C -- Many issuers --> D{Started with a deploy or config change?}
+          D -- Yes --> E[Diff the requests before and after - amount, currency, flags, 3DS data]
+          D -- No --> F{One payment method or channel?}
+          F -- Yes --> G[That integration - app version, wallet set-up, method config]
+          F -- No --> H[PSP or acquirer incident - check status page, open a case with evidence]
+          B -- Not set or missing --> N[Request may not reach the PSP - check client and service logs for errors before the call]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [layered-isolation, control-experiments]
+    title: Step by step - isolating a payment failure
+    body: |
+      1. **State the symptom precisely**: what, since when, for whom (all customers? one method, app version, region, issuer?),
+         how often. Get the numbers from metrics.
+      2. **Collect cases**: 5-10 failing and 5-10 succeeding payments from the same period, with all their ids.
+      3. **Compare failing with succeeding**, field by field and layer by layer - client version, method, request fields, which
+         server, which PSP response. The differences are your hypotheses.
+      4. **Find the first wrong state**: walk the chain for one failing case (see
+         [tracing a payment end to end](#/lesson/tracing-a-payment-end-to-end)) and find the first hop where the data or outcome
+         differs from a succeeding case.
+      5. **Run a control experiment** for that hop - change only it: send the same request directly with curl, use the previous
+         build, another card, another browser, the same input in a test environment.
+      6. **Confirm both ways** - the fault appears with the factor, disappears without it.
+      7. **Write the conclusion** with the component, the evidence, what was ruled out and how, and the confidence level.
+
+  - id: internals
+    kind: internals
+    concepts: [control-experiments]
+    title: Control experiments that rule layers in or out
+    body: |
+      | Question | Control experiment | Rules out if it works |
+      |---|---|---|
+      | Is it the client? | send the captured request with curl (Copy as cURL) | the server side for this request |
+      | Is it this browser or app version? | same account, same steps, another browser or the previous app version | the shared back end |
+      | Is it this deploy? | run the previous build in a test environment with the same input | code outside the diff |
+      | Is it the data? | same request with a fresh test customer or product | the logic, if the old record fails and the new one works |
+      | Is it configuration? | compare config and feature flags between a working and a failing environment | code, if only config differs |
+      | Is it the PSP? | call the PSP sandbox directly with the same payload; check the PSP status page | your services, if the direct call fails the same way |
+      | Is it one issuer? | group failures by card issuer or BIN; test with a card from another issuer (test data only) | your system, if one issuer fails and others don't |
+
+      A control experiment must change **one** factor. "I tried another browser on another network with another account and it
+      worked" proves nothing about which factor mattered.
+
+  - id: example
+    kind: example
+    concepts: [layered-isolation, control-experiments]
+    title: "Real-world example: \"the PSP is declining our app payments\""
+    body: |
+      The mobile team reports that since Tuesday, 12 % of Android payments fail with "declined", and asks the PSP to investigate.
+      The tester isolates it before anyone escalates:
+
+      1. **Symptom:** declines only on Android, only app versions ≥ 5.3 (released Tuesday), all issuers, all amounts.
+      2. **Decline source:** `psp_validation`, code `invalid_amount` - not an issuer decline at all.
+      3. **Compare a failing 5.3 request with a succeeding 5.2 request** for the same 24.99 EUR basket: 5.2 sends
+         `"amount": 2499` (minor units, as the API requires); 5.3 sends `"amount": 24.99`.
+      4. **Control experiment:** replay the 5.3 request with curl, changing only `amount` to `2499` → approved. Replay 5.2's
+         request unchanged → approved.
+      5. **Confirmation:** the 5.3 code switched to a new money formatter that outputs major units; only amounts with a fractional
+         part fail validation (whole-euro amounts are accepted - as 100 times too little!).
+
+      Conclusion: **client defect in app 5.3** - amount sent in major units. Evidence: two captured requests, the curl replay, the
+      code change. And a second, more serious finding from step 5: whole-euro payments from 5.3 were **charged 100 times too
+      little** - found only because the tester confirmed both ways. Escalation to the PSP: not needed.
+
+  - id: code
+    kind: code
+    concepts: [control-experiments]
+    title: A replay experiment, step by step
+    collapsed: true
+    body: |
+      Capture the failing request from the app (debug build through a proxy) or from the service's request log, then replay it
+      against the sandbox with **one** change at a time:
+
+      ```bash
+      # 1. replay exactly as captured - expect the same failure (reproduction)
+      curl -s https://api.sandpay.example/v1/payments \
+        -H "Authorization: Bearer $SANDPAY_KEY" -H "Content-Type: application/json" \
+        -H "Idempotency-Key: replay-$(date +%s)-1" \
+        -d '{"amount": 24.99, "currency": "EUR", "payment_method": "pm_sandpay_approve"}' -w "\n%{http_code}\n"
+
+      # 2. change only the amount format - expect success if the hypothesis is right
+      curl -s https://api.sandpay.example/v1/payments \
+        -H "Authorization: Bearer $SANDPAY_KEY" -H "Content-Type: application/json" \
+        -H "Idempotency-Key: replay-$(date +%s)-2" \
+        -d '{"amount": 2499, "currency": "EUR", "payment_method": "pm_sandpay_approve"}' -w "\n%{http_code}\n"
+      ```
+
+      Each replay gets a **new idempotency key** - reusing the captured one would only replay the stored first response. Use test
+      payment methods only; never replay production requests with real customer data against production.
+
+  - id: tests
+    kind: tests
+    concepts: [payment-decision-trees]
+    title: Decision trees for other symptoms
+    body: |
+      | Symptom | First question (evidence) | Typical branches and owners |
+      |---|---|---|
+      | **Timeouts at checkout** | Which span is slow? (traces) | our service → its code or pool; PSP span → PSP status, latency by region; before our service → gateway or client network |
+      | **Duplicate charges** | Different or identical idempotency keys? (PSP records) | different → our attempt handling (refresh, tabs, retries); identical → PSP or our response handling |
+      | **Charged, no order** | Did a webhook arrive, and what did we answer? (PSP delivery log) | not sent → PSP; rejected 4xx → our signature, secret, parsing; accepted → order-service logic (state, reference matching) |
+      | **Wrong amount charged** | Is the amount wrong in our request to the PSP? (request log) | yes → our calculation, currency exponent, client field; no → PSP or FX conversion |
+      | **3-D Secure failures rise** | Fail at challenge or after return? (3DS status vs return logs) | challenge → issuer or ACS; return → our return handler, sessions, mobile app switching |
+      | **Refund "not received"** | Does the PSP show the refund succeeded? (PSP) | no → our refund call or PSP; yes → issuer posting time - explain timelines to the customer |
+
+      For each tree, a test team keeps the **evidence query** next to the question - the exact log search or dashboard - so anyone
+      can follow it at 3 a.m.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [layered-isolation, control-experiments, payment-decision-trees]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Starting with the most suspected layer.** Start with the first hop where the state is wrong, not with the usual suspect.
+      - **Changing several factors at once.** A control experiment changes one.
+      - **Confirming only one way.** Show the fault disappears without the factor *and* appears with it.
+      - **Escalating without evidence.** A PSP case with captured requests, ids and times is answered; "it's broken" is queued.
+      - **Ignoring the successful cases.** The differences between failing and succeeding payments are the best hypotheses.
+      - **Stopping at the symptom's owner.** The order service shows the symptom; the cause may be a rotated secret in deployment.
+      - **Overconfident conclusions.** State the confidence - "confirmed", "likely", "not ruled out" - and what would raise it.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Layers: **client, network/edge, your services, data/config, PSP, acquirer/network/issuer, async back channel**.
+      - Find the **first hop where the state is wrong**; compare **failing with succeeding** cases.
+      - Decision trees: one question per node, **each with an evidence source**, leaves name an **owner**.
+      - **Control experiments** change **one** factor: curl replay, previous build, other browser or version, fresh data, config
+        diff, direct PSP call, another issuer.
+      - Confirm **both ways**; write the conclusion with evidence, what was ruled out, and confidence.
+
+exercises:
+  - id: first-question
+    type: mcq
+    concept: payment-decision-trees
+    skill: application
+    title: The first question for declines
+    prompt: Declines jumped from 4 % to 11 % this morning. Which question should come first in the decision tree?
+    options:
+      - id: source
+        text: Who declined them - the PSP's risk rules, PSP validation, or the network and issuers? (decline source in payment records)
+        feedback: Correct - the source splits the problem into owners immediately.
+      - id: code-change
+        text: Which developer changed the payment code last?
+        feedback: That might come later; first find out where the declines originate - they may not involve your code at all.
+      - id: restart
+        text: Should we restart the payment service?
+        feedback: An action without a diagnosis - and declines are answers, not crashes.
+      - id: customers
+        text: Which customers complained?
+        feedback: Complaints are a biased sample; the payment records give the full picture.
+    correct: [source]
+    hints:
+      - Which single field divides the problem between different companies?
+    solution: |
+      **The decline source.** Issuer declines spread across many banks point one way; PSP risk or validation declines point another;
+      missing sources point at requests that never reached the PSP.
+    followUp: |
+      The source is "issuer" and 90 % of the new declines come from one bank. What do you do next - and what don't you do?
+
+  - id: control-design
+    type: mcq
+    concept: control-experiments
+    skill: analysis
+    title: A valid control experiment
+    prompt: You suspect app version 5.3 builds a wrong request. Which experiment best tests that?
+    options:
+      - id: replay
+        text: Replay a failing 5.3 request with curl, then replay it again changing only the field you suspect
+        feedback: Correct - the first replay reproduces the failure outside the app; the second changes one factor.
+      - id: everything
+        text: Try on another phone, another network and another account with version 5.2
+        feedback: Too many factors changed at once - if it works, you can't say which mattered.
+      - id: wait
+        text: Wait for more customer reports
+        feedback: More reports don't isolate anything; experiments do.
+      - id: logs-only
+        text: Read the payment service's code
+        feedback: Code reading can suggest hypotheses, but it doesn't prove which layer fails.
+    correct: [replay]
+    hints:
+      - How many factors may an experiment change?
+    solution: |
+      **Replay, then change one field.** If the modified replay succeeds and the original fails, the field - and so the app - is
+      implicated.
+    followUp: |
+      Why must each replay use a new idempotency key?
+
+  - id: debug-conclusion
+    type: debug
+    concept: layered-isolation
+    skill: analysis
+    title: The isolation report that jumps to conclusions
+    prompt: Click the line of this isolation report whose conclusion isn't supported by its evidence.
+    language: plaintext
+    code: |
+      Symptom: 3% of checkouts time out since 14:00, web and app, all payment methods
+      Evidence 1: traces of 20 slow checkouts - 19 spend >25 s in span psp.create_payment
+      Evidence 2: PSP status page - "degraded performance in EU region" since 13:55
+      Evidence 3: direct sandbox call from our network at 14:30 took 26 s
+      Conclusion 1: the slowness is in the PSP call, not in our services before it
+      Conclusion 2: our payment-service code introduced the slowness in today's deploy
+      Next step: open a PSP case with the 20 trace ids and timestamps; lower our timeout alert noise
+    correctLines: [6]
+    lineNotes:
+      - line: 5
+        note: Supported - 19 of 20 traces show the time in the PSP span.
+      - line: 4
+        note: A useful control - the direct call isolates the PSP from our services.
+    hints:
+      - Which conclusion has no evidence pointing to it - or evidence pointing against it?
+    solution: |
+      **Line 6.** Nothing in the evidence implicates today's deploy; the traces, the PSP status page and the direct call all point
+      at the PSP. To consider the deploy, you'd need a control - the previous build, same time, same PSP - showing a difference.
+    followUp: |
+      One of the 20 traces didn't spend its time in the PSP span. What would you do with it?
+
+  - id: tree-design
+    type: testdesign
+    concept: payment-decision-trees
+    skill: application
+    title: Build the tree for "charged, no order"
+    prompt: |
+      Build a decision tree for the symptom "customer charged, no order (or order not paid)". For each question, give the evidence
+      source; for each leaf, the likely component and owner. Include at least six questions or branches, and say how you would
+      confirm the leaf you end at.
+    hints:
+      - Start from the PSP's record - did the payment succeed, and with which reference?
+      - Then the back channel - webhook sent? delivered? answered how?
+      - Then your own processing - found the order? state allowed the change?
+    modelAnswer: |
+      1. Does the PSP show a succeeded payment for this customer? (PSP dashboard by amount/time/reference)
+         - No → not charged by this PSP; check other methods or the bank statement entry → explain to the customer.
+      2. Does the PSP payment carry our order reference? (PSP payment object)
+         - No → our payment request didn't send it (payment-service) → defect in the request mapping.
+      3. Did the PSP send a webhook, and what did we answer? (PSP webhook delivery log)
+         - Not sent / PSP shows failures on their side → PSP case with ids.
+         - Rejected 401/400 → our webhook endpoint: signature secret, parsing (order-service or edge) → check config and logs.
+         - Timed out → our endpoint too slow → order-service performance.
+         - Accepted 200 → continue.
+      4. Did order-service find the order by the reference? (order-service logs by event id)
+         - No → reference format or lookup (case, prefix) → order-service.
+      5. Did it change the status? (logs, order history)
+         - Refused by state (order cancelled or expired) → design: late success must refund or fulfil → order-service and product.
+      6. Did the payment-service also time out at checkout? (traces) → explains why the customer saw a failure first.
+
+      Confirm the leaf with a control experiment in a test environment: reproduce with the same condition (wrong secret, lower-case
+      reference, cancelled order) and see the same symptom; remove it and see the order paid.
+    rubric:
+      - Started from the PSP's record of the payment
+      - Checked the merchant reference on the PSP payment
+      - Branched on webhook delivery outcome (not sent, rejected, timed out, accepted)
+      - Checked order lookup and state transitions in order-service
+      - Gave an evidence source for every question
+      - Named an owner for every leaf
+      - Confirmed the leaf with a control experiment
+    solution: |
+      Compare with the model answer. The webhook **delivery log** at the PSP is the pivot of this tree - it tells you which side of
+      the boundary to look at.
+    followUp: |
+      Turn your tree into a support runbook: which three queries should be bookmarked for on-call?
+
+  - id: order-isolation
+    type: order
+    concept: layered-isolation
+    skill: recall
+    title: Isolation, step by step
+    prompt: Put the steps of isolating a payment failure in order.
+    items:
+      - id: symptom
+        text: State the symptom precisely, with numbers from metrics
+      - id: cases
+        text: Collect failing and succeeding cases from the same period
+      - id: compare
+        text: Compare them field by field and layer by layer
+      - id: first-wrong
+        text: Walk the chain for a failing case to find the first wrong state
+      - id: control
+        text: Run a control experiment that changes only that factor
+      - id: conclude
+        text: Confirm both ways and write the conclusion with evidence and confidence
+    hints:
+      - Hypotheses come from comparing; experiments test them.
+    solution: |
+      Symptom → cases → compare → first wrong state → control experiment → conclusion with evidence.
+
+  - id: interview-isolation
+    type: interview
+    concept: control-experiments
+    skill: application
+    title: "Interview: \"it's the PSP's fault\""
+    prompt: |
+      *"During an incident, the developers say it's the PSP's fault and want to open a ticket with them. How would you make sure
+      that's right before escalating?"* Answer as you would in the interview.
+    hints:
+      - What evidence would prove the PSP is at fault - and what would prove it isn't?
+    modelAnswer: |
+      I'd look for evidence that the state is already wrong when it leaves the PSP, and none before. First the symptom with numbers:
+      which payments, since when, all methods or one. Then compare failing and succeeding payments: if our request to the PSP is
+      identical for both and only the PSP's answer differs, that points at the PSP; if our requests differ - an app version, a field
+      format, a config flag - it points at us.
+
+      Then traces: is the time or the error in the PSP span, or before it? Then a control experiment that bypasses our services:
+      send the same payload directly to the PSP sandbox from our network with curl. If that fails the same way and the PSP status
+      page shows an incident, the PSP is very likely the cause. If the direct call works, it's on our side.
+
+      If it is the PSP, I'd open the case with the evidence - payment ids, timestamps, the direct-call result, our trace data - so they
+      can act quickly, and meanwhile check our side handles it safely: timeouts treated as unknown, no double charges on retry.
+    rubric:
+      - Required evidence that the first wrong state is at the PSP
+      - Compared failing and succeeding requests
+      - Used traces to locate the time or error
+      - Ran a control experiment bypassing own services
+      - Checked the PSP status page
+      - Escalated with concrete evidence
+      - Checked own system's safe handling meanwhile
+    followUps:
+      - The direct call works but the incident continues. What next?
+      - How would you tell an issuer outage from a PSP outage?
+      - What would you put in the PSP case?
+    solution: |
+      Interviewers listen for **the control experiment** - it is what turns an opinion into a finding.
+
+  - id: explain-first-wrong
+    type: short
+    concept: layered-isolation
+    skill: recall
+    title: Why the first wrong state
+    prompt: In two or three sentences, explain why isolation looks for the first hop where the state is wrong, rather than where the error is visible.
+    hints:
+      - Where does a customer usually see the error?
+    modelAnswer: |
+      Errors are usually visible far downstream - in the app or the order page - while the cause sits at an earlier hop whose wrong
+      output every later hop faithfully processes. The first hop where the data or outcome differs from a working case is the
+      earliest point the fault can be, so investigating there avoids chasing consequences.
+    rubric:
+      - Said symptoms appear downstream of causes
+      - Said later hops propagate an earlier wrong state
+      - Said the first divergence is where to investigate
+    solution: |
+      The same idea appears in [tracing a payment end to end](#/lesson/tracing-a-payment-end-to-end): the first divergence in the
+      timeline.
+
+placement:
+  - id: place-layer
+    type: mcq
+    concept: layered-isolation
+    skill: application
+    title: Ruled out?
+    prompt: A failing app request, replayed exactly with curl from your laptop, succeeds every time. What does that suggest?
+    options:
+      - id: client
+        text: The server side handles this request correctly; look at the client - how the app builds or sends it in practice
+        feedback: Correct - the same request succeeds outside the app, so the app's real requests probably differ from the captured one (or its environment does).
+      - id: server
+        text: The server is definitely at fault
+        feedback: The replay just showed the server accepts this request.
+      - id: psp
+        text: The PSP is at fault
+        feedback: The replay went through the same PSP and succeeded.
+      - id: nothing
+        text: Nothing - replays prove nothing
+        feedback: A replay is a strong control experiment; it rules out the server side for this request.
+    correct: [client]
+    solution: |
+      **Look at the client.** Check whether the capture is complete (headers, body), the app's network conditions, retries, and app
+      version differences.
+
+  - id: place-tree
+    type: mcq
+    concept: payment-decision-trees
+    skill: application
+    title: Duplicates - the pivot question
+    prompt: Customers report duplicate charges. Which evidence best splits the problem between your system and the PSP?
+    options:
+      - id: keys
+        text: Whether the two PSP payments carry different or identical idempotency keys
+        feedback: Correct - different keys mean your side created two attempts; identical keys point at the PSP's or your response handling.
+      - id: amounts
+        text: Whether the two amounts are the same
+        feedback: They usually are - it doesn't tell you who created the second payment.
+      - id: issuer
+        text: Which bank issued the cards
+        feedback: Issuers don't create duplicate charges by themselves in this pattern.
+      - id: time-of-day
+        text: The time of day
+        feedback: Useful context (load), but not the pivot between components.
+    correct: [keys]
+    solution: |
+      **Idempotency keys.** Then follow the matching branch - see
+      [interruptions and back navigation](#/lesson/interruptions-refresh-back-navigation) for the usual client-side causes.
+
+  - id: place-control
+    type: mcq
+    concept: control-experiments
+    skill: analysis
+    title: What does the experiment prove?
+    prompt: The failure happens on build 7.4 and not on 7.3, with the same input, in the same test environment. What does that prove?
+    options:
+      - id: diff
+        text: A change between 7.3 and 7.4 is involved - narrow it down within the diff (for example with git bisect)
+        feedback: Correct - one factor (the build) changed and the outcome changed.
+      - id: line
+        text: Exactly which line of code is wrong
+        feedback: It narrows to the diff; finding the line takes further isolation.
+      - id: psp
+        text: That the PSP changed
+        feedback: The PSP was the same for both runs.
+      - id: data
+        text: That the data is corrupt
+        feedback: The input was the same for both builds.
+    correct: [diff]
+    solution: |
+      **The diff is implicated.** `git bisect` between the two builds' commits finds the commit (see
+      [scientific debugging](#/lesson/scientific-debugging)).
+
+recall:
+  - id: recall-layers
+    concept: layered-isolation
+    prompt: Name the layers of a payment chain used for isolation.
+    answer: Client, network and edge, your services, data and configuration, the PSP, the acquirer, network and issuer, and the asynchronous back channel.
+  - id: recall-question
+    concept: layered-isolation
+    prompt: What question decides whether a layer is implicated?
+    answer: Does the evidence show the state is already wrong when it leaves this layer - not merely whether it could cause the symptom.
+  - id: recall-tree
+    concept: payment-decision-trees
+    prompt: What does every node and leaf of a good decision tree have?
+    answer: Each question has an evidence source; each leaf names a likely component and owner.
+  - id: recall-decline-first
+    concept: payment-decision-trees
+    prompt: What is the first question when declines rise?
+    answer: Who declined - PSP risk or validation, or the network and issuers - from the decline source in the payment records.
+  - id: recall-control
+    concept: control-experiments
+    prompt: What makes an experiment a valid control experiment?
+    answer: It changes exactly one factor while holding the others, and the result is compared with the original.
+  - id: recall-both-ways
+    concept: control-experiments
+    prompt: What does "confirm both ways" mean?
+    answer: The fault appears with the suspected factor and disappears without it.
+
+next:
+  - inconsistent-status-incidents
+  - scientific-debugging

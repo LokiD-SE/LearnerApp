@@ -11,13 +11,28 @@ import http from 'highlight.js/lib/languages/http';
 import java from 'highlight.js/lib/languages/java';
 import javascript from 'highlight.js/lib/languages/javascript';
 import json from 'highlight.js/lib/languages/json';
+import kotlin from 'highlight.js/lib/languages/kotlin';
 import plaintext from 'highlight.js/lib/languages/plaintext';
 import sql from 'highlight.js/lib/languages/sql';
+import swift from 'highlight.js/lib/languages/swift';
 import typescript from 'highlight.js/lib/languages/typescript';
 import xml from 'highlight.js/lib/languages/xml';
 import yaml from 'highlight.js/lib/languages/yaml';
 
-const languages = { bash, http, java, javascript, json, plaintext, sql, typescript, xml, yaml };
+const languages = {
+  bash,
+  http,
+  java,
+  javascript,
+  json,
+  kotlin,
+  plaintext,
+  sql,
+  swift,
+  typescript,
+  xml,
+  yaml,
+};
 for (const [name, definition] of Object.entries(languages)) hljs.registerLanguage(name, definition);
 hljs.registerAliases(['sh', 'shell', 'curl'], { languageName: 'bash' });
 hljs.registerAliases(['html'], { languageName: 'xml' });

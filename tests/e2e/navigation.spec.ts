@@ -99,6 +99,6 @@ test('a course page totals its time and lists its chapters beside it', async ({ 
   await expect(panel.locator('.course-list > li.is-current')).toContainText('Java basics');
 
   // A course with planned lessons says so, with a rough figure for them.
-  await page.goto('./#/learn?subject=api-testing');
+  await page.goto('./#/learn?subject=frameworks');
   await expect(page.locator('.time-summary').first()).toContainText(/planned lessons?, about \d+/);
 });

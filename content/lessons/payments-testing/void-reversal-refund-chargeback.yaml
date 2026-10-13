@@ -1,0 +1,643 @@
+id: void-reversal-refund-chargeback
+title: Void, reversal, refund and chargeback
+subject: payments-testing
+module: payment-lifecycle
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: Four ways money goes back to a cardholder - cancelling an authorisation, reversing an error, refunding a settled payment, and a dispute raised by the issuer - who starts each one, when it is possible, and how to test it.
+tags: [payments, void, authorization reversal, refund, chargeback, dispute, pre-arbitration, arbitration, visa, mastercard]
+
+environment: |
+  - **Scheme rules (primary source):** definitions and the dispute process follow the **Visa Core Rules and
+    Visa Product and Service Rules**, edition of **18 April 2026**
+    ([public PDF](https://usa.visa.com/dam/VCOM/download/about-visa/visa-rules-public.pdf)): the Glossary
+    (Authorization Reversal, Reversal, Credit Transaction Receipt, Dispute, Dispute Response, Arbitration)
+    and chapter 11 "Dispute Resolution" (dispute categories 10-13, Tables 11-1 and 11-2).
+  - **Other networks:** Mastercard describes its process in its Chargeback Guide with different stage names
+    (first chargeback, second presentment, pre-arbitration, arbitration); RuPay, American Express and
+    others have their own rules. Stages are similar, details differ.
+  - **Time limits and fees change** and vary by region and dispute condition. This lesson quotes the
+    structure, not deadlines to rely on - always check the current rules or your acquirer.
+  - **Provider-specific:** what your PSP calls "void", "cancel", "reverse" or "refund", and which it allows
+    in each payment status. **Fictional:** SandPay's endpoints and statuses.
+
+prerequisites:
+  - payment-lifecycle-overview
+  - payment-ecosystem-roles
+
+concepts:
+  - id: money-back-mechanisms
+    name: Void, reversal, refund and chargeback
+    summary: A void cancels an authorisation before it settles; a reversal negates an error; a refund is the merchant's credit after settlement; a chargeback (dispute) is the issuer returning a transaction.
+  - id: dispute-lifecycle
+    name: The dispute lifecycle
+    summary: The issuer raises a dispute under a category and condition; the acquirer may respond with evidence; pre-arbitration and arbitration decide liability if they still disagree.
+  - id: refund-and-dispute-testing
+    name: Testing refunds and disputes
+    summary: Check which operation each payment status allows, totals that never exceed the original, idempotent retries, and no double credit when a refund and a dispute meet.
+
+objectives:
+  - Choose between void, refund and the other mechanisms for a payment in a given status, and explain who starts each.
+  - Describe the stages of a card dispute and what the merchant and acquirer can do at each.
+  - Design tests for voids, refunds and disputes, including the double-credit case.
+  - Explain which timings and amounts are set by scheme rules and must be checked, not assumed.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [money-back-mechanisms]
+    title: The idea in plain language
+    body: |
+      Ordering in a restaurant:
+
+      - You change your mind **before the kitchen starts** - the waiter just tears up the order slip. Nothing
+        was cooked, nothing is charged. That is a **void**.
+      - The waiter typed the order twice **by mistake** and fixes it at the till. That is a **reversal** of
+        an error.
+      - You ate, paid, went home, and the restaurant later **gives money back** because the soup was cold.
+        That is a **refund** - the restaurant decides to do it.
+      - You tell **your bank** the restaurant charged you for a meal you never had, and the bank takes the
+        money back from the restaurant's bank. That is a **chargeback** - the restaurant didn't decide it, and
+        it now has to prove its case.
+
+      Same result for the customer - money back - but **different people start it, at different times, with
+      different consequences** for the merchant.
+
+  - id: what
+    kind: what
+    concepts: [money-back-mechanisms]
+    title: What each mechanism is
+    body: |
+      Definitions quoted from the Visa Core Rules Glossary (April 2026 edition):
+
+      | Mechanism | Visa definition | Started by | When |
+      |---|---|---|---|
+      | **Authorisation reversal** (what most PSPs call **void** or **cancel**) | "A V.I.P. System message that cancels an Approval Response." | merchant (via PSP and acquirer) | after authorisation, **before** capture or clearing |
+      | **Reversal** | "A Deferred Clearing or Online Financial Transaction used to negate or cancel a transaction that has been sent through Interchange in error." | acquirer or processor | to correct an **error**, such as a duplicate submission |
+      | **Refund** (a credit) | a Credit Transaction Receipt is "a Transaction Receipt evidencing a Merchant's refund or price adjustment to be credited to a Cardholder's account" | **merchant** | after the payment is captured or settled |
+      | **Chargeback** (Visa says **Dispute**) | "A Transaction that an Issuer returns to an Acquirer." | **issuer**, usually after the cardholder complains | after the transaction has been presented |
+
+      Practical differences:
+
+      | | Void | Refund | Chargeback |
+      |---|---|---|---|
+      | Customer sees | the pending hold disappears | a separate credit line on the statement | a credit from their bank, often provisional first |
+      | Fees | usually none or small | the original fees are often not returned (contract-specific) | dispute fees, and the merchant may lose the goods too |
+      | Merchant control | full | full | none at the start - it can only respond with evidence |
+      | Effect on risk monitoring | none | none | dispute ratios are monitored by the networks |
+
+  - id: why
+    kind: why
+    concepts: [money-back-mechanisms, refund-and-dispute-testing]
+    title: Why the difference matters to testing
+    body: |
+      - **The system must pick the right operation for the status.** Refunding a payment that was only
+        authorised fails at many PSPs, or leaves a hold *and* a credit; voiding a settled payment is
+        impossible. The order-management code decides - and it is a classic defect.
+      - **Money must not go back twice.** A customer complains, support refunds, and the cardholder has also
+        disputed: without checks, the merchant pays twice. The Visa rules address part of this - if a credit
+        was processed before the dispute, the issuer must apply it to the disputed transaction or explain why
+        it does not resolve the dispute (Tables 11-1 and 11-2) - but your own system must also stop issuing a
+        refund on a disputed payment.
+      - **Chargebacks cost more than refunds.** Fees, lost goods and network monitoring of dispute ratios make
+        a fast, correct refund flow a business feature, not only a support tool.
+      - **Timing explains many "defects".** Refunds appear on the statement after clearing and settlement, and
+        the Visa rules give issuers a set number of days after settlement to post them, depending on region
+        and card type (section 1.4.4.4). "The refund didn't arrive" an hour later is usually expected behaviour.
+
+  - id: internals
+    kind: internals
+    concepts: [dispute-lifecycle]
+    title: How a dispute runs - the Visa process
+    body: |
+      Visa groups disputes into four **categories**, each with numbered **conditions** (chapter 11):
+
+      | Category | Examples of conditions |
+      |---|---|
+      | **10 Fraud** | 10.4 Other Fraud - Card-Absent Environment (an online payment the cardholder says they didn't make) |
+      | **11 Authorization** | 11.2 Declined Authorization, 11.3 No Authorization / Late Presentment |
+      | **12 Processing Errors** | 12.5 Incorrect Amount, 12.6 Duplicate Processing / Paid by Other Means |
+      | **13 Consumer Disputes** | 13.1 Merchandise / Services Not Received, 13.3 Not as Described, 13.6 Credit Not Processed, 13.7 Cancelled Merchandise / Services |
+
+      The stages differ by category group:
+
+      | Stage | Categories 10 and 11 (Table 11-1) | Categories 12 and 13 (Table 11-2) |
+      |---|---|---|
+      | 1 | **Dispute** - the issuer returns the transaction | **Dispute** - the issuer returns the transaction |
+      | 2 | **Pre-Arbitration attempt** by the acquirer (for example with *Compelling Evidence*, section 11.5.1) | **Dispute Response** by the acquirer, with the merchant's evidence |
+      | 3 | **Pre-Arbitration response** by the issuer - accept, or decline with reasons | **Pre-Arbitration attempt** by the issuer if it disagrees with the response |
+      | 4 | **Arbitration** - Visa decides liability | **Arbitration** - Visa decides liability |
+
+      Each stage has a time limit counted from the previous stage's processing date (30 calendar days for
+      several stages in the April 2026 tables, with regional exceptions); Arbitration is "a process where Visa
+      determines financial liability between Members". A merchant can also **accept** a dispute rather than
+      fight it.
+
+      Mastercard's equivalent stages are usually called **first chargeback**, **second presentment**,
+      **pre-arbitration** and **arbitration**. For a tester the shape is the same: **issuer starts,
+      merchant answers with evidence, the network decides if they still disagree.**
+
+  - id: visual
+    kind: visual
+    concepts: [money-back-mechanisms]
+    title: "Flowchart: which operation for this payment?"
+    body: |
+      The decision your order-management system makes when an agent clicks "Give money back". Statuses are
+      SandPay's fictional ones.
+
+      ```mermaid
+      flowchart TD
+          A[Agent asks to give money back] --> B{Payment status?}
+          B -- authorized, not captured --> C[Void - cancel the authorisation]
+          B -- captured or settled --> D{Is a dispute open on it?}
+          D -- Yes --> E[Do not refund - respond to the dispute or accept it]
+          D -- No --> F{Amount within the refundable balance?}
+          F -- Yes --> G[Refund - full or partial]
+          F -- No --> H[Refuse with a clear error]
+          B -- declined, voided or expired --> I[Nothing to give back]
+          B -- fully refunded --> I
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [refund-and-dispute-testing]
+    title: Step by step - testing the money-back paths in a sandbox
+    body: |
+      1. **Read the PSP's documentation** for each operation: which statuses allow it, partial amounts, time
+         limits (some PSPs only allow a void within a window after authorisation), and the resulting statuses
+         and webhooks.
+      2. **Build the status × operation table** (see [state transition testing](#/lesson/state-transition-testing)):
+         every status as a row, void / capture / refund as columns. Every empty cell is a refusal to test.
+      3. **Create each status on demand** with the sandbox's test payment methods - authorised only, captured,
+         partially refunded, disputed (many sandboxes have a test method or API call that simulates a
+         dispute).
+      4. **Test the boundaries of amounts** - refund exactly the remaining amount, one cent more, and several
+         partial refunds that add up (see [partial refunds and invariants](#/lesson/partial-refunds-and-invariants)).
+      5. **Retry every operation** with the same idempotency key and with a new one, to prove no double
+         refund (see [idempotency keys](#/lesson/idempotency-keys)).
+      6. **Simulate a dispute** on a payment, then try to refund it, and check your system blocks the refund or
+         warns the agent.
+      7. **Check the records:** order status, payment status, refund ids, webhooks received, and the customer
+         notification.
+
+  - id: example
+    kind: example
+    concepts: [refund-and-dispute-testing, dispute-lifecycle]
+    title: "Real-world example: the double credit"
+    body: |
+      A customer says a parcel never arrived. Support refunds 64.00 EUR. Two days later, the PSP's webhook
+      reports a **dispute** on the same payment - condition 13.1, Merchandise / Services Not Received - for
+      64.00 EUR. The finance team's report shows the merchant **lost 128.00 EUR**: the refund, and the disputed
+      amount debited by the acquirer.
+
+      What the tester finds, step by step:
+
+      1. The refund was processed **before** the dispute. Under the Visa process the issuer must apply such a
+         credit to the dispute or explain why it doesn't resolve it - so the acquirer can answer the dispute with
+         the refund's details as evidence.
+      2. The merchant's system never told the acquirer: the dispute screen had no link to refunds on the same
+         payment, so nobody responded, and the dispute was effectively accepted.
+      3. The order system also **allowed a second refund** after the dispute arrived - it didn't check open
+         disputes.
+
+      Defects raised: show refunds on the dispute screen and send them as evidence; block refunds on payments
+      with an open dispute; add the double-credit scenario to the regression suite.
+
+  - id: code
+    kind: code
+    concepts: [money-back-mechanisms, refund-and-dispute-testing]
+    title: Void and refund requests (fictional SandPay API)
+    collapsed: true
+    body: |
+      Void an authorisation that hasn't been captured:
+
+      ```http
+      POST /v1/payments/pay_81Fz/void HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      Idempotency-Key: void-ORD-1042
+      ```
+
+      ```http
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {"id": "pay_81Fz", "status": "voided", "amount": 6400, "currency": "EUR"}
+      ```
+
+      Partial refund of a captured payment:
+
+      ```http
+      POST /v1/payments/pay_92Kd/refunds HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      Content-Type: application/json
+      Idempotency-Key: refund-ORD-1043-1
+
+      {"amount": 2000, "reason": "requested_by_customer"}
+      ```
+
+      ```http
+      HTTP/1.1 201 Created
+      Content-Type: application/json
+
+      {"id": "re_3Pq1", "payment": "pay_92Kd", "amount": 2000, "status": "pending"}
+      ```
+
+      Trying to refund a payment that is only authorised:
+
+      ```http
+      HTTP/1.1 409 Conflict
+      Content-Type: application/json
+
+      {"error": {"code": "payment_not_captured", "message": "Void the authorisation instead."}}
+      ```
+
+      The refund starts **pending**; a webhook reports when it succeeds or fails. Real providers name these
+      endpoints, statuses and error codes differently - check your PSP's API reference.
+
+  - id: tests
+    kind: tests
+    concepts: [refund-and-dispute-testing]
+    title: Positive and negative test cases
+    body: |
+      | ID | Payment status | Action | Expected | Evidence |
+      |---|---|---|---|---|
+      | P1 | authorised | void | `voided`; hold released; order cancelled | payment status, webhook |
+      | P2 | captured 64.00 | full refund | refund pending → succeeded; payment `refunded` | refund object, webhook, customer email |
+      | P3 | captured 64.00 | refunds 20.00 + 44.00 | both succeed; payment `refunded`; total 64.00 | refund list, payment balance |
+      | N1 | authorised | refund | refused (or converted to a void by design) - never a hold **and** a credit | API error, status unchanged |
+      | N2 | captured | void | refused - use refund | API error |
+      | N3 | captured 64.00 | refund 64.01 | refused - exceeds refundable amount | error, no refund created |
+      | N4 | refund sent twice, same idempotency key | - | one refund only | refund list |
+      | N5 | open dispute | refund from the back office | blocked or warned; dispute response offered instead | UI message, no refund created |
+      | N6 | refund processed, then dispute arrives | - | dispute screen shows the refund as evidence; alert to respond | dispute record |
+      | N7 | dispute lost (sandbox) | - | order marked charged back; stock and accounting updated | order record, ledger |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [money-back-mechanisms, dispute-lifecycle, refund-and-dispute-testing]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Using refund and void interchangeably.** They are different operations for different statuses.
+      - **Refunding a disputed payment.** It risks paying twice - block it, respond to the dispute instead.
+      - **Ignoring dispute webhooks in tests.** Disputes arrive days or weeks later, asynchronously; simulate
+        them in the sandbox.
+      - **Quoting deadlines from memory.** Time limits differ by network, region and condition, and change with
+        rule updates. Read the current rules or ask the acquirer.
+      - **Assuming fees come back with a refund.** Contract-specific - check, and reconcile.
+      - **Not testing partial and repeated operations.** Several partial refunds are where totals go wrong.
+      - **Treating a refund as instant.** It is pending until the PSP confirms it, and appears on the statement
+        later.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [money-back-mechanisms]
+    title: Choosing the mechanism - trade-offs
+    body: |
+      | Situation | Best option | Why |
+      |---|---|---|
+      | Order cancelled before shipping, payment only authorised | void | no money moved; cheapest; the hold disappears quickly |
+      | Order cancelled after capture | refund | void is no longer possible |
+      | Duplicate submission by the system | reversal or refund (as the PSP supports) | fixes the error before the customer complains |
+      | Customer complains to the merchant | refund promptly | prevents a dispute, which costs more |
+      | Customer already disputed | respond to or accept the dispute | a refund now risks a double credit |
+
+      Capturing only at shipping (delayed capture) makes voids possible for more cancellations - but
+      authorisations expire, so it needs its own tests (see the
+      [payment lifecycle](#/lesson/payment-lifecycle-overview)).
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - **Void / authorisation reversal** - merchant cancels an approval before capture or clearing.
+      - **Reversal** - negates a transaction sent in error.
+      - **Refund** - merchant credits the cardholder after capture or settlement.
+      - **Chargeback / dispute** - the issuer returns a transaction; the merchant can only respond with evidence.
+      - Visa dispute categories: **10 Fraud, 11 Authorization, 12 Processing Errors, 13 Consumer Disputes**;
+        stages run to pre-arbitration and arbitration.
+      - Test: operation × status table, amount boundaries, idempotent retries, **refund-plus-dispute double
+        credit**. Source: Visa Core Rules, 18 April 2026.
+
+exercises:
+  - id: choose-operation
+    type: mcq
+    concept: money-back-mechanisms
+    skill: application
+    title: Cancel before shipping
+    prompt: |
+      An order is cancelled an hour after the customer paid. The payment is **authorised but not captured**
+      (the shop captures at shipping). What should the system do?
+    options:
+      - id: void
+        text: Void (cancel) the authorisation
+        feedback: Correct - nothing has been captured, so cancelling the approval releases the hold without any money moving.
+      - id: refund
+        text: Issue a full refund
+        feedback: There is nothing captured to refund. Many PSPs refuse it; at worst the customer sees a hold and a credit.
+      - id: chargeback
+        text: Ask the customer to raise a chargeback with their bank
+        feedback: A chargeback is the issuer's process for disputes - costly for the merchant and unnecessary here.
+      - id: wait
+        text: Do nothing - the authorisation will expire
+        feedback: It would eventually, but the customer's funds stay blocked until then. Voiding is the clean, immediate option.
+    correct: [void]
+    hints:
+      - Has any money moved yet?
+    solution: |
+      **Void.** The authorisation reserved the amount; cancelling it (an authorisation reversal) releases the
+      hold. Test that the order is cancelled, the payment becomes `voided`, and a later capture attempt is refused.
+    followUp: |
+      The same order is cancelled after shipping, when the payment has been captured. What changes for the
+      customer - and for the merchant's fees?
+
+  - id: who-starts
+    type: mcq
+    concept: money-back-mechanisms
+    skill: recognition
+    title: Who starts it?
+    prompt: Which mechanism is started by the **issuer**, not by the merchant?
+    options:
+      - id: chargeback
+        text: A chargeback (dispute)
+        feedback: Correct - the Visa rules define a dispute as a transaction that an issuer returns to an acquirer.
+      - id: refund
+        text: A refund
+        feedback: A refund is the merchant's decision, evidenced by a credit transaction receipt.
+      - id: void
+        text: A void
+        feedback: The merchant cancels its own authorisation.
+      - id: partial-refund
+        text: A partial refund
+        feedback: Still a merchant refund - just for part of the amount.
+    correct: [chargeback]
+    hints:
+      - Which one can happen even if the merchant disagrees?
+    solution: |
+      **A chargeback.** It is why chargebacks are expensive: the merchant didn't choose it and can only respond
+      with evidence.
+    followUp: |
+      Name two dispute conditions from Visa's category 13 that a better refund process could prevent.
+
+  - id: order-dispute-stages
+    type: order
+    concept: dispute-lifecycle
+    skill: recall
+    title: A consumer dispute, stage by stage
+    prompt: Put the stages of a Visa category 13 (Consumer Disputes) dispute in order, when neither side gives in.
+    items:
+      - id: complaint
+        text: The cardholder complains to the issuer
+      - id: dispute
+        text: The issuer raises a Dispute under a category 13 condition
+      - id: response
+        text: The acquirer sends a Dispute Response with the merchant's evidence
+      - id: prearb
+        text: The issuer makes a Pre-Arbitration attempt with new information
+      - id: arbitration
+        text: Visa decides liability in Arbitration
+    hints:
+      - In categories 12 and 13 the acquirer answers first with a Dispute Response.
+    solution: |
+      Complaint → Dispute → Dispute Response → Pre-Arbitration attempt → Arbitration (Table 11-2). For fraud and
+      authorization categories (Table 11-1) the acquirer's first move is a pre-arbitration attempt instead.
+
+  - id: debug-refund-guard
+    type: debug
+    concept: refund-and-dispute-testing
+    skill: analysis
+    title: Find the missing guard
+    prompt: |
+      Test N5 fails: the back office lets an agent refund a payment with an open dispute. Click the line where the
+      refund is allowed without checking for disputes.
+    language: java
+    code: |
+      RefundDecision decide(Payment payment, long amountMinor) {
+          if (payment.status() == Status.AUTHORIZED) {
+              return RefundDecision.useVoid();
+          }
+          long refundable = payment.capturedMinor() - payment.refundedMinor();
+          if (amountMinor <= 0 || amountMinor > refundable) {
+              return RefundDecision.refuse("amount_exceeds_refundable");
+          }
+          return RefundDecision.allow();
+      }
+    correctLines: [9]
+    lineNotes:
+      - line: 2
+        note: Sending authorised-only payments to a void is correct.
+      - line: 6
+        note: The amount checks are right - zero, negative and above the refundable balance are refused.
+    hints:
+      - Which payments should never get a refund, whatever the amount?
+    solution: |
+      **Line 9.** Every amount within the balance is allowed, including on payments with an open dispute. Before
+      allowing, the method must check `payment.hasOpenDispute()` and refuse (or route the agent to the dispute
+      response). Otherwise the merchant can lose the money twice.
+    followUp: |
+      After the guard is added, which tests prove it - including one that shows refunds still work when a dispute
+      has been closed in the merchant's favour?
+
+  - id: refund-dispute-tests
+    type: testdesign
+    concept: refund-and-dispute-testing
+    skill: application
+    title: Design the money-back test set
+    prompt: |
+      For a shop that captures at shipping and allows partial refunds, write test cases that cover: void,
+      full and partial refunds, a refund that exceeds the balance, a retried refund, a dispute on a refunded
+      payment, and a refund attempt on a disputed payment. Give preconditions, steps, expected results and evidence.
+    hints:
+      - Create each status on demand with sandbox test methods - authorised only, captured, disputed.
+      - Which tests use the same idempotency key, and which a new one?
+      - What evidence proves the merchant didn't pay twice?
+    modelAnswer: |
+      1. Authorised payment → cancel order → void; payment `voided`, order cancelled. Evidence: payment status,
+         webhook.
+      2. Captured 64.00 → refund 64.00 → refund succeeds; payment `refunded`. Evidence: refund object, webhook,
+         email.
+      3. Captured 64.00 → refund 20.00, then 44.00 → both succeed; refunded total 64.00. Evidence: refund list.
+      4. Captured 64.00 → refund 64.01 → refused, no refund created. Evidence: error, refund list unchanged.
+      5. Refund 20.00 sent twice with the same idempotency key → one refund. Evidence: refund list, second response
+         replays the first.
+      6. Refund 64.00, then simulate a dispute for 64.00 → dispute screen shows the refund; alert to respond.
+         Evidence: dispute record with the linked refund.
+      7. Simulate a dispute, then try to refund → blocked with a message pointing to the dispute. Evidence: no
+         refund created.
+    rubric:
+      - Covered void on an authorised-only payment
+      - Covered full and partial refunds, with totals checked
+      - Covered an amount above the refundable balance
+      - Covered an idempotent retry of a refund
+      - Covered a dispute arriving after a refund (double credit)
+      - Covered a refund attempt on a disputed payment
+      - Named evidence beyond the UI (payment and refund objects, webhooks, dispute records)
+    solution: |
+      Compare with the model answer. Tests 6 and 7 are the ones most often missing - and the ones that protect the
+      merchant from paying twice.
+    followUp: |
+      How would you test that dispute webhooks arriving out of order (dispute closed before dispute opened) don't
+      break the order's status?
+
+  - id: interview-chargeback
+    type: interview
+    concept: dispute-lifecycle
+    skill: application
+    title: "Interview: refund or chargeback?"
+    prompt: |
+      *"What's the difference between a refund and a chargeback, and why should a payments tester care?"* Answer
+      as you would in the interview.
+    hints:
+      - Who starts each, and when?
+      - What does it cost the merchant, and what can go wrong in the system?
+    modelAnswer: |
+      A refund is the merchant's decision to give money back after a payment was captured - the merchant creates
+      it through its PSP and controls the amount. A chargeback - Visa calls it a dispute - is started by the
+      cardholder's bank, the issuer, which returns the transaction to the merchant's acquirer under a dispute
+      reason, for example fraud, an incorrect amount or goods not received. The merchant can accept it or respond
+      with evidence; if the parties still disagree it goes through pre-arbitration and finally arbitration by the
+      network.
+
+      Testers should care because chargebacks are costly - fees, lost goods, and networks monitor dispute ratios -
+      so a fast, correct refund flow prevents them. And because the system must handle both safely: choose void or
+      refund by status, keep refund totals within the captured amount, make retries idempotent, process dispute
+      webhooks that arrive weeks later, and never refund a payment that is already disputed, which would pay the
+      customer twice.
+    rubric:
+      - Said a refund is merchant-initiated and a chargeback issuer-initiated
+      - Mentioned dispute reasons or categories
+      - Described the merchant's options (accept or respond with evidence) and escalation to arbitration
+      - Explained the cost to the merchant
+      - Named concrete test risks, including the double credit
+      - Mentioned asynchronous dispute notifications
+    followUps:
+      - How would you simulate a dispute in a sandbox?
+      - What evidence would you give the acquirer for a "goods not received" dispute?
+      - What's a void, and when is it better than a refund?
+    solution: |
+      The best answers move from definitions to **system risks** - double credit, status rules and asynchronous
+      events.
+
+  - id: explain-dispute-timing
+    type: short
+    concept: dispute-lifecycle
+    skill: recall
+    title: Why not hard-code dispute deadlines
+    prompt: In two or three sentences, explain why a merchant's system should not hard-code dispute response deadlines from a blog post or from memory.
+    hints:
+      - What do the deadlines depend on, and who changes them?
+    modelAnswer: |
+      Time limits are set by each card network's rules and differ by network, region and dispute condition, and the
+      networks update them in new rule editions. The deadline that applies to a dispute should come from the
+      acquirer's or PSP's dispute data (which states the respond-by date) or from configuration reviewed against
+      the current rules.
+    rubric:
+      - Said deadlines vary by network, region or condition
+      - Said rules change over time
+      - Proposed using the deadline supplied with the dispute or reviewed configuration
+    solution: |
+      The Visa tables themselves list regional exceptions to their standard time limits - a good illustration.
+
+placement:
+  - id: place-mechanism
+    type: mcq
+    concept: money-back-mechanisms
+    skill: application
+    title: Captured, then returned
+    prompt: A customer returns goods two weeks after the payment was captured and settled. What does the merchant do?
+    options:
+      - id: refund
+        text: Issue a refund
+        feedback: Correct - after capture and settlement, giving money back is a merchant refund.
+      - id: void
+        text: Void the authorisation
+        feedback: The authorisation was captured and settled long ago; there is nothing left to cancel.
+      - id: chargeback
+        text: Raise a chargeback
+        feedback: Merchants don't raise chargebacks - issuers do, on the cardholder's behalf.
+      - id: reversal
+        text: Send a reversal
+        feedback: A reversal negates a transaction sent in error; a customer return is not a processing error.
+    correct: [refund]
+    solution: |
+      **A refund** - full or partial, as the return policy says, and never more than the refundable balance.
+
+  - id: place-dispute
+    type: mcq
+    concept: dispute-lifecycle
+    skill: application
+    title: The merchant disagrees
+    prompt: An issuer raises a consumer dispute ("merchandise not received"), but the merchant has a signed delivery confirmation. What is the next step on the merchant's side?
+    options:
+      - id: response
+        text: Give the evidence to the acquirer, which presents a dispute response to the issuer
+        feedback: Correct - in categories 12 and 13 the acquirer responds to the dispute with the merchant's evidence.
+      - id: refund-now
+        text: Refund the customer now to close the dispute
+        feedback: The disputed amount is already returned to the cardholder; a refund now would pay twice.
+      - id: arbitration
+        text: Go straight to arbitration
+        feedback: Arbitration comes after the earlier stages have failed to resolve the dispute.
+      - id: contact-network
+        text: Contact the card network directly
+        feedback: The merchant works through its acquirer; the network deals with its members.
+    correct: [response]
+    solution: |
+      **Evidence through the acquirer** (a Dispute Response, in Visa's terms). If the issuer still disagrees it can
+      make a pre-arbitration attempt, and the network can finally decide in arbitration.
+
+  - id: place-testing
+    type: mcq
+    concept: refund-and-dispute-testing
+    skill: analysis
+    title: The riskiest gap
+    prompt: Which missing check is most likely to make the merchant lose money twice?
+    options:
+      - id: dispute-guard
+        text: Allowing a refund on a payment that already has an open dispute
+        feedback: Correct - the disputed amount is already taken back; refunding it as well pays the customer twice.
+      - id: email
+        text: Not sending a refund confirmation email
+        feedback: Annoying for the customer, but no money is lost.
+      - id: reason
+        text: Not storing the refund reason
+        feedback: Useful for reporting, but it doesn't move money.
+      - id: void-expiry
+        text: Letting an authorisation expire instead of voiding it
+        feedback: The customer waits longer for the hold to disappear, but no money is lost twice.
+    correct: [dispute-guard]
+    solution: |
+      **Refunding a disputed payment.** Block it, and show refunds on the dispute screen so they can be used as
+      evidence.
+
+recall:
+  - id: recall-void
+    concept: money-back-mechanisms
+    prompt: What is a void, in card terms?
+    answer: An authorisation reversal - the merchant cancels an approval before capture or clearing, so the hold is released and no money moves.
+  - id: recall-refund
+    concept: money-back-mechanisms
+    prompt: Who starts a refund and who starts a chargeback?
+    answer: The merchant starts a refund; the issuer starts a chargeback (a dispute), usually after the cardholder complains.
+  - id: recall-categories
+    concept: dispute-lifecycle
+    prompt: What are Visa's four dispute categories?
+    answer: 10 Fraud, 11 Authorization, 12 Processing Errors and 13 Consumer Disputes.
+  - id: recall-stages
+    concept: dispute-lifecycle
+    prompt: What are the stages of a Visa consumer dispute when it isn't resolved early?
+    answer: Dispute, Dispute Response by the acquirer, Pre-Arbitration attempt by the issuer, then Arbitration by Visa.
+  - id: recall-double-credit
+    concept: refund-and-dispute-testing
+    prompt: What is the double-credit risk?
+    answer: The merchant refunds a payment and also loses a dispute on it, so the customer gets the money back twice.
+  - id: recall-status-table
+    concept: refund-and-dispute-testing
+    prompt: Which operation fits an authorised-only payment, and which a captured one?
+    answer: Void for authorised-only; refund for captured or settled payments.
+
+next:
+  - partial-refunds-and-invariants
+  - card-payments-and-tokenisation

@@ -1,0 +1,684 @@
+id: three-d-secure-and-redirects
+title: 3-D Secure, redirects and return flows
+subject: payments-testing
+module: checkout-and-methods
+level: intermediate
+status: published
+estimatedMinutes: 55
+summary: How EMV 3-D Secure authenticates a card payment - frictionless and challenge flows, the parties and status values - where strong customer authentication rules and exemptions come in, and how to test the redirect out to the bank and back.
+tags: [payments, 3-d secure, emv 3ds, sca, psd2, challenge, frictionless, redirect, return url, abandonment, liability shift]
+
+environment: |
+  - **Standards:**
+    - **EMV 3-D Secure** by EMVCo ([emvco.com/emv-technologies/3-d-secure](https://www.emvco.com/emv-technologies/3-d-secure/)).
+      EMVCo currently lists protocol versions **2.2.0 to 2.3.1.1** as supported and recommends v2.2 or higher; a
+      v2.4.0 draft was open for comment in 2026. The message and status names in this lesson (AReq/ARes,
+      CReq/CRes, `transStatus`) are the protocol's; the values a merchant sees depend on its PSP's API.
+    - The Visa rules define **Visa Secure** as "a Visa-approved Authentication Method based on the 3-D Secure
+      Specification" ([Visa Core Rules, 18 April 2026](https://usa.visa.com/dam/VCOM/download/about-visa/visa-rules-public.pdf));
+      Mastercard's programme is called Identity Check.
+  - **Regulation (region-specific):** in the EEA, **strong customer authentication (SCA)** is required by PSD2
+    (Directive (EU) 2015/2366, Article 97) and detailed in the **RTS, Commission Delegated Regulation (EU)
+    2018/389**, including its exemptions (Articles 10-18). Other countries have their own rules - for example
+    the Reserve Bank of India requires an additional factor of authentication for most domestic card-not-present
+    payments. Summaries here are for testers, not legal advice; check the current text and your PSP's guidance.
+  - **Provider-specific:** how your PSP exposes 3-D Secure (a `requires_action` status, a redirect URL, an SDK
+    for apps), which exemptions it requests, and its sandbox test methods. **Fictional:** SandPay
+    (`pm_sandpay_3ds_challenge`).
+
+prerequisites:
+  - payment-lifecycle-overview
+  - card-payments-and-tokenisation
+
+concepts:
+  - id: emv-3ds-flows
+    name: EMV 3-D Secure flows
+    summary: The merchant's 3DS server sends transaction and device data through the network's directory server to the issuer's ACS, which either approves frictionlessly or asks for a challenge; the result travels into authorisation.
+  - id: sca-and-exemptions
+    name: Strong customer authentication and exemptions
+    summary: SCA needs two independent factors from knowledge, possession and inherence; regulated exemptions (low value, low risk, recurring, trusted payees) and out-of-scope payments decide when no challenge is needed.
+  - id: redirect-return-flows
+    name: Redirect and return flows
+    summary: The customer leaves the shop for the bank's page or app and must come back to a correct, final state - even if they abandon, close the tab, switch apps or return twice.
+
+objectives:
+  - Describe the frictionless and challenge flows of EMV 3-D Secure and the role of each party.
+  - Interpret the 3-D Secure outcome values and decide what the shop should do with each.
+  - Explain when strong customer authentication is required and which exemptions avoid a challenge.
+  - Design tests for redirects and returns, including abandonment, timeouts, duplicate returns and app switching.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [emv-3ds-flows]
+    title: The idea in plain language
+    body: |
+      At a hotel desk, the receptionist may simply recognise you and hand over the key. If something looks odd -
+      a new face, a big bill - they ask for your passport. **Most guests are waved through; a few are checked.**
+
+      3-D Secure does that for online card payments. The shop sends the card issuer information about the
+      purchase and the device. The issuer's system decides:
+
+      - **"I recognise this"** - approve the authentication silently (**frictionless**);
+      - **"prove it's you"** - show a **challenge**: a one-time code, a banking-app approval, a fingerprint;
+      - or **"no"**.
+
+      For the shop, the hard part isn't the decision - it's the **journey**. The customer leaves your page for
+      the bank's page or app, and you don't control what happens there: they may succeed, give up, close the
+      tab, or come back twice. Your checkout has to end in the right state every time.
+
+  - id: what
+    kind: what
+    concepts: [emv-3ds-flows]
+    title: What the parties and messages are
+    body: |
+      | Party (EMV 3DS term) | Who runs it | Role |
+      |---|---|---|
+      | **3DS Requestor** | the merchant | asks for authentication |
+      | **3DS Server** | usually the PSP | builds and sends the authentication request |
+      | **3DS SDK** | in the merchant's mobile app | collects device data and shows native challenges |
+      | **Directory Server (DS)** | the card network | routes the request to the right issuer |
+      | **Access Control Server (ACS)** | the issuer (or its provider) | decides frictionless or challenge, runs the challenge |
+
+      Main messages: **AReq / ARes** (authentication request and response), **CReq / CRes** (the challenge),
+      **RReq / RRes** (the final result after a challenge). Channels: **app-based**, **browser-based**, and
+      **3RI** (3DS Requestor Initiated - authentication without the customer, for example for some
+      merchant-initiated payments).
+
+      The outcome is the **transaction status** (`transStatus`):
+
+      | Value | Meaning | Typical shop action |
+      |---|---|---|
+      | `Y` | authenticated | continue to authorisation |
+      | `A` | attempts processing - not authenticated, but proof of an attempt | continue (rules on liability vary) |
+      | `C` | challenge required | show the challenge |
+      | `D` | decoupled challenge - the customer authenticates elsewhere (v2.2+) | wait for the result |
+      | `N` | not authenticated / denied | don't authorise; ask for another method |
+      | `R` | rejected - issuer asks not to attempt authorisation | don't authorise |
+      | `U` | authentication could not be performed (technical) | PSP- and risk-dependent - often retry or decline |
+      | `I` | informational only (v2.2+) | continue as the PSP advises |
+
+      Most PSPs translate this into their own statuses - SandPay uses `requires_action` while a challenge is
+      pending.
+
+  - id: why
+    kind: why
+    concepts: [sca-and-exemptions, redirect-return-flows]
+    title: Why 3-D Secure is a testing hotspot
+    body: |
+      - **It is required in many places.** In the EEA, PSD2 Article 97 requires strong customer authentication
+        for electronic payments the payer initiates, unless an exemption applies. A checkout that never handles
+        a challenge will fail for many real customers.
+      - **It moves fraud liability.** Successful authentication can shift liability for certain fraud disputes
+        from the merchant to the issuer, under each network's rules - one reason merchants request it.
+      - **It leaves your control.** The bank's page, the bank's app, the customer's phone: the most common
+        defects are in **leaving and coming back** - lost sessions, orders stuck in "pending", double charges
+        after a second return.
+      - **It differs per issuer.** Every bank's challenge looks and behaves differently. A sandbox shows one
+        simulated challenge page; production shows hundreds.
+
+  - id: internals
+    kind: internals
+    concepts: [sca-and-exemptions]
+    title: How SCA and exemptions decide whether a challenge appears
+    body: |
+      **SCA** (RTS Article 4) means authentication with **two or more independent elements** from:
+
+      - **knowledge** - something only the customer knows (a password, a PIN);
+      - **possession** - something only they have (their phone with the banking app, a one-time code sent to it);
+      - **inherence** - something they are (fingerprint, face).
+
+      **Exemptions and out-of-scope payments** (RTS Articles 10-18 and regulators' guidance - EEA rules) can
+      avoid a challenge. Whether one is *granted* is the issuer's decision; the merchant's PSP can only *request* it.
+
+      | Case | Idea | Who decides |
+      |---|---|---|
+      | Low-value remote payment (Art. 16) | up to 30 EUR, until the cumulative amount since the last SCA exceeds 100 EUR or 5 consecutive payments | issuer tracks the counters |
+      | Transaction risk analysis (Art. 18) | low-risk payments, within limits tied to the provider's measured fraud rate | acquirer or issuer, if their fraud rate qualifies |
+      | Recurring payments (Art. 14) | same amount, same payee, after SCA on the first | issuer |
+      | Trusted beneficiaries (Art. 13) | the customer added the merchant to a trusted list at their bank | issuer |
+      | Merchant-initiated payments | not initiated by the payer, so treated as outside SCA when the agreement was set up with SCA | issuer, based on correct flags |
+
+      The practical consequence for testers: **any payment can be challenged** - even a 5 EUR one, even one
+      where an exemption was requested - because the issuer always may. The checkout must handle a challenge
+      on every path.
+
+  - id: visual
+    kind: visual
+    concepts: [emv-3ds-flows, redirect-return-flows]
+    title: "Sequence diagram: a browser challenge and the return"
+    body: |
+      The customer's browser leaves the shop for the issuer's challenge and comes back to the return URL. The
+      shop must **check the payment's final status with the PSP** - never trust the return alone.
+
+      ```mermaid
+      sequenceDiagram
+          participant B as Customer browser
+          participant M as Merchant
+          participant P as PSP and 3DS server
+          participant DS as Directory server
+          participant ACS as Issuer ACS
+          B->>M: Pay 120.00 EUR
+          M->>P: Create payment
+          P->>DS: AReq with transaction and device data
+          DS->>ACS: AReq
+          ACS-->>DS: ARes - C, challenge required
+          DS-->>P: ARes C
+          P-->>M: requires_action, challenge URL
+          M-->>B: Redirect or open challenge frame
+          B->>ACS: Challenge - customer approves in banking app
+          ACS-->>P: RReq - Y, authenticated
+          ACS-->>B: Back to the return URL
+          B->>M: GET return URL
+          M->>P: Get payment status
+          P-->>M: authorized
+          M-->>B: Order confirmed
+          P-->>M: Webhook payment.authorized
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [redirect-return-flows]
+    title: Step by step - testing the return journey
+    body: |
+      1. **List the outcomes** your PSP's sandbox can simulate: frictionless success, challenge passed,
+         challenge failed, challenge abandoned, authentication unavailable, decline after authentication.
+      2. **For each outcome, define the final state** of the order, the payment and the customer's screen -
+         before you run anything.
+      3. **Run each one on desktop and on a phone**, including a challenge in a separate banking app (the
+         sandbox often simulates this with a page; note what it can't show).
+      4. **Break the journey** at every point: close the tab during the challenge, press Back from the bank page,
+         let the challenge time out, reload the return URL, open the return URL twice, return after the shop
+         session expired.
+      5. **Check the server, not only the screen**: payment status from the PSP API, order status, webhook
+         received, number of authorisations (exactly one).
+      6. **Check the messages**: a failed or abandoned authentication should offer another try or another method,
+         without the word "error" for a normal "no".
+
+  - id: example
+    kind: example
+    concepts: [redirect-return-flows]
+    title: "Real-world example: paid at the bank, \"failed\" at the shop"
+    body: |
+      Customers complain: "My bank app said approved, your shop said payment failed, and now I see the amount
+      reserved." Support finds a pattern - all on mobile, all with banking-app challenges.
+
+      The tester reproduces it on a phone: the challenge opens the bank's app; after approving, the phone
+      returns to the **browser tab** - but the operating system had discarded the tab to free memory, so it
+      reloads the return URL **without the shop's session cookie**. The shop's return handler looked up the
+      payment **from the session**, found nothing, and showed "Payment failed".
+
+      Meanwhile the PSP had authorised the payment and sent a webhook - which the shop ignored for orders it
+      considered failed.
+
+      Fixes: put the order reference in the return URL (signed, so it can't be tampered with), always read the
+      payment status from the PSP, and let the webhook update the order regardless of what the browser did.
+      Regression tests: return without a session cookie; webhook before return; webhook after return; no return
+      at all.
+
+  - id: code
+    kind: code
+    concepts: [emv-3ds-flows, redirect-return-flows]
+    title: A payment that needs a challenge (fictional SandPay API)
+    collapsed: true
+    body: |
+      ```http
+      POST /v1/payments HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      Content-Type: application/json
+      Idempotency-Key: ORD-3007
+
+      {
+        "amount": 12000,
+        "currency": "EUR",
+        "payment_method": "pm_sandpay_3ds_challenge",
+        "return_url": "https://shop.example.com/checkout/return?order=ORD-3007&sig=<signature>"
+      }
+      ```
+
+      ```http
+      HTTP/1.1 201 Created
+      Content-Type: application/json
+
+      {
+        "id": "pay_6Wm4",
+        "status": "requires_action",
+        "next_action": {
+          "type": "redirect",
+          "url": "https://acs.sandpay.example/challenge/7f3c"
+        },
+        "authentication": {"protocol": "3ds2", "version": "2.2.0", "trans_status": "C"}
+      }
+      ```
+
+      On return, the shop **asks the PSP** for the status:
+
+      ```http
+      GET /v1/payments/pay_6Wm4 HTTP/1.1
+      Host: api.sandpay.example
+      Authorization: Bearer <sandbox key>
+      ```
+
+      ```json
+      {"id": "pay_6Wm4", "status": "authorized", "authentication": {"trans_status": "Y", "eci": "05"}}
+      ```
+
+      The **ECI** (electronic commerce indicator) records the authentication outcome in the authorisation; its
+      values are brand-specific (Visa and Mastercard use different codes) - your PSP's documentation lists them.
+
+  - id: tests
+    kind: tests
+    concepts: [emv-3ds-flows, redirect-return-flows, sca-and-exemptions]
+    title: Positive and negative test cases
+    body: |
+      | ID | Scenario | Expected | Evidence |
+      |---|---|---|---|
+      | P1 | frictionless authentication | no challenge; order paid | payment `authorized`, trans_status Y |
+      | P2 | challenge passed | return → order paid; exactly one authorisation | PSP payment, order, webhook |
+      | P3 | small payment where an exemption is requested **and** the sandbox still challenges | challenge shown and handled | recording, payment status |
+      | N1 | challenge failed (N) | no authorisation; message offers another try or method | payment status, screen |
+      | N2 | challenge abandoned - tab closed | order stays unpaid; payment ends cancelled or expires per PSP; cart kept | payment status later, order, cart |
+      | N3 | Back pressed on the bank page | returns to checkout with a clear state; no duplicate payment on retry | payment list |
+      | N4 | return URL opened twice | one order confirmation, no second capture | order list, payment list |
+      | N5 | return without the session cookie | status read from the PSP; correct result shown | screen, server log |
+      | N6 | webhook arrives before the browser returns | order already paid; return shows the confirmation | event log, order |
+      | N7 | customer never returns | webhook completes the order; customer emailed | webhook, email |
+      | N8 | authentication unavailable (U) | behaviour the PSP documents (retry or decline), never "paid" without authorisation | payment status |
+      | N9 | tampered return URL (another order's reference) | rejected - signature check fails | 4xx or error page, no order change |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [redirect-return-flows, sca-and-exemptions, emv-3ds-flows]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Trusting the return URL.** It only says "the customer came back". Read the payment status from the PSP.
+      - **Keeping the order reference only in the session.** Phones discard tabs; banking apps open new ones.
+      - **Ignoring webhooks for "failed" orders.** The payment may have succeeded after all.
+      - **Assuming exemptions mean "no challenge".** The issuer decides; every path must handle a challenge.
+      - **Unsigned return parameters.** A customer can edit the URL to point at someone else's order.
+      - **Testing only the sandbox challenge page.** Real issuers use apps, codes and biometrics - plan a small
+        controlled production check if your organisation allows it, and monitor authentication success rates.
+      - **Hard-coding status values.** Use the PSP's documented statuses; protocol values (Y, C, N...) may be
+        mapped differently.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sca-and-exemptions]
+    title: Frictionless, challenge and exemptions - the trade-offs
+    body: |
+      | Choice | Benefit | Cost |
+      |---|---|---|
+      | Always request a challenge | strongest authentication, fraud liability usually shifted | more abandoned checkouts |
+      | Request exemptions where allowed | smoother checkout | liability may stay with the merchant; issuer may still challenge |
+      | Send rich data (device, address, history) | more frictionless approvals by issuers | integration effort, data-protection review |
+      | Decoupled or in-app challenges | better on phones | harder to test; depends on the issuer's app |
+
+      Track **authentication success rate**, **challenge rate** and **abandonment** per issuer after release - the
+      sandbox can't predict them.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - EMV 3DS: **3DS Requestor / 3DS Server → Directory Server → ACS**; frictionless or **challenge**;
+        result into authorisation.
+      - `transStatus`: **Y** authenticated, **A** attempted, **C** challenge, **D** decoupled, **N** no, **R**
+        rejected, **U** unavailable, **I** informational.
+      - SCA (EEA): **two of knowledge, possession, inherence**; exemptions (low value, TRA, recurring, trusted
+        payees) are **requested by the merchant side, granted by the issuer**.
+      - Returns: **never trust the return** - read the status from the PSP, sign return parameters, handle no
+        session, double returns, abandonment and webhooks first.
+      - Sources: EMVCo 3-D Secure; PSD2 Art. 97 and RTS (EU) 2018/389; Visa Core Rules.
+
+exercises:
+  - id: frictionless-or-challenge
+    type: mcq
+    concept: emv-3ds-flows
+    skill: recognition
+    title: Who decides the challenge?
+    prompt: In EMV 3-D Secure, which party decides whether the customer gets a frictionless authentication or a challenge?
+    options:
+      - id: acs
+        text: The issuer's Access Control Server (ACS)
+        feedback: Correct - the ACS assesses the transaction and device data and answers with Y, C, N and so on.
+      - id: merchant
+        text: The merchant
+        feedback: The merchant can request a challenge or an exemption, but the issuer's ACS decides.
+      - id: ds
+        text: The card network's Directory Server
+        feedback: The Directory Server routes messages between the 3DS server and the ACS; it doesn't make the risk decision.
+      - id: psp
+        text: The PSP's 3DS server
+        feedback: The 3DS server builds and sends the request on the merchant's behalf; the answer comes from the issuer.
+    correct: [acs]
+    hints:
+      - Who knows the cardholder and their usual behaviour?
+    solution: |
+      **The issuer's ACS.** That is why the same checkout can be frictionless for one customer and challenged for
+      another - and why every path must handle a challenge.
+    followUp: |
+      What data could the merchant send in the authentication request to make a frictionless approval more likely?
+
+  - id: trans-status-action
+    type: mcq
+    concept: emv-3ds-flows
+    skill: application
+    title: The ARes says R
+    prompt: The authentication result for a payment has `transStatus` **R**. What should the shop do?
+    options:
+      - id: stop
+        text: Not attempt authorisation, and offer the customer another payment method
+        feedback: Correct - R means the issuer rejects the authentication and asks that authorisation not be attempted.
+      - id: retry
+        text: Retry the authentication straight away
+        feedback: R is a deliberate rejection, not a technical problem; retrying will usually give the same answer and annoys the customer.
+      - id: authorise
+        text: Authorise anyway without authentication
+        feedback: The issuer has asked not to authorise; doing it anyway risks a decline or a fraud dispute the merchant loses.
+      - id: challenge
+        text: Show a challenge
+        feedback: A challenge is what C asks for. With R there is no challenge to show.
+    correct: [stop]
+    hints:
+      - Compare R with U - which one is technical?
+    solution: |
+      **Stop and offer another method.** Test that the message is clear and polite, the order stays unpaid and the
+      cart is kept.
+    followUp: |
+      What should happen for U instead? Find what your PSP documents for it.
+
+  - id: exemption-low-value
+    type: mcq
+    concept: sca-and-exemptions
+    skill: application
+    title: The 12-euro challenge
+    prompt: |
+      An EEA customer buys a 12 EUR item. The PSP requests the low-value exemption, but the customer is still
+      challenged. A colleague files a defect: "Exemption not working". What is the most likely explanation?
+    options:
+      - id: issuer-decides
+        text: The issuer chose to apply SCA - for example because the low-value counters (cumulative amount or number of payments since the last SCA) were exceeded, or for risk reasons.
+        feedback: Correct - exemptions are requested, not guaranteed; the issuer tracks the low-value limits and may always ask for SCA.
+      - id: bug
+        text: A defect in the PSP - an exemption must prevent the challenge.
+        feedback: The issuer always has the final say. A challenge after an exemption request is expected behaviour.
+      - id: over-limit
+        text: 12 EUR is above the low-value limit.
+        feedback: The single-payment limit for the low-value exemption is 30 EUR, so 12 EUR qualifies on amount alone.
+      - id: no-sca-eea
+        text: SCA doesn't apply in the EEA.
+        feedback: The EEA is exactly where PSD2 requires SCA for payer-initiated electronic payments.
+    correct: [issuer-decides]
+    hints:
+      - Who grants an exemption?
+    solution: |
+      **The issuer decided.** Under RTS Article 16 the low-value exemption is capped by cumulative limits (100 EUR or
+      5 consecutive payments since the last SCA), and issuers can always require SCA. Not a defect - but the
+      checkout must handle the challenge.
+    followUp: |
+      How would you test that the checkout handles a challenge on a payment where an exemption was requested?
+
+  - id: debug-return-handler
+    type: debug
+    concept: redirect-return-flows
+    skill: analysis
+    title: Trusting the return
+    prompt: |
+      Customers sometimes see "Order confirmed" although their challenge failed. Click the line that causes it.
+    language: java
+    code: |
+      Response handleReturn(HttpRequest request) {
+          String orderRef = request.query("order");
+          if (!signatures.valid(orderRef, request.query("sig"))) {
+              return Response.badRequest();
+          }
+          Order order = orders.find(orderRef);
+          if ("completed".equals(request.query("result"))) {
+              order.markPaid();
+              return Response.redirect("/order/" + orderRef);
+          }
+          Payment payment = psp.getPayment(order.paymentId());
+          return showStatus(order, payment);
+      }
+    correctLines: [7]
+    lineNotes:
+      - line: 3
+        note: Checking the signature of the return parameters is right - it stops customers pointing the return at another order.
+      - line: 11
+        note: Reading the payment from the PSP is what the whole handler should rely on.
+    hints:
+      - Which line believes something the browser says?
+      - What does result=completed actually prove?
+    solution: |
+      **Line 7.** The handler trusts a `result` parameter from the browser - which only says the challenge page
+      finished, not that authentication or authorisation succeeded (and it could be edited). Remove the shortcut:
+      always read the payment status from the PSP (line 11) and mark the order paid only when the PSP says it is.
+    followUp: |
+      Write the test that would have caught this, using a failed sandbox challenge.
+
+  - id: return-tests
+    type: testdesign
+    concept: redirect-return-flows
+    skill: application
+    title: Break the journey
+    prompt: |
+      Design tests for the moment the customer leaves your checkout for a 3-D Secure challenge and comes back. Cover
+      at least six ways the journey can go wrong, with the expected final state of order and payment, and the evidence.
+    hints:
+      - What can the customer do on the bank's side - and what can the browser or phone do?
+      - Which arrives first, the webhook or the customer?
+      - How do you prove there was exactly one authorisation?
+    modelAnswer: |
+      1. Challenge passed, normal return → order paid; one authorisation. Evidence: PSP payment, order, webhook.
+      2. Challenge failed → order unpaid, message offers another try or method. Evidence: payment status, screen.
+      3. Tab closed during the challenge → order unpaid, cart kept; payment cancelled or expired per the PSP. Evidence:
+         payment status after the PSP's timeout, order.
+      4. Back pressed on the bank page → checkout shows a clear state; paying again creates no second authorisation for
+         the first attempt. Evidence: payment list.
+      5. Return URL opened twice (or reloaded) → one confirmation, no duplicate order. Evidence: order list.
+      6. Return without the shop's session cookie (new tab from the banking app) → correct status from the PSP. Evidence:
+         screen, logs.
+      7. Webhook before return, and webhook only (customer never returns) → order paid either way; email sent.
+         Evidence: event log, email.
+      8. Tampered return URL → rejected by the signature check. Evidence: error, order unchanged.
+    rubric:
+      - Covered passed and failed challenges
+      - Covered abandonment (closed tab or timeout)
+      - Covered Back navigation and duplicate returns
+      - Covered a return without the session
+      - Covered webhook-first and no-return cases
+      - Covered tampering with return parameters
+      - Checked the PSP status and the number of authorisations, not only the screen
+    solution: |
+      Compare with the model answer. Cases 6 and 7 come straight from real incidents on phones - they are the ones to
+      prioritise.
+    followUp: |
+      Which of these can you automate against the sandbox, and which need a real phone and banking app?
+
+  - id: order-challenge-flow
+    type: order
+    concept: emv-3ds-flows
+    skill: recall
+    title: A challenge, message by message
+    prompt: Put the steps of a browser-based 3-D Secure challenge in order.
+    items:
+      - id: areq
+        text: The 3DS server sends the authentication request (AReq) through the directory server
+      - id: ares
+        text: The ACS answers with ARes - challenge required (C)
+      - id: creq
+        text: The customer's browser shows the issuer's challenge (CReq / CRes)
+      - id: rreq
+        text: The ACS sends the result (RReq) to the 3DS server
+      - id: return
+        text: The customer is returned to the shop's return URL
+      - id: auth
+        text: The shop reads the status and the payment is authorised with the authentication result
+    hints:
+      - The result goes to the 3DS server before the customer comes back.
+    solution: |
+      AReq → ARes C → challenge (CReq/CRes) → RReq with the result → return → status read and authorisation. The return
+      is the last step for the browser, but the decision was already sent server to server.
+
+  - id: interview-3ds
+    type: interview
+    concept: sca-and-exemptions
+    skill: application
+    title: "Interview: how would you test 3-D Secure?"
+    prompt: |
+      *"Our checkout supports 3-D Secure. How would you test it?"* Answer as you would in the interview.
+    hints:
+      - Outcomes first, then the journey, then what the sandbox can't show.
+      - Mention SCA and exemptions, but keep the focus on behaviour you can verify.
+    modelAnswer: |
+      I'd start from the outcomes the protocol and the PSP define - frictionless success, challenge passed, failed,
+      abandoned, authentication unavailable, and a decline after authentication - and agree the expected order, payment
+      and screen state for each.
+
+      Then the journey: the customer leaves for the bank's page or app and must come back to the right state. I'd test
+      closed tabs, Back, timeouts, double returns, returns without the session cookie, webhook before or instead of the
+      return, and tampered return URLs - always checking the PSP's payment status and that there's exactly one
+      authorisation, not just the screen.
+
+      For SCA, I'd make sure every path handles a challenge even when an exemption is requested, because the issuer
+      decides; that merchant-initiated renewals are flagged so they aren't challenged; and that messages for a normal
+      "no" are friendly. I'd test on real phones as well as desktop. And I'd be clear about the sandbox's limits - real
+      issuers' challenges and apps differ - so I'd propose monitoring authentication and abandonment rates per issuer
+      after release.
+    rubric:
+      - Listed the authentication outcomes and expected states
+      - Tested leaving and returning, including abandonment and duplicate returns
+      - Never trusted the return alone - checked the PSP status and authorisation count
+      - Handled webhooks before or instead of the return
+      - Said exemptions are requested but the issuer decides
+      - Mentioned merchant-initiated flags
+      - Named sandbox limits and proposed monitoring
+    followUps:
+      - What's the difference between a frictionless flow and a challenge flow?
+      - What would you check if challenge abandonment doubles after a release?
+      - How is 3-D Secure in a mobile app different from the browser?
+    solution: |
+      Interviewers listen for **the return journey** - it is where real defects live - and for knowing what a sandbox
+      can't prove.
+
+  - id: explain-sca-factors
+    type: short
+    concept: sca-and-exemptions
+    skill: recall
+    title: Two of three
+    prompt: In two or three sentences, explain what makes authentication "strong" under PSD2, with an example.
+    hints:
+      - Three categories; how many are needed; must they be independent?
+    modelAnswer: |
+      Strong customer authentication uses at least two independent elements from different categories - knowledge
+      (something you know, such as a PIN), possession (something you have, such as your phone) and inherence (something
+      you are, such as a fingerprint). For example, approving a payment in a banking app on your phone (possession)
+      unlocked with your fingerprint (inherence).
+    rubric:
+      - Named the three categories
+      - Said at least two are needed, from different categories
+      - Said they must be independent
+      - Gave a valid example
+    solution: |
+      Independence matters: if stealing one element also gives the other, it isn't strong (RTS Article 9).
+
+placement:
+  - id: place-status
+    type: mcq
+    concept: emv-3ds-flows
+    skill: application
+    title: The ARes says C
+    prompt: The authentication response for a payment has `transStatus` C. What happens next?
+    options:
+      - id: challenge
+        text: The customer is shown the issuer's challenge
+        feedback: Correct - C means challenge required.
+      - id: authorise
+        text: The payment is authorised straight away
+        feedback: That would follow Y (or sometimes A). C needs a challenge first.
+      - id: decline
+        text: The payment is declined
+        feedback: Declines of authentication are N or R. C is a request for more proof.
+      - id: retry
+        text: The merchant retries the authentication request
+        feedback: Nothing failed; the issuer simply wants a challenge.
+    correct: [challenge]
+    solution: |
+      **Show the challenge.** The result comes back afterwards (RReq), and the shop reads the final status from its PSP.
+
+  - id: place-exemption
+    type: mcq
+    concept: sca-and-exemptions
+    skill: application
+    title: Who grants the exemption?
+    prompt: A merchant's PSP requests an SCA exemption for a low-risk payment. Who decides whether the customer is challenged anyway?
+    options:
+      - id: issuer
+        text: The issuer
+        feedback: Correct - exemptions are requested by the merchant side; the issuer decides and can always require SCA.
+      - id: merchant
+        text: The merchant, because it requested the exemption
+        feedback: Requesting isn't granting. The issuer has the final say.
+      - id: customer
+        text: The customer, by choosing "skip"
+        feedback: Customers don't choose; authentication is required or exempted by the payment service providers.
+      - id: network
+        text: The card network, in every case
+        feedback: The network routes and sets rules; the decision to challenge sits with the issuer.
+    correct: [issuer]
+    solution: |
+      **The issuer.** Test every exemption path with a forced challenge.
+
+  - id: place-return
+    type: mcq
+    concept: redirect-return-flows
+    skill: analysis
+    title: Back at the return URL
+    prompt: The customer lands back on the shop's return URL after a challenge. What should the shop do before showing "Order confirmed"?
+    options:
+      - id: check-psp
+        text: Read the payment's status from the PSP and confirm only if it is authorised (or captured)
+        feedback: Correct - the return only shows the customer came back; the PSP knows the outcome.
+      - id: trust-param
+        text: Check that the return URL contains result=success
+        feedback: Browser parameters can be edited and don't prove authorisation.
+      - id: session
+        text: Check the customer's session for the payment
+        feedback: The session may be gone - phones discard tabs and banking apps open new ones. And it doesn't prove the outcome.
+      - id: nothing
+        text: Nothing - coming back means it worked
+        feedback: Customers come back after failed and abandoned challenges too.
+    correct: [check-psp]
+    solution: |
+      **Ask the PSP.** And let the webhook update the order too, in case the customer never returns.
+
+recall:
+  - id: recall-parties
+    concept: emv-3ds-flows
+    prompt: What are the main parties in EMV 3-D Secure?
+    answer: The 3DS Requestor (merchant) and 3DS Server (often the PSP), the network's Directory Server, and the issuer's Access Control Server - plus the 3DS SDK in mobile apps.
+  - id: recall-trans-status
+    concept: emv-3ds-flows
+    prompt: What do transStatus Y, C, N and U mean?
+    answer: Y authenticated, C challenge required, N not authenticated or denied, U authentication could not be performed.
+  - id: recall-sca
+    concept: sca-and-exemptions
+    prompt: What does strong customer authentication require?
+    answer: At least two independent elements from knowledge, possession and inherence.
+  - id: recall-low-value
+    concept: sca-and-exemptions
+    prompt: What are the limits of the PSD2 low-value exemption?
+    answer: Up to 30 EUR per payment, until the cumulative amount since the last SCA exceeds 100 EUR or five consecutive payments have used it.
+  - id: recall-return-rule
+    concept: redirect-return-flows
+    prompt: What is the golden rule for the return URL?
+    answer: Never trust the return - read the payment status from the PSP, sign the parameters, and let webhooks complete orders.
+  - id: recall-session
+    concept: redirect-return-flows
+    prompt: Why must the return handler work without the shop's session?
+    answer: Phones discard tabs and banking apps can open a new browser context, so the session cookie may be missing on return.
+
+next:
+  - wallets-and-bank-payments
+  - interruptions-refresh-back-navigation

@@ -159,6 +159,24 @@ course.
 - [x] A **Testing foundations** learning path (added after the existing paths, so the home page still starts
       with the Payments QA core path).
 
+## Increment 7d - completing the courses (in progress)
+
+- [x] Track A (payments): ecosystem roles; void, reversal, refund and chargeback; card payments and tokenisation; 3-D
+      Secure and redirects; wallets and bank payments (UPI, SEPA); amounts, currency and rounding; refresh, back and
+      interruptions; partial refunds and invariants; reconciliation; PCI DSS awareness. Sources: Visa Core Rules (18 April
+      2026), EMVCo, PCI DSS v4.0.1, PSD2 RTS (EU) 2018/389, NPCI circulars, EPC rulebooks, ISO 4217, ISO 20022.
+- [x] Track C (API testing): status codes and Problem Details (RFC 9110, 9457, 6585); authentication and authorization
+      (RFC 6749, 6750, 7519, 8725, 9700, OWASP API Top 10 2023); Postman and the Postman CLI; JSON Schema 2020-12, OpenAPI
+      and Pact; pagination, filtering and rate limits (RFC 8288); the payment API negative matrix.
+- [x] Track B (architecture and RCA): tracing (W3C Trace Context, OpenTelemetry); sync versus async; logs, metrics and
+      traces (Google SRE book); defect isolation decision trees; inconsistent status incidents and postmortems.
+- [x] Track D (mobile): test planning; interruptions and lifecycle; Android lifecycle and process death; adb and logcat;
+      iOS lifecycle and universal links; mobile payment interruptions. Kotlin and Swift code highlighting added.
+- [x] Practice project `practice/java`: `parallel/TestDataFactory` and `parallel/PerThread` exercises with tests and
+      solutions (verified with `practice/verify.sh java`), for the coming parallel-runs lesson.
+- [ ] Track G: parallel runs and thread safety, CI quality gates, end-to-end capstone, mock interview.
+- [ ] Review of the earlier lessons against their official sources.
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).

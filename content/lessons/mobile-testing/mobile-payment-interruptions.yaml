@@ -1,0 +1,574 @@
+id: mobile-payment-interruptions
+title: Mobile payment interruptions
+subject: mobile-testing
+module: mobile-payment-testing
+level: advanced
+status: published
+estimatedMinutes: 55
+summary: Test the moment a mobile payment leaves the app - to a banking app, a UPI app, a wallet sheet or a 3-D Secure challenge - and comes back - persisted attempts, returns by link or result callback, process death in between, missing or multiple apps, network changes and pending outcomes, so every customer ends with one payment and the true result.
+tags: [mobile, payments, upi, 3-d secure, banking app, app switch, process death, deep links, recovery, idempotency, pending]
+
+environment: |
+  - **Builds on:** [interruptions and lifecycle](#/lesson/interruptions-and-lifecycle),
+    [Android lifecycle and process death](#/lesson/android-lifecycle-and-process-death),
+    [iOS lifecycle and links](#/lesson/ios-lifecycle-and-links), [wallets and bank payments](#/lesson/wallets-and-bank-payments),
+    [3-D Secure and redirects](#/lesson/three-d-secure-and-redirects) and [idempotency keys](#/lesson/idempotency-keys).
+  - **Region- and provider-specific:** UPI flows and status rules are set by **NPCI circulars** (check the current ones); 3-D Secure
+    app-based flows follow **EMV 3DS** (EMVCo) via your PSP's SDK; wallet behaviour follows Apple's and Google's documentation. Each PSP's
+    mobile SDK has its own result callbacks and return mechanisms - read its integration guide.
+  - **Tools:** `adb shell am kill` for process death on Android (app in the background); terminating a backgrounded debug build from Xcode
+    on iOS.
+  - **Fictional:** the demo shop app, SandPay's SDK names and statuses.
+
+prerequisites:
+  - interruptions-and-lifecycle
+  - wallets-and-bank-payments
+
+concepts:
+  - id: app-switch-payment-flows
+    name: Payment flows that leave the app
+    summary: UPI intent, banking-app approvals, wallet sheets and app-based 3-D Secure hand control to another app or system screen; the result comes back by callback, deep link or only via the server.
+  - id: payment-attempt-persistence
+    name: Persisting the payment attempt
+    summary: Before leaving the app, persist the order and attempt id; on return or relaunch, resume that attempt and ask the server for its status instead of starting or sending a new one.
+  - id: mobile-payment-recovery-testing
+    name: Recovery testing for mobile payments
+    summary: A matrix of what can happen while the customer is away - success, failure, abandonment, process death, network change, no app, several apps, late results - each checked against one payment and the true result.
+
+objectives:
+  - Map the ways a mobile payment leaves and returns to the app for UPI, banking apps, wallets and 3-D Secure.
+  - Verify the app persists the attempt and re-checks the server on return or relaunch.
+  - Design a recovery test matrix for app-switch payments, including process death and late results.
+  - Report mobile payment defects with the attempt id, timings, device logs and server records.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [app-switch-payment-flows]
+    title: The idea in plain language
+    body: |
+      At a shop counter, you sometimes step outside to the cash machine and come back to pay. A good shopkeeper keeps your items
+      **reserved with your name on them** and, when you return, asks "did the cash machine work?" - rather than starting your order again or
+      forgetting you.
+
+      Mobile payments step outside all the time: the shop app hands over to a **UPI app**, a **banking app**, a **wallet sheet** or a **3-D
+      Secure challenge**. While the customer is away, the phone may close the shop app to save memory, the network may change, the customer
+      may get distracted. When they come back - by a link, a callback, or simply by reopening the app - the shop must **know which payment it
+      was** and **ask for the real result**.
+
+      Testing this moment is where mobile payment testing earns its keep: it's where duplicate charges and "paid but no order" come from.
+
+  - id: what
+    kind: what
+    concepts: [app-switch-payment-flows]
+    title: What leaves the app, and how it comes back
+    body: |
+      | Flow | Where the customer goes | How the app gets control back | Where the true result is |
+      |---|---|---|---|
+      | **UPI intent** (Android, India) | the chosen UPI app, approve with UPI PIN | the UPI app returns to the shop app (an activity result) | the PSP - status may be **pending** |
+      | **UPI QR / other device** | another device or app | the customer switches back manually | the PSP, by webhook or status check |
+      | **Banking-app approval** (3-D Secure app-based or decoupled, open banking) | the bank's app | a universal link / app link, the PSP SDK's callback - or the customer returns manually | the PSP |
+      | **3-D Secure in the PSP SDK** | a native challenge screen inside the app | the SDK's result callback | the PSP |
+      | **Wallet sheet** (Apple Pay, Google Pay) | a system sheet over the app | the sheet's callback with a token | the PSP, after authorisation |
+      | **Browser redirect** (in-app browser or system browser) | a web page | a return URL - universal link or custom scheme | the PSP |
+
+      Three facts that drive the tests:
+
+      1. **The result in the return is a hint, not proof.** A UPI app saying "success" or a return URL saying `result=ok` is reported by
+         the client side; the payment's real status is at the PSP.
+      2. **Control may never come back.** The customer can close everything, or the OS can kill the shop app and the return lands in a fresh
+         process with no memory of the payment.
+      3. **The outcome can arrive late.** UPI and bank payments can be pending for minutes (see
+         [wallets and bank payments](#/lesson/wallets-and-bank-payments)).
+
+  - id: why
+    kind: why
+    concepts: [payment-attempt-persistence]
+    title: Why app switches lose payments
+    body: |
+      - **Process death while away.** The shop app is in the background for as long as the customer is in the banking app; on mid-range
+        phones and with battery savers, it is often killed (see
+        [Android lifecycle and process death](#/lesson/android-lifecycle-and-process-death)).
+      - **State in memory only.** If the attempt lived in a ViewModel or a variable, the recreated app doesn't know a payment is in progress
+        - it shows the cart, and the customer pays again.
+      - **Trusting the client-side result.** "Success" from the other app is shown as paid; a failure at the PSP isn't. Or "failure" is
+        shown while the bank actually approved.
+      - **Retry creates a new attempt.** The resumed app starts a new payment with a new idempotency key - two charges.
+      - **No app installed, several apps installed.** UPI intent with no UPI app, or a chooser the customer cancels.
+      - **These happen rarely in testing** - on fast phones, with quick approvals, on Wi-Fi.
+
+  - id: internals
+    kind: internals
+    concepts: [payment-attempt-persistence]
+    title: How a robust app handles the round trip
+    body: |
+      **Before leaving the app:**
+
+      1. Create the payment **attempt** on the server (order id + attempt id, used as the idempotency key).
+      2. **Persist** `{orderId, attemptId, startedAt}` on the device - saved state plus persistent storage (it must survive process death).
+      3. Hand over to the other app or sheet.
+
+      **On return** - by callback, link, or the customer simply reopening the app:
+
+      4. Restore the attempt from storage.
+      5. **Ask the server** for the attempt's status. Treat any result from the other app as a hint only.
+      6. Show the true state: **paid**, **failed with a retry** (a *new* attempt only after the old one is final), or **pending** with a
+         clear message and automatic update.
+
+      **If the customer never returns**, the server-side webhook completes the order, and a notification or email tells the customer.
+
+      The rule underneath: **one attempt per payment intent, resumed - never re-sent - and the server as the source of truth.**
+
+  - id: visual
+    kind: visual
+    concepts: [payment-attempt-persistence, app-switch-payment-flows]
+    title: "State diagram: a payment attempt across an app switch"
+    body: |
+      The attempt's state lives on the server and in persistent storage on the device - so it survives the shop app being killed.
+
+      ```mermaid
+      stateDiagram-v2
+          [*] --> Created: attempt created and persisted
+          Created --> AwayInOtherApp: hand over to UPI, bank or wallet
+          AwayInOtherApp --> CheckingStatus: callback, link, or app reopened
+          AwayInOtherApp --> AppKilled: OS kills the shop app
+          AppKilled --> CheckingStatus: relaunch restores the attempt
+          CheckingStatus --> Paid: server says succeeded
+          CheckingStatus --> Failed: server says failed
+          CheckingStatus --> Pending: server says pending
+          Pending --> Paid: webhook or status update
+          Pending --> Failed: expired or rejected
+          Failed --> [*]: retry creates a NEW attempt
+          Paid --> [*]
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [mobile-payment-recovery-testing]
+    title: Step by step - recovery testing on a real device
+    body: |
+      Set-up: a real Android device with a UPI or banking test app available in the sandbox (or the PSP's test app), a real iPhone for
+      banking-app 3-D Secure, the PSP sandbox, adb and server log access.
+
+      1. **Start a payment** and note the attempt id (from the app's debug log or the server).
+      2. **In the other app**, choose the outcome: approve, decline, or do nothing.
+      3. **Apply an interruption** while away: wait 5 minutes; switch networks; kill the shop app (`adb shell am kill <package>` on
+         Android while it is in the background; stop the backgrounded debug build from Xcode on iOS).
+      4. **Return** the way a customer would: via the other app's "back to merchant" button, the return link, the notification, or by
+         opening the shop app from the home screen.
+      5. **Check the app**: right screen, true status, no second payment started, a pending state that updates by itself.
+      6. **Check the server**: exactly one payment for the attempt id, order status correct, webhook received.
+      7. **Repeat** for each outcome × interruption × return path - the matrix in the tests section.
+
+  - id: example
+    kind: example
+    concepts: [payment-attempt-persistence, mobile-payment-recovery-testing]
+    title: "Real-world example: the double UPI payment"
+    body: |
+      Support sees a pattern: Android customers in India charged **twice** for one order, a few minutes apart; one payment is refunded later
+      by finance. All on mid-range phones.
+
+      The tester's timeline for one case (server and device logs):
+
+      | Time | Event |
+      |---|---|
+      | 10:01:05 | app creates attempt `att_7Jk2`, opens the UPI app (intent) |
+      | 10:01:40 | customer approves with UPI PIN; UPI app shows "Payment successful" |
+      | 10:01:40 | shop app process **not running** (killed while in the background - logcat shows the process death at 10:01:22) |
+      | 10:01:43 | UPI app returns to the shop app - **new process**, launches on the **cart screen** |
+      | 10:01:51 | customer taps Pay again - app creates **new attempt** `att_7Jk9` |
+      | 10:02:30 | second payment approved |
+
+      The attempt id lived only in memory; the return came back to a fresh process with no record of `att_7Jk2`, and the PSP's later webhook for
+      it was attached to the order **after** the second payment had already been made.
+
+      Reproduction on demand: start a UPI payment, `adb shell am kill com.sandpay.demoshop` while in the UPI app, approve, return. Fixes: persist
+      the attempt before leaving; on launch, check for an unfinished attempt and ask the server; block a new attempt for an order whose previous
+      one isn't final. Regression tests: kill during UPI approval, during decline, and when the customer never returns.
+
+  - id: code
+    kind: code
+    concepts: [payment-attempt-persistence]
+    title: Resuming an attempt on launch (illustrative Kotlin)
+    collapsed: true
+    body: |
+      The shape of the logic a tester should see in the app - persisted attempt, server check, no re-send:
+
+      ```kotlin
+      class CheckoutResumer(
+          private val store: PendingAttemptStore,   // persistent storage - survives process death
+          private val api: ShopApi,
+      ) {
+          suspend fun resumeIfNeeded(): CheckoutState? {
+              val pending = store.load() ?: return null            // nothing in progress
+              val status = api.paymentStatus(pending.orderId, pending.attemptId)
+              return when (status) {
+                  PaymentStatus.SUCCEEDED -> { store.clear(); CheckoutState.Paid(pending.orderId) }
+                  PaymentStatus.FAILED -> { store.clear(); CheckoutState.Failed(pending.orderId, canRetry = true) }
+                  PaymentStatus.PENDING -> CheckoutState.Pending(pending.orderId)     // keep it; update when the status changes
+              }
+          }
+      }
+      ```
+
+      What to test against it: the attempt is stored **before** the app leaves; on launch with a stored attempt, the app **calls the status
+      endpoint** (visible in logs or a proxy) and **never** the create-payment endpoint; the stored attempt is cleared only on a final status.
+
+  - id: tests
+    kind: tests
+    concepts: [mobile-payment-recovery-testing, app-switch-payment-flows]
+    title: The recovery test matrix
+    body: |
+      Each row: outcome in the other app × what happens while away × how the customer returns. Expected for all: **one payment per attempt** at
+      the PSP, the **true** status shown, and the order correct on the server.
+
+      | ID | Outcome in the other app | While away | Return path | Expected in the app |
+      |---|---|---|---|---|
+      | M1 | approve | nothing | other app's back button | paid |
+      | M2 | approve | shop app killed | other app's back button | paid (after a server check) |
+      | M3 | approve | shop app killed | customer opens the shop app from the home screen | paid, from the persisted attempt |
+      | M4 | approve | network off on return | back button | "checking your payment" → paid when online |
+      | M5 | decline | nothing | back button | failed, retry offered (new attempt) |
+      | M6 | decline | shop app killed | home screen | failed, retry offered |
+      | M7 | no action, customer returns | nothing | back button | pending or cancelled per PSP; no second payment possible meanwhile |
+      | M8 | approve, PSP pending for 5 min | shop app killed | notification | pending → paid on the webhook |
+      | M9 | - | no UPI app installed | - | clear message, other methods offered |
+      | M10 | - | several UPI apps, chooser cancelled | - | back to checkout, nothing charged |
+      | M11 | approve | customer never returns | - | order completed by webhook; email or notification |
+      | M12 | approve | app updated from the store before return | home screen | attempt survives the update; paid |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [payment-attempt-persistence, mobile-payment-recovery-testing, app-switch-payment-flows]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Trusting the other app's result.** Always re-check with the server.
+      - **Keeping the attempt in memory.** It must survive process death - persist it before leaving.
+      - **A new attempt on retry before the old one is final.** That's how double charges happen.
+      - **Testing only the "back to merchant" button.** Customers also return via the home screen, notifications, links - or never.
+      - **Testing only fast approvals on Wi-Fi.** Use slow approvals, pending outcomes and network switches.
+      - **No test for missing or multiple apps.** UPI intent with no UPI app is a common first-time-user path.
+      - **Missing evidence.** Report the attempt id, timestamps, device logs (including process death) and the server's payment records.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Flows that leave the app: **UPI intent, banking apps, app-based 3-D Secure, wallet sheets, browser redirects**.
+      - Before leaving: **create and persist the attempt** (order id + attempt id = idempotency key).
+      - On any return or relaunch: **restore, ask the server, show paid / failed / pending** - the other app's result is only a hint.
+      - **One attempt per payment intent**; a retry is a new attempt only after the old one is final.
+      - Test the **matrix**: outcome × while away (process death, network, long wait, update) × return path (button, home screen,
+        notification, link, never) - one payment, true status, correct order.
+
+exercises:
+  - id: trust-result
+    type: mcq
+    concept: app-switch-payment-flows
+    skill: application
+    title: The UPI app says "success"
+    prompt: The UPI app returns to the shop app reporting "success". What should the shop app do before showing the order as paid?
+    options:
+      - id: server
+        text: Ask its server for the payment attempt's status and show what the server says
+        feedback: Correct - the result from the other app is a client-side hint; the PSP and the server hold the truth.
+      - id: trust
+        text: Show "paid" immediately, because the UPI app confirmed it
+        feedback: The callback can be wrong, spoofed, or describe a payment that is still pending at the PSP.
+      - id: new-payment
+        text: Send a confirmation payment request
+        feedback: That would create a second charge.
+      - id: wait-forever
+        text: Show nothing until the customer restarts the app
+        feedback: The app should check the status right away and show pending if needed.
+    correct: [server]
+    hints:
+      - Who is the source of truth for whether money moved?
+    solution: |
+      **Ask the server.** If it says pending, show a waiting state that updates by itself.
+    followUp: |
+      What should happen if the status check itself fails because the phone is offline?
+
+  - id: persistence-mcq
+    type: mcq
+    concept: payment-attempt-persistence
+    skill: analysis
+    title: Where should the attempt live?
+    prompt: Which storage for the current payment attempt survives the shop app being killed while the customer is in the banking app?
+    options:
+      - id: persistent
+        text: Persistent storage on the device (plus the server's record), written before handing over to the bank app
+        feedback: Correct - only persistent storage and the server survive process death.
+      - id: viewmodel
+        text: A ViewModel
+        feedback: A ViewModel survives rotation but not process death.
+      - id: static
+        text: A static variable or singleton
+        feedback: It lives in the process, which is killed.
+      - id: intent-extra
+        text: Only in the intent sent to the UPI app
+        feedback: The other app isn't obliged to give it back, and the app may relaunch from the home screen instead.
+    correct: [persistent]
+    hints:
+      - What does process death destroy?
+    solution: |
+      **Persistent storage, written before leaving.** Test with `adb shell am kill` while the customer is in the other app.
+    followUp: |
+      When should the stored attempt be cleared - and what goes wrong if it's cleared too early?
+
+  - id: debug-retry
+    type: debug
+    concept: payment-attempt-persistence
+    skill: analysis
+    title: The retry that charges twice
+    prompt: Customers who return from the banking app and tap "Try again" are sometimes charged twice. Click the line responsible.
+    language: kotlin
+    code: |
+      fun onRetryTapped(orderId: String) {
+          val previous = attemptStore.load(orderId)
+          val attemptId = UUID.randomUUID().toString()
+          attemptStore.save(orderId, attemptId)
+          viewModelScope.launch {
+              api.createPayment(orderId, idempotencyKey = attemptId)
+              openBankApp(orderId)
+          }
+      }
+    correctLines: [3]
+    lineNotes:
+      - line: 2
+        note: Loading the previous attempt is right - but its status is never checked.
+      - line: 6
+        note: Using the attempt id as the idempotency key is the right pattern.
+    hints:
+      - What does the code do with the previous attempt before creating a new one?
+    solution: |
+      **Line 3.** A new attempt is created regardless of the previous one. If the previous attempt succeeded (or is still pending) at the PSP, the
+      retry charges again. Before creating a new attempt: ask the server for `previous`'s status; only if it is **final and failed** create a new
+      attempt; if pending, show the pending state; if succeeded, show paid.
+    followUp: |
+      Write the test case that proves the fix, using a pending sandbox method.
+
+  - id: matrix-design
+    type: testdesign
+    concept: mobile-payment-recovery-testing
+    skill: application
+    title: Recovery matrix for app-based 3-D Secure
+    prompt: |
+      The iOS app uses the PSP's SDK for 3-D Secure; some banks challenge in their own banking app (out of band). Design the recovery tests:
+      outcomes, what happens while the customer is away, the return paths, and the checks on device and server. Include process termination
+      and at least one late result.
+    hints:
+      - The bank app approval returns how - SDK callback, universal link, or not at all?
+      - What if the shop app was terminated while the customer was in the bank app?
+    modelAnswer: |
+      Outcomes: approved, declined in the bank app, abandoned (customer never approves), bank slow (approval after 3 minutes).
+
+      While away: nothing; shop app terminated (stop the backgrounded debug build from Xcode); network switched; device locked.
+
+      Return paths: the SDK's callback when the customer switches back; the universal-link return; opening the app from the home screen; a push
+      notification; never.
+
+      Key cases:
+      1. Approve, nothing, switch back → SDK callback → app checks the server → paid; one authorisation.
+      2. Approve, app terminated, home screen → persisted attempt restored → server check → paid.
+      3. Approve, app terminated, universal-link return → routes to the order → paid.
+      4. Decline in bank app → app shows failed after server check → retry creates a new attempt only then.
+      5. Abandon → after the PSP's timeout, status failed or expired; no second payment possible while it was pending.
+      6. Slow approval (3 minutes), app terminated meanwhile → pending shown on return → paid via webhook update; notification sent.
+      7. Network off on return → "checking your payment" → resolves when online.
+
+      Checks: server shows one payment per attempt id; order status matches; device logs show the status call and no second create call; push
+      or email for completed orders.
+    rubric:
+      - Covered approve, decline, abandon and a slow approval
+      - Included app termination while in the bank app
+      - Included several return paths, including the home screen and never
+      - Required a server status check on every return
+      - Allowed a new attempt only after the old one is final
+      - Checked one payment per attempt and the order status on the server
+      - Checked device logs for the absence of a second create call
+    solution: |
+      Compare with the model answer. Cases 2 and 6 - **terminated** and **late** - are the ones a casual test run never produces.
+    followUp: |
+      Which of these could you automate with Appium, and which need a person and a real bank test app?
+
+  - id: order-round-trip
+    type: order
+    concept: payment-attempt-persistence
+    skill: recall
+    title: The safe round trip
+    prompt: Put the steps of a safe app-switch payment in order.
+    items:
+      - id: create
+        text: Create the payment attempt on the server (attempt id as idempotency key)
+      - id: persist
+        text: Persist the order id and attempt id on the device
+      - id: handover
+        text: Hand over to the UPI, bank or wallet app
+      - id: restore
+        text: On return or relaunch, restore the attempt from storage
+      - id: check
+        text: Ask the server for the attempt's status
+      - id: show
+        text: Show paid, failed (retry as a new attempt) or pending
+    hints:
+      - Persist before you leave, check after you return.
+    solution: |
+      Create → persist → hand over → restore → check → show. The server is the source of truth throughout.
+
+  - id: interview-mobile-payments
+    type: interview
+    concept: mobile-payment-recovery-testing
+    skill: application
+    title: "Interview: payments that switch apps"
+    prompt: |
+      *"Our app takes UPI payments by opening the customer's UPI app. What would you test, and what worries you most?"* Answer as you would in
+      the interview.
+    hints:
+      - What happens to the shop app while the customer is in the UPI app?
+      - Which result do you trust?
+    modelAnswer: |
+      What worries me most is the moment the customer is in the UPI app: the shop app is in the background and, on many phones, the OS kills it.
+      If the app only kept the payment attempt in memory, it comes back without knowing a payment is in progress - and the customer pays again.
+      So I'd check that the app creates the attempt on the server and persists it on the device before handing over, and that on any return - the
+      UPI app's back button, opening the app from the home screen, a notification - it restores the attempt and asks our server for the status,
+      rather than trusting what the UPI app reported or starting a new payment.
+
+      Then I'd run a recovery matrix on real devices: approve, decline and abandon in the UPI app; while away, kill the shop app with adb am kill,
+      switch networks, wait for a pending result; return by each path. Each case must end with exactly one payment at the PSP, the true status in
+      the app, and the right order status. I'd also cover no UPI app installed, several apps with the chooser cancelled, pending payments that
+      complete minutes later, and an app update while a payment is pending. Evidence would be the attempt id, timestamps, logcat including the
+      process death, and the server records.
+    rubric:
+      - Identified process death during the UPI app as the main risk
+      - Required persisting the attempt before handing over
+      - Required a server status check on return instead of trusting the UPI app
+      - Prevented a new attempt while the old one isn't final
+      - Ran a matrix of outcomes, interruptions and return paths on real devices
+      - Covered no app, several apps and pending outcomes
+      - Named concrete evidence
+    followUps:
+      - How do you reproduce the process death on demand?
+      - What should the app show if the payment is still pending after ten minutes?
+      - How does this differ for iOS?
+    solution: |
+      The answer that impresses names **process death during the app switch** and the **persist-then-re-check** pattern.
+
+  - id: explain-hint
+    type: short
+    concept: app-switch-payment-flows
+    skill: recall
+    title: Why the return result is only a hint
+    prompt: In two or three sentences, explain why the result passed back by a UPI or banking app is treated as a hint rather than the truth.
+    hints:
+      - Who reports it, and can the payment still change?
+    modelAnswer: |
+      The result comes from the client side - another app or the device - and can be missing, wrong, tampered with, or describe a payment that is
+      still pending at the PSP. The shop's server, informed by the PSP, holds the real status, so the app must ask the server before showing paid or
+      failed.
+    rubric:
+      - Said the result comes from the client side or another app
+      - Said it can be wrong, missing or pending
+      - Said the server or PSP holds the true status
+    solution: |
+      The same rule as the web's return URL: [never trust the return](#/lesson/three-d-secure-and-redirects).
+
+placement:
+  - id: place-flow
+    type: mcq
+    concept: app-switch-payment-flows
+    skill: application
+    title: Where is the truth?
+    prompt: After an app-based payment approval, where is the authoritative payment status?
+    options:
+      - id: psp
+        text: At the PSP, as reflected by the shop's server
+        feedback: Correct - the app must ask its server.
+      - id: bank-app
+        text: In the banking app's success screen
+        feedback: That is what the customer saw, not a record the shop can rely on.
+      - id: shop-app
+        text: In the shop app's memory
+        feedback: Memory may have been wiped by process death - and it only knows what it was told.
+      - id: sms
+        text: In the bank's SMS to the customer
+        feedback: Useful to the customer, but not something the shop's system can use.
+    correct: [psp]
+    solution: |
+      **The PSP, through the server.**
+
+  - id: place-persist
+    type: mcq
+    concept: payment-attempt-persistence
+    skill: application
+    title: When to persist
+    prompt: When must the app persist the payment attempt on the device?
+    options:
+      - id: before
+        text: Before handing over to the other app
+        feedback: Correct - the shop app may be killed the moment it goes to the background.
+      - id: after
+        text: After the customer returns
+        feedback: If the app was killed while away, there is nothing left to persist.
+      - id: on-success
+        text: Only once the payment succeeded
+        feedback: Then a killed app wouldn't know a payment was in progress.
+      - id: never
+        text: Never - the server knows
+        feedback: The server knows the attempt, but the relaunched app must know which attempt to ask about.
+    correct: [before]
+    solution: |
+      **Before leaving.** And clear it only when the status is final.
+
+  - id: place-matrix
+    type: mcq
+    concept: mobile-payment-recovery-testing
+    skill: analysis
+    title: The case most likely to double-charge
+    prompt: Which recovery test is most likely to reveal a double charge?
+    options:
+      - id: killed-home
+        text: Approve in the UPI app, the shop app is killed meanwhile, the customer reopens the shop app from the home screen and taps Pay
+        feedback: Correct - without a persisted attempt, the app doesn't know a payment succeeded and lets the customer pay again.
+      - id: quick
+        text: Approve quickly and return with the back button, app still in memory
+        feedback: The common happy path - usually fine.
+      - id: no-app
+        text: No UPI app installed
+        feedback: Nothing is charged in this case.
+      - id: chooser
+        text: Several UPI apps, the customer cancels the chooser
+        feedback: No payment is started.
+    correct: [killed-home]
+    solution: |
+      **Killed app, home-screen return.** Reproduce with `adb shell am kill` while the customer is in the UPI app.
+
+recall:
+  - id: recall-flows
+    concept: app-switch-payment-flows
+    prompt: Name four mobile payment flows that leave the shop app.
+    answer: UPI intent, banking-app approval (app-based or decoupled 3-D Secure, open banking), wallet sheets, and browser redirects - plus native 3-D Secure screens in the PSP SDK.
+  - id: recall-hint
+    concept: app-switch-payment-flows
+    prompt: How should the app treat the result returned by the other app?
+    answer: As a hint - it must ask its server for the attempt's real status.
+  - id: recall-persist
+    concept: payment-attempt-persistence
+    prompt: What must the app do before handing over to another app?
+    answer: Create the attempt on the server and persist the order id and attempt id on the device.
+  - id: recall-retry
+    concept: payment-attempt-persistence
+    prompt: When may the app create a new payment attempt for the same order?
+    answer: Only when the previous attempt's status is final and failed.
+  - id: recall-matrix
+    concept: mobile-payment-recovery-testing
+    prompt: What are the axes of the mobile payment recovery matrix?
+    answer: The outcome in the other app, what happens while the customer is away, and how the customer returns.
+  - id: recall-expected
+    concept: mobile-payment-recovery-testing
+    prompt: What must be true at the end of every recovery test?
+    answer: Exactly one payment per attempt at the PSP, the true status shown in the app, and the correct order status on the server.
+
+next:
+  - e2e-payment-capstone
+  - wallets-and-bank-payments

@@ -1,0 +1,616 @@
+id: tracing-a-payment-end-to-end
+title: Tracing a payment end to end
+subject: payment-architecture
+module: payment-request-flow
+level: intermediate
+status: published
+estimatedMinutes: 50
+summary: Follow one payment across the browser, the shop's services, the PSP, webhooks and the ledger - with correlation ids, W3C trace context and a timeline - so that "my payment is missing" becomes a reconstructed sequence of events with the failing hop identified.
+tags: [payments, architecture, tracing, correlation id, w3c trace context, traceparent, opentelemetry, spans, logs, root cause analysis]
+
+environment: |
+  - **Standards:** **W3C Trace Context** (W3C Recommendation, Level 1, 23 November 2021 -
+    [w3.org/TR/trace-context](https://www.w3.org/TR/trace-context/)) - the `traceparent` header
+    (`version-trace-id-parent-id-trace-flags`, a 32-hex-character trace id and a 16-hex-character parent id) and
+    `tracestate`.
+  - **Framework documentation:** **OpenTelemetry** ([opentelemetry.io](https://opentelemetry.io/docs/concepts/signals/)) -
+    signals: traces ("the path of a request through your application"), metrics, logs and baggage.
+  - **Provider-specific:** which ids your PSP returns and accepts (payment id, request id, your merchant reference), and
+    whether its webhooks carry them. PSPs don't usually join your trace - you correlate by ids.
+  - **Fictional:** the demo shop's services (`checkout-api`, `payment-service`, `order-service`, `ledger`), SandPay and all
+    ids and timestamps.
+
+prerequisites:
+  - client-server-request-flow
+  - webhooks-and-async-status
+
+concepts:
+  - id: correlation-identifiers
+    name: Correlation identifiers
+    summary: Order id, idempotency key, PSP payment id, request id and trace id are created at different hops; recording them together at every hop is what lets you join records across systems.
+  - id: distributed-tracing
+    name: Distributed tracing
+    summary: A trace is a tree of spans - one per operation - linked by a trace id propagated in the traceparent header, showing where time went and where an error started.
+  - id: payment-timeline
+    name: Reconstructing a payment timeline
+    summary: Merge the events of one payment from every system into one time-ordered timeline, mind clock differences, and find the first hop where reality diverged from expectation.
+
+objectives:
+  - Name the identifiers created at each hop of a payment and where each is recorded.
+  - Read a distributed trace and its spans to find where time was spent and where an error started.
+  - Reconstruct a payment's timeline from logs, traces, PSP records and webhooks, and identify the failing hop.
+  - Check that a system propagates and logs correlation ids well enough to be debuggable - and test it.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [correlation-identifiers]
+    title: The idea in plain language
+    body: |
+      A parcel that never arrived: to find it, you need its **tracking number** - and every depot must have scanned it with
+      that number. If one depot wrote down only "a brown box", the trail breaks there.
+
+      A payment travels through many "depots": the browser, the shop's checkout API, a payment service, the PSP, the card
+      network and back, a webhook, the order service, the ledger, the email service. Each one logs what it did - but with
+      **its own ids**. The browser knows the order number; the PSP knows its payment id; the webhook knows an event id.
+
+      Tracing is making sure **every depot writes down the same tracking numbers**, so that when a customer says "I paid and
+      have no order", you can lay out the whole journey on one timeline and point at the depot where it went wrong.
+
+  - id: what
+    kind: what
+    concepts: [correlation-identifiers]
+    title: What the identifiers are and where they come from
+    body: |
+      | Identifier | Created by | Example | Lets you join |
+      |---|---|---|---|
+      | **Order id** (merchant reference) | the shop, at checkout | `ORD-1042` | orders, emails, support tickets, the PSP's `reference` field |
+      | **Idempotency key** | the client or shop, per attempt | `att_9Qe2` | retries of the same attempt |
+      | **Request id** | the API gateway or service, per HTTP request | `req_7Hq2` | one request across a service's logs |
+      | **Trace id** | the first instrumented service | `4bf92f3577b34da6a3ce929d0e0e4736` | every span of one request across your services |
+      | **PSP payment id** | the PSP | `pay_81Fz` | PSP dashboard, API responses, webhooks, settlement reports |
+      | **Webhook event id** | the PSP | `evt_5Kd2` | deliveries and retries of one event |
+      | **Ledger entry id** | the accounting system | `le_3301` | journal entries for the order |
+
+      The rule that makes them useful: **wherever one is known, log it together with the others you know.** The payment service
+      logs `ORD-1042`, `att_9Qe2`, the trace id and - once the PSP answers - `pay_81Fz` on the same line. Then any one id
+      leads to all the others.
+
+  - id: internals
+    kind: internals
+    concepts: [distributed-tracing]
+    title: How distributed tracing works
+    body: |
+      A **trace** is the path of one request; it is made of **spans** - one per operation (an HTTP request, a database query,
+      a call to the PSP), each with a start time, a duration, attributes and a status, and a link to its **parent** span.
+
+      Services pass the trace along in the **`traceparent`** header (W3C Trace Context). The spec's example:
+
+      ```http
+      traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      ```
+
+      | Part | Value | Meaning |
+      |---|---|---|
+      | version | `00` | format version |
+      | trace-id | `4bf92f3577b34da6a3ce929d0e0e4736` | 32 hex characters - the same for every span of this trace |
+      | parent-id | `00f067aa0ba902b7` | 16 hex characters - the span that made this call |
+      | trace-flags | `01` | the lowest bit is "sampled" - the caller may have recorded the trace |
+
+      `tracestate` carries vendor-specific data alongside. Frameworks such as OpenTelemetry create spans, propagate the
+      headers and export the data to a tracing backend.
+
+      Two practical limits:
+
+      - **Sampling.** Many systems keep only a share of traces. The one you need may not have been kept - log the trace id
+        anyway, so logs can be joined even without the trace.
+      - **External parties.** The PSP doesn't continue your trace. Your span for "call PSP" ends at your boundary; after that you
+        correlate with the **PSP payment id** and your **reference**.
+
+  - id: visual
+    kind: visual
+    concepts: [distributed-tracing, correlation-identifiers]
+    title: "Sequence diagram: which ids travel where"
+    body: |
+      The trace id travels between the shop's own services; the order id and PSP payment id connect everything else.
+
+      ```mermaid
+      sequenceDiagram
+          participant B as Browser
+          participant C as checkout-api
+          participant P as payment-service
+          participant S as SandPay
+          participant O as order-service
+          participant L as ledger
+          B->>C: POST /checkout/ORD-1042/pay, attempt att_9Qe2
+          Note over C: new trace 4bf9..4736, request req_7Hq2
+          C->>P: create payment - traceparent 00-4bf9..-01
+          P->>S: POST /v1/payments, reference ORD-1042, Idempotency-Key att_9Qe2
+          S-->>P: 201 pay_81Fz, status authorized
+          P-->>C: authorized, pay_81Fz
+          C-->>B: 303 to /orders/ORD-1042
+          S->>O: webhook evt_5Kd2 - payment.authorized pay_81Fz, reference ORD-1042
+          Note over O: new trace for the webhook, logs ORD-1042 and pay_81Fz
+          O->>L: book order ORD-1042, payment pay_81Fz
+      ```
+
+      Notice the webhook starts a **new trace** - it comes from the PSP, not from your request. Only the ids in its body link
+      it to the checkout.
+
+  - id: why
+    kind: why
+    concepts: [payment-timeline]
+    title: Why testers need end-to-end traces
+    body: |
+      - **Payment defects cross boundaries.** "Charged but no order" can be a lost webhook, a webhook rejected by a signature
+        check, an order service that ignored a late event, or a ledger job that failed - four teams, four log stores.
+      - **Without correlation, investigations stall.** "We can't find it in our logs" often means "we searched for the wrong
+        id".
+      - **Timing is evidence.** The order of events - did the webhook arrive before the redirect? did the retry start before
+        the first request finished? - explains most race conditions.
+      - **Debuggability is a requirement you can test.** A system whose logs can't answer "what happened to ORD-1042?" will
+        fail its first serious incident. Testing that ids are propagated and logged is cheap; discovering it in an incident is
+        not.
+
+  - id: steps
+    kind: steps
+    concepts: [payment-timeline, correlation-identifiers]
+    title: Step by step - reconstructing a payment's journey
+    body: |
+      1. **Start from the id you have** - usually the order id from the customer, or the PSP payment id from finance.
+      2. **Find the other ids.** The order record gives the PSP payment id; the PSP dashboard gives your reference and the
+         webhook event ids; a log line with the order id gives the trace and request ids.
+      3. **Collect events from each system** for those ids: browser (if you have a HAR or recording), checkout-api and
+         payment-service logs and trace, PSP payment events and webhook delivery attempts, order-service and ledger logs.
+      4. **Normalise times** to UTC and note each system's clock - a 2-second skew can reorder events.
+      5. **Put everything on one timeline**, sorted by time, one line per event, with the system and the ids.
+      6. **Write the expected sequence** next to it (from the design or a successful payment's timeline).
+      7. **Find the first divergence** - the earliest event that is missing, late, duplicated or different. That hop is where
+         the investigation goes, not the last one that looks wrong.
+      8. **Record the timeline in the defect report** - it is the most convincing evidence there is.
+
+  - id: example
+    kind: example
+    concepts: [payment-timeline]
+    title: "Real-world example: charged, no order"
+    body: |
+      A customer was charged 64.00 EUR for `ORD-2207`; the shop shows the order as "awaiting payment". The tester builds the
+      timeline (UTC):
+
+      | Time | System | Event | Ids |
+      |---|---|---|---|
+      | 10:02:11.204 | checkout-api | pay request received | ORD-2207, att_4Rt7, trace 9c1e... |
+      | 10:02:11.390 | payment-service | call SandPay | ORD-2207, att_4Rt7 |
+      | 10:02:41.392 | payment-service | **timeout after 30 s**, order left awaiting payment | ORD-2207 |
+      | 10:02:41.400 | checkout-api | "Payment could not be completed" shown | ORD-2207 |
+      | 10:02:44.015 | SandPay | payment authorised | pay_6Lm2, reference ORD-2207 |
+      | 10:02:44.950 | SandPay | webhook evt_8Pq1 sent | pay_6Lm2, ORD-2207 |
+      | 10:02:45.012 | order-service | webhook **rejected: 401 signature invalid** | evt_8Pq1 |
+      | 10:07:45 ... 12:02:45 | SandPay | 6 retries, all rejected 401 | evt_8Pq1 |
+
+      Expected: authorisation within the timeout, or - after a timeout - a webhook that completes the order. The **first**
+      divergence is the timeout (the PSP took 32.6 s); the **second** is the webhook rejected for its signature. The timeout is
+      an operational issue; the rejection is the defect that turned it into lost money: order-service had been deployed with the
+      previous webhook secret after a rotation.
+
+      Without the timeline, the team would have blamed the timeout alone - and the next slow payment would have been lost too.
+
+  - id: code
+    kind: code
+    concepts: [correlation-identifiers, distributed-tracing]
+    title: Structured log lines that join up
+    collapsed: true
+    body: |
+      Structured (JSON) logs with the ids as fields - searchable by any of them:
+
+      ```json
+      {"ts": "2026-10-12T10:02:11.390Z", "service": "payment-service", "level": "INFO", "msg": "calling psp",
+       "trace_id": "9c1e6a2b5d7f4e30a1b2c3d4e5f60718", "order_id": "ORD-2207", "attempt_id": "att_4Rt7"}
+      {"ts": "2026-10-12T10:02:41.392Z", "service": "payment-service", "level": "WARN", "msg": "psp timeout",
+       "trace_id": "9c1e6a2b5d7f4e30a1b2c3d4e5f60718", "order_id": "ORD-2207", "attempt_id": "att_4Rt7", "timeout_ms": 30000}
+      {"ts": "2026-10-12T10:02:45.012Z", "service": "order-service", "level": "ERROR", "msg": "webhook signature invalid",
+       "trace_id": "0a7d3c9e1f2b4a6c8e0f1a2b3c4d5e6f", "event_id": "evt_8Pq1", "psp_payment_id": "pay_6Lm2", "order_id": "ORD-2207"}
+      ```
+
+      Finding everything for one order across services (the query syntax depends on your log platform):
+
+      ```plaintext
+      order_id:"ORD-2207" OR psp_payment_id:"pay_6Lm2" OR attempt_id:"att_4Rt7"
+      ```
+
+      A test that checks propagation through your own services, illustrated with Playwright's API client:
+
+      ```typescript
+      const traceId = '4bf92f3577b34da6a3ce929d0e0e4736';
+      const response = await request.post('/checkout/ORD-1042/pay', {
+        headers: { traceparent: `00-${traceId}-00f067aa0ba902b7-01` },
+      });
+      // then: query the test log store and assert every service's log lines for ORD-1042 carry this trace id
+      ```
+
+  - id: tests
+    kind: tests
+    concepts: [correlation-identifiers, distributed-tracing, payment-timeline]
+    title: Debuggability tests
+    body: |
+      | ID | Check | Expected | Evidence |
+      |---|---|---|---|
+      | D1 | send a payment with a known `traceparent` | every own service's spans and log lines carry that trace id | tracing backend, log search |
+      | D2 | search logs by order id | finds the PSP payment id, attempt id and trace id | log query result |
+      | D3 | search logs by PSP payment id | finds the order id | log query result |
+      | D4 | PSP request | carries the order id as reference and the attempt id as idempotency key | PSP request log / dashboard |
+      | D5 | webhook handling | logs event id, PSP payment id and order id - including when it rejects the event | log lines for a rejected webhook |
+      | D6 | failed payment, timeout and retry | each logged with the same attempt id | log lines |
+      | D7 | logs contain no card data, secrets or full tokens | none | search for PAN-like values and key prefixes |
+      | D8 | timestamps | UTC, millisecond precision, from synchronised clocks | log samples across services |
+      | D9 | reconstruct the timeline of a test payment from scratch in under 10 minutes | possible with the tools available | the timeline |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [correlation-identifiers, payment-timeline, distributed-tracing]
+    title: Common mistakes and how to avoid them
+    body: |
+      - **Searching by the wrong id.** Each system knows different ids - start by collecting all of them.
+      - **Logging ids only on success.** The rejected webhook and the timeout are exactly the lines you need.
+      - **Not sending your reference to the PSP.** Without it, joining PSP records to orders depends on amounts and times.
+      - **Trusting the last error.** The visible error is often a consequence; find the **first** divergence.
+      - **Ignoring clock skew.** Normalise to UTC and check clocks before concluding "the webhook came first".
+      - **Expecting a trace for everything.** Sampling drops traces; logs with ids are the fallback.
+      - **Free-text logs.** "Payment failed for order" without the id can't be searched. Structured fields can.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Ids per hop: **order id, attempt / idempotency key, request id, trace id, PSP payment id, webhook event id, ledger id** -
+        log them **together** wherever known.
+      - **W3C traceparent**: `00-<32 hex trace id>-<16 hex parent id>-<flags>`; a trace = tree of **spans**; sampling may drop
+        traces.
+      - The PSP and webhooks are **outside your trace** - correlate by your reference and the PSP payment id.
+      - Timeline: collect events for all ids, **UTC**, sort, compare with the expected sequence, find the **first divergence**.
+      - Test debuggability: propagation, searchability by any id, logged failures, no secrets.
+
+exercises:
+  - id: which-id
+    type: mcq
+    concept: correlation-identifiers
+    skill: application
+    title: Joining the PSP's record to the order
+    prompt: Finance has a SandPay settlement line with payment id `pay_6Lm2` and wants the shop's order. Which practice makes that lookup reliable?
+    options:
+      - id: reference
+        text: The shop sends its order id as the payment's reference to the PSP and stores the PSP payment id on the order
+        feedback: Correct - each side records the other's id, so either one leads to the other.
+      - id: amount-time
+        text: Match on amount and time
+        feedback: Many payments share amounts and seconds; that matching is guesswork.
+      - id: trace
+        text: Use the trace id
+        feedback: The PSP's records don't carry your trace id; traces only cover your own services.
+      - id: email
+        text: Ask the customer for their email
+        feedback: Customers have many orders, and finance shouldn't need the customer to join two records.
+    correct: [reference]
+    hints:
+      - Which ids does the PSP know about your system?
+    solution: |
+      **Exchange ids at the boundary.** Send your order id as the PSP's reference (and the attempt id as idempotency key), store
+      the PSP payment id on the order, and log both together.
+    followUp: |
+      Which test proves this works for retried payments, where one order has two PSP payments?
+
+  - id: traceparent-read
+    type: mcq
+    concept: distributed-tracing
+    skill: recognition
+    title: Read the traceparent
+    prompt: "In `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`, which part stays the same across all services handling this request?"
+    options:
+      - id: trace-id
+        text: 4bf92f3577b34da6a3ce929d0e0e4736 - the trace id
+        feedback: Correct - the 32-hex-character trace id identifies the whole trace.
+      - id: parent-id
+        text: 00f067aa0ba902b7 - the parent id
+        feedback: The parent id changes at each hop - it identifies the span that made the call.
+      - id: version
+        text: 00 - the version
+        feedback: The version is the same too, but it identifies the format, not the request.
+      - id: flags
+        text: 01 - the trace flags
+        feedback: The flags carry sampling information, not the identity of the request.
+    correct: [trace-id]
+    hints:
+      - Which part is 32 hex characters long?
+    solution: |
+      **The trace id.** Search your logs and tracing backend by it to see every span of this request.
+    followUp: |
+      What does the last bit of `01` mean, and why might the trace still be missing from your tracing backend?
+
+  - id: first-divergence
+    type: mcq
+    concept: payment-timeline
+    skill: analysis
+    title: Where did it go wrong?
+    prompt: |
+      Timeline for an order stuck at "awaiting payment":
+
+      1. 09:00:01 checkout-api - pay request received
+      2. 09:00:02 SandPay - payment authorised (pay_2Wq8)
+      3. 09:00:02 payment-service - response 201 received, saved
+      4. 09:00:03 SandPay - webhook evt_3Mn1 sent
+      5. 09:00:03 order-service - webhook accepted, **order not found by reference** (reference was `ord-3301`, orders use `ORD-3301`)
+      6. 09:00:04 checkout-api - shows "awaiting confirmation"
+
+      Where is the first divergence from the expected sequence?
+    options:
+      - id: step5
+        text: Step 5 - the webhook's reference doesn't match the order id format, so the order isn't found
+        feedback: Correct - everything up to step 4 is as expected; step 5 is the first event that differs.
+      - id: step6
+        text: Step 6 - the checkout shows the wrong status
+        feedback: That is a consequence of step 5, not the first divergence.
+      - id: step2
+        text: Step 2 - the payment was authorised too quickly
+        feedback: A fast authorisation is fine; nothing diverged there.
+      - id: step4
+        text: Step 4 - the PSP sent the webhook
+        feedback: Sending the webhook is expected.
+    correct: [step5]
+    hints:
+      - Compare each line with what a successful payment's timeline would show.
+    solution: |
+      **Step 5** - but the cause is earlier in the design: the reference was sent in lower case by the payment-service when it
+      created the payment, and order-service matched it case-sensitively. Check the PSP request to confirm, then fix one side and add a test with mixed-case
+      references.
+    followUp: |
+      Which log fields would you have needed to find this in five minutes rather than an hour?
+
+  - id: debug-log-line
+    type: debug
+    concept: correlation-identifiers
+    skill: analysis
+    title: The log line that can't be joined
+    prompt: These log lines come from the webhook handler. Click the line that will make an investigation hard.
+    language: plaintext
+    code: |
+      2026-10-12T10:02:45.010Z INFO  webhook received event=evt_8Pq1 type=payment.authorized psp_payment=pay_6Lm2
+      2026-10-12T10:02:45.011Z DEBUG verifying signature event=evt_8Pq1
+      2026-10-12T10:02:45.012Z ERROR Webhook rejected - signature invalid
+      2026-10-12T10:02:45.013Z INFO  responding 401 event=evt_8Pq1
+    correctLines: [3]
+    lineNotes:
+      - line: 1
+        note: A good line - event id, type and PSP payment id are all there.
+      - line: 4
+        note: The response line carries the event id, so it can be joined.
+    hints:
+      - Which line has no identifier at all?
+    solution: |
+      **Line 3.** The error - the most important line - has no event id, PSP payment id or order id. Searching for `pay_6Lm2`
+      would never show why the webhook was rejected. Log the ids on every line, especially errors (structured fields make this
+      automatic).
+    followUp: |
+      Which test would catch log lines without ids before release?
+
+  - id: timeline-design
+    type: testdesign
+    concept: payment-timeline
+    skill: application
+    title: A debuggability test for the checkout
+    prompt: |
+      Design a test session that proves the demo shop's payment flow is debuggable: run a successful payment, a timeout and a
+      rejected webhook in a test environment, then show you can reconstruct each one's timeline. List what you trigger, which ids
+      you expect where, and the checks that fail the session.
+    hints:
+      - Use a known traceparent so you can search for it.
+      - What must be logged when something fails?
+      - Time-box the reconstruction - it is part of the test.
+    modelAnswer: |
+      Set-up: test environment with log search and tracing; sandbox delay method for the timeout; a wrong webhook secret
+      configured for the third run.
+
+      1. Successful payment with a known `traceparent`. Expect: the trace id on all checkout-api and payment-service lines;
+         order id, attempt id and PSP payment id together on the payment-service line after the PSP answers; the PSP request with
+         reference = order id; the webhook handler lines with event id, PSP payment id and order id; the ledger line with the order
+         id.
+      2. Timeout: the PSP call times out. Expect: a WARN line with order id, attempt id and timeout; the order left in an
+         explicit "unknown / awaiting confirmation" status; the later webhook completes it, logged with all ids.
+      3. Rejected webhook: expect an ERROR line with event id, PSP payment id and the reason; an alert or metric for rejected
+         webhooks.
+
+      For each run: reconstruct the timeline from the order id alone, within 10 minutes, and write it down. The session fails if
+      any step can't be joined, any error line lacks ids, any line contains a key or card data, or timestamps aren't UTC.
+    rubric:
+      - Used a known trace id to check propagation
+      - Checked ids are logged together after the PSP responds
+      - Checked the PSP request carries the merchant reference and idempotency key
+      - Included a timeout and a rejected webhook, not only success
+      - Required ids on error lines
+      - Reconstructed timelines from one id within a time limit
+      - Checked for secrets in logs and UTC timestamps
+    solution: |
+      Compare with the model answer. The **time-boxed reconstruction** turns "we have logs" into proof that the logs are usable.
+    followUp: |
+      Which of these checks could run automatically in CI, and how?
+
+  - id: order-reconstruct
+    type: order
+    concept: payment-timeline
+    skill: recall
+    title: Reconstructing a timeline
+    prompt: Put the steps of reconstructing a payment's timeline in order.
+    items:
+      - id: start
+        text: Start from the id you have (order id or PSP payment id)
+      - id: collect-ids
+        text: Collect the related ids from each system
+      - id: collect-events
+        text: Gather events for those ids from every system
+      - id: utc
+        text: Normalise timestamps to UTC and note clock differences
+      - id: sort
+        text: Sort into one timeline and compare with the expected sequence
+      - id: first
+        text: Identify the first divergence and investigate that hop
+    hints:
+      - You can only collect events once you know all the ids.
+    solution: |
+      Id → related ids → events → UTC → timeline vs expected → first divergence.
+
+  - id: interview-trace
+    type: interview
+    concept: distributed-tracing
+    skill: application
+    title: "Interview: \"I paid but have no order\""
+    prompt: |
+      *"A customer says they were charged but have no order. Walk me through how you'd find out what happened."* Answer as you
+      would in the interview.
+    hints:
+      - Which ids, which systems, which order of steps?
+    modelAnswer: |
+      I'd get every identifier first: the order id or email from the customer, then from our order record the PSP payment id, and
+      from logs the attempt id and trace id. If the customer only has a bank statement entry, I'd search the PSP dashboard by
+      amount and time and then by our reference.
+
+      Then I'd collect the events for those ids from every system - our checkout and payment services' logs and trace, the PSP's
+      payment events and webhook delivery attempts, the order service and the ledger - normalise the timestamps to UTC, and put
+      them on one timeline next to the sequence a normal payment produces.
+
+      The first event that differs tells me where to look. Common findings: a PSP timeout that left the order "awaiting
+      payment", followed by a webhook we rejected - wrong secret, wrong reference format - or ignored because the order was
+      already cancelled. I'd confirm the cause by reproducing it in a test environment, make sure the customer is refunded or
+      the order fulfilled, and report the defect with the timeline as evidence. If any step couldn't be joined because ids
+      weren't logged, that's a second defect.
+    rubric:
+      - Collected all identifiers before searching
+      - Included the PSP's records and webhook delivery attempts
+      - Normalised timestamps and built one timeline
+      - Compared with the expected sequence and looked for the first divergence
+      - Named typical causes (timeout plus webhook rejected or ignored)
+      - Confirmed by reproduction and made sure the customer was made whole
+      - Treated missing ids in logs as a defect
+    followUps:
+      - What would you do if the trace for that payment wasn't sampled?
+      - How do clock differences between services mislead you?
+      - Which ids would you insist every service logs?
+    solution: |
+      Interviewers want **a method** - ids, systems, timeline, first divergence - not guesses about the cause.
+
+  - id: explain-webhook-trace
+    type: short
+    concept: distributed-tracing
+    skill: recall
+    title: Why the webhook has a different trace
+    prompt: In two or three sentences, explain why a PSP's webhook usually starts a new trace in your system, and how you still connect it to the original payment.
+    hints:
+      - Who sends the webhook, and which headers does it carry?
+    modelAnswer: |
+      The webhook is a new request sent by the PSP, which doesn't carry your traceparent, so your system starts a fresh trace for
+      it. You connect it to the payment through the ids in the webhook body - the PSP payment id and your own reference (order id)
+      - which your services should log together with the new trace id.
+    rubric:
+      - Said the webhook is a new request from the PSP without your trace context
+      - Said the connection is made through ids in the body
+      - Mentioned logging those ids with the new trace id
+    solution: |
+      Some tracing tools let you add a span link from the webhook's trace to the original - but the ids in the body are what always works.
+
+placement:
+  - id: place-ids
+    type: mcq
+    concept: correlation-identifiers
+    skill: application
+    title: The essential log line
+    prompt: After the PSP answers a payment request, which log line from the payment service is most useful for later investigations?
+    options:
+      - id: all-ids
+        text: One line with the order id, attempt id, trace id, PSP payment id and status together
+        feedback: Correct - any one of those ids then leads to all the others.
+      - id: message
+        text: '"Payment successful"'
+        feedback: With no ids, it can't be found or joined.
+      - id: psp-only
+        text: The PSP payment id only
+        feedback: Better than nothing, but searching by order id or trace id won't find it.
+      - id: full-body
+        text: The full PSP request and response bodies
+        feedback: Bodies can contain personal or card data and still need ids as fields to be searchable.
+    correct: [all-ids]
+    solution: |
+      **All the ids together**, as structured fields.
+
+  - id: place-trace
+    type: mcq
+    concept: distributed-tracing
+    skill: application
+    title: What a span is
+    prompt: In distributed tracing, what is a span?
+    options:
+      - id: span
+        text: One timed operation within a trace - such as an HTTP call or a database query - with a parent link
+        feedback: Correct - spans form a tree that makes up the trace.
+      - id: trace
+        text: The whole journey of a request through all services
+        feedback: That is the trace; spans are its parts.
+      - id: log
+        text: A log line with a timestamp
+        feedback: Logs record events; a span has a start, a duration and a place in the trace tree.
+      - id: metric
+        text: A counter of requests per second
+        feedback: That is a metric.
+    correct: [span]
+    solution: |
+      **A timed operation in the trace tree.** The slowest or first failing span usually points at the problem.
+
+  - id: place-timeline
+    type: mcq
+    concept: payment-timeline
+    skill: analysis
+    title: Two seconds apart
+    prompt: In a timeline, the order-service log shows a webhook processed at 10:00:01, and the payment-service log shows the PSP response saved at 10:00:02. Before concluding that the webhook arrived first, what should you check?
+    options:
+      - id: clocks
+        text: Whether the two services' clocks are synchronised and both logs use UTC
+        feedback: Correct - a small clock skew or a time-zone mix-up can reverse the apparent order.
+      - id: nothing
+        text: Nothing - the logs prove the order
+        feedback: Logs from different machines are only comparable if their clocks agree.
+      - id: restart
+        text: Whether the order-service was restarted
+        feedback: A restart doesn't change the order of these two events.
+      - id: amount
+        text: Whether the amounts match
+        feedback: Useful, but it doesn't tell you which event came first.
+    correct: [clocks]
+    solution: |
+      **Clocks and time zones.** Ordering conclusions across machines need synchronised clocks - or sequence numbers and causal ids.
+
+recall:
+  - id: recall-ids
+    concept: correlation-identifiers
+    prompt: Name five identifiers of a payment and who creates them.
+    answer: Order id (shop), idempotency or attempt key (client or shop), request id (gateway), trace id (first instrumented service), PSP payment id and webhook event id (PSP).
+  - id: recall-log-rule
+    concept: correlation-identifiers
+    prompt: What is the logging rule that makes correlation work?
+    answer: Wherever an id is known, log it together with the other known ids, as structured fields - including on error lines.
+  - id: recall-traceparent
+    concept: distributed-tracing
+    prompt: What are the four parts of a W3C traceparent header?
+    answer: Version, trace id (32 hex characters), parent id (16 hex characters) and trace flags (including the sampled bit).
+  - id: recall-sampling
+    concept: distributed-tracing
+    prompt: Why might the trace you need be missing?
+    answer: Sampling keeps only some traces; log the trace id anyway so logs can be joined without the trace.
+  - id: recall-first
+    concept: payment-timeline
+    prompt: In a reconstructed timeline, which event do you investigate first?
+    answer: The first divergence from the expected sequence - later errors are often consequences.
+  - id: recall-psp-boundary
+    concept: payment-timeline
+    prompt: How do you follow a payment past your own services into the PSP?
+    answer: With your reference (order id) sent to the PSP and the PSP payment id returned and stored - the PSP doesn't continue your trace.
+
+next:
+  - sync-vs-async-payments
+  - logs-metrics-traces
