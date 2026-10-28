@@ -1,0 +1,786 @@
+id: ci-quality-gates
+title: CI pipelines and quality gates
+subject: frameworks
+module: framework-design
+level: advanced
+status: published
+estimatedMinutes: 60
+summary: Running suites in CI with secrets handled safely - pipeline stages, required checks that really block a merge, evidence on failure, and the GitHub Actions settings that keep credentials out of the wrong hands.
+tags: [ci, github actions, quality gates, branch protection, secrets, maven, surefire, failsafe, evidence, devsecops, interview]
+
+environment: |
+  - **CI system:** GitHub Actions, as documented in October 2026. Jenkins, GitLab CI and others use the
+    same ideas (triggers, jobs, steps, agents or runners, credentials stores, protected branches) with
+    different syntax - check their own documentation; this lesson does not describe them.
+  - **Worked example:** this repository's real workflow, `.github/workflows/pages.yml` (Node from
+    `.nvmrc`, Java 21 Temurin, `actions/checkout@v4`, `setup-node@v4`, `setup-java@v4`,
+    `upload-artifact@v4`, `upload-pages-artifact@v3`, `deploy-pages@v4`).
+  - **Maven:** Apache Maven 3.8+, maven-surefire-plugin and maven-failsafe-plugin 3.5.6 (as in the practice
+    projects). The `BUILD SUCCESS` / exit-code output in the lesson is real output from
+    `practice/java` (`TransfersTest` against the unsolved exercise), shortened.
+  - **Sources, checked:**
+    [Workflow syntax for GitHub Actions](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions)
+    (permissions, concurrency, `timeout-minutes` default 360, `needs`, default shells, schedule);
+    [Using secrets in GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions);
+    [Security hardening for GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions);
+    [Controlling permissions for GITHUB_TOKEN](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token)
+    and [GITHUB_TOKEN concepts](https://docs.github.com/en/actions/concepts/security/github_token);
+    [Deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments);
+    [OpenID Connect](https://docs.github.com/en/actions/concepts/security/openid-connect) and its
+    [reference](https://docs.github.com/en/actions/reference/security/oidc);
+    [About protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches);
+    [Dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching);
+    [actions/upload-artifact](https://github.com/actions/upload-artifact);
+    [actions/deploy-pages](https://github.com/actions/deploy-pages);
+    [Maven Surefire `test` goal](https://maven.apache.org/surefire/maven-surefire-plugin/test-mojo.html);
+    [Maven Failsafe plugin](https://maven.apache.org/surefire/maven-failsafe-plugin/) and its
+    [`verify` goal](https://maven.apache.org/surefire/maven-failsafe-plugin/verify-mojo.html);
+    [OWASP Top 10 CI/CD Security Risks](https://owasp.org/www-project-top-10-ci-cd-security-risks/).
+  - **Platform-specific, labelled:** environment secrets on private repositories need a paid GitHub plan
+    (on GitHub Free they are available in public repositories only). GitHub's settings screens and
+    defaults change - check the current documentation before quoting a default.
+  - **Opinion, labelled:** coverage thresholds, flaky-test budgets and "what runs on a pull request versus
+    nightly" are team policy, not standards. The lesson shows common choices and the reasoning.
+  - **Fictional:** SandPay (`https://api.sandpay.example`) and its `SANDPAY_API_KEY` sandbox key. No real
+    credentials appear anywhere.
+
+prerequisites:
+  - reference-framework-skeleton
+  - maven-lifecycle-surefire
+  - parallel-runs-and-thread-safety
+
+concepts:
+  - id: ci-pipeline-stages
+    name: Pipelines and test stages
+    summary: A workflow is triggered by events and runs jobs of steps on runners; fast checks run on every pull request, slower suites later or nightly, each with a timeout and evidence on failure.
+  - id: ci-quality-gate
+    name: Quality gates
+    summary: A gate is a check that blocks a merge or release - the job must fail when tests fail, and branch protection must require that job; anything that turns a failure green breaks the gate.
+  - id: ci-secrets-handling
+    name: Secrets in CI
+    summary: Credentials live in the CI secret store, reach only the steps and jobs that need them through environment variables, never reach untrusted code, and the job token gets least privilege.
+
+objectives:
+  - Describe a CI workflow in terms of triggers, jobs, steps and runners, and read a real GitHub Actions workflow.
+  - Design which test suites run on a pull request, after merge and nightly, with timeouts, caching, concurrency and evidence.
+  - Explain what makes a quality gate real - a failing exit code and a required status check - and spot configurations that make it pass while tests fail.
+  - Handle a test suite's credentials safely in CI - secret store, environment variables, least-privilege permissions, environments, and no secrets for untrusted code.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [ci-pipeline-stages, ci-quality-gate]
+    title: The idea in plain language
+    body: |
+      Think of a **factory with inspection points**. Every part that comes in goes through a quick check at
+      the door - seconds, cheap, catches the obvious. Assembled products get a longer test before they leave
+      the building. Once a night, a full stress test runs on a sample.
+
+      An inspection point only protects you if **a failed part really stops**. An inspector who writes
+      "faulty" in a notebook and waves the part through is worse than none - everyone believes the part was
+      checked.
+
+      CI is that factory. The **pipeline** is the route; the **quality gates** are the inspection points that
+      can stop a merge or a release; and the **secrets** are the keys to the test lab, which you hand only to
+      the inspectors who need them and never to a stranger's parcel.
+
+  - id: what
+    kind: what
+    concepts: [ci-pipeline-stages, ci-quality-gate, ci-secrets-handling]
+    title: What the words mean
+    body: |
+      | Term | Meaning in GitHub Actions |
+      |---|---|
+      | **workflow** | a YAML file in `.github/workflows/`; one automated process |
+      | **trigger** (`on:`) | events that start it - `push`, `pull_request`, `schedule` (cron, in UTC, at most every 5 minutes), `workflow_dispatch` (a button) |
+      | **job** | a set of steps on one **runner** (a fresh virtual machine such as `ubuntu-latest`); jobs run in parallel unless one `needs` another |
+      | **step** | one command (`run:`) or one action (`uses:`), run in order; a failing step fails the job |
+      | **status check** | each job reports a result on the commit - success, failure, skipped... |
+      | **quality gate** | a check that must pass before code moves on: a **required status check** on a protected branch, or an approval on a deployment environment |
+      | **secret** | an encrypted value stored in the repository, organisation or environment settings, read as `${{ secrets.NAME }}` |
+      | **`GITHUB_TOKEN`** | a token GitHub creates for each job to call the GitHub API; its rights are set with `permissions:`; it expires when the job finishes |
+      | **environment** | a named target (`github-pages`, `sandpay-sandbox`) with its own secrets and protection rules |
+
+      **Exit codes are the contract.** A `run:` step fails when its command exits with a non-zero code. Maven
+      exits non-zero when a test fails, so "the test failed" becomes "the step failed", "the job failed" and
+      finally "the pull request can't merge". Every link in that chain must hold.
+
+  - id: why
+    kind: why
+    concepts: [ci-quality-gate, ci-secrets-handling]
+    title: Why testers own this
+    body: |
+      - **A test that runs only on your laptop protects nobody.** CI makes the suite run on every change,
+        on a clean machine, with the same steps every time.
+      - **A green build is a claim.** If a flag ignores failures, or a required check is quietly skipped, the
+        claim is false and the team ships on it. Testers are the people who ask "how do we know this check
+        can fail?".
+      - **Test suites hold real access.** A payment suite needs a sandbox API key, a test-user password,
+        maybe a cloud login. A leaked CI secret is one of the OWASP Top 10 CI/CD risks
+        (CICD-SEC-6, *Insufficient Credential Hygiene*); running untrusted code with access is another
+        (CICD-SEC-4, *Poisoned Pipeline Execution*).
+      - **Interviews ask it.** "How do your tests run in CI, and what stops a broken build from merging?" is
+        a standard senior-QA question.
+
+  - id: internals
+    kind: internals
+    concepts: [ci-pipeline-stages, ci-quality-gate]
+    title: How a run works, step by step
+    body: |
+      1. **An event arrives** - a pull request is opened. GitHub finds workflows whose `on:` matches.
+      2. **Jobs are scheduled.** Jobs without `needs` start at once on separate runners. If a job fails or
+         is skipped, jobs that `need` it are skipped too, unless they use a condition such as `always()`.
+      3. **Each runner starts empty.** Checkout, install the JDK or Node, restore the dependency **cache**,
+         then run the steps. Nothing from the last run survives except caches and uploaded artefacts.
+      4. **Steps run in order** in a shell. If you don't name a shell on Linux, GitHub runs `bash -e {0}`:
+         the step stops at the first failing command - but **without `pipefail`**, so in
+         `mvn verify | tee build.log` only `tee`'s exit code counts. With `shell: bash` it runs
+         `bash --noprofile --norc -eo pipefail {0}` and the pipe fails when Maven does.
+      5. **Later steps check the result.** A step without `if:` runs only while everything before it
+         succeeded. `if: failure()` runs only when an earlier step failed - the place for uploading evidence.
+         `if: always()` runs either way.
+      6. **The job reports a status check** on the commit. Branch protection compares the required checks
+         with these results; GitHub counts **success, skipped and neutral** as passing.
+      7. **Limits.** A job is cancelled after `timeout-minutes` (default **360** - six hours of a hung
+         browser). `concurrency` allows at most one running run per group; `cancel-in-progress: true` also
+         cancels the older run when a newer one starts.
+
+      **Maven's part.** `mvn -B verify` (batch mode: no interactive prompts, plainer logs) runs Surefire in
+      `test` and Failsafe in `integration-test`, and Failsafe's `verify` goal fails the build. Maven exits
+      with 1 on a failed build and 0 on success; reports land in `target/surefire-reports` and
+      `target/failsafe-reports`. Failsafe's documentation tells you to run `mvn verify` rather than
+      `mvn integration-test`, otherwise `post-integration-test` clean-up is skipped.
+
+  - id: visual
+    kind: visual
+    concepts: [ci-pipeline-stages, ci-quality-gate]
+    title: "Diagram: stages and gates for a SandPay checkout team"
+    body: |
+      ```mermaid
+      flowchart LR
+          PR["Pull request opened"] --> F["fast job - unit and API contract tests, about 5 min"]
+          F --> RC{"Required checks pass?"}
+          RC -- no --> BLK["Merge blocked - evidence uploaded"]
+          RC -- yes --> M["Merge to main"]
+          M --> E2E["e2e job - UI journeys against the SandPay sandbox"]
+          N["Nightly schedule"] --> FULL["full regression and cross-browser"]
+          E2E --> ENV{"Environment approval"}
+          ENV -- approved --> DEP["Deploy or release"]
+      ```
+
+      Notice where the **gates** are: the required checks before merge, and the environment approval before
+      deploy. The nightly run is information, not a gate - unless someone owns its failures every morning.
+
+  - id: when
+    kind: when
+    concepts: [ci-pipeline-stages]
+    title: What runs when
+    body: |
+      The test pyramid in CI is a question of **feedback time**. A common policy (opinion, not a standard):
+
+      | Stage | Trigger | Runs | Target time | Gate? |
+      |---|---|---|---|---|
+      | pull request | `pull_request` | compile, lint, unit tests, API tests against stubs, a few UI smoke journeys | minutes | yes - required checks |
+      | after merge | `push` to `main` | full API suite and the main UI journeys against a shared sandbox | tens of minutes | gates the deploy |
+      | nightly | `schedule` | full regression, other browsers, long-running and data-heavy tests | hours allowed | no - but someone triages every failure |
+      | before release | `workflow_dispatch` or a tag | the release checklist suite, against the release candidate | as needed | yes - environment approval |
+
+      **Move a test earlier** when the defects it finds are expensive to find late. **Move it later** when
+      it is slow, needs a shared environment, or needs secrets that pull requests from forks don't get.
+
+      **Not a replacement:** CI does not replace exploratory testing, or a human reading the evidence of a
+      red build. It only makes the checks you wrote run reliably.
+
+  - id: example
+    kind: example
+    concepts: [ci-pipeline-stages, ci-quality-gate, ci-secrets-handling]
+    title: "Real-world example: this repository's own workflow"
+    body: |
+      LearnerApp's `.github/workflows/pages.yml` is a small but complete example. Read the
+      [whole file](https://github.com/LokiD-SE/LearnerApp/blob/main/.github/workflows/pages.yml); the parts
+      that matter here:
+
+      | Part | What it does | Why |
+      |---|---|---|
+      | `on: push` to `main`, `pull_request`, `workflow_dispatch` | runs on every pull request and every merge; can be started by hand | every change is checked |
+      | `permissions: contents: read` at the top | the token can read the code and nothing else | least privilege; everything not listed is `none` |
+      | `concurrency` with `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` | a new push to a pull request cancels the older run; runs on `main` are not cancelled mid-deploy | saves runner time without breaking deploys |
+      | `timeout-minutes: 20` per job | a hung browser costs 20 minutes, not 6 hours | timeouts are a gate against hangs |
+      | `check` job - `npm ci`, `npm run check` | typecheck, lint, format, unit tests, build, Playwright end-to-end tests | one command, the same one developers run |
+      | `practice` job - `practice/verify.sh java`, `maven`, `framework`, `playwright` | reference solutions pass, unsolved exercises fail; Selenium runs headless because `CI=true` | proves the exercises can fail |
+      | `if: failure()` + `upload-artifact@v4`, `retention-days: 7`, `if-no-files-found: ignore` | keeps `test-results`, `surefire-reports` and screenshots **only when something failed** | evidence without storing every green run |
+      | `cache: npm` / `cache: maven` on the setup actions | restores dependencies from the cache | faster runs; caches unused for 7 days are evicted |
+      | `deploy` job - `needs: [check, practice]`, only on `main`, own `permissions: pages: write, id-token: write`, `environment: github-pages` | deploys only after both test jobs passed, with only the rights a Pages deploy needs | the deploy is gated by the tests |
+
+      Two details worth noticing:
+
+      - `practice/verify.sh` deliberately runs Maven with `-Dmaven.test.failure.ignore=true` when it
+        **expects** the exercise tests to fail - then reads the `TEST-*.xml` reports itself and exits 1 if
+        an exercise test *passed*. Ignoring failures is safe only because something else turns the result
+        back into an exit code.
+      - The actions are pinned to major tags (`@v4`), not to commit SHAs. GitHub's hardening guide
+        recommends full-length SHAs, because a tag can be moved; tags are the common, more readable
+        compromise for first-party `actions/*` actions. For third-party actions, prefer SHAs.
+
+  - id: code
+    kind: code
+    concepts: [ci-pipeline-stages, ci-secrets-handling]
+    title: "Code: a workflow for a SandPay test suite"
+    collapsed: true
+    body: |
+      Illustrative - a Java suite with fast tests (`*Test`, Surefire) and UI journeys against the fictional
+      SandPay sandbox (`*IT`, Failsafe). Every key below is documented GitHub Actions syntax.
+
+      ```yaml
+      name: SandPay checkout tests
+      on:
+        pull_request:
+        push:
+          branches: [main]
+        schedule:
+          - cron: '30 1 * * *'          # 01:30 UTC every night
+        workflow_dispatch:
+
+      permissions:
+        contents: read                  # everything else: none
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+      jobs:
+        fast-tests:                     # unique job name: it becomes the required check
+          runs-on: ubuntu-latest
+          timeout-minutes: 15
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '21'
+                cache: maven
+            - run: mvn -B -ntp test     # no secrets needed: SandPay is stubbed
+            - name: Keep reports when tests fail
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                name: surefire-reports
+                path: target/surefire-reports
+                retention-days: 7
+
+        sandbox-journeys:
+          if: github.event_name != 'pull_request'
+          needs: fast-tests
+          runs-on: ubuntu-latest
+          timeout-minutes: 45
+          environment: sandpay-sandbox  # holds the secret; deployment branches limited to main
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '21'
+                cache: maven
+            - name: UI and API journeys against the sandbox
+              shell: bash               # -eo pipefail: Maven's exit code survives the pipe
+              run: mvn -B -ntp verify | tee build.log
+              env:
+                SANDPAY_BASE_URL: https://api.sandpay.example
+                SANDPAY_API_KEY: ${{ secrets.SANDPAY_API_KEY }}
+            - name: Keep evidence when journeys fail
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                name: journey-evidence
+                path: |
+                  target/failsafe-reports
+                  target/evidence
+                  build.log
+                retention-days: 7
+      ```
+
+      In the test code the key is read from the environment, never from a file in the repository:
+
+      ```java
+      String apiKey = System.getenv("SANDPAY_API_KEY");
+      if (apiKey == null || apiKey.isBlank()) {
+          throw new IllegalStateException("SANDPAY_API_KEY is not set");   // never print the value
+      }
+      ```
+
+      **Real output - what "ignore failures" does to the exit code** (`practice/java`, three tests failing):
+
+      ```plaintext
+      $ mvn -B -ntp test -Dtest=TransfersTest; echo "exit=$?"
+      [ERROR] Tests run: 4, Failures: 3, Errors: 0, Skipped: 0
+      [INFO] BUILD FAILURE
+      exit=1
+
+      $ mvn -B -ntp test -Dtest=TransfersTest -Dmaven.test.failure.ignore=true; echo "exit=$?"
+      [ERROR] Tests run: 4, Failures: 3, Errors: 0, Skipped: 0
+      [ERROR] There are test failures.
+      [INFO] BUILD SUCCESS
+      exit=0
+      ```
+
+      The second run prints the failures - and exits 0. CI sees only the exit code: a green check.
+
+  - id: secrets
+    kind: internals
+    concepts: [ci-secrets-handling]
+    title: How secrets stay secret
+    body: |
+      | Rule | What GitHub documents | What to do |
+      |---|---|---|
+      | store them in the secret store | secrets are encrypted; values read through `${{ secrets.NAME }}` are redacted in logs | never commit keys, `.env` files or `settings.xml` passwords |
+      | redaction is a safety net, not a guarantee | structured data (a JSON blob as one secret) can make redaction fail; transformed values (Base64) are not the stored string | one secret per value; never `echo` a secret, even "to check it is set"; `::add-mask::VALUE` for sensitive values that aren't secrets |
+      | pass them as environment variables | avoid passing secrets on the command line; use `env:`, stdin or other process mechanisms | set `env:` on the one step that needs it, not the whole workflow |
+      | secrets in conditions | secrets can't be referenced directly in `if:` | put it in a job-level `env` variable and test that |
+      | forks get no secrets | apart from `GITHUB_TOKEN`, secrets are not passed to the runner when a workflow is triggered from a forked repository; on fork pull requests the token's write permissions become read-only | design pull-request jobs to need no secrets (stubs, mocks) |
+      | `pull_request_target` is dangerous | it runs with the base repository's secrets; the hardening guide says to avoid it (and `workflow_run`) with untrusted pull requests or code | never check out and run a fork's code under it |
+      | least-privilege token | `permissions:` sets the `GITHUB_TOKEN` rights; once you list any, the unlisted ones are `none`; `{}` disables all | `contents: read` at the top, extra rights per job |
+      | environments | secrets of an environment are available only to jobs that reference it; with required reviewers, the job can't read them until someone approves; deployment branch rules limit which branches can use it | put sandbox or production credentials behind an environment |
+      | OIDC instead of stored cloud keys | the workflow exchanges a short-lived token with the cloud provider; needs `id-token: write`, which "only enables fetching and setting the OIDC token" | no long-lived cloud secret to leak |
+      | untrusted input is code | an expression such as `${{ github.event.pull_request.title }}` inside `run:` is pasted into the script before it runs | pass it through an intermediate `env:` variable and quote it |
+
+      **Caches and artefacts are not secret.** Anyone with read access can see cache contents and download
+      artefacts. Never cache or upload files that contain credentials - including logs or page sources that
+      show a token.
+
+  - id: tests
+    kind: tests
+    concepts: [ci-quality-gate]
+    title: Testing the gate itself
+    body: |
+      A gate you never saw fail is a gate you don't know works. Check it like any feature:
+
+      | ID | Check | Expected | Evidence |
+      |---|---|---|---|
+      | G1 | push a branch with one deliberately failing test | the job is red and the pull request cannot be merged | screenshot of the checks list; the job log with Maven's exit 1 |
+      | G2 | the same, but with a step that pipes Maven into `tee` | still red (needs `shell: bash` or no pipe) | job log |
+      | G3 | a failing run | the evidence artefact exists and contains the report and screenshot | the artefact's file list |
+      | G4 | rename the gated job | the old required check never reports, so it keeps waiting and blocks; update the rule | the branch-protection settings |
+      | G5 | a change that skips the gated job (`paths`, `if:`) | decide on purpose: a skipped required check counts as passing | the run summary showing "skipped" |
+      | G6 | a hanging test (a `sleep` longer than the timeout) | the job is cancelled at `timeout-minutes` | job log ending in the timeout |
+      | G7 | a pull request from a fork | the fast job passes without secrets; secret-needing jobs don't run | run list for the fork pull request |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [ci-quality-gate, ci-secrets-handling, ci-pipeline-stages]
+    title: Common mistakes, and a debugging method
+    body: |
+      **Gates that can't fail:**
+
+      - `-Dmaven.test.failure.ignore=true` (Surefire's `testFailureIgnore`, "NOT RECOMMENDED" in its own
+        docs) left in the pom or the CI command - `BUILD SUCCESS` with failures.
+      - Failsafe with only the `integration-test` goal, no `verify` - failures are recorded, never enforced.
+      - `continue-on-error: true` on the test step or job - the job stays green.
+      - `mvn verify | tee log` in the default shell - no `pipefail`, so `tee` decides.
+      - The CI job is not a **required** status check, or the rule allows admins to bypass it (the default
+        for branch protection rules unless "Do not allow bypassing the above settings" is on).
+      - A required check that is **skipped** by an `if:` or path filter - skipped counts as passing.
+      - Automatic re-runs (`rerunFailingTestsCount`) that turn a flaky failure into a pass; Surefire does
+        report it as a "flake", but only if someone reads the report.
+
+      **Pipelines that waste time or hide evidence:** no `timeout-minutes` (six-hour hangs); no
+      `concurrency` (ten stale runs per pull request); everything in one 50-minute job; evidence uploaded
+      without `if: failure()` (so it never runs after a failure) or never uploaded at all; reports
+      overwritten because two jobs upload the same artefact name (v4 artefacts are immutable - the second
+      upload fails unless `overwrite: true`).
+
+      **Secret leaks:** echoing a secret; a JSON blob as one secret; `pull_request_target` checking out the
+      pull request's code; `permissions: write-all`; secrets in `env:` at workflow level when one step needs
+      them; credentials in cached directories or uploaded logs.
+
+      **Debugging method for "CI is green but the feature is broken":** open the run → find the test step →
+      read Maven's `Tests run:` line (did the tests run at all?) → check the exit code path (flags, pipes,
+      `continue-on-error`) → check the branch rule (is this job required, under its current name?) → check
+      whether the job ran or was skipped.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [ci-pipeline-stages, ci-quality-gate]
+    title: Trade-offs
+    body: |
+      | Choice | Gains | Costs |
+      |---|---|---|
+      | everything on every pull request | nothing slips through | slow feedback; people stop waiting for CI and merge anyway |
+      | UI suite only nightly | fast pull requests | a broken journey is found the next morning, mixed with other changes |
+      | "branches must be up to date" (strict) | checks run on what will really be merged | more builds and more rebasing |
+      | coverage threshold as a gate (team policy) | stops untested code | invites tests that execute code without asserting anything |
+      | flaky-test quarantine (team policy) | the gate stays trustworthy | quarantined tests protect nothing until fixed - give each an owner and a date |
+      | actions pinned to commit SHAs | a moved tag can't change your pipeline | updates are manual (or need a bot) |
+      | environment with required reviewers | a human decides each deploy | slower; reviewers approve by habit if it's every run |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Workflow → jobs (on runners, parallel unless `needs`) → steps (in order). Triggers: `push`,
+        `pull_request`, `schedule` (UTC), `workflow_dispatch`.
+      - Fast tests on every pull request; slow and secret-needing suites after merge or nightly.
+      - A gate needs **a non-zero exit code** and **a required status check**. Watch for
+        `testFailureIgnore`, Failsafe without `verify`, `continue-on-error`, pipes without `pipefail`,
+        skipped required checks, admin bypass.
+      - `timeout-minutes` (default 360), `concurrency`, setup-action caching, evidence with `if: failure()`.
+      - Secrets: secret store, `env:` on the step, never echoed, never structured; forks get none; avoid
+        `pull_request_target` with untrusted code; `permissions: contents: read` plus per-job extras;
+        environments for sandbox and production keys; OIDC instead of long-lived cloud keys.
+
+exercises:
+  - id: place-the-suites
+    type: mcq
+    concept: ci-pipeline-stages
+    skill: application
+    title: Which suites gate the pull request?
+    prompt: |
+      A SandPay checkout team has: 900 unit tests (2 min), 150 API tests against WireMock stubs (4 min),
+      40 UI journeys against the shared SandPay sandbox that need `SANDPAY_API_KEY` (35 min), and a
+      cross-browser run (2 h). Outside contributors open pull requests from forks. Which plan fits?
+    options:
+      - id: tiered
+        text: "Pull request: unit and stubbed API tests as required checks. Merge to main: UI journeys with the sandbox key. Nightly: cross-browser."
+        feedback: Correct - fast and secret-free checks gate the merge; slow and secret-needing suites run where the secret is available and time is acceptable.
+      - id: all-on-pr
+        text: Everything on every pull request, so nothing slips through
+        feedback: Over two and a half hours per push, and fork pull requests don't receive the sandbox secret, so the UI journeys would fail for every outside contributor.
+      - id: target
+        text: Everything on pull requests, using pull_request_target so forks get the secret
+        feedback: This runs fork code with your secrets - exactly what GitHub's hardening guide warns against (Poisoned Pipeline Execution).
+      - id: nightly-only
+        text: Only a nightly run of everything, to save runner minutes
+        feedback: Then nothing gates a merge; broken code lands on main and is found the next morning mixed with everyone else's changes.
+    correct: [tiered]
+    hints:
+      - Which suites need a secret, and what do fork pull requests get?
+      - What feedback time keeps people waiting for CI instead of merging around it?
+    solution: |
+      **Tiered.** The pull-request gate must be fast and must not need secrets (forks don't get them). The
+      UI journeys run on `push` to `main`, in a job with the sandbox environment; cross-browser runs nightly
+      and someone triages its failures each morning. If UI regressions on main hurt, add two or three
+      secret-free smoke journeys against a local shop to the pull-request stage.
+    followUp: |
+      The team now wants the UI journeys to gate merges too. What would you change so they can run on
+      pull requests without the sandbox secret?
+
+  - id: debug-workflow
+    type: debug
+    concept: ci-secrets-handling
+    skill: analysis
+    title: Review this workflow
+    prompt: |
+      A contributor proposes this workflow so pull requests from forks can run the SandPay sandbox journeys.
+      Click every line that leaks a secret, gives untrusted code access, turns a failure green or loses the
+      evidence.
+    language: yaml
+    code: |
+      name: SandPay journeys
+      on:
+        pull_request_target:
+      permissions: write-all
+      jobs:
+        journeys:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '21'
+                cache: maven
+            - run: echo "Using key ${{ secrets.SANDPAY_API_KEY }}"
+            - run: mvn -B verify | tee build.log
+              env:
+                SANDPAY_API_KEY: ${{ secrets.SANDPAY_API_KEY }}
+            - uses: actions/upload-artifact@v4
+              with:
+                name: evidence
+                path: target/failsafe-reports
+    correctLines: [3, 4, 11, 17, 18, 21]
+    lineNotes:
+      - line: 16
+        note: Caching the Maven repository is fine - as long as nothing secret is written into it.
+      - line: 20
+        note: Passing the secret through env on the one step that needs it is the documented, recommended way. The problem is which code that step runs.
+      - line: 9
+        note: Checking out is needed. On its own it checks out the base branch; line 11 is what makes it check out the fork's code.
+    hints:
+      - Which trigger gives the job the base repository's secrets, and whose code does line 11 run?
+      - Which shell runs a run step that names none, and does it have pipefail?
+      - A step without if runs only while everything before it succeeded.
+    solution: |
+      **Lines 3, 4, 11, 17, 18 and 21.**
+
+      - **3 and 11** - `pull_request_target` runs with the repository's secrets and token, and line 11 checks
+        out and runs the fork's code under it. Any contributor can change a test to send the key anywhere.
+        Use `pull_request` (no secrets for forks) and stubs, or run the sandbox journeys after merge.
+      - **4** - `write-all` gives the token write access to everything. Use `contents: read`.
+      - **17** - never echo a secret. Redaction usually hides it, but it is a safety net; any
+        transformation of the value is not redacted. The expression is also pasted into the script text.
+      - **18** - no `shell:` means `bash -e`, without `pipefail`: `tee` exits 0, so failed tests leave the
+        step green. Add `shell: bash` or drop the pipe.
+      - **21** - no `if: failure()` (or `always()`): after a failure this step never runs, so the evidence is
+        lost exactly when it's needed.
+    followUp: |
+      Rewrite the workflow so fork pull requests get a useful, secret-free check and the sandbox journeys
+      still run with the key after merge.
+
+  - id: skipped-required-check
+    type: mcq
+    concept: ci-quality-gate
+    skill: analysis
+    title: The merge that shouldn't have happened
+    prompt: |
+      `main` requires the status check `e2e`. A pull request changing only `src/payment/Refund.java`
+      merged, and refunds broke. The run page shows the `e2e` job as **skipped**. The job has
+      `if: contains(github.event.pull_request.labels.*.name, 'run-e2e')`, and nobody added the label.
+      Why did the merge go through?
+    options:
+      - id: skipped-passes
+        text: GitHub counts a skipped required check as passing, so the condition switched the gate off
+        feedback: Correct - success, skipped and neutral all satisfy a required status check. A gate controlled by an optional label is optional.
+      - id: admin
+        text: An administrator must have bypassed branch protection
+        feedback: Possible in general (admins bypass by default), but the evidence - a skipped job and no label - explains it without that. Check the audit before blaming a person.
+      - id: flaky
+        text: The e2e suite is flaky and passed by luck
+        feedback: The job didn't run at all - it was skipped, so no test could pass or fail.
+      - id: not-required
+        text: The check isn't really required; the rule must be misconfigured
+        feedback: The rule names e2e. A required check that reports skipped is satisfied, which is the real gap here.
+    correct: [skipped-passes]
+    hints:
+      - What did the e2e job report on the commit?
+      - Which results does GitHub accept for a required status check?
+    solution: |
+      **A skipped required check passes.** Confirm it on the pull request's checks list (`e2e - skipped`).
+      Fixes: run the gate unconditionally and make it fast enough; or make the job always run and decide
+      *inside* it what to test (it then reports success or failure); never let a label decide whether the
+      gate exists.
+    followUp: |
+      A team uses `paths:` filters so the UI suite only runs when front-end files change. What would you
+      check before agreeing?
+
+  - id: green-with-failures
+    type: short
+    concept: ci-quality-gate
+    skill: analysis
+    title: Green build, failing tests
+    prompt: |
+      The nightly job is green, but its log contains:
+
+      ```plaintext
+      [ERROR] Tests run: 212, Failures: 7, Errors: 0, Skipped: 0
+      [ERROR] There are test failures.
+      [INFO] BUILD SUCCESS
+      ```
+
+      In three to five sentences: what is the most likely cause, how do you confirm it, and what do you
+      change?
+    hints:
+      - Which Maven setting reports failures but still ends in BUILD SUCCESS?
+      - Where could that setting come from - the command, the pom, a profile, MAVEN_OPTS?
+    modelAnswer: |
+      Failures are reported but the build succeeds, which is what Surefire's `testFailureIgnore`
+      (`maven.test.failure.ignore`) does - Maven exits 0, so the job is green. I'd confirm by searching the
+      workflow's command line, the pom (including profiles and parent poms) and `.mvn/maven.config` for the
+      property, and by running the same command locally and printing `$?`. Then remove it, so failures exit 1
+      and the job turns red. If someone needs "run everything and report", the job must still end with a
+      step that fails when the reports contain failures - as `practice/verify.sh` does.
+    rubric:
+      - Named testFailureIgnore / maven.test.failure.ignore
+      - Explained that CI reads only the exit code (0 means green)
+      - Gave a way to confirm (search command and pom, reproduce and check the exit code)
+      - Proposed removing it, or a later step that fails on failures in the reports
+    solution: |
+      **`testFailureIgnore`.** The log is real Maven behaviour - this lesson's code section shows the same
+      run exiting 1 without the flag and 0 with it. Two other causes of a green job with failing tests -
+      Failsafe without its `verify` goal, and `continue-on-error: true` - are worth ruling out, but the
+      `There are test failures` line followed by `BUILD SUCCESS` points first at the ignore flag.
+
+  - id: fork-401
+    type: mcq
+    concept: ci-secrets-handling
+    skill: application
+    title: Fork pull requests fail with 401
+    prompt: |
+      Pull requests from team branches pass. Pull requests from forks fail in the API tests with
+      `401 Unauthorized` from `https://api.sandpay.example`. The step sets
+      `SANDPAY_API_KEY: ${{ secrets.SANDPAY_API_KEY }}`. What do you do?
+    options:
+      - id: stub
+        text: Make pull-request tests use stubs and need no key; run the sandbox tests after merge
+        feedback: Correct - fork workflows don't receive secrets by design; the fix is a pull-request stage that doesn't need them.
+      - id: target
+        text: Switch the trigger to pull_request_target so forks receive the secret
+        feedback: That runs untrusted code with your secret - the attack the hardening guide warns about.
+      - id: commit-key
+        text: Put the sandbox key in the repository - it's only a sandbox
+        feedback: A committed key is public to everyone who can read the repository and its history; sandbox keys still give access (and cost) in the provider's account.
+      - id: rotate
+        text: Rotate the secret - it must have expired
+        feedback: Team branches pass with the same secret, so it works. The difference is where the workflow was triggered from.
+    correct: [stub]
+    hints:
+      - What is different between the passing and failing runs?
+      - What does GitHub pass to a workflow triggered from a fork?
+    solution: |
+      **Forks get no secrets** (only `GITHUB_TOKEN`, read-only for their pull requests), so the variable is
+      empty and SandPay answers 401. Confirm by checking that the failing runs all come from forks, and have
+      the tests fail fast with a clear message ("SANDPAY_API_KEY is not set") instead of a confusing 401.
+      Then split the stages: stubs on pull requests, the sandbox after merge.
+
+  - id: interview-ci-design
+    type: interview
+    concept: ci-pipeline-stages
+    skill: application
+    title: "Interview: how do your tests run in CI?"
+    prompt: |
+      **Interviewer:** "You own the automation for a payments checkout - API and UI suites, a sandbox
+      provider that needs an API key. How would you run them in CI, and what stops a broken build from
+      merging?"
+    hints:
+      - Stages and triggers first, then the gate, then evidence, then secrets.
+    modelAnswer: |
+      - **Stages:** on every pull request, unit and API tests against stubs plus a few smoke journeys -
+        under ten minutes, no secrets. After merge to main, the UI journeys and API tests against the
+        sandbox. Nightly, full regression and other browsers, triaged every morning.
+      - **Gate:** `mvn -B verify` exits non-zero on any failure; the pull-request job is a required status
+        check under a unique, stable name; no `testFailureIgnore`, no `continue-on-error`, no conditions that
+        skip the required job; admins can't bypass.
+      - **Reliability:** a fresh runner per job, browser per test, headless in CI, `timeout-minutes` on every
+        job, concurrency to cancel stale pull-request runs, cached dependencies.
+      - **Evidence:** on failure, upload Surefire/Failsafe reports, screenshots and logs as artefacts with a
+        short retention.
+      - **Secrets:** sandbox key in an environment's secrets, passed as an environment variable to the one
+        step that needs it, never printed; `permissions: contents: read`; forks get no secrets so their
+        stage uses stubs; OIDC rather than stored keys for cloud access.
+    followUps:
+      - How do you know the gate can actually fail?
+      - What do you do about a flaky test that blocks everyone's merges?
+      - How would you keep the sandbox key safe from a malicious pull request?
+    rubric:
+      - Described stages by trigger and feedback time, with reasons
+      - Explained the gate as exit code plus required status check, and named a way it can be bypassed
+      - Mentioned timeouts and evidence on failure
+      - Handled secrets - store, environment variable, least privilege, forks get none
+      - Showed judgement (team policy, triage of nightly failures) rather than listing tools
+    solution: |
+      Strong answers connect each choice to a risk: slow feedback, a gate that can't fail, a hang, a
+      failure nobody can analyse, a leaked key. Listing "Jenkins, Docker, Allure" without that is the weak
+      answer.
+
+recall:
+  - id: recall-anatomy
+    concept: ci-pipeline-stages
+    prompt: Name the parts of a GitHub Actions workflow, from the outside in.
+    answer: Triggers (on), jobs (each on its own runner, parallel unless needs), steps (run or uses, in order).
+  - id: recall-timeout
+    concept: ci-pipeline-stages
+    prompt: What is the default job timeout in GitHub Actions, and why set your own?
+    answer: 360 minutes. A hung browser or test would hold a runner for six hours; a realistic timeout fails fast.
+  - id: recall-gate
+    concept: ci-quality-gate
+    prompt: What two things make a CI quality gate real?
+    answer: The job fails (non-zero exit) when a test fails, and branch protection requires that job's status check.
+  - id: recall-skipped
+    concept: ci-quality-gate
+    prompt: Which results satisfy a required status check?
+    answer: Success, skipped and neutral - so a required job skipped by a condition doesn't block the merge.
+  - id: recall-pipefail
+    concept: ci-quality-gate
+    prompt: Why can `mvn verify | tee build.log` hide failures in a run step?
+    answer: Without a shell set, Linux steps run bash -e without pipefail, so the pipe's exit code is tee's (0). Use shell bash, which adds pipefail.
+  - id: recall-forks
+    concept: ci-secrets-handling
+    prompt: What does a workflow triggered from a fork receive?
+    answer: No secrets except GITHUB_TOKEN, whose write permissions become read-only on fork pull requests.
+  - id: recall-permissions
+    concept: ci-secrets-handling
+    prompt: What happens to the token's other permissions when you write `permissions` with `contents read`?
+    answer: Every permission you don't list is set to none.
+
+next:
+  - e2e-payment-capstone
+
+placement:
+  - id: place-stage
+    type: mcq
+    concept: ci-pipeline-stages
+    skill: application
+    title: The 50-minute pull request
+    prompt: |
+      Every pull request runs the whole suite - unit tests, API tests and 60 UI journeys - in one job that
+      takes 50 minutes. Developers have started merging before it finishes. What is the best first change?
+    options:
+      - id: split
+        text: Split into a fast required job (unit, API, a few smoke journeys) and run the full UI suite after merge or nightly
+        feedback: Correct - the gate must be fast enough that people wait for it; the rest still runs, later.
+      - id: retries
+        text: Add automatic re-runs so the job fails less often
+        feedback: Re-runs make it slower and hide flakiness; the problem is feedback time.
+      - id: drop-ui
+        text: Delete the UI journeys
+        feedback: They still find defects; move them to a later stage instead of losing them.
+      - id: bigger-timeout
+        text: Raise timeout-minutes so the job never times out
+        feedback: The job isn't timing out - it is too slow to be waited for.
+    correct: [split]
+    solution: |
+      **Tier the pipeline.** A pull-request gate that takes minutes, required by branch protection; the
+      slow suites after merge or nightly, with someone owning their failures.
+
+  - id: place-failsafe-gate
+    type: mcq
+    concept: ci-quality-gate
+    skill: analysis
+    title: Integration failures, green job
+    prompt: |
+      The CI step runs `mvn -B verify`. The log shows Failsafe running `CheckoutIT` with two failures,
+      then `BUILD SUCCESS`, and the job is green. The pom has the Failsafe plugin with one execution whose
+      goals list contains only `integration-test`. What is wrong?
+    options:
+      - id: no-verify
+        text: The verify goal is missing - integration-test records failures without failing the build
+        feedback: Correct - Failsafe deliberately doesn't fail in integration-test, so post-integration-test can clean up; its verify goal fails the build.
+      - id: wrong-phase
+        text: The command should be mvn integration-test
+        feedback: Failsafe's documentation says to run mvn verify; integration-test would also skip post-integration-test clean-up, and still never fail.
+      - id: batch-mode
+        text: The -B flag hides test failures
+        feedback: Batch mode only makes Maven non-interactive; it doesn't change the result.
+      - id: required
+        text: The job isn't a required status check
+        feedback: That would let a red job merge - but this job is green, so the problem is earlier.
+    correct: [no-verify]
+    solution: |
+      **Add the `verify` goal** to the Failsafe execution. `integration-test` runs and records;
+      `verify` reads `target/failsafe-reports` and fails the build, which is what turns the job red.
+
+  - id: place-secret
+    type: mcq
+    concept: ci-secrets-handling
+    skill: application
+    title: Storing the SandPay credentials
+    prompt: |
+      The UI suite needs a SandPay sandbox API key and a test merchant password. Which setup is safest in
+      GitHub Actions?
+    options:
+      - id: separate-env
+        text: Two separate secrets in an environment limited to main, passed through env on the step that runs Maven
+        feedback: Correct - one value per secret keeps redaction working, and only the job and step that need them get them.
+      - id: json
+        text: One secret holding a JSON object with both values, exported at the top of the workflow
+        feedback: GitHub warns that structured data can make log redaction fail, and workflow-level env gives every step the values.
+      - id: base64-file
+        text: A Base64-encoded properties file committed to the repository
+        feedback: Base64 is encoding, not encryption; anyone who can read the repository can decode it.
+      - id: cli-arg
+        text: Pass them as -Dsandpay.key=... on the Maven command line, printed in the log so failures are easy to debug
+        feedback: GitHub advises against passing secrets on the command line, and printing them defeats the point.
+    correct: [separate-env]
+    solution: |
+      **One secret per value, scoped to an environment, delivered as environment variables to the one step
+      that needs them.** Add `permissions: contents: read` and keep those jobs off fork pull requests.

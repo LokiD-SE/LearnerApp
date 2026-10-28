@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { pathProgress, lessonStatus } from '../../src/store/selectors';
 import { emptyState, markRead, recordAttempt, type ProgressState } from '../../src/store/state';
-import { at, realIndex } from './helpers';
+import { at, realIndex, withPlannedLesson } from './helpers';
 
 const index = realIndex();
 const now = at('2026-10-01T09:00:00.000Z');
@@ -49,21 +49,21 @@ describe('pathProgress', () => {
   });
 
   it('reports no next lesson for a path whose lessons are all planned', () => {
-    const planned = [...index.refs.values()].filter((ref) => ref.planned).map((ref) => ref.id);
+    const { index: withPlanned, planned } = withPlannedLesson(index);
     const plannedPath = {
       id: 'planned',
       title: 'P',
       level: 'beginner' as const,
       summary: 'S',
-      lessons: planned,
+      lessons: [planned.id],
     };
-    const progress = pathProgress(index, emptyState(), plannedPath);
-    expect(progress).toMatchObject({ total: planned.length, ready: 0 });
+    const progress = pathProgress(withPlanned, emptyState(), plannedPath);
+    expect(progress).toMatchObject({ total: 1, ready: 0 });
     expect(progress.next).toBeUndefined();
   });
 
   it('skips planned lessons when suggesting the next one', () => {
-    const planned = [...index.refs.values()].find((ref) => ref.planned)!;
+    const { index: withPlanned, planned } = withPlannedLesson(index);
     const mixed = {
       id: 'mixed',
       title: 'M',
@@ -71,7 +71,7 @@ describe('pathProgress', () => {
       summary: 'S',
       lessons: [planned.id, 'java-types-and-variables'],
     };
-    const progress = pathProgress(index, emptyState(), mixed);
+    const progress = pathProgress(withPlanned, emptyState(), mixed);
     expect(progress).toMatchObject({ total: 2, ready: 1 });
     expect(progress.next?.id).toBe('java-types-and-variables');
   });

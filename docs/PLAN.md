@@ -174,7 +174,9 @@ course.
       iOS lifecycle and universal links; mobile payment interruptions. Kotlin and Swift code highlighting added.
 - [x] Practice project `practice/java`: `parallel/TestDataFactory` and `parallel/PerThread` exercises with tests and
       solutions (verified with `practice/verify.sh java`), for the coming parallel-runs lesson.
-- [ ] Track G: parallel runs and thread safety, CI quality gates, end-to-end capstone, mock interview.
+- [x] Track G: parallel runs and thread safety (JUnit parallel execution, Surefire forks, ThreadLocal, unique data,
+      honest retries); CI pipelines and quality gates (GitHub Actions, secrets, required checks); the end-to-end
+      payment capstone; the payments QA mock interview.
 - [ ] Review of the earlier lessons against their official sources.
 
 ## Next increments

@@ -1,0 +1,793 @@
+id: e2e-payment-capstone
+title: Capstone - an end-to-end payment journey
+subject: frameworks
+module: capstone
+level: expert
+status: published
+estimatedMinutes: 90
+summary: Checkout to refund, verified at the UI, the API and the data - one journey designed and automated with page objects, an idempotent API client, bounded polling for asynchronous status, ledger invariants and evidence that joins every layer by its ids.
+tags: [capstone, end-to-end, payments, refunds, partial refund, page objects, api testing, idempotency, webhooks, polling, invariants, reconciliation, mobile, ci, interview]
+
+environment: |
+  - **What exists in this repository:** the SandPay Demo Shop (`practice/shop`) and the practice framework
+    (`practice/framework` - Java 17+, Maven, Selenium 4.51, JUnit 6). The shop has test cards
+    (`sandpay-success`, `sandpay-slow`, `sandpay-insufficient-funds`, `sandpay-card-declined`, `sandpay-unknown`,
+    `sandpay-pending-then-failed`), orders that are `PENDING` and settle as `SUCCEEDED` or `FAILED` about 3 s later on
+    the order page, and orders kept in the browser's `sessionStorage`. The framework has `CheckoutJourneyTest`, the
+    page objects `CatalogPage`, `CheckoutPage`, `OrderPage`, the `SandPayCardFrame` component, and `ShopExtension`
+    (browser per test, evidence on failure).
+  - **What does not exist - design exercises:** the shop has **no refunds, no server and no SandPay API**. The SandPay
+    API (`https://api.sandpay.example`), its refund endpoint, webhooks, ledger and the mobile demo shop app are
+    **fictional**, using the same names as the earlier lessons ([idempotency keys](#/lesson/idempotency-keys),
+    [webhooks](#/lesson/webhooks-and-async-status), [partial refunds](#/lesson/partial-refunds-and-invariants)). Code
+    that uses them is illustrative and does not compile against this repository.
+  - **Standards and primary sources:** idempotent methods - **RFC 9110** section 9.2.2
+    ([rfc-editor.org](https://www.rfc-editor.org/rfc/rfc9110.html)); the `Idempotency-Key` header and its suggested
+    400 / 409 / 422 responses - IETF HTTPAPI Internet-Draft *The Idempotency-Key HTTP Header Field*, still a draft
+    (version 08 in October 2026, [datatracker](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/));
+    test levels (section 2.2.1) and the test pyramid (section 5.1.6) - **ISTQB CTFL v4.0.1**
+    ([free PDF](https://www.istqb.org/wp-content/uploads/2024/11/ISTQB_CTFL_Syllabus_v4.0.1.pdf)); waits - the
+    [Selenium documentation on waits](https://www.selenium.dev/documentation/webdriver/waits/) ("Do not mix implicit and
+    explicit waits"; sleeps fail "when it doesn't sleep long enough"); "push your tests as far down the test pyramid as
+    you can" - Ham Vocke, [The Practical Test Pyramid](https://martinfowler.com/articles/practical-test-pyramid.html)
+    (martinfowler.com, 2018).
+  - **Opinion, labelled:** the split of checks between layers in this lesson is one sound design, not a standard. What
+    is not negotiable is that every check has an oracle and every failure leaves evidence.
+
+prerequisites:
+  - payment-scenario-matrix
+  - idempotency-keys
+  - webhooks-and-async-status
+  - partial-refunds-and-invariants
+  - reconciliation-for-testers
+  - page-objects-done-right
+  - reference-framework-skeleton
+  - mobile-payment-interruptions
+  - ci-quality-gates
+
+concepts:
+  - id: e2e-journey-matrix
+    name: Designing the end-to-end journey
+    summary: One customer journey - checkout, payment (including PENDING), order status, partial and full refund - turned into a small matrix of journeys with test data, preconditions, expected results per layer and evidence, kept few because end-to-end tests are slow and costly.
+  - id: e2e-check-placement
+    name: Placing each check at the right layer
+    summary: The UI proves what the customer sees, the API proves the contract and state, the data proves the money invariants; each check lives once, at the lowest layer that can see it, and the end-to-end test only proves the layers join up.
+  - id: e2e-async-oracles
+    name: Asynchronous oracles and evidence
+    summary: Wait for PENDING payments, refunds and webhooks by polling a condition with a deadline - never a fixed sleep - and record the ids that join the layers (order id, idempotency key, payment id, refund id, event id) so a failure can be traced.
+
+objectives:
+  - Design a small end-to-end matrix for a payment journey from checkout to refund, with test data, expected results per layer and evidence.
+  - Decide for each check whether it belongs to the UI, the API or the data layer, and remove checks duplicated across layers.
+  - Replace fixed sleeps with bounded polling for PENDING payments, refunds and webhooks, and explain the failure message a good poll gives.
+  - Write an idempotent refund step and data-level invariant checks, and say which parts of the journey the practice shop really supports.
+  - Plan how the journey runs in CI and on a mobile device, including a process-death check, and what evidence each run keeps.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [e2e-check-placement, e2e-journey-matrix]
+    title: The idea in plain language
+    body: |
+      Think of a parcel delivery. You can check it three ways: the **customer** opens the door and sees the parcel
+      (the UI); the **tracking system** says "delivered, signed by A. Rao" (the API); the **warehouse stock count**
+      dropped by one (the data). Each check catches problems the others miss: a parcel left at the wrong door, a
+      tracking record with no parcel, a parcel sent twice.
+
+      You don't need to count the whole warehouse every time you look through the letterbox. Each check has a home,
+      and one end-to-end walk proves that the three agree for one real delivery.
+
+      This capstone does that for a payment: one shopper pays, waits for a PENDING payment to settle, gets part of the
+      money back and then the rest - and you prove each step where it is cheapest and most precise to prove it.
+
+  - id: what
+    kind: what
+    concepts: [e2e-journey-matrix, e2e-check-placement]
+    title: What the capstone journey is - and what really exists
+    body: |
+      **The journey:** catalog → cart → checkout → pay (instant, slow, declined, PENDING then settled) → order status →
+      partial refund → full refund of the rest.
+
+      **Three layers of verification:**
+
+      | Layer | Tool | Its oracle (where the expected result comes from) |
+      |---|---|---|
+      | UI | page objects in the practice framework (Selenium) | what the customer must see: total, status, messages |
+      | API | a SandPay client (Java `HttpClient`) | the API contract: statuses, amounts, idempotent replays, events |
+      | Data | queries over the order, refund and ledger records | the money invariants and reconciliation rules |
+
+      **Honest scope** - the part you can run today and the part you design:
+
+      | Part | Status |
+      |---|---|
+      | Checkout, test cards, declines, PENDING settling on the order page | **real** - `practice/shop` and `practice/framework` |
+      | Reading the shop's order record | **real** - the shop keeps orders in `sessionStorage` (`sandpay-shop-orders`) |
+      | SandPay payments API, refunds, webhooks, ledger | **fictional** - a design exercise using SandPay's names |
+      | Mobile demo shop app and its process-death check | **fictional** - planned with the mobile lessons' tools |
+
+      In ISTQB terms (CTFL v4.0.1, section 2.2.1) this journey is **system testing** of end-to-end tasks, and its
+      SandPay leg is **system integration testing** - the interface to an external service.
+
+  - id: why
+    kind: why
+    concepts: [e2e-check-placement]
+    title: Why three layers - and why not everything at every layer
+    body: |
+      - **The UI alone lies by omission.** "Refunded" on the order page says nothing about how much was refunded, or
+        whether the refund happened twice. Duplicate refunds, rounding and ledger errors are invisible on screen.
+      - **The API alone misses the customer.** The payment can be `captured` while the order page still says PENDING
+        forever - a defect only the UI shows.
+      - **The data alone misses behaviour.** Records can balance while the customer was told the payment failed.
+      - **Duplicating every check everywhere is the opposite mistake.** End-to-end tests "require a lot of maintenance
+        and run pretty slowly" (Vocke, *The Practical Test Pyramid*); ISTQB's pyramid (CTFL 5.1.6) says the high-level
+        tests are slower, so "usually just a few of them are needed". Checking 40 refund boundaries through a browser
+        multiplies that cost by 40.
+
+      The rule this lesson uses: **each check lives once, at the lowest layer that can see it.** The end-to-end
+      journey then only proves that the layers *join up* - the order the customer saw is the payment the API holds,
+      is the money the ledger booked.
+
+  - id: internals
+    kind: internals
+    concepts: [e2e-check-placement, e2e-async-oracles]
+    title: How the test harness is built
+    body: |
+      The journey test uses four helpers, each owned by one layer:
+
+      | Helper | Layer | Job | Exists? |
+      |---|---|---|---|
+      | page objects (`CatalogPage`, `CheckoutPage`, `OrderPage`, `SandPayCardFrame`) | UI | drive the shop, read what is shown; waits inside | yes |
+      | `ShopExtension` | lifecycle | browser per test, screenshot and page source to `target/evidence` on failure | yes |
+      | `SandPayClient` | API | get a payment, create a refund with an `Idempotency-Key`, list refunds and events | design |
+      | `LedgerChecks` | data | assert the invariants of [partial refunds](#/lesson/partial-refunds-and-invariants) | design |
+
+      Plus two cross-cutting pieces:
+
+      - **A poll helper** - "read, test a condition, wait a short interval, repeat until a deadline" - used for every
+        asynchronous step: the PENDING payment, the refund, the webhook. On timeout it fails with the **last value it
+        saw**, not just "timed out".
+      - **A journey record** - the ids created along the way: order id, idempotency keys, SandPay payment id, refund
+        ids, webhook event ids, timestamps. It is written to the test's evidence folder whether the test passes or
+        fails, and it is how you join a UI screenshot to an API response to a ledger row (see
+        [tracing a payment end to end](#/lesson/tracing-a-payment-end-to-end)).
+
+      **Keys are created once per intent.** The refund step creates its `Idempotency-Key` before the first attempt
+      and reuses it on every retry - exactly the contract of [idempotency keys](#/lesson/idempotency-keys).
+
+  - id: visual
+    kind: visual
+    concepts: [e2e-check-placement, e2e-async-oracles]
+    title: "Sequence: one journey, three layers"
+    body: |
+      ```mermaid
+      sequenceDiagram
+          participant T as Journey test
+          participant UI as Shop UI (page objects)
+          participant API as SandPay API (fictional)
+          participant D as Order and ledger data (fictional)
+          T->>UI: pay 18.99 EUR with sandpay-unknown
+          UI-->>T: order ord_x, status PENDING
+          loop poll until final or deadline
+              T->>UI: read order status
+          end
+          UI-->>T: SUCCEEDED
+          T->>API: GET payment by reference ord_x
+          API-->>T: captured 1899
+          T->>API: POST refund 500 (Idempotency-Key k1)
+          API-->>T: refund pending
+          T->>API: same request again (key k1)
+          API-->>T: same refund id replayed
+          loop poll until refund succeeded or deadline
+              T->>API: GET refund
+          end
+          T->>D: check invariants for ord_x
+          D-->>T: refunded 500 of 1899, ledger balances
+          T->>UI: order shows partially refunded
+      ```
+
+      Notice: the UI is used at the **start** (the customer pays) and the **end** (the customer sees the result). The
+      money checks in the middle go to the API and the data. Every loop has a deadline.
+
+  - id: when
+    kind: when
+    concepts: [e2e-check-placement]
+    title: Where to verify what
+    body: |
+      | Check | Layer | Why there |
+      |---|---|---|
+      | Pay button disabled until details are complete | UI | only the UI can show it (already in `CheckoutJourneyTest`) |
+      | decline message shown and the shopper can retry | UI | customer-facing wording and state |
+      | PENDING shown, then the final status without reloading | UI | the customer's experience of async status |
+      | captured amount = order total, one payment per order reference | API | exact amounts and counts are not on screen |
+      | a retried refund with the same key returns the same refund | API | the idempotency contract |
+      | same key with a different amount is rejected | API (lower: contract test) | a contract rule, no journey needed |
+      | refund boundaries (exactly refundable, one minor unit more, 0) | API or component test | many cases, cheap below the UI |
+      | duplicate or reordered `refund.succeeded` events counted once | API with a test event, or consumer component test | needs controlled event delivery |
+      | refunded ≤ captured; sum of refunds = refunded; ledger balances | data | the money invariants |
+      | the order appears in the reconciliation input with the right reference | data | proves the journey is reconcilable; the matching job has its own tests |
+      | order page shows the refunded amount | UI | one check that the layers joined up |
+
+      **Not in the journey:** the full [scenario matrix](#/lesson/payment-scenario-matrix), every boundary, every
+      webhook ordering case, every reconciliation break. Those live in lower-level suites; the journey proves the
+      wiring.
+
+  - id: steps
+    kind: steps
+    concepts: [e2e-journey-matrix, e2e-async-oracles]
+    title: "The capstone brief, step by step"
+    body: |
+      1. **Run what exists.** `cd practice/framework && mvn test -Dtest=CheckoutJourneyTest`. Read the four journeys and
+         the page objects they use.
+      2. **Add the PENDING journeys** (real): pay with `sandpay-unknown` and `sandpay-pending-then-failed`, assert the
+         order first shows PENDING, then wait - by polling, never sleeping - for `SUCCEEDED` or `FAILED`. The
+         [waits lesson](#/lesson/selenium-waits-and-synchronisation) has an exercise (`OrderWaits`) for the waiting part.
+      3. **Add a data check** (real, small): read the order the shop saved in `sessionStorage` and check its total and
+         status match what the page shows - your first cross-layer check.
+      4. **Design the API leg** (fictional): the `SandPayClient` methods, the refund request with an idempotency key,
+         and the retry rule. Write the requests and expected responses, as in the
+         [idempotency lesson](#/lesson/idempotency-keys).
+      5. **Design the data leg** (fictional): the invariants you will assert after every refund, from the
+         [partial refunds lesson](#/lesson/partial-refunds-and-invariants), and what the order must look like for
+         [reconciliation](#/lesson/reconciliation-for-testers).
+      6. **Write the matrix**: 6-10 journeys, each with test data, steps, expected result per layer and evidence
+         (the first exercise below).
+      7. **Plan the mobile leg** and the **CI run**: which journeys run on every change, which nightly, which on a
+         device, and what evidence each keeps.
+
+  - id: example
+    kind: example
+    concepts: [e2e-journey-matrix, e2e-async-oracles]
+    title: "Real-world example: the mobile leg and the CI run"
+    body: |
+      **Mobile leg (fictional demo shop app).** The riskiest mobile moment is the customer leaving the app while a
+      payment is PENDING. The check, using the tools of the
+      [Android process death lesson](#/lesson/android-lifecycle-and-process-death) and
+      [mobile payment interruptions](#/lesson/mobile-payment-interruptions):
+
+      1. Pay with the pending test card; while the app shows PENDING, send it to the background.
+      2. `adb shell am kill <package>` - kills the backgrounded process the way the system would.
+      3. Relaunch from the launcher.
+      4. **Expected:** the app resumes the **same** attempt (same order id), asks the server for its status, and ends
+         on the true final status. **API check:** exactly one payment for that order reference. **Data:** no second
+         order.
+      5. **Evidence:** `adb logcat` for the app's process around the kill, the attempt id from the app log, the API
+         payment list for the reference.
+
+      **CI run.** A sensible split, measured and adjusted later (see [CI quality gates](#/lesson/ci-quality-gates)):
+
+      | When | What | Why |
+      |---|---|---|
+      | every pull request | API contract and data-invariant suites; the shop journeys (`CheckoutJourneyTest` plus PENDING) headless | fast enough, they catch most defects |
+      | nightly | the full journey with refunds against the sandbox; the mobile leg on an emulator | slower, depends on external services |
+      | before a release | the mobile leg on real devices; a reconciliation dry run over the night's test orders | closest to production |
+
+      Every run uploads `target/evidence` (screenshots, page source - already done by `ShopExtension` on failure) and
+      the journey record of ids for **every** journey, passed or failed, so a failure seen tomorrow can still be joined
+      to SandPay's logs.
+
+  - id: code
+    kind: code
+    concepts: [e2e-async-oracles, e2e-check-placement]
+    title: "Code: the real PENDING journey, and the illustrative refund leg"
+    collapsed: true
+    body: |
+      **Runs against the practice shop** (add it to a test class with `@ExtendWith(ShopExtension.class)`):
+
+      ```java
+      @Test
+      void aPendingPaymentSettlesAndTheStoredOrderAgrees(WebDriver driver, Shop shop) {
+          OrderPage order = CatalogPage.open(driver, shop)
+              .addToCart("espresso-beans").header().goToCheckout()
+              .enterEmail("learner@example.com")
+              .enterCard("sandpay-unknown", "Asha Rao")
+              .payAndExpectOrder();
+
+          assertEquals("PENDING", order.status());          // settles about 3 s after paying
+
+          By status = By.cssSelector("[data-testid='order-status']");
+          String finalStatus = new WebDriverWait(driver, Duration.ofSeconds(10)).until(d -> {
+              String s = d.findElement(status).getText().trim();
+              return s.isEmpty() || s.equals("PENDING") ? null : s;   // null = keep waiting
+          });
+          assertEquals("SUCCEEDED", finalStatus);
+
+          // data layer of the practice shop: the order it saved in sessionStorage
+          String stored = (String) ((JavascriptExecutor) driver)
+              .executeScript("return sessionStorage.getItem('sandpay-shop-orders');");
+          assertTrue(stored.contains("\"id\":\"" + order.orderId() + "\""), stored);
+          assertTrue(stored.contains("\"total\":1899"), stored);
+      }
+      ```
+
+      **Illustrative - SandPay is fictional, this does not compile here.** A poll helper and an idempotent refund step:
+
+      ```java
+      static <T> T pollUntil(Supplier<T> read, Predicate<T> done, Duration timeout, Duration every)
+              throws InterruptedException {
+          Instant deadline = Instant.now().plus(timeout);
+          T last = read.get();
+          while (!done.test(last)) {
+              if (Instant.now().isAfter(deadline)) {
+                  throw new AssertionError("not done after " + timeout + "; last seen: " + last);
+              }
+              Thread.sleep(every.toMillis());               // the interval between reads, not a guess at the outcome
+              last = read.get();
+          }
+          return last;
+      }
+
+      Refund refundPart(String paymentId, long amountMinor, JourneyRecord record) throws Exception {
+          String key = UUID.randomUUID().toString();       // once per refund intent
+          record.add("refund-key", key);
+          Refund refund = sandpay.createRefundWithRetries(paymentId, amountMinor, key);   // same key on every retry
+          record.add("refund-id", refund.id());
+          return pollUntil(() -> sandpay.getRefund(refund.id()),
+                           r -> !r.status().equals("pending"),
+                           Duration.ofSeconds(60), Duration.ofSeconds(2));
+      }
+      ```
+
+      ```http
+      POST /v1/payments/pay_81Fz/refunds HTTP/1.1
+      Host: api.sandpay.example
+      Content-Type: application/json
+      Idempotency-Key: 0b7e2d4a-5c1f-4e8b-9a37-6f2d1c8e4b90
+
+      {"amount": 500, "reason": "customer_request"}
+      ```
+
+      Then the data leg, after every refund: `refunded ≤ captured`, sum of succeeded refund records = `refunded`,
+      payment status `partially_refunded` while `0 < refunded < captured` and `refunded` when equal, and every ledger
+      entry balances - invariants I2, I4, I7 and I6 of the partial refunds lesson.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [e2e-async-oracles]
+    title: Line by line - why the waits and keys are written that way
+    body: |
+      - **`assertEquals("PENDING", order.status())`** - the shop settles a `sandpay-unknown` order about 3 s after
+        paying and the order page re-checks every second, so PENDING is what the page shows when it opens. If the
+        environment were much slower this first assertion could see the final status; the important assertion is the
+        final one.
+      - **`until(d -> ... ? null : s)`** - `WebDriverWait` repeats the function until it returns something other than
+        `null` or `false`, and throws a `TimeoutException` at the deadline. It returns **as soon as** the status is
+        final - no wasted seconds, no guessing.
+      - **`sessionStorage.getItem(...)`** - the practice shop has no server; its "database" is the browser's session
+        storage. Reading it is a small, real cross-layer check: what the page shows must equal what was stored.
+      - **`Thread.sleep(every...)` inside `pollUntil`** - a pause *between reads* with a deadline is polling. A fixed
+        `Thread.sleep(3000)` followed by one assertion is a guess: too short and the test is flaky, too long and every
+        run pays for it. The Selenium documentation says the same of sleeps: they fail "when it doesn't sleep long
+        enough".
+      - **`"last seen: " + last`** - a timeout that says "still pending after 60 s" points to the provider or the
+        webhook consumer; "timed out" alone points nowhere.
+      - **`String key = UUID...` before the call** - created once per intent and passed in, so retries inside
+        `createRefundWithRetries` reuse it. A key created inside the retry loop makes each retry a new refund.
+
+  - id: tests
+    kind: tests
+    concepts: [e2e-journey-matrix]
+    title: The journey matrix
+    body: |
+      Espresso beans, 18.99 EUR (1899 minor units). **R** = runs today against the practice shop; **D** = design
+      against fictional SandPay.
+
+      | ID | Journey | UI expected | API / data expected | Evidence | |
+      |---|---|---|---|---|---|
+      | J1 | pay `sandpay-success` | order SUCCEEDED, total 18.99 | stored order total 1899 | screenshot, order id | R |
+      | J2 | pay `sandpay-card-declined`, then `sandpay-success` | decline message, then SUCCEEDED | one order only | screenshots | R |
+      | J3 | pay `sandpay-unknown` | PENDING, then SUCCEEDED without reload | stored status SUCCEEDED | status timeline | R |
+      | J4 | pay `sandpay-pending-then-failed` | PENDING, then FAILED with "not charged" message | no captured payment | status timeline | R / D |
+      | J5 | J1, then refund 5.00 | partially refunded, 13.99 refundable | `partially_refunded`; refunded 500; ledger balances | refund id, key | D |
+      | J6 | J5, retry the refund with the same key | no change | same refund id; refunded still 500 | both responses | D |
+      | J7 | J5, then refund the remaining 13.99 | refunded | `refunded`; refunded = captured | refund ids | D |
+      | J8 | J5, then refund 14.00 | error shown, nothing changes | rejected; refunded still 500 | API error body | D |
+      | J9 | mobile: J3 with process death while PENDING | same order, true final status | one payment for the reference | logcat, attempt id | D |
+
+      J8's boundary is here once to prove the error reaches the customer; the other boundaries live in the API suite.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [e2e-check-placement, e2e-async-oracles, e2e-journey-matrix]
+    title: Common mistakes
+    body: |
+      - **Fixed sleeps** before asserting an asynchronous status - flaky when too short, slow when too long.
+      - **Waiting with no deadline** - a poll loop without a timeout hangs CI instead of failing.
+      - **Asserting only the UI** - "Refunded" on screen with two refunds at the PSP passes.
+      - **Asserting everything at every layer** - forty boundaries through the browser; a slow suite that fails for
+        layout changes.
+      - **A new idempotency key per retry** - the retry becomes a second refund; the test itself causes the defect it
+        should catch.
+      - **Shared, reused test data** - two parallel runs refund the same payment, or a data check counts another run's
+        refunds. Create a fresh order per journey and scope data checks to its ids.
+      - **No ids in the evidence** - a red build with a screenshot but no order id, payment id or refund id cannot be
+        joined to SandPay's logs.
+      - **Pretending the fictional parts exist** - in this repository, refunds and the SandPay API are designs; say
+        so in the test plan.
+
+      **Debugging a red journey:** open the journey record; find the first layer where the actual result differs
+      from the expected one (UI, API or data); check that layer's evidence; then reproduce at that layer alone.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [e2e-check-placement, e2e-journey-matrix]
+    title: Trade-offs
+    body: |
+      | Choice | Gains | Costs |
+      |---|---|---|
+      | few journeys, checks pushed down | fast, stable, precise failures | the journey proves wiring, not every rule |
+      | many end-to-end journeys | confidence that looks complete | slow, flaky, expensive to maintain (Vocke; ISTQB 5.1.6) |
+      | real sandbox webhooks | proves the real integration | slow and outside your control; retries and delays vary |
+      | injected test events (signed with the test secret) | fast, repeatable, can test duplicates and reordering | doesn't prove the provider really sends them |
+      | polling the API instead of waiting for a webhook | simple oracle | doesn't prove the webhook path; combine both |
+      | data checks via a read-only database or reporting API | sees the invariants | needs access and a stable schema; never write to it from tests |
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Journey: checkout → pay (incl. PENDING) → status → partial refund → full refund.
+      - UI = what the customer sees; API = contract and state; data = invariants. Each check once, as low as possible.
+      - Async: poll a condition with a deadline; fail with the last value seen. No fixed sleeps.
+      - Idempotency key created once per intent, reused on every retry.
+      - Fresh test data per journey; data checks scoped to its ids.
+      - Evidence: screenshots and the journey record of ids, for every run.
+      - Real today: checkout, test cards, PENDING on the order page, `sessionStorage` orders. Fictional: refunds, the
+        SandPay API, ledger, the mobile app.
+
+exercises:
+  - id: capstone-matrix
+    type: testdesign
+    concept: e2e-journey-matrix
+    skill: application
+    title: The capstone matrix
+    prompt: |
+      Design the end-to-end matrix for the journey **checkout → payment → order status → partial refund → full
+      refund** for the shop and fictional SandPay. Write **6 to 8 journeys**. For each: preconditions and test data,
+      steps, expected result **per layer** (UI, API, data) and the **evidence** you keep. Mark which journeys can run
+      against the practice shop today.
+    hints:
+      - Start from the test cards - which outcomes does the shop already produce?
+      - Each refund journey needs a captured payment first. What does a retry, a too-large refund and the final refund each prove?
+      - Keep boundaries and webhook ordering out - which suite owns them?
+    modelAnswer: |
+      Fresh order per journey; email `run-<runId>@example.com`; 1 × espresso beans (1899).
+
+      | ID | Steps | UI | API / data | Evidence | Today? |
+      |---|---|---|---|---|---|
+      | J1 | pay `sandpay-success` | SUCCEEDED, 18.99 | stored total 1899 | screenshot, order id | yes |
+      | J2 | `sandpay-card-declined`, retry `sandpay-success` | message, then SUCCEEDED | one order | screenshots | yes |
+      | J3 | pay `sandpay-unknown` | PENDING → SUCCEEDED, no reload | stored SUCCEEDED | status times | yes |
+      | J4 | pay `sandpay-pending-then-failed` | PENDING → FAILED, not-charged message | no capture | status times | UI yes |
+      | J5 | J1 + refund 5.00 | 13.99 refundable | `partially_refunded`, refunded 500, ledger balances | key, refund id | no |
+      | J6 | J5 + same request, same key | unchanged | same refund id, refunded 500 | both responses | no |
+      | J7 | J5 + refund 13.99 | refunded | `refunded`, refunded = captured | refund ids | no |
+      | J8 | J5 + refund 14.00 | error shown | rejected, refunded 500 | error body | no |
+    rubric:
+      - Each journey has test data, steps, an expected result per layer and evidence
+      - Covers success, decline, PENDING settling both ways, partial, retry with same key, final refund and over-refund
+      - Expected results include amounts in minor units, not only statuses
+      - Uses fresh data per journey and records the ids
+      - Honestly marks what runs against the practice shop and what is a design
+      - Leaves exhaustive boundaries and webhook ordering to lower-level suites
+    solution: |
+      A good matrix is **short and complete for the wiring**: every state of the journey appears once, every row says
+      what must be true at each layer and how you'll prove it. If you wrote 30 rows, look for ones that differ only in
+      a boundary or an amount - those belong in the API suite.
+    followUp: |
+      Add one journey for a **disputed** payment (chargeback) after a partial refund. What would you expect at each
+      layer, and which parts could you not automate against a sandbox?
+
+  - id: choose-the-layer
+    type: short
+    concept: e2e-check-placement
+    skill: analysis
+    title: Choose the layer for each check
+    prompt: |
+      A colleague's end-to-end refund test checks all of the following **through the browser**. For each, say which
+      layer it belongs to (UI, API, data, or a lower-level suite) and why, and which ones the journey should keep.
+
+      1. The order page shows "Partially refunded".
+      2. Refund of exactly the refundable amount is accepted; one cent more is refused.
+      3. A retried refund with the same key does not refund twice.
+      4. The ledger entries for the refund balance.
+      5. The Pay button is disabled until the card is entered.
+      6. A duplicate `refund.succeeded` webhook is counted once.
+      7. The refunded amount shown equals the PSP's `refunded_amount`.
+    hints:
+      - Which of these can a customer actually see?
+      - Which need many cases, controlled timing or records that aren't on screen?
+    modelAnswer: |
+      1. **UI** - keep in the journey: it is the customer's view.
+      2. **API suite** (or a component test) - boundaries need several cases; one over-refund row can stay in the
+         journey to prove the error reaches the screen.
+      3. **API** - compare the two responses (same refund id) and the refund list; the screen can't show it.
+      4. **Data** - invariant check after each refund.
+      5. **UI** - already covered by `CheckoutJourneyTest`; not part of the refund journey.
+      6. **API / consumer component test** with an injected signed test event - needs controlled delivery.
+      7. **Cross-layer** - keep once in the journey: UI value against the API value. This is the "layers join up"
+         check.
+    rubric:
+      - Puts customer-visible checks in the UI and money totals in the API or data layer
+      - Moves boundaries and duplicate-event cases to lower-level suites
+      - Keeps at least one cross-layer comparison in the journey
+      - Gives a reason per check, not only a label
+    solution: |
+      The journey keeps 1, 7 and one over-refund row; 3 and 4 run in the journey but at the API and data layers; 2
+      and 6 move to suites that can run many cases quickly; 5 belongs to the checkout journeys.
+    followUp: |
+      Your end-to-end suite already fails whenever the API suite fails. What does Vocke's advice "if a higher-level test
+      spots an error and there's no lower-level test failing, you need to write a lower-level test" ask you to do when
+      only the journey fails?
+
+  - id: flawed-refund-test
+    type: debug
+    concept: e2e-async-oracles
+    skill: analysis
+    title: Review this end-to-end refund test
+    prompt: |
+      This journey test (illustrative - SandPay is fictional) fails in CI about once in ten runs, and last week it
+      left a payment with **two** 5.00 refunds in the sandbox. Click every line that is a defect in the test.
+    language: java
+    code: |
+      @Test
+      void partialRefundEndToEnd(WebDriver driver, Shop shop) throws Exception {
+          OrderPage order = payWith(driver, shop, "sandpay-unknown");
+          Thread.sleep(3000);
+          assertEquals("SUCCEEDED", order.status());
+
+          String paymentId = sandpay.findByReference(order.orderId()).id();
+          for (int attempt = 1; attempt <= 3; attempt++) {
+              try {
+                  sandpay.refund(paymentId, 500, UUID.randomUUID().toString());
+                  break;
+              } catch (HttpTimeoutException e) {
+                  // timeout: outcome unknown - try again
+              }
+          }
+
+          driver.navigate().refresh();
+          assertTrue(driver.getPageSource().contains("Refunded"));
+      }
+    correctLines: [4, 10, 18]
+    lineNotes:
+      - line: 7
+        note: Looking up the payment by the order reference is good - it is how the layers are joined.
+      - line: 12
+        note: Retrying after a timeout is right - the outcome is unknown. The defect is what the retry sends (line 10).
+      - line: 17
+        note: Refreshing is fine; the problem is the weak assertion that follows.
+    hints:
+      - Which line guesses how long an asynchronous step takes?
+      - What happens if the first refund succeeded but its response was lost?
+      - What would still pass if the refunded amount were wrong?
+    solution: |
+      **Lines 4, 10 and 18.**
+
+      - **4** - a fixed 3 s sleep. The order settles about 3 s after paying and the page re-checks every second, so
+        the status may still be PENDING - the one-in-ten failure. Poll the status with a deadline instead.
+      - **10** - a new idempotency key on every attempt. A timed-out refund that actually succeeded is sent again as a
+        **new** refund - the double 5.00. Create the key once, before the loop, and reuse it.
+      - **18** - a UI-only, text-anywhere oracle. "Refunded" anywhere on the page passes with the wrong amount or two
+        refunds. Assert at the API (one refund of 500, same id on replay) and the data layer (refunded ≤ captured,
+        ledger balances), and keep one precise UI check of the shown amount.
+
+      **To confirm** the double refund came from line 10: the sandbox refund list shows two refunds with different
+      idempotency keys a few seconds apart, and the CI log shows a timeout on the first attempt.
+    followUp: |
+      Rewrite the loop so it is safe, and add the evidence you would record for each attempt.
+
+  - id: journey-order
+    type: order
+    concept: e2e-async-oracles
+    skill: application
+    title: Order the steps of the refund journey
+    prompt: |
+      Put the steps of the end-to-end partial-refund journey in the order the test should run them.
+    items:
+      - id: data
+        text: Create fresh test data and start the journey record (run id, email)
+      - id: pay
+        text: Pay through the UI with the pending test card and record the order id
+      - id: settle
+        text: Poll the order status until it is final, with a deadline
+      - id: api-payment
+        text: Fetch the payment by order reference and check captured amount = order total
+      - id: key
+        text: Create the refund's idempotency key and record it
+      - id: refund
+        text: Send the refund, retrying with the same key on timeout
+      - id: refund-final
+        text: Poll the refund until it is no longer pending, with a deadline
+      - id: invariants
+        text: Check the invariants in the data - refunded ≤ captured, ledger balances
+      - id: ui-end
+        text: Check the order page shows the refunded amount
+    hints:
+      - Nothing can be refunded before it is captured - and nothing can be checked before it has settled.
+      - The key must exist before the first attempt.
+    solution: |
+      **Data → pay → settle → API payment → key → refund → refund final → invariants → UI end.** The UI frames the
+      journey (the customer acts, the customer sees); the money is checked in between at the API and data layers, and
+      every asynchronous step is a bounded poll.
+    followUp: |
+      Where in this order would you inject a duplicate `refund.succeeded` event, and what would you then assert?
+
+  - id: mobile-process-death
+    type: mcq
+    concept: e2e-journey-matrix
+    skill: application
+    title: The mobile leg after process death
+    prompt: |
+      In the mobile demo shop app (fictional), a payment is PENDING. You background the app, run
+      `adb shell am kill <package>`, wait until SandPay has captured the payment, and relaunch. Which expected result
+      belongs in the matrix row?
+    options:
+      - id: resume
+        text: The app shows the same order, asks the server for its status and shows it as paid; the API lists exactly one payment for the order reference
+        feedback: Correct - the attempt was persisted before leaving, so the app resumes it and the server is the source of truth.
+      - id: restart
+        text: The app opens on an empty checkout, because the process died and its memory is gone
+        feedback: That is the defect the check looks for - the order and attempt must survive process death.
+      - id: pay-again
+        text: The app offers Pay again with a new idempotency key, which is safe because SandPay de-duplicates
+        feedback: A new key is a new payment; SandPay can only de-duplicate retries that reuse the key.
+      - id: pending-forever
+        text: The order shows PENDING until the customer pulls to refresh
+        feedback: The app must re-check the server on relaunch; leaving it to the customer is a UX defect.
+    correct: [resume]
+    hints:
+      - What did the app save before the customer left, and who knows the true outcome?
+    solution: |
+      **Same order, status from the server, one payment.** Expected results cover all layers: the screen (paid), the
+      API (one payment for the reference) and the data (one order). Evidence: logcat around the kill, the attempt id,
+      the API payment list.
+    followUp: |
+      Repeat the row for a payment that SandPay **declined** while the app was dead. What changes?
+
+  - id: interview-refunds-e2e
+    type: interview
+    concept: e2e-check-placement
+    skill: application
+    title: "Interview: refunds end to end"
+    prompt: |
+      **Interviewer:** "Walk me through how you'd test refunds end to end - from the customer paying to the money
+      coming back."
+    hints:
+      - Journey first, then the layers and what each proves, then async, data and evidence.
+      - Say what you would keep out of the end-to-end tests.
+    modelAnswer: |
+      - **Journey:** pay (including a pending payment that settles), then a partial refund, a retried refund, the
+        rest, and an over-refund - a handful of journeys, fresh data each.
+      - **Layers:** UI for what the customer sees (status, refunded amount, error message); API for the contract
+        (refund amounts, statuses, same refund id on a retry with the same idempotency key, a different amount with
+        the same key rejected); data for the invariants (refunded ≤ captured, refund records add up, ledger balances,
+        the refund appears with the order reference for reconciliation).
+      - **Async:** refunds and webhooks are asynchronous - poll with a deadline, fail with the last status seen; test
+        duplicate and reordered webhooks with injected signed events in a lower-level suite.
+      - **Push down:** boundaries, concurrency (parallel refunds) and webhook ordering live in API or component
+        suites; the journey proves the wiring.
+      - **Evidence:** a record of order id, keys, payment id, refund ids, event ids for every run; screenshots on
+        failure; CI keeps both.
+    followUps:
+      - How would you test two support agents refunding the same payment at the same moment?
+      - The refund shows succeeded in SandPay but the order page still says paid. Where do you look first?
+      - What would you check in the next day's settlement report?
+    rubric:
+      - Described a small set of journeys, including partial, retry and over-refund
+      - Assigned checks to UI, API and data with a reason
+      - Mentioned idempotency keys reused on retries
+      - Handled asynchrony with bounded polling and mentioned webhooks
+      - Named the money invariants and reconciliation
+      - Mentioned evidence and correlation ids, and what is pushed to lower levels
+    solution: |
+      Strong answers are **structured by layer** and say **what is not in the end-to-end tests**. Weak answers list
+      UI steps ("click refund, check the message") and stop.
+
+recall:
+  - id: recall-layers
+    concept: e2e-check-placement
+    prompt: What does each layer prove in the payment journey?
+    answer: UI - what the customer sees; API - the contract and the payment's state; data - the money invariants and reconciliation.
+  - id: recall-push-down
+    concept: e2e-check-placement
+    prompt: Where should a check live?
+    answer: Once, at the lowest layer that can see it. The end-to-end journey proves the layers join up.
+  - id: recall-sleep-vs-poll
+    concept: e2e-async-oracles
+    prompt: What is the difference between a fixed sleep and a poll?
+    answer: A sleep guesses how long to wait, then checks once. A poll re-checks a condition at intervals until it holds or a deadline passes, and fails with the last value seen.
+  - id: recall-key
+    concept: e2e-async-oracles
+    prompt: When is the refund's idempotency key created?
+    answer: Once per refund intent, before the first attempt - and reused on every retry.
+  - id: recall-ids
+    concept: e2e-async-oracles
+    prompt: Which ids go into the journey record?
+    answer: Order id, idempotency keys, payment id, refund ids, webhook event ids, with timestamps.
+  - id: recall-real
+    concept: e2e-journey-matrix
+    prompt: Which parts of the capstone run against the practice shop today?
+    answer: Checkout, test cards and declines, PENDING orders settling on the order page, and the order saved in sessionStorage. Refunds, the SandPay API, the ledger and the mobile app are fictional designs.
+
+next:
+  - mock-interview-payments-qa
+
+placement:
+  - id: place-boundaries
+    type: mcq
+    concept: e2e-check-placement
+    skill: application
+    title: Thirty refund boundaries
+    prompt: |
+      A team wants to verify 30 refund-amount combinations (full, partial, exactly refundable, one minor unit over,
+      several small refunds). Where should most of them run?
+    options:
+      - id: api
+        text: In the API (or component) suite, with one over-refund journey kept end to end
+        feedback: Correct - many cases, exact amounts, no browser; the journey proves only that the error reaches the customer.
+      - id: ui
+        text: In the end-to-end UI suite, because that is what the customer uses
+        feedback: Thirty browser journeys are slow and flaky, and the screen doesn't show the totals you need to check.
+      - id: data-only
+        text: Only as data checks on the ledger, without calling the API
+        feedback: The ledger proves invariants after the fact; the rule that refuses an over-refund is an API behaviour.
+      - id: manual
+        text: Manually before each release, because amounts are business-critical
+        feedback: Critical and repetitive is exactly what automation at a low level is for.
+    correct: [api]
+    solution: |
+      **Push them down.** Each check lives once, at the lowest layer that can see it; the end-to-end suite keeps one
+      row to prove the wiring.
+
+  - id: place-flaky-wait
+    type: mcq
+    concept: e2e-async-oracles
+    skill: application
+    title: The 2 % failure
+    prompt: |
+      An end-to-end test refunds a payment, waits `Thread.sleep(5000)`, then asserts the refund is `succeeded`. It fails
+      about 2 % of the time with status `pending`. What is the best change?
+    options:
+      - id: poll
+        text: Poll the refund status every couple of seconds until it is not pending, with a deadline, and fail with the last status seen
+        feedback: Correct - it waits as long as needed and no longer, and a real hang still fails with a useful message.
+      - id: longer
+        text: Increase the sleep to 15 seconds
+        feedback: Every run now pays 15 s, and a slow day still fails. Sleeps fail "when it doesn't sleep long enough".
+      - id: retry
+        text: Enable automatic test retries in CI
+        feedback: That hides the race and doubles the run time on failure; it doesn't fix the oracle.
+      - id: accept-pending
+        text: Accept either pending or succeeded as a pass
+        feedback: Then a refund stuck in pending forever - a real defect - passes.
+    correct: [poll]
+    solution: |
+      **A bounded poll.** The status is asynchronous by design; the test must wait for the condition, not for a guessed
+      time.
+
+  - id: place-parallel-data
+    type: mcq
+    concept: e2e-journey-matrix
+    skill: analysis
+    title: Refunds that are not yours
+    prompt: |
+      Two CI jobs run the refund journey in parallel against one sandbox account, both using a fixed order reference
+      `ORD-TEST`. The data check "sum of refunds = refunded" fails at random with sums too high. What is the most
+      likely cause and fix?
+    options:
+      - id: shared-data
+        text: Both jobs refund the same payment and count each other's refunds - create a fresh order per journey and scope data checks to its ids
+        feedback: Correct - shared test data makes parallel runs interfere; unique data per run removes it.
+      - id: psp-bug
+        text: SandPay double-counts refunds under load - report it to the provider
+        feedback: Possible, but the fixed shared reference explains it directly. Rule out your own test data first.
+      - id: serial
+        text: Run the jobs one after another
+        feedback: It hides the problem and makes CI slower; any manual tester using ORD-TEST breaks it again.
+      - id: tolerance
+        text: Allow the sum to be up to 10 % higher than refunded
+        feedback: An invariant with a tolerance no longer catches the over-refunds it exists for.
+    correct: [shared-data]
+    solution: |
+      **Fresh data per journey.** Each journey creates its own order and records its ids; every data check is scoped to
+      them, so parallel runs can't see each other.

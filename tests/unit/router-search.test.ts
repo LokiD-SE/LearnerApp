@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { searchContent } from '../../src/content/search';
 import { href, parseHash } from '../../src/ui/router';
-import { realIndex } from './helpers';
+import { realIndex, withPlannedLesson } from './helpers';
 
 describe('parseHash', () => {
   it('parses every route', () => {
@@ -36,8 +36,9 @@ describe('searchContent', () => {
     expect(searchContent(index, 'fingerprint').map((h) => h.lessonId)).toContain('idempotency-keys');
   });
   it('finds planned lessons by title', () => {
-    const hits = searchContent(index, 'capstone');
-    expect(hits.find((h) => h.lessonId === 'e2e-payment-capstone')?.planned).toBe(true);
+    const { index: withPlanned, planned } = withPlannedLesson(index);
+    const hits = searchContent(withPlanned, 'mutation');
+    expect(hits.find((h) => h.lessonId === planned.id)?.planned).toBe(true);
   });
   it('requires every word and ignores one-letter noise', () => {
     expect(searchContent(index, 'idempotency zebra')).toEqual([]);

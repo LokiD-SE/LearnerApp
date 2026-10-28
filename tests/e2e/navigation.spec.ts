@@ -98,7 +98,7 @@ test('a course page totals its time and lists its chapters beside it', async ({ 
   await expect(panel.getByRole('link', { name: 'Course overview' }).first()).toBeVisible();
   await expect(panel.locator('.course-list > li.is-current')).toContainText('Java basics');
 
-  // A course with planned lessons says so, with a rough figure for them.
+  // Track G was the last course with planned lessons; it now totals only written ones.
   await page.goto('./#/learn?subject=frameworks');
-  await expect(page.locator('.time-summary').first()).toContainText(/planned lessons?, about \d+/);
+  await expect(page.locator('.time-summary').first()).toHaveText(/^\d+ h( \d+ min)? for 8 lessons$/);
 });

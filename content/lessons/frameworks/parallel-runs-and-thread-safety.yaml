@@ -1,0 +1,879 @@
+id: parallel-runs-and-thread-safety
+title: Parallel execution and thread safety
+subject: frameworks
+module: framework-design
+level: advanced
+status: published
+estimatedMinutes: 65
+summary: One driver per thread, isolated data and honest retries - how JUnit and Surefire run tests in parallel, what breaks when tests share state, and why a retry that turns red into green is evidence, not a fix.
+tags: [parallel execution, thread safety, junit, surefire, threadlocal, selenium grid, flaky tests, retries, test data, interview]
+
+environment: |
+  - **Tools:** Java 17+, Maven 3.8+, maven-surefire-plugin 3.5.6, JUnit 6.1.3 (Jupiter), Selenium 4.51 - the
+    versions of `practice/java` and `practice/framework`. The console output in this lesson is real, from
+    those versions: a four-test demo class and the two practice exercises.
+  - **JUnit, from the JUnit 6.1.3 User Guide:**
+    [Parallel Execution](https://docs.junit.org/6.1.3/writing-tests/parallel-execution.html) (every
+    `junit.jupiter.execution.parallel.*` key, `@Execution`, `@ResourceLock`, `@Isolated`) and
+    [Configuration Parameters](https://docs.junit.org/6.1.3/running-tests/configuration-parameters.html)
+    (where the keys are read from). Parallel execution is an opt-in feature; the `worker_thread_pool`
+    executor service is marked experimental in 6.1.3 and is not used here.
+  - **Surefire:** [Fork Options and Parallel Test Execution](https://maven.apache.org/surefire/maven-surefire-plugin/examples/fork-options-and-parallel-execution.html)
+    and [Rerun Failing Tests](https://maven.apache.org/surefire/maven-surefire-plugin/examples/rerun-failing-tests.html).
+    Surefire's own `parallel`/`threadCount` parameters are for JUnit 4 and TestNG; for JUnit 5/6 the page
+    points to Jupiter's settings. Version-specific: from Surefire 3.6.0 every framework runs through the
+    JUnit Platform provider and reruns happen after the first pass completes.
+  - **Java:** [`ThreadLocal` Javadoc (Java 17)](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/ThreadLocal.html).
+  - **Selenium Grid:** [Grid overview](https://www.selenium.dev/documentation/grid/),
+    [When to use Grid](https://www.selenium.dev/documentation/grid/applicability/) and
+    [Getting started](https://www.selenium.dev/documentation/grid/getting_started/).
+  - **Flaky tests:** Martin Fowler, [Eradicating Non-Determinism in Tests](https://martinfowler.com/articles/nonDeterminism.html)
+    (isolation and quarantine). "Quarantine with a limit, then fix" is that article's advice and this
+    course's rule - a practice, not a standard.
+  - **Fictional:** SandPay (`https://api.sandpay.example`), its sandbox accounts and the practice shop
+    (`practice/shop`). Order references and emails use `example.com`.
+
+prerequisites:
+  - reference-framework-skeleton
+  - java-concurrency-basics
+
+concepts:
+  - id: junit-parallel-config
+    name: Configuring parallel runs
+    summary: JUnit Jupiter runs tests on threads in one JVM when junit.jupiter.execution.parallel.enabled is true and an execution mode is concurrent; Surefire forkCount adds separate JVMs; @Execution, @ResourceLock and @Isolated control what may run together.
+  - id: parallel-isolation
+    name: Isolation for parallel tests
+    summary: Every thread gets its own driver (ThreadLocal with remove(), or a per-test store), every test its own data (run id plus an atomic counter), and nothing mutable is shared through static fields, shared accounts or shared carts.
+  - id: honest-retries
+    name: Honest retries
+    summary: A test that passes on a rerun is flaky, not fixed - Surefire reports it as a flake and the build stays green; quarantine it with a limit, find the race or shared state, and fix it.
+
+objectives:
+  - Write a junit-platform.properties that runs classes or methods in parallel with a fixed number of threads, and predict which tests share a thread.
+  - Choose between threads in one JVM (Jupiter) and several JVMs (Surefire forkCount), and explain what each isolates.
+  - Write a per-thread resource holder with ThreadLocal that closes and removes its value, and a test-data factory that stays unique across threads and runs.
+  - Diagnose a parallel failure from its evidence - values from another test, a closed browser, a duplicate order - and name the shared state behind it.
+  - Explain why rerunFailingTestsCount hides races, and describe a quarantine-and-fix policy for flaky tests.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [parallel-isolation, junit-parallel-config]
+    title: The idea in plain language
+    body: |
+      Picture a supermarket with one till. Opening four tills makes the queue four times shorter - **if**
+      every till has its own cash drawer, its own scanner and its own receipt roll. Share one cash drawer
+      between four cashiers and the totals stop adding up, but only on busy days, and never when you watch.
+
+      A test suite is the same. Running tests in parallel is a configuration change; making them **safe** to
+      run together is a design property. Each test needs its own browser, its own customer, its own order
+      and its own cart. When two tests share any of these, the suite still passes on a quiet laptop and fails
+      on a busy CI runner - and a retry makes the failure disappear without fixing anything.
+
+  - id: what
+    kind: what
+    concepts: [junit-parallel-config, parallel-isolation, honest-retries]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      |---|---|
+      | **In-JVM parallelism** | JUnit Jupiter runs several tests at once on threads of one Java process. Static fields, singletons and system properties are **shared**. |
+      | **Forked JVMs** | Surefire starts several Java processes (`forkCount`) and gives each some test classes. Static state is separate **between** forks, shared **within** a fork. |
+      | **Execution mode** | Jupiter's `same_thread` (run on the parent's thread) or `concurrent` (may run alongside others), per class or method. |
+      | **Thread confinement** | Each thread (or test) owns its mutable objects - its WebDriver, its API client - so nothing mutable is shared. |
+      | **`ThreadLocal<T>`** | A Java variable with one independent value per thread (`get`, `set`, `remove`). |
+      | **Unique test data** | Values no other test or run can produce: run id plus a counter, not a timestamp. |
+      | **Flaky test** | A test that passes and fails on the same code. Surefire calls a test that fails, then passes on a rerun, a **flake**. |
+      | **Quarantine** | Moving a known-flaky test out of the gating suite, tracked, with a limit, until it is fixed. |
+
+  - id: why
+    kind: why
+    concepts: [parallel-isolation, honest-retries]
+    title: Why parallel runs break suites that "worked"
+    body: |
+      - **Sequential runs hide shared state.** A static driver, a shared SandPay sandbox account or one cart
+        reused by every test works when tests take turns. With four threads, two tests type into the same
+        browser, or one test's clean-up empties a cart another test is paying for.
+      - **The failures look random.** They depend on timing, so they appear on CI (more load, more threads)
+        and vanish when you re-run one test on your laptop.
+      - **Retries make the evidence disappear.** If a rerun passes, the build is green and the race stays -
+        until it shows up as a real defect that nobody believes, because "that test is flaky".
+      - **The payoff is real.** UI and API tests spend most of their time waiting for the application, so a
+        few tests at once often cut run time close to proportionally - once they are isolated.
+
+  - id: internals
+    kind: internals
+    concepts: [junit-parallel-config]
+    title: How JUnit Jupiter decides what runs in parallel
+    body: |
+      By default Jupiter runs tests **sequentially on one thread**. Parallelism needs two things
+      (JUnit 6.1.3 User Guide, "Parallel Execution"):
+
+      1. `junit.jupiter.execution.parallel.enabled=true` - default `false`. On its own this changes nothing,
+         because every node's default mode is still `same_thread`.
+      2. A `concurrent` execution mode, set globally or per class or method.
+
+      | Key | Values (default) | What it sets |
+      |---|---|---|
+      | `junit.jupiter.execution.parallel.mode.default` | `same_thread`, `concurrent` (`same_thread`) | the mode of every node in the test tree |
+      | `junit.jupiter.execution.parallel.mode.classes.default` | `same_thread`, `concurrent` (falls back to `mode.default`) | the mode of top-level classes |
+      | `junit.jupiter.execution.parallel.config.strategy` | `dynamic`, `fixed`, `custom` (`dynamic`) | how the number of threads is chosen |
+      | `...config.dynamic.factor` | positive decimal (`1.0`) | parallelism = available processors × factor |
+      | `...config.fixed.parallelism` | positive integer (required for `fixed`) | the desired parallelism |
+      | `...config.fixed.max-pool-size` | integer ≥ parallelism (256 + parallelism) | the most threads the pool may create |
+
+      **The two mode keys combine:**
+
+      | `mode.default` | `mode.classes.default` | Result |
+      |---|---|---|
+      | `same_thread` | `same_thread` | everything sequential (the default) |
+      | `same_thread` | `concurrent` | classes in parallel; the methods of one class on one thread |
+      | `concurrent` | `same_thread` | classes one after another; methods of a class in parallel |
+      | `concurrent` | `concurrent` | everything in parallel |
+
+      **Annotations override the defaults:**
+
+      - `@Execution(ExecutionMode.CONCURRENT)` or `@Execution(ExecutionMode.SAME_THREAD)` on a class or method.
+        Classes with `@TestInstance(Lifecycle.PER_CLASS)` or a `MethodOrderer` run their methods
+        concurrently only if they say `@Execution(CONCURRENT)` themselves.
+      - `@ResourceLock("name")`, mode `READ` or `READ_WRITE`: tests that lock the same resource don't run at
+        the same time (two `READ` locks may). `Resources` has constants for `SYSTEM_PROPERTIES`,
+        `SYSTEM_OUT`, `SYSTEM_ERR`, `LOCALE` and `TIME_ZONE`.
+      - `@Isolated` on a class: its tests run with no other test running at the same time.
+
+      **Two cautions from the guide:** with the default `fork_join_pool` executor, JUnit does not guarantee
+      that the number of threads stays at the configured parallelism - blocking JDK calls or `ForkJoinPool`
+      use in tests may let more tests run at once. Size browser-heavy suites with some headroom.
+
+      **Where the keys are read from**, highest precedence first: the launcher request, JVM system
+      properties (`-D...`), then `junit-platform.properties` in the root of the test class path - in Maven,
+      `src/test/resources/junit-platform.properties`.
+
+  - id: visual
+    kind: visual
+    concepts: [junit-parallel-config, parallel-isolation]
+    title: "Diagram: forks, threads and what they share"
+    body: |
+      ```mermaid
+      flowchart TB
+          M["mvn test"] --> F1["Fork 1 - JVM (forkCount)"]
+          M --> F2["Fork 2 - JVM"]
+          F1 --> P1["Jupiter thread pool"]
+          P1 --> T1["Thread 1 - its own WebDriver"]
+          P1 --> T2["Thread 2 - its own WebDriver"]
+          F1 -.- S1["Static fields, system properties - shared by threads 1 and 2"]
+          F2 --> P2["Jupiter thread pool"]
+          P2 --> T3["Thread 3 - its own WebDriver"]
+          F2 -.- S2["Static fields - separate from fork 1"]
+          T1 --> SB["SandPay sandbox and test database - shared by everyone"]
+          T2 --> SB
+          T3 --> SB
+      ```
+
+      Notice what forks do **not** isolate: the system under test. Separate JVMs give separate static
+      fields, but every thread in every fork still talks to the same sandbox account, the same shop and the
+      same database. Only unique data per test isolates that.
+
+  - id: when
+    kind: when
+    concepts: [junit-parallel-config, parallel-isolation]
+    title: Threads, forks or a Grid - when to use which
+    body: |
+      | Option | Use it when | It does not |
+      |---|---|---|
+      | Jupiter threads (`parallel.enabled`) | tests are isolated and mostly wait for an app or a browser | isolate static state - threads share the JVM |
+      | Surefire `forkCount` > 1 | legacy code has static state you can't remove yet, or tests need separate JVM settings | isolate the app, database or sandbox the tests talk to |
+      | `forkCount=1` with `reuseForks=false` | one class pollutes the JVM and must run alone | run fast - Surefire's docs call it "a last resort" |
+      | Selenium Grid | one machine can't run enough browsers, or you need other browsers, versions or operating systems | make unsafe tests safe - it multiplies the same race |
+      | sequential | the suite is fast enough, or the tests are not isolated yet | - |
+
+      **Selenium Grid in two sentences.** Grid routes WebDriver commands to browsers on other machines, so
+      tests run in parallel across machines, browser versions and platforms; a test connects with
+      `new RemoteWebDriver(gridUrl, options)` instead of `new ChromeDriver()`. Locally,
+      `java -jar selenium-server-<version>.jar standalone` listens on `http://localhost:4444`, and by default
+      a node runs at most as many sessions as it has CPUs.
+
+      **Don't parallelise** until the tests pass reliably one at a time and in any order. Parallelism turns
+      every hidden dependency into a random failure.
+
+  - id: example
+    kind: example
+    concepts: [parallel-isolation, honest-retries]
+    title: "Real-world example: the cart that cost 35"
+    body: |
+      A team enables `mode.default = concurrent` on a SandPay checkout suite. Run time drops from 22 to 7
+      minutes, and a few tests start failing about one run in five. Someone adds
+      `-Dsurefire.rerunFailingTestsCount=2`; CI is green again.
+
+      This reproduction is the pattern, cut down to a static cart shared by two tests in one class:
+
+      ```java
+      class CartTotalTest {
+          static final List<Integer> CART = new ArrayList<>();   // shared by every test
+
+          @Test void twoItemsCostThirty() throws Exception {
+              CART.clear(); CART.add(10); Thread.sleep(50); CART.add(20);
+              assertEquals(30, CART.stream().mapToInt(Integer::intValue).sum());
+          }
+          @Test void oneItemCostsFive() throws Exception {
+              CART.clear(); CART.add(5); Thread.sleep(50);
+              assertEquals(5, CART.stream().mapToInt(Integer::intValue).sum());
+          }
+      }
+      ```
+
+      With methods running concurrently and two reruns, one real run printed:
+
+      ```plaintext
+      [ERROR] demo.CartTotalTest.oneItemCostsFive -- Time elapsed: 0.101 s <<< FAILURE!
+      org.opentest4j.AssertionFailedError: expected: <5> but was: <30>
+      [INFO] Running demo.CartTotalTest
+      [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.059 s -- in demo.CartTotalTest
+      [WARNING] Flakes:
+      [WARNING] demo.CartTotalTest.oneItemCostsFive
+      [ERROR]   Run 1: CartTotalTest.oneItemCostsFive:14 expected: <5> but was: <30>
+      [INFO]   Run 2: PASS
+      [WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1
+      [INFO] BUILD SUCCESS
+      ```
+
+      **What a tester reads from it:** `5` expected, `30` actual - and 30 is exactly the *other* test's
+      total (10 + 20). The test saw another test's data. The rerun passed because the rerun ran alone, not
+      because anything was fixed, and the build says `BUILD SUCCESS`.
+
+      **The fix is isolation:** each test builds its own cart (a local variable, or a cart created through
+      the API for a unique customer). If a resource truly must be shared, `@ResourceLock("cart")` on both
+      tests makes JUnit run them one at a time - three runs in a row then passed with no reruns. A lock is
+      the honest fallback; a cart per test is the better design.
+
+  - id: code
+    kind: code
+    concepts: [junit-parallel-config, parallel-isolation]
+    title: "Code: configuration, a per-thread driver and unique data"
+    collapsed: true
+    body: |
+      **`src/test/resources/junit-platform.properties`** - classes and methods in parallel, four threads:
+
+      ```properties
+      junit.jupiter.execution.parallel.enabled = true
+      junit.jupiter.execution.parallel.mode.default = concurrent
+      junit.jupiter.execution.parallel.config.strategy = fixed
+      junit.jupiter.execution.parallel.config.fixed.parallelism = 4
+      ```
+
+      Four tests that each wait 500 ms, first with that file, then with
+      `mvn test -Djunit.jupiter.execution.parallel.enabled=false` (a system property overrides the file):
+
+      ```plaintext
+      declinedCard on ForkJoinPool-1-worker-4
+      payByCard on ForkJoinPool-1-worker-2
+      payByWallet on ForkJoinPool-1-worker-1
+      refund on ForkJoinPool-1-worker-3
+      [INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.605 s -- in demo.CheckoutParallelTest
+
+      payByCard on main
+      refund on main
+      declinedCard on main
+      payByWallet on main
+      [INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.125 s -- in demo.CheckoutParallelTest
+      ```
+
+      **Locks and isolation** (illustrative excerpts):
+
+      ```java
+      @Execution(ExecutionMode.CONCURRENT)
+      class SandPayWebhookConfigTest {
+          @Test
+          @ResourceLock(value = Resources.SYSTEM_PROPERTIES, mode = ResourceAccessMode.READ_WRITE)
+          void usesTheOverriddenWebhookUrl() { System.setProperty("sandpay.webhook", "..."); /* ... */ }
+      }
+
+      @Isolated   // runs with no other test at the same time
+      class SettlementBatchTest { /* resets the shared sandbox ledger */ }
+      ```
+
+      **One driver per thread**, if your framework hands drivers out from a static helper (illustrative):
+
+      ```java
+      public final class Drivers {
+          private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();
+
+          public static WebDriver get() {
+              WebDriver driver = DRIVER.get();
+              if (driver == null) {
+                  driver = new ChromeDriver();
+                  DRIVER.set(driver);
+              }
+              return driver;
+          }
+
+          public static void quit() {          // call from @AfterEach / afterEach
+              WebDriver driver = DRIVER.get();
+              if (driver == null) return;
+              try {
+                  driver.quit();
+              } finally {
+                  DRIVER.remove();             // pooled threads run the next test
+              }
+          }
+      }
+      ```
+
+      The practice framework doesn't need this: its `ShopExtension` keeps the driver in the **per-test
+      extension store**, which is already one per test. `ThreadLocal` is for code that reaches the driver
+      without a parameter.
+
+      **Unique data**, as in the reference solution of the `TestDataFactory` exercise:
+
+      ```java
+      private final AtomicLong next = new AtomicLong();
+      public String orderReference() { return "ORD-" + runId + "-" + next.incrementAndGet(); }
+      ```
+
+      **Surefire forks** with a separate schema per fork - the placeholder is from Surefire's docs:
+
+      ```xml
+      <configuration>
+        <forkCount>2</forkCount>
+        <reuseForks>true</reuseForks>
+        <systemPropertyVariables>
+          <databaseSchema>CHECKOUT_TEST_${surefire.forkNumber}</databaseSchema>
+        </systemPropertyVariables>
+      </configuration>
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [parallel-isolation]
+    title: Why the per-thread code is written that way
+    body: |
+      - **`ThreadLocal`, not a field.** A plain field (static or in a shared holder) has one value for every
+        thread. The Javadoc: each thread that accesses a `ThreadLocal` "has its own, independently
+        initialized copy of the variable".
+      - **`remove()` in `finally`.** Test runners reuse threads from a pool. A thread keeps its copy "as long
+        as the thread is alive", so without `remove()` the next test on that thread gets the previous test's
+        driver - already quit. After `remove()`, the next `get()` starts empty.
+      - **`quit()` before `remove()`, and `remove()` even if `quit()` throws.** Otherwise a crash in
+        `quit()` leaves a dead driver attached to the thread.
+      - **`AtomicLong.incrementAndGet()`.** One atomic step - two threads can never get the same number, with
+        no lock. `System.currentTimeMillis()` returns the same value for many calls in one millisecond.
+      - **The run id in every value.** Two CI jobs against one sandbox both start counting at 1; the run id
+        (for example the CI build number) keeps their orders apart.
+
+  - id: tests
+    kind: tests
+    concepts: [parallel-isolation, honest-retries]
+    title: Checks before and after turning parallelism on
+    body: |
+      | ID | Check | Expected | Evidence |
+      |---|---|---|---|
+      | P1 | run each test class alone, then the suite in a random class order, sequentially | all pass | two green runs; failures here are order dependencies, fix them first |
+      | P2 | grep for `static` mutable fields and singletons in tests and framework | none, or each protected by a lock | the list, with a decision per field |
+      | P3 | run with parallelism on, 10 times in a row, reruns off | 10 green runs | CI history; any failure is a race until proven otherwise |
+      | P4 | look for shared data: one sandbox account, one customer, fixed order ids | each test creates or is given its own | data factory used everywhere; no literal ids in tests |
+      | P5 | after each test, no browser processes left | process count back to the baseline | `ps` on the runner, or the Grid's session count |
+      | P6 | run time before and after | lower, with CPU and memory headroom on the runner | the two durations and the runner's metrics |
+      | P7 (negative) | two tests that do need one resource | they never overlap | `@ResourceLock` and a log showing one finishes before the other starts |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [junit-parallel-config, parallel-isolation, honest-retries]
+    title: Common mistakes and how to debug them
+    body: |
+      - **`parallel.enabled=true` and nothing else** - every mode is still `same_thread`, so nothing runs in
+        parallel. Set a `concurrent` mode.
+      - **Configuring Surefire's `parallel`/`threadCount` for a JUnit 5/6 suite** - those parameters are for
+        JUnit 4 and TestNG. Jupiter uses its own `junit.jupiter.execution.parallel.*` keys.
+      - **Static WebDriver, or a `ThreadLocal` without `remove()`** - tests get another test's browser, or a
+        browser that was already quit (`NoSuchSessionException` in the *next* test).
+      - **Timestamps or `Random` as "unique" ids** - duplicate orders and customers under load. Use a run id
+        plus an atomic counter.
+      - **Shared accounts and carts** - one SandPay sandbox merchant whose balance every refund test asserts;
+        one customer whose cart every checkout test fills.
+      - **Too many browsers** - `dynamic` with factor 1 on a 16-core runner starts 16 Chromes. Choose
+        `fixed` from measured memory and CPU.
+      - **Retries on by default** - races become `Flakes:` lines nobody reads.
+
+      **Debugging a parallel-only failure:** (1) confirm it passes sequentially (`-Djunit.jupiter.execution.parallel.enabled=false`);
+      (2) log the thread name and the test data ids in every failure; (3) look at the actual value - does it
+      belong to another test?; (4) find the shared object (static field, shared account, fixed id); (5) give
+      each test its own, or lock it, and re-run in parallel many times with reruns off.
+
+  - id: retries
+    kind: tradeoffs
+    concepts: [honest-retries]
+    title: "Retries: what they report and what they hide"
+    body: |
+      Surefire's `rerunFailingTestsCount` (for example `mvn -Dsurefire.rerunFailingTestsCount=2 test`) reruns
+      a failing test until it passes or the reruns are used up. From the Surefire docs:
+
+      - A test that passes on a rerun is counted as a **flake**, the last run is marked `PASS`, and **the build
+        is successful**. The XML report keeps the failed attempts as `flakyFailure` / `flakyError` elements.
+      - A test that fails every run fails the build; the XML has the first failure plus `rerunFailure`
+        elements.
+      - `failOnFlakeCount` (Surefire 3.0.0-M6+, with `rerunFailingTestsCount`) fails the build when more than
+        that many tests were flaky.
+
+      | Policy | Gains | Costs |
+      |---|---|---|
+      | no retries | every race is visible | red builds until the races are fixed |
+      | retries with `failOnFlakeCount` and a dashboard of flakes | builds survive known infrastructure blips; flakes stay counted | someone must read and act on the count |
+      | retries, nobody reads `Flakes:` | green builds | races and real intermittent defects ship; trust in the suite erodes |
+      | quarantine with a limit (out of the gating suite, tracked, fixed within a set time) | the gate stays trustworthy | the quarantined behaviour is untested meanwhile |
+
+      **The honest rule:** a flake is a bug report about the test or the product. Record it, quarantine it if
+      it blocks the team, and fix the cause - shared state, missing wait, non-unique data or a real race in
+      the product. Fowler's article suggests a cap on quarantine, such as a number of tests or "no longer
+      than a week". A payment race that "only happens under load" may be exactly the defect customers will
+      hit.
+
+  - id: summary
+    kind: summary
+    title: Summary and quick reference
+    body: |
+      - Jupiter: `junit.jupiter.execution.parallel.enabled = true` **and** a `concurrent` mode
+        (`mode.default`, `mode.classes.default`). Size with `config.strategy = fixed` and
+        `config.fixed.parallelism`.
+      - `@Execution`, `@ResourceLock(value, mode)`, `@Isolated` for tests that must not overlap.
+      - Surefire `forkCount`/`reuseForks` = separate JVMs; static state is per fork, the app is still shared.
+        Surefire's `parallel` is not for JUnit 5/6.
+      - One driver per test or thread: per-test store, or `ThreadLocal` with `quit()` then `remove()` in
+        `finally`.
+      - Unique data: run id plus `AtomicLong`; never timestamps; never shared accounts or carts.
+      - Grid scales browsers across machines; it doesn't fix shared state.
+      - A rerun pass is a flake, not a fix: count it, quarantine with a limit, fix the cause.
+
+exercises:
+  - id: pick-the-modes
+    type: mcq
+    concept: junit-parallel-config
+    skill: application
+    title: Classes in parallel, methods in order
+    prompt: |
+      In the SandPay checkout suite, each test class shares a logged-in session between its methods (it is
+      created once per class), so methods of one class must not overlap - but different classes may run
+      together. Which `junit-platform.properties` does that?
+    options:
+      - id: classes-concurrent
+        text: "`parallel.enabled = true`, `mode.default = same_thread`, `mode.classes.default = concurrent`"
+        feedback: Correct - top-level classes run in parallel, and the methods of each class run on that class's thread, one after another.
+      - id: methods-concurrent
+        text: "`parallel.enabled = true`, `mode.default = concurrent`, `mode.classes.default = same_thread`"
+        feedback: This is the opposite - classes one after another, methods of a class in parallel, so the shared session is used by several threads at once.
+      - id: enabled-only
+        text: "`parallel.enabled = true` and nothing else"
+        feedback: Enabling is only the first step - both modes default to same_thread, so nothing runs in parallel.
+      - id: surefire-parallel
+        text: "Surefire `<parallel>classes</parallel>` with `<threadCount>4</threadCount>`"
+        feedback: Those Surefire parameters are for JUnit 4 and TestNG; for Jupiter tests Surefire's docs point to the junit.jupiter.execution.parallel keys.
+    correct: [classes-concurrent]
+    hints:
+      - There are two mode keys. Which one applies to top-level classes, and which to everything else?
+      - The default mode for methods must keep them on one thread.
+    solution: |
+      **`mode.default = same_thread` with `mode.classes.default = concurrent`.** The JUnit guide lists this
+      combination as "top-level classes run in parallel, methods of each class on the same thread". It is
+      a common first step for suites whose classes share setup between methods.
+    followUp: |
+      One class in that suite changes a system property in two of its tests. What would you add so those two
+      tests never overlap with any other test that reads the property?
+
+  - id: threadlocal-review
+    type: debug
+    concept: parallel-isolation
+    skill: analysis
+    title: The browser that was already closed
+    prompt: |
+      Parallel runs fail with `NoSuchSessionException` in the first step of random tests - always a test that
+      starts right after another test finished **on the same worker thread**. Sequential runs pass. Click the
+      line or lines that cause it.
+    language: java
+    code: |
+      public final class Drivers {
+          private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();
+
+          public static WebDriver get() {
+              WebDriver driver = DRIVER.get();
+              if (driver == null) {
+                  driver = new ChromeDriver();
+                  DRIVER.set(driver);
+              }
+              return driver;
+          }
+
+          public static void quit() {
+              WebDriver driver = DRIVER.get();
+              if (driver != null) {
+                  driver.quit();
+              }
+          }
+      }
+    correctLines: [16]
+    lineNotes:
+      - line: 2
+        note: A static ThreadLocal is fine - the static field holds the ThreadLocal object, and each thread still has its own value. The Javadoc says ThreadLocal instances are typically private static fields.
+      - line: 8
+        note: Setting the value for the current thread is right; the problem is that nothing ever clears it.
+    hints:
+      - After `quit()`, what does `DRIVER.get()` return on that thread?
+      - The pool hands the same thread to the next test. What does `get()` see on line 6?
+    solution: |
+      **Line 16 - `quit()` closes the browser but leaves it in the `ThreadLocal`.** The next test on that
+      pooled thread calls `get()`, finds a non-null value on line 6, and receives a dead session. The fix:
+
+      ```java
+      try {
+          driver.quit();
+      } finally {
+          DRIVER.remove();
+      }
+      ```
+
+      **Confirm before fixing:** log `Thread.currentThread().getName()` and the session id in `get()` and
+      `quit()`. The failing test will report the same thread and the session id the previous test quit.
+    followUp: |
+      The same holder keeps a SandPay API client with an auth token per thread. What goes wrong if `remove()`
+      is missing there, and why is it worse than the browser case?
+
+  - id: per-thread-holder
+    type: coding
+    concept: parallel-isolation
+    skill: application
+    title: One resource per test thread
+    prompt: |
+      `PerThread<T>` hands out a resource - a browser, an API client - and closes it with `release()`. It
+      keeps one instance in a plain field, so parallel tests share it. Make every thread get its own
+      instance, created on first use, and make `release()` close and forget only the calling thread's
+      instance. A thread that never called `get()` must be able to call `release()` without creating
+      anything.
+    project: java
+    files:
+      - src/exercises/java/learnerapp/parallel/PerThread.java
+    test: src/test/java/learnerapp/parallel/PerThreadTest.java
+    command: mvn test -Dtest=PerThreadTest
+    hints:
+      - Which JDK class keeps a separate value per thread?
+      - "`release()` has two jobs: close the value, and make the next `get()` on this thread create a new one."
+      - Pool threads are reused. Which `ThreadLocal` method forgets the value - and should it run even if closing throws?
+    modelAnswer: |
+      ```java
+      private final ThreadLocal<T> instance = new ThreadLocal<>();
+
+      public T get() {
+          T current = instance.get();
+          if (current == null) {
+              current = factory.get();
+              instance.set(current);
+          }
+          return current;
+      }
+
+      public void release() {
+          T current = instance.get();
+          if (current == null) {
+              return;
+          }
+          try {
+              closer.accept(current);
+          } finally {
+              instance.remove();
+          }
+      }
+      ```
+
+      Against the unsolved exercise, three of the six tests fail - for example
+      `two threads share one browser ==> expected: not same`. With a `ThreadLocal` each thread's `get()`
+      sees only its own value, and `remove()` makes the next test on a pooled thread start clean.
+    rubric:
+      - Every test in PerThreadTest passes
+      - Uses a ThreadLocal (not a map keyed by thread that is never cleaned)
+      - release() calls remove(), in a finally block, so a failing close still clears the thread
+      - release() on a thread without an instance creates nothing
+      - Can explain why remove() matters when the test runner reuses threads
+    solution: |
+      The `ThreadLocal` gives confinement - nothing is shared, so nothing needs locking. `remove()` is the
+      part people forget: the runner's pool threads outlive tests, and a leftover value is a leftover
+      browser.
+    followUp: |
+      Would `ThreadLocal.withInitial(factory)` simplify `get()`? What would `release()` then do on a thread
+      that never called `get()`?
+
+  - id: unique-data-factory
+    type: coding
+    concept: parallel-isolation
+    skill: application
+    title: Unique test data under parallel load
+    prompt: |
+      `TestDataFactory` builds order references and customer emails from `System.currentTimeMillis()`.
+      Running its tests against the unsolved file gave:
+
+      ```plaintext
+      TestDataFactoryTest.consecutiveReferencesAreUnique:70 duplicate reference after 1 calls ==> expected: <true> but was: <false>
+      TestDataFactoryTest.referencesAreUniqueAcrossParallelThreads:89 some parallel tests got the same order reference ==> expected: <8000> but was: <15>
+      ```
+
+      Make every value unique within a run, also when 16 threads call the factory at once, and keep the
+      formats `ORD-<runId>-<number>` and `buyer+<runId>-<number>@example.com`.
+    project: java
+    files:
+      - src/exercises/java/learnerapp/parallel/TestDataFactory.java
+    test: src/test/java/learnerapp/parallel/TestDataFactoryTest.java
+    command: mvn test -Dtest=TestDataFactoryTest
+    hints:
+      - 8,000 calls produced 15 distinct values. How many milliseconds did the test take?
+      - You need a number that is different on every call, whichever thread makes it.
+      - "`java.util.concurrent.atomic` has a counter whose increment is one indivisible step."
+    modelAnswer: |
+      ```java
+      private final AtomicLong next = new AtomicLong();
+
+      public String orderReference() {
+          return "ORD-" + runId + "-" + next.incrementAndGet();
+      }
+
+      public String customerEmail() {
+          return "buyer+" + runId + "-" + next.incrementAndGet() + "@example.com";
+      }
+      ```
+
+      The 8,000 calls ran in a few milliseconds, so the clock gave 15 values. `incrementAndGet()` returns a
+      new number on every call, atomically, without a lock. A plain `long` with `next++` would lose updates
+      under 16 threads (read, add, write is three steps). The run id keeps two runs - two CI jobs against
+      one SandPay sandbox - apart.
+    rubric:
+      - Every test in TestDataFactoryTest passes
+      - Uses an atomic counter (AtomicLong or similar), not a timestamp, Random or an unsynchronised long
+      - Keeps the run id in every value so runs do not collide
+      - Keeps the documented formats
+      - Can explain why the clock produced duplicates
+    solution: |
+      **Run id + atomic counter** is unique within a run by construction and across runs by the run id -
+      no guessing about probability, no lock.
+    followUp: |
+      Two CI pipelines both use the build number `412` from different projects against the same sandbox.
+      What would you put in the run id instead?
+
+  - id: green-with-flakes
+    type: mcq
+    concept: honest-retries
+    skill: analysis
+    title: The green build with a flake
+    prompt: |
+      After enabling parallel execution, CI runs with `-Dsurefire.rerunFailingTestsCount=2` and ends:
+
+      ```plaintext
+      [WARNING] Flakes:
+      [WARNING] demo.CartTotalTest.oneItemCostsFive
+      [ERROR]   Run 1: CartTotalTest.oneItemCostsFive:14 expected: <5> but was: <30>
+      [INFO]   Run 2: PASS
+      [WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 1
+      [INFO] BUILD SUCCESS
+      ```
+
+      `twoItemsCostThirty` in the same class builds a cart of 10 + 20. What is the best reading and next step?
+    options:
+      - id: race
+        text: The test read the other test's cart (30 = 10 + 20) - shared state between concurrent tests. Find the shared cart and give each test its own.
+        feedback: Correct - the actual value belongs to another test, which is the signature of shared state, and the rerun passed because it ran alone.
+      - id: fixed-by-rerun
+        text: The build passed, so the problem resolved itself - no action needed
+        feedback: The rerun passed under different timing; nothing changed in the code. Surefire counts it as a flake precisely because it is not a pass you can trust.
+      - id: timeout
+        text: The test needs a longer wait before asserting
+        feedback: A longer wait doesn't change whose items are in the cart - 30 is another test's total, not a late update of this one.
+      - id: more-retries
+        text: Raise the rerun count to 5 so the build stays reliable
+        feedback: More retries hide the race better; they don't remove it.
+    correct: [race]
+    hints:
+      - Where could the value 30 come from?
+      - Why might the rerun behave differently from the first run?
+    solution: |
+      **Shared state.** 30 is exactly `twoItemsCostThirty`'s total, so the two tests used one cart. Confirm
+      it by running the class with parallelism off (it passes) and by looking for a static or shared cart.
+      Fix with a cart per test; use `@ResourceLock` only if the resource truly must be shared. Then run in
+      parallel many times with reruns off.
+    followUp: |
+      Which Surefire setting would have made this build fail on the flake while keeping reruns for a known
+      infrastructure problem?
+
+  - id: rollout-order
+    type: order
+    concept: junit-parallel-config
+    skill: recall
+    title: Turning on parallel runs safely
+    prompt: Put the steps for moving a 300-test suite to parallel execution in a sensible order.
+    items:
+      - id: baseline
+        text: Measure the current run time and failure rate, with reruns off
+      - id: isolate
+        text: Remove static drivers and shared data; run classes alone and in random order until green
+      - id: classes
+        text: Enable parallel classes (mode.classes.default = concurrent) with a small fixed parallelism
+      - id: soak
+        text: Run the suite in parallel many times with reruns off, and fix or quarantine every failure
+      - id: widen
+        text: Increase parallelism, or add concurrent methods, while the runner has CPU and memory headroom
+      - id: compare
+        text: Compare run time and failure rate with the baseline
+    hints:
+      - You can't judge a change without a "before".
+      - Isolation comes before concurrency, and the smallest step comes first.
+    solution: |
+      **Baseline → isolate → classes with a small fixed pool → soak → widen → compare.** Each step changes
+      one thing and has evidence, so a new failure points to the step that caused it.
+
+  - id: interview-parallel-suite
+    type: interview
+    concept: junit-parallel-config
+    skill: application
+    title: "Interview: make this suite run in parallel"
+    prompt: |
+      **Interviewer:** "Our Selenium suite for the SandPay checkout takes 50 minutes on CI. How would you make
+      it run in parallel, and how would you know it's safe?"
+    hints:
+      - Cover configuration, isolation (driver and data), sizing and evidence - and what you would not do.
+    modelAnswer: |
+      - **First, isolation:** a WebDriver per test (per-test store, or a `ThreadLocal` with `remove()`), no
+        static state; unique data per test - run id plus a counter for orders and customers, no shared
+        sandbox accounts or carts. Prove it by running classes alone and in random order.
+      - **Configuration:** JUnit Jupiter `junit-platform.properties` -
+        `junit.jupiter.execution.parallel.enabled=true`, start with `mode.classes.default=concurrent`,
+        `config.strategy=fixed` with a small `fixed.parallelism`. `@ResourceLock` or `@Isolated` for the few
+        tests that touch a truly shared resource.
+      - **Sizing:** browsers cost memory and CPU, so size parallelism from the runner's metrics; beyond one
+        machine, Selenium Grid or several CI shards.
+      - **Evidence:** baseline run time and failure rate; many parallel runs with reruns off; thread name and
+        data ids in every failure log.
+      - **Not:** retries to make it green - a rerun pass is a flake to investigate; quarantine with a limit.
+    followUps:
+      - What is the difference between Surefire forkCount and Jupiter's parallel mode?
+      - A test fails only in parallel with another customer's order id in the error. What do you do?
+      - When would you use Selenium Grid instead of more threads on one runner?
+      - Would you use rerunFailingTestsCount? Under what conditions?
+    rubric:
+      - Put isolation (driver and data) before configuration
+      - Named the real Jupiter keys and at least one of @ResourceLock or @Isolated
+      - Sized parallelism from measurements, and placed Grid correctly as a scaling option
+      - Described evidence - baseline, repeated parallel runs with reruns off
+      - Treated retries as hiding races, with a quarantine-and-fix policy
+    solution: |
+      Strong answers **start with isolation and end with evidence**. Weak answers name a setting ("set
+      threadCount to 10") and a retry library.
+
+recall:
+  - id: recall-two-switches
+    concept: junit-parallel-config
+    prompt: What two settings does JUnit Jupiter need before any tests run in parallel?
+    answer: junit.jupiter.execution.parallel.enabled = true, and a concurrent mode - mode.default or mode.classes.default (or @Execution(CONCURRENT)).
+  - id: recall-forks-vs-threads
+    concept: junit-parallel-config
+    prompt: What do Surefire forks isolate that Jupiter threads do not - and what do neither isolate?
+    answer: Forks are separate JVMs, so static fields and system properties are separate per fork. Neither isolates the application, sandbox or database the tests talk to.
+  - id: recall-resource-lock
+    concept: junit-parallel-config
+    prompt: Two tests change the same system property. How do you stop them overlapping without making the whole suite sequential?
+    answer: "@ResourceLock(value = Resources.SYSTEM_PROPERTIES, mode = READ_WRITE) on both (READ on tests that only read it); @Isolated if a class must run with nothing else."
+  - id: recall-remove
+    concept: parallel-isolation
+    prompt: Why must a ThreadLocal driver be removed after each test?
+    answer: Runners reuse pool threads; the value lives as long as the thread, so the next test on that thread would get the old - already quit - driver.
+  - id: recall-unique
+    concept: parallel-isolation
+    prompt: How do you make test data unique within a parallel run and across runs?
+    answer: A run id (for example the CI build number) plus an AtomicLong counter - not timestamps or Random.
+  - id: recall-flake
+    concept: honest-retries
+    prompt: What does Surefire do with a test that fails, then passes on a rerun?
+    answer: Counts it as a flake, marks the last run PASS, and the build succeeds - unless failOnFlakeCount is set.
+  - id: recall-quarantine
+    concept: honest-retries
+    prompt: What is an honest policy for a flaky test?
+    answer: Record it, quarantine it out of the gating suite with a limit (number or time), find the shared state or race, and fix it - don't let retries keep it green.
+
+next:
+  - ci-quality-gates
+
+placement:
+  - id: place-nothing-parallel
+    type: mcq
+    concept: junit-parallel-config
+    skill: application
+    title: Parallel is on, but nothing runs in parallel
+    prompt: |
+      A suite's `src/test/resources/junit-platform.properties` contains only
+      `junit.jupiter.execution.parallel.enabled = true`. Logs show every test on the `main` thread and the
+      run time hasn't changed. Why?
+    options:
+      - id: no-mode
+        text: Both execution modes still default to same_thread - a concurrent mode is also needed
+        feedback: Correct - enabling parallel execution is only the first step; mode.default or mode.classes.default (or @Execution) must be concurrent.
+      - id: wrong-place
+        text: The file must be in src/main/resources to be read
+        feedback: JUnit reads junit-platform.properties from the root of the test class path - src/test/resources is right for test configuration.
+      - id: surefire-needed
+        text: Surefire must also set forkCount above 1
+        feedback: forkCount starts more JVMs; it isn't needed for Jupiter's threads inside one JVM.
+      - id: cores
+        text: The runner has only one CPU core
+        feedback: The default dynamic strategy would still use at least one thread per core, but the logs show the problem is earlier - nothing is allowed to run concurrently.
+    correct: [no-mode]
+    solution: |
+      **No concurrent mode.** `parallel.enabled` allows parallel execution; `mode.default` /
+      `mode.classes.default` (default `same_thread`) or `@Execution(CONCURRENT)` decide what actually runs
+      concurrently.
+
+  - id: place-customer-mixup
+    type: mcq
+    concept: parallel-isolation
+    skill: analysis
+    title: Another test's order
+    prompt: |
+      In parallel runs, `refundShowsOnOrderPage` sometimes fails: the order page shows `ORD-run7-1730123`,
+      but the test created `ORD-run7-1730124`. Both suffixes are the last digits of `System.currentTimeMillis()`,
+      and all tests log in as the same sandbox customer `buyer@example.com`. Which change fixes the cause?
+    options:
+      - id: unique-customer
+        text: Give every test its own customer and order reference - a run id plus an atomic counter
+        feedback: Correct - the test is reading another test's order from the shared customer's account; unique data per test removes the overlap.
+      - id: sleep
+        text: Wait two seconds before opening the order page
+        feedback: Timing changes how often it happens, not why - the page still lists the shared customer's orders from other tests.
+      - id: retry
+        text: Rerun the test once when it fails
+        feedback: A rerun would often pass and hide that tests share a customer.
+      - id: forks
+        text: Run each test class in its own JVM with forkCount
+        feedback: Separate JVMs don't separate data in the shop - every fork logs in as the same customer.
+    correct: [unique-customer]
+    solution: |
+      **Shared customer, near-identical ids.** The two orders were created a millisecond apart by different
+      tests under one account. Unique data per test - its own customer and a counter-based reference - is the
+      fix; forks and retries only change timing.
+
+  - id: place-retry-policy
+    type: mcq
+    concept: honest-retries
+    skill: application
+    title: The retry proposal
+    prompt: |
+      After moving to parallel runs, five tests fail in about one run in ten. A colleague proposes
+      `rerunFailingTestsCount=3` for the whole suite "so the pipeline stays green". What is the best response?
+    options:
+      - id: quarantine-fix
+        text: Keep failures visible - track each flaky test, quarantine it with a limit if it blocks the team, and fix the shared state or race behind it
+        feedback: Correct - a rerun pass is a flake to investigate, and a payment race may be a real defect.
+      - id: accept
+        text: Accept - Surefire will still fail the build if a test fails on every run
+        feedback: True, but the intermittent failures - the ones caused by races - will pass on a rerun and disappear into a Flakes count.
+      - id: sequential
+        text: Turn parallel execution off permanently
+        feedback: That hides the shared state too, and gives up the speed; isolate the tests instead.
+      - id: delete
+        text: Delete the five tests
+        feedback: That removes coverage of the behaviour, and the shared state remains for the next test that hits it.
+    correct: [quarantine-fix]
+    solution: |
+      **Visible, tracked, fixed.** Surefire marks a rerun pass as a flake and the build succeeds, so blanket
+      retries turn races into green builds. Quarantine with a limit protects the pipeline while the cause is
+      fixed.

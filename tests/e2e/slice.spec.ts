@@ -144,8 +144,12 @@ test('empty, planned, not-found and corrupt-storage states', async ({ page }) =>
   await page.getByRole('button', { name: 'Clear filters' }).click();
   await expect(page.locator('.lesson-list').getByRole('link', { name: LESSON })).toBeVisible();
 
+  // Every curriculum lesson is written now, so a former planned lesson opens as a lesson.
   await page.goto('./#/lesson/e2e-payment-capstone');
-  await expect(page.getByText(/This lesson is planned but not written yet/)).toBeVisible();
+  await expect(
+    page.getByRole('heading', { level: 1, name: 'Capstone - an end-to-end payment journey' }),
+  ).toBeVisible();
+  await expect(page.getByText(/This lesson is planned but not written yet/)).toHaveCount(0);
 
   await page.goto('./#/lesson/does-not-exist');
   await expect(page.getByRole('heading', { level: 1, name: 'Lesson not found' })).toBeVisible();
