@@ -104,7 +104,7 @@ Goal: UI automation practised against a real (fictional) shop, with a framework 
       `practice/maven`: broken exercise projects (`receipt-tool`, `checkout-suite`) whose test classes run
       Maven on the learner's project and check the outcome - build success, the real test count, the
       Failsafe phase, a failing integration test failing the build. CI runs `practice/verify.sh maven`.
-- [ ] Parallel runs and thread safety, CI quality gates and the capstone.
+- [x] Parallel runs and thread safety, CI quality gates and the capstone.
 
 ## Increment 7 - Playwright track and interview practice (done)
 
@@ -159,7 +159,7 @@ course.
 - [x] A **Testing foundations** learning path (added after the existing paths, so the home page still starts
       with the Payments QA core path).
 
-## Increment 7d - completing the courses (in progress)
+## Increment 7d - completing the courses (done)
 
 - [x] Track A (payments): ecosystem roles; void, reversal, refund and chargeback; card payments and tokenisation; 3-D
       Secure and redirects; wallets and bank payments (UPI, SEPA); amounts, currency and rounding; refresh, back and
@@ -177,7 +177,9 @@ course.
 - [x] Track G: parallel runs and thread safety (JUnit parallel execution, Surefire forks, ThreadLocal, unique data,
       honest retries); CI pipelines and quality gates (GitHub Actions, secrets, required checks); the end-to-end
       payment capstone; the payments QA mock interview.
-- [ ] Review of the earlier lessons against their official sources.
+- [x] Review of the 28 earlier lessons against their official sources: claims checked against RFCs, the JLS and
+      Java SE 17 Javadoc, W3C WebDriver, Maven, JUnit, Selenium, Appium, Playwright, Visa rules, ISTQB and PCI SSC;
+      outputs re-run; sources cited in each `environment:`. No ids or answers changed.
 
 ## Next increments
 

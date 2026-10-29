@@ -18,9 +18,9 @@ public final class ReportLine {
 
   /**
    * Splits one line of a SandPay settlement report into its fields. Fields are separated by {@code |}.
-   * Each field is stripped of leading and trailing white space - any Unicode white space, not only
-   * spaces. Empty fields are kept, including empty fields at the end: {@code "a||"} has three fields,
-   * {@code "a"}, {@code ""} and {@code ""}.
+   * Each field is stripped of leading and trailing white space - Unicode white space as
+   * {@code Character.isWhitespace} defines it, not only spaces. Empty fields are kept, including
+   * empty fields at the end: {@code "a||"} has three fields, {@code "a"}, {@code ""} and {@code ""}.
    *
    * @throws IllegalArgumentException if {@code line} is null
    */
