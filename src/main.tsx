@@ -1,14 +1,14 @@
 import { render } from 'preact';
 import { contentResult } from './content';
 import { registerServiceWorker } from './pwa/register';
-import { ProgressProvider } from './store/ProgressContext';
+import { ProfilesProvider } from './store/ProfilesContext';
 import { App } from './ui/App';
 import './ui/styles.css';
 
 render(
-  <ProgressProvider>
+  <ProfilesProvider>
     <App content={contentResult} />
-  </ProgressProvider>,
+  </ProfilesProvider>,
   document.getElementById('app')!,
 );
 

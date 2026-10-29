@@ -83,7 +83,7 @@ test('learn, practise, save, reload and resume', async ({ page }) => {
   // Home offers to resume, and progress shows the evidence.
   await page.goto('./#/');
   await expect(page.getByRole('heading', { name: 'Continue' })).toBeVisible();
-  await page.getByRole('link', { name: 'Resume lesson' }).click();
+  await page.getByRole('link', { name: 'Resume study' }).click();
   await expect(page.getByRole('heading', { level: 1, name: LESSON })).toBeVisible();
   await page.goto('./#/progress');
   await expect(page.getByRole('heading', { level: 1, name: 'Progress' })).toBeVisible();
@@ -157,7 +157,7 @@ test('empty, planned, not-found and corrupt-storage states', async ({ page }) =>
   await page.goto('./#/nowhere');
   await expect(page.getByRole('heading', { level: 1, name: 'Page not found' })).toBeVisible();
 
-  await page.evaluate(() => localStorage.setItem('learnerapp.progress.v1', '{broken'));
+  await page.evaluate(() => localStorage.setItem('learnerapp.profile.loki.progress.v1', '{broken'));
   await page.goto('./#/');
   await page.reload();
   await expect(page.getByRole('alert')).toContainText('Saved progress could not be loaded');

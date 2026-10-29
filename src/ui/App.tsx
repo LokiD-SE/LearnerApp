@@ -1,8 +1,10 @@
 import { useEffect } from 'preact/hooks';
 import type { ValidationResult } from '../content/validate';
 import { applyUpdate, dismissOfflineStatus, useOfflineStatus } from '../pwa/register';
-import { useProgress } from '../store/ProgressContext';
-import { dueReviews } from '../store/selectors';
+import { progressKey, progressPercentage, signOut, withSummary } from '../store/profiles';
+import { useProfiles } from '../store/ProfilesContext';
+import { ProgressProvider, useProgress } from '../store/ProgressContext';
+import { dueReviews, lessonStatus } from '../store/selectors';
 import { HomePage } from './pages/HomePage';
 import { InterviewHomePage } from './pages/InterviewHomePage';
 import { InterviewPage } from './pages/InterviewPage';
@@ -11,6 +13,7 @@ import { LearnPage } from './pages/LearnPage';
 import { LessonPage } from './pages/LessonPage';
 import { PlacementPage } from './pages/PlacementPage';
 import { PracticePage } from './pages/PracticePage';
+import { ProfilesPage } from './pages/ProfilesPage';
 import { ProgressPage } from './pages/ProgressPage';
 import { ReviewPage } from './pages/ReviewPage';
 import { SearchPage } from './pages/SearchPage';
@@ -18,7 +21,20 @@ import { href, useRoute, type Route } from './router';
 
 export function App({ content }: { content: ValidationResult }) {
   if (!content.ok) return <ContentError errors={content.errors} />;
-  return <Shell content={content} />;
+  return <SignedIn content={content} />;
+}
+
+/** Nobody signed in: the profile screen. Otherwise the app, with that profile's own progress. */
+function SignedIn({ content }: { content: Extract<ValidationResult, { ok: true }> }) {
+  const { state, store } = useProfiles();
+  const id = state.activeUserId;
+  if (!id) return <ProfilesPage />;
+  // Keyed by profile so switching loads the other profile's progress from scratch.
+  return (
+    <ProgressProvider key={id} store={store} storageKey={progressKey(id)}>
+      <Shell content={content} profileId={id} />
+    </ProgressProvider>
+  );
 }
 
 function ContentError({ errors }: { errors: string[] }) {
@@ -37,12 +53,36 @@ function ContentError({ errors }: { errors: string[] }) {
   );
 }
 
-function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }) {
+function Shell({
+  content,
+  profileId,
+}: {
+  content: Extract<ValidationResult, { ok: true }>;
+  profileId: string;
+}) {
   const index = content.index;
   const route = useRoute();
   const { state, now, warning, dismissWarning } = useProgress();
+  const profiles = useProfiles();
+  const firstName = profiles.state.profiles[profileId]?.firstName ?? profileId;
   const due = dueReviews(index, state, now()).length;
   const offline = useOfflineStatus();
+
+  // Keep the profile screen's summary in step with this profile's progress.
+  const { update: updateProfiles } = profiles;
+  useEffect(() => {
+    const published = [...index.lessons.keys()];
+    const completedLessons = published.filter((id) =>
+      ['completed', 'mastered'].includes(lessonStatus(index, state, id)),
+    );
+    updateProfiles((current) =>
+      withSummary(current, profileId, {
+        completedLessons,
+        lastActiveLesson: state.lastLessonId ?? null,
+        progressPercentage: progressPercentage(completedLessons.length, published.length),
+      }),
+    );
+  }, [index, state, profileId, updateProfiles]);
 
   // Move focus to the new page's heading so keyboard and screen-reader users land on it.
   useEffect(() => {
@@ -100,6 +140,15 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
           {navLink('progress', href.progress(), 'Progress')}
           {navLink('search', href.search(), 'Search')}
         </nav>
+        <div class="profile-chip">
+          <span class="profile-avatar small" aria-hidden="true">
+            {firstName.charAt(0)}
+          </span>
+          <span class="profile-chip-name">{firstName}</span>
+          <button type="button" class="button ghost small" onClick={() => updateProfiles(signOut)}>
+            Switch profile
+          </button>
+        </div>
       </header>
       {warning && (
         <div class="banner" role="alert">

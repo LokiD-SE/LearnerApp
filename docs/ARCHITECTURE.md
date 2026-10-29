@@ -21,7 +21,8 @@ content/*.yaml ──(Vite plugin: YAML → JS, validate all)──► src/conte
                                                               │
 src/domain (pure: grading, mastery, srs) ◄────────────────────┤
                                                               ▼
-src/store (state.ts pure updates → ProgressContext → localStorage via storage.ts; selectors.ts derived views;
+src/store (profiles.ts → ProfilesContext: who is signed in, one progress key per profile;
+           state.ts pure updates → ProgressContext → localStorage via storage.ts; selectors.ts derived views;
            adaptive.ts remediation and practice sessions; interviews.ts interview generation, scoring, reports)
                                                               │
 src/ui (router, Markdown/Mermaid, components, pages) ◄────────┘
@@ -59,6 +60,9 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
   fail CI, and the app shows a readable error page instead of crashing if content is somehow invalid at runtime.
 - **Persistence is defensive.** Unavailable storage, corrupt JSON, unknown versions and quota errors all
   become visible warnings. Corrupt data is kept aside, never silently overwritten.
+- **Profiles share a device, not data.** Each profile's progress has its own localStorage key, and the
+  ProgressProvider is remounted per profile, so a profile only ever loads and saves its own progress. The
+  profile list holds a summary for the profile screen, recomputed from progress whenever it changes.
 
 ## Security and privacy
 

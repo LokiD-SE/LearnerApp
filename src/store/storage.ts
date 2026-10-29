@@ -1,5 +1,6 @@
 /**
- * Persistence: progress lives in this browser's localStorage under one key. Loading never
+ * Persistence: each profile's progress lives in this browser's localStorage under its own key
+ * (see progressKey in profiles.ts); STORAGE_KEY is where it lived before profiles existed. Loading never
  * throws - an unreadable or unavailable store falls back to an empty state with a warning
  * the UI shows, and a corrupt value is kept aside instead of being overwritten.
  */
@@ -55,7 +56,11 @@ export function parseProgress(
   return { ok: true, state: parsed.data };
 }
 
-export function loadProgress(store: KeyValueStore | undefined, now: Date = new Date()): LoadResult {
+export function loadProgress(
+  store: KeyValueStore | undefined,
+  now: Date = new Date(),
+  key: string = STORAGE_KEY,
+): LoadResult {
   if (!store) {
     return {
       state: emptyState(),
@@ -66,7 +71,7 @@ export function loadProgress(store: KeyValueStore | undefined, now: Date = new D
   }
   let raw: string | null;
   try {
-    raw = store.getItem(STORAGE_KEY);
+    raw = store.getItem(key);
   } catch {
     return {
       state: emptyState(),
@@ -95,10 +100,11 @@ export function loadProgress(store: KeyValueStore | undefined, now: Date = new D
 export function saveProgress(
   store: KeyValueStore | undefined,
   state: ProgressState,
+  key: string = STORAGE_KEY,
 ): { ok: true } | { ok: false; error: string } {
   if (!store) return { ok: false, error: 'storage unavailable' };
   try {
-    store.setItem(STORAGE_KEY, JSON.stringify(state));
+    store.setItem(key, JSON.stringify(state));
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

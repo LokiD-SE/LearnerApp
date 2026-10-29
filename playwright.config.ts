@@ -4,6 +4,11 @@ import { defineConfig } from '@playwright/test';
 // They use the installed Google Chrome by default (no browser download needed);
 // set PW_CHANNEL=chromium to use Playwright's bundled Chromium instead.
 const channel = process.env.PW_CHANNEL ?? 'chrome';
+const baseURL = 'http://localhost:4173';
+
+// Tests start signed in as Loki so they land on the app, not the profile screen;
+// tests/e2e/profiles.spec.ts starts from an empty browser instead.
+const profiles = { activeUserId: 'loki', profiles: { loki: { firstName: 'Loki' } } };
 
 export default defineConfig({
   testDir: 'tests/e2e',
@@ -11,7 +16,16 @@ export default defineConfig({
   retries: 0,
   reporter: [['list']],
   use: {
-    baseURL: 'http://localhost:4173',
+    baseURL,
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: baseURL,
+          localStorage: [{ name: 'learnerapp.profiles.v1', value: JSON.stringify(profiles) }],
+        },
+      ],
+    },
     channel: channel === 'chromium' ? undefined : channel,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
@@ -25,7 +39,7 @@ export default defineConfig({
   ],
   webServer: {
     command: 'npm run preview',
-    url: 'http://localhost:4173',
+    url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
   },

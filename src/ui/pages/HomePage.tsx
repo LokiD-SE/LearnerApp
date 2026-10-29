@@ -1,5 +1,6 @@
 import { pathTime, stageTime } from '../../content/time';
 import type { ContentIndex } from '../../content/validate';
+import { useProfiles } from '../../store/ProfilesContext';
 import { useProgress } from '../../store/ProgressContext';
 import {
   dueReviews,
@@ -15,6 +16,8 @@ import { href } from '../router';
 
 export function HomePage({ index }: { index: ContentIndex }) {
   const { state, now } = useProgress();
+  const profiles = useProfiles().state;
+  const profile = profiles.activeUserId ? profiles.profiles[profiles.activeUserId] : undefined;
   const due = dueReviews(index, state, now());
   const last = state.lastLessonId ? index.refs.get(state.lastLessonId) : undefined;
   const weak = weakConcepts(index, state).slice(0, 3);
@@ -39,6 +42,26 @@ export function HomePage({ index }: { index: ContentIndex }) {
         </p>
       </header>
 
+      {profile && (
+        <section class="card welcome" aria-labelledby="welcome-title">
+          <h2 id="welcome-title">
+            {fresh ? `Welcome, ${profile.firstName}` : `Welcome back, ${profile.firstName}`}
+          </h2>
+          <p>
+            <strong>{profile.completedLessons.length}</strong> of {index.lessons.size} lessons completed (
+            {profile.progressPercentage}%)
+          </p>
+          <progress
+            max={100}
+            value={profile.progressPercentage}
+            aria-label={`Overall progress: ${profile.progressPercentage}%`}
+          />
+          <p class="small">
+            <a href={href.progress()}>See your activity</a>
+          </p>
+        </section>
+      )}
+
       <div class="cards">
         <section class="card">
           <h2>{resume ? 'Continue' : fresh ? 'Start here' : 'Next on your path'}</h2>
@@ -48,7 +71,7 @@ export function HomePage({ index }: { index: ContentIndex }) {
                 <a href={href.lesson(resume.id)}>{resume.title}</a> <StatusBadge status={lastStatus!} />
               </p>
               <a class="button primary" href={href.lesson(resume.id)}>
-                Resume lesson
+                Resume study
               </a>
             </>
           ) : nextLesson ? (

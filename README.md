@@ -181,8 +181,14 @@ There is nothing to configure for normal use: no environment variables, keys or 
 
 - **End-to-end browser:** the tests use the installed Google Chrome (`channel: 'chrome'`). Without Chrome, run
   `npx playwright install chromium` once and then `PW_CHANNEL=chromium npm run test:e2e`.
-- **Progress data:** stored in `localStorage` under `learnerapp.progress.v1`. Use **Progress → Export
-  progress** to back it up or move it to another device, and **Import progress** to restore it.
+- **Profiles:** the first visit on a browser creates five profiles (Loki, Gayu, Kishore, Saurabh, Raji) and asks
+  who is learning; anyone can add a profile (one word, letters only) and pick it - there is no password. The
+  profile list, who is signed in and each profile's summary (completed lessons, last lesson, percentage) live
+  under `learnerapp.profiles.v1`. **Switch profile** in the header goes back to the list.
+- **Progress data:** each profile's progress is stored in `localStorage` under
+  `learnerapp.profile.<id>.progress.v1`. Progress saved before profiles existed (`learnerapp.progress.v1`) is
+  copied to Loki the first time. Use **Progress → Export progress** to back up the signed-in profile's progress
+  or move it to another device, and **Import progress** to restore it.
 
 ## Project layout
 
