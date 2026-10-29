@@ -1,5 +1,6 @@
 import { useEffect } from 'preact/hooks';
 import type { ValidationResult } from '../content/validate';
+import { applyUpdate, dismissOfflineStatus, useOfflineStatus } from '../pwa/register';
 import { useProgress } from '../store/ProgressContext';
 import { dueReviews } from '../store/selectors';
 import { HomePage } from './pages/HomePage';
@@ -41,6 +42,7 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
   const route = useRoute();
   const { state, now, warning, dismissWarning } = useProgress();
   const due = dueReviews(index, state, now()).length;
+  const offline = useOfflineStatus();
 
   // Move focus to the new page's heading so keyboard and screen-reader users land on it.
   useEffect(() => {
@@ -103,6 +105,22 @@ function Shell({ content }: { content: Extract<ValidationResult, { ok: true }> }
         <div class="banner" role="alert">
           <p>{warning}</p>
           <button type="button" class="button ghost small" onClick={dismissWarning}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {offline === 'update' && (
+        <div class="banner info" role="status">
+          <p>A new version of LearnerApp is ready.</p>
+          <button type="button" class="button small" onClick={applyUpdate}>
+            Reload
+          </button>
+        </div>
+      )}
+      {offline === 'ready' && (
+        <div class="banner info" role="status">
+          <p>LearnerApp is saved on this device and now works offline.</p>
+          <button type="button" class="button ghost small" onClick={dismissOfflineStatus}>
             Dismiss
           </button>
         </div>

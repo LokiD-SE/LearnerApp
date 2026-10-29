@@ -15,6 +15,9 @@ export default defineConfig({
     channel: channel === 'chromium' ? undefined : channel,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    // The production build installs a service worker; tests that mock the network with page.route
+    // need it out of the way. tests/e2e/offline.spec.ts allows it to test the offline install.
+    serviceWorkers: 'block',
   },
   projects: [
     { name: 'desktop', use: { viewport: { width: 1280, height: 860 } } },

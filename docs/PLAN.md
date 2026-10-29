@@ -181,13 +181,24 @@ course.
       Java SE 17 Javadoc, W3C WebDriver, Maven, JUnit, Selenium, Appium, Playwright, Visa rules, ISTQB and PCI SSC;
       outputs re-run; sources cited in each `environment:`. No ids or answers changed.
 
+## Increment 8 - offline install (done)
+
+- [x] Web app manifest (name, standalone display, theme colour) with 192 and 512 px icons, a maskable icon
+      and an Apple touch icon, rendered from the app's mark by `scripts/make-icons.mjs`.
+- [x] Service worker generated at build time: precaches every file of the build, including all Mermaid
+      chunks, so every lesson and diagram works offline after the first visit; the practice shop stays on the
+      network. Unchanged hashed files are reused between versions.
+- [x] Updates wait for the learner: a "new version is ready - Reload" banner; a one-time "now works offline"
+      message after the first install.
+- [x] Tests: unit tests for the precache list, the worker source and the update logic; Playwright tests for
+      the manifest and icons, every diagram type offline, and the shop staying uncached. The update flow was
+      also checked by hand in Chrome (banner, Reload, old cache removed).
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).
 
-8. **Offline install (PWA).** A service worker and manifest so the app installs on a phone and works offline
-   after the first visit.
-9. **More interview depth.** Spoken-answer practice with a recording timer, and company profiles for more
+8. **More interview depth.** Spoken-answer practice with a recording timer, and company profiles for more
    companies as reports are checked.
 
 ## Open questions for the owner

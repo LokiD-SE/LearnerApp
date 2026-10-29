@@ -11,6 +11,7 @@
 | Markdown    | marked + DOMPurify + highlight.js (selected languages)            | Small, safe (raw HTML escaped, output sanitised)                                                             | Rich interactive content is needed                                        |
 | Diagrams    | Mermaid, lazy-loaded chunk, `securityLevel: 'strict'`             | Diagrams as text in content; only pages that use them pay the cost                                           | Bundle size matters more than live rendering - pre-render to SVG at build |
 | Tests       | Vitest (+ jsdom, Testing Library), Playwright on installed Chrome | Unit, integration and journey coverage without downloading browsers                                          | CI needs Playwright's bundled browsers                                    |
+| Offline     | Hand-written service worker, generated at build time, no library  | Precaches the exact build (every lazy chunk), small enough to read in one sitting, no new dependencies       | Caching rules grow (runtime caches, background sync) - consider Workbox   |
 | Node        | 24 LTS via `.nvmrc` (≥ 22.12 required)                            | Current tool versions need it; the system Node 18 is end-of-life                                             | -                                                                         |
 
 ## Layers
@@ -45,6 +46,15 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
 - **All progress changes are pure functions** in `src/store/state.ts`: `(state, input, now) → state`. The
   Preact context only holds the state and saves it after each change. That makes the rules testable without a
   browser and keeps time injectable (tests and Playwright fix the clock).
+- **Offline install** (`src/pwa/`, `public/`). A Vite plugin (`offlineApp` in `vite.config.ts`) writes
+  `dist/sw.js` from `src/pwa/service-worker.js`, filling in the list of this build's files (the bundle and
+  `public/`, never the practice shop) and a version hashed from their contents. The worker precaches that list
+  into a cache named after the version (copying unchanged hashed files from the previous cache), answers the
+  app's requests from it - page loads get `index.html`, as the app routes with the URL hash - and leaves
+  `shop/` to the network. A new version waits until the learner chooses **Reload** (`src/pwa/register.ts`
+  posts `SKIP_WAITING` and reloads on `controllerchange`), so a page never mixes files from two builds; the
+  activated version deletes older caches. The worker is registered only in production builds. Playwright
+  blocks service workers except in `tests/e2e/offline.spec.ts`, so `page.route` mocking keeps working.
 - **Validation happens three times.** The Vite plugin fails `dev`/`build` on invalid content, the content tests
   fail CI, and the app shows a readable error page instead of crashing if content is somehow invalid at runtime.
 - **Persistence is defensive.** Unavailable storage, corrupt JSON, unknown versions and quota errors all
@@ -52,7 +62,8 @@ src/ui (router, Markdown/Mermaid, components, pages) ◄────────
 
 ## Security and privacy
 
-- No network calls at runtime apart from loading the app's own files. No analytics, no CDN.
+- No network calls at runtime apart from loading the app's own files (and the service worker checking for a
+  new `sw.js`). No analytics, no CDN.
 - Lesson Markdown cannot inject HTML: raw HTML is escaped and the output passes through DOMPurify. User notes
   and answers are rendered as text only.
 - Mermaid runs in strict mode. Diagram source travels as escaped text, never as an attribute (sanitisers strip

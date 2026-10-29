@@ -8,8 +8,9 @@ Every lesson follows one template: plain-language idea, mechanics, diagrams, wor
 mistakes, trade-offs and summary. Practice is built around active recall, progressive hints, worked solutions,
 spaced repetition and a mastery model that weighs practical work over multiple choice.
 
-- **Static and offline-friendly.** All content is bundled into the build; there is no server, account or paid
-  API. Progress is stored in your browser.
+- **Static, installable and offline.** All content is bundled into the build; there is no server, account or
+  paid API. Progress is stored in your browser. Install it on a phone or desktop like an app; after the first
+  visit every lesson, diagram and exercise works without a network.
 - **Skip what you already know.** A placement test per learning path (and "Test out" on each lesson) marks
   lessons you can already show you know as _tested out_; their recall cards still come back for review.
 - **Practice that adapts.** A wrong answer points back to the sections that teach the concept and a similar
@@ -140,6 +141,23 @@ server), not by double-clicking `index.html`. Browsers block ES modules loaded f
 One-time repository setting: **Settings → Pages → Build and deployment → Source: GitHub Actions**. A failed
 check blocks the deployment, so the live site is always a build that passed every test.
 
+## Install and use offline
+
+Open the site once while online. LearnerApp then downloads the whole app in the background (about 2.3 MB
+compressed, 7.8 MB stored) and says **"LearnerApp is saved on this device and now works offline."**
+
+- **Android (Chrome):** menu **⋮ → Add to Home screen → Install**.
+- **iPhone and iPad (Safari):** **Share → Add to Home Screen**.
+- **Desktop (Chrome or Edge):** the install icon in the address bar.
+
+After a new version is published, the next visit downloads it in the background and shows **"A new version of
+LearnerApp is ready."** Choose **Reload** to switch, or keep working - the new version starts the next time
+the app is opened after every LearnerApp tab or window is closed. Progress is not affected: it stays in the
+browser's storage, separate from the app's files.
+
+The practice shop (`shop/`) is not saved for offline use. It is an automation target, so its requests always
+go to the network, where your tests can see and mock them.
+
 ## Scripts
 
 | Command                     | What it does                                                                             |
@@ -175,6 +193,8 @@ src/content/              schema (zod), validation, loader, search
 src/domain/               grading, spaced repetition, mastery model (pure functions)
 src/store/                progress state, persistence, derived views, Preact context
 src/ui/                   router, Markdown and diagram rendering, components, pages, styles
+src/pwa/                  offline install: service worker template, build helpers, registration
+public/                   web app manifest and icons (scripts/make-icons.mjs renders the icons)
 tests/unit/               Vitest: domain, state, storage, content, search, router, components
 tests/e2e/                Playwright: the learning journey end to end
 docs/                     architecture, mastery model, content guide, plan
@@ -195,16 +215,18 @@ Interview questions go in `content/interviews/questions/*.yaml` and company prof
 
 ## Troubleshooting
 
-| Symptom                                                             | Cause and fix                                                                                                            |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `npm ci` or `vite` fails with an engine/syntax error                | Old Node. Run `nvm use` (or install Node 22.12+). `node -v` must show v22.12 or later.                                   |
-| Build fails with `Invalid content:` and a list                      | A lesson or `curriculum.yaml` breaks the schema or a reference. Each line names the file and field to fix.               |
-| Blank page after opening `dist/index.html` directly                 | ES modules can't load from `file://`. Use `npm run preview` or any static web server.                                    |
-| "Saved progress could not be loaded" banner                         | Stored progress was unreadable. It was kept aside under `learnerapp.progress.corrupt.<time>` and a fresh start was made. |
-| "This browser is not letting LearnerApp save data" banner           | Storage is disabled (some private modes) or full. Progress lasts only for the session; export it before closing.         |
-| A diagram shows as text with "could not be rendered"                | The Mermaid source in that lesson is invalid. Check it at [mermaid.live](https://mermaid.live) and fix the lesson YAML.  |
-| `test:e2e` fails with "Chromium distribution 'chrome' is not found" | Install Google Chrome, or `npx playwright install chromium` and run with `PW_CHANNEL=chromium`.                          |
-| `test:e2e` fails at start with "port 4173 is already used"          | Something else is on 4173. Stop it, or let Playwright reuse a running `npm run preview` of the current build.            |
+| Symptom                                                             | Cause and fix                                                                                                               |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `npm ci` or `vite` fails with an engine/syntax error                | Old Node. Run `nvm use` (or install Node 22.12+). `node -v` must show v22.12 or later.                                      |
+| Build fails with `Invalid content:` and a list                      | A lesson or `curriculum.yaml` breaks the schema or a reference. Each line names the file and field to fix.                  |
+| Blank page after opening `dist/index.html` directly                 | ES modules can't load from `file://`. Use `npm run preview` or any static web server.                                       |
+| "Saved progress could not be loaded" banner                         | Stored progress was unreadable. It was kept aside under `learnerapp.progress.corrupt.<time>` and a fresh start was made.    |
+| "This browser is not letting LearnerApp save data" banner           | Storage is disabled (some private modes) or full. Progress lasts only for the session; export it before closing.            |
+| A diagram shows as text with "could not be rendered"                | The Mermaid source in that lesson is invalid. Check it at [mermaid.live](https://mermaid.live) and fix the lesson YAML.     |
+| `test:e2e` fails with "Chromium distribution 'chrome' is not found" | Install Google Chrome, or `npx playwright install chromium` and run with `PW_CHANNEL=chromium`.                             |
+| `test:e2e` fails at start with "port 4173 is already used"          | Something else is on 4173. Stop it, or let Playwright reuse a running `npm run preview` of the current build.               |
+| The site still shows an old version after a deploy                  | The installed copy updates in the background. Choose **Reload** on the "new version" banner, or close every LearnerApp tab. |
+| Offline, the app shows the browser's "no internet" page             | It was never opened online in this browser, or site data was cleared. Open it once online and wait for the offline message. |
 
 ## Known limitations
 
@@ -217,8 +239,8 @@ Interview questions go in `content/interviews/questions/*.yaml` and company prof
 - **Interview profiles come from public reports** (checked 2026-10-12, sources listed with each). Real loops
   vary by team, level and year, and questions are written for practice, not taken from any company.
   Interview scores are practice signals, not predictions.
-- **Bundle size.** Mermaid is large, but it is a separate lazily loaded chunk fetched only on pages with
-  diagrams.
+- **Bundle size.** Mermaid is large. Online it is a separate chunk fetched only on pages with diagrams; the
+  offline install downloads all of it once, so every diagram also works offline.
 - `npm audit` reports two low-severity advisories in `katex`, which Mermaid depends on. LearnerApp content does
   not use KaTeX math, and the suggested `--force` fix would change Mermaid's version, so it was not applied.
 

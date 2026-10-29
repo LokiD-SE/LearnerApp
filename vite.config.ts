@@ -1,13 +1,22 @@
 /// <reference types="vitest/config" />
+import { createHash } from 'node:crypto';
 import { cpSync, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, normalize, relative, sep } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import { parse } from 'yaml';
 import { validateContent } from './src/content/validate.ts';
+import { precachePaths, serviceWorkerSource } from './src/pwa/precache.ts';
 
 const CONTENT_DIR = join(import.meta.dirname, 'content');
 const SHOP_DIR = join(import.meta.dirname, 'practice', 'shop');
+const PUBLIC_DIR = join(import.meta.dirname, 'public');
+const SW_TEMPLATE = join(import.meta.dirname, 'src', 'pwa', 'service-worker.js');
+
+const allFiles = (dir: string): string[] =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? allFiles(join(dir, entry.name)) : [join(dir, entry.name)],
+  );
 
 const yamlFiles = (dir: string): string[] =>
   readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
@@ -105,11 +114,48 @@ function practiceShop(): Plugin {
   };
 }
 
+/**
+ * Offline install: writes dist/sw.js, the service worker from src/pwa/service-worker.js with the list of
+ * this build's files (the bundle plus public/) and a version hashed from their contents, so every
+ * content or code change makes browsers install a new version.
+ */
+function offlineApp(): Plugin {
+  return {
+    name: 'offline-app',
+    apply: 'build',
+    enforce: 'post',
+    generateBundle(_options, bundle) {
+      const files = new Map<string, string | Uint8Array>();
+      for (const [name, item] of Object.entries(bundle)) {
+        files.set(name, item.type === 'chunk' ? item.code : item.source);
+      }
+      if (existsSync(PUBLIC_DIR)) {
+        for (const file of allFiles(PUBLIC_DIR)) {
+          files.set(relative(PUBLIC_DIR, file).split(sep).join('/'), readFileSync(file));
+        }
+      }
+      if (!files.has('index.html')) throw new Error('offline-app: index.html is not in the bundle');
+      const paths = precachePaths([...files.keys()]);
+      const hash = createHash('sha256');
+      for (const path of paths) hash.update(path).update(files.get(path)!);
+      this.emitFile({
+        type: 'asset',
+        fileName: 'sw.js',
+        source: serviceWorkerSource(
+          readFileSync(SW_TEMPLATE, 'utf8'),
+          paths,
+          hash.digest('hex').slice(0, 16),
+        ),
+      });
+    },
+  };
+}
+
 export default defineConfig({
   // Relative asset paths + hash routing: the build works from any folder or sub-path
   // (GitHub Pages project site, a static server, or `npm run preview`).
   base: './',
-  plugins: [preact(), learnerContent(), practiceShop()],
+  plugins: [preact(), learnerContent(), practiceShop(), offlineApp()],
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 1500,
