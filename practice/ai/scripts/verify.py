@@ -59,7 +59,10 @@ def main() -> int:
         totals[file][0] += 1
         totals[file][1] += int(failed)
 
-    expected = sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").rglob("test_*.py"))
+    # tests/support checks the shared helpers, not a learner exercise.
+    expected = sorted(
+        str(p.relative_to(ROOT)) for p in (ROOT / "tests").rglob("test_*.py") if "support" not in p.parts
+    )
     if not expected:
         print("FAIL: no exercise tests found", file=sys.stderr)
         return 1
