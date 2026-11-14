@@ -1,0 +1,25 @@
+-- Exercise: create the indexes the SandPay merchant dashboard needs.
+-- Tests: tests/indexes/dashboard-indexes.test.ts
+--
+-- The schema is in sandpay-db.ts (merchants, orders, payments). Only the primary keys are indexed.
+-- These four queries are the slow ones in production; each must be answered without a sequential
+-- scan of the big table, and the first and third without a separate Sort step:
+--
+--   1. The merchant's latest orders, newest first (keyset pagination, ties broken by id):
+--        SELECT id, status, amount_minor, created_at FROM orders
+--        WHERE merchant_id = 42 ORDER BY created_at DESC, id DESC LIMIT 20;
+--
+--   2. Support looks a customer up by email, whatever case they type it in:
+--        SELECT id, status FROM orders WHERE lower(customer_email) = lower('customer777@example.test');
+--
+--   3. The reconciliation job takes the oldest PENDING orders (about 1% of all orders):
+--        SELECT id, created_at FROM orders WHERE status = 'PENDING' ORDER BY created_at LIMIT 100;
+--      Use an index that holds only the pending orders, so it stays small.
+--
+--   4. The dashboard loads the payment attempts of a page of orders in one query:
+--        SELECT * FROM payments WHERE order_id = ANY('{4242,4207,4401}'::int[]);
+--
+-- Rules: at most 4 CREATE INDEX statements (every index slows down every insert), and nothing
+-- that changes the tables or the queries. The tests run this file, then ANALYZE, then EXPLAIN.
+
+-- Write your CREATE INDEX statements below.

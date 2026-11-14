@@ -1,0 +1,1282 @@
+id: postgres-indexes-and-query-plans
+title: PostgreSQL indexes and query plans
+subject: fullstack
+module: databases
+level: intermediate
+status: published
+estimatedMinutes: 70
+summary: Find out why a query is slow and fix it with evidence - how PostgreSQL reads a table, what a B-tree index can and can't do, reading EXPLAIN and EXPLAIN ANALYZE, partial, expression, covering and GIN indexes, why the planner ignores an index, what indexes cost on writes, and the N+1 query that no index can fix. Every plan shown here was produced by a real run.
+tags:
+  [
+    postgresql,
+    postgres,
+    index,
+    b-tree,
+    explain,
+    explain analyze,
+    query plan,
+    seq scan,
+    index scan,
+    bitmap heap scan,
+    index only scan,
+    nested loop,
+    hash join,
+    partial index,
+    expression index,
+    covering index,
+    include,
+    gin,
+    jsonb,
+    analyze,
+    statistics,
+    skip scan,
+    n+1,
+    keyset pagination,
+    performance,
+  ]
+
+environment: |
+  - **Database:** **PostgreSQL 18.6** running in **PGlite 0.5.14** (PostgreSQL compiled to WebAssembly - the
+    database `practice/fullstack` uses, so you can repeat every experiment with nothing to install). Every plan
+    in this lesson was produced by running `EXPLAIN` on Node.js 24 in November 2026, on a table of **200,000
+    fictional orders** (`generate_series`, then `ANALYZE`) unless the text says otherwise. Plans, costs, row
+    estimates and timings **vary with your data, your settings, your PostgreSQL version and your machine** -
+    read them for their shape, not their exact numbers.
+  - **PGlite differences seen:** none in the plans themselves. PGlite runs single-user inside your process, so
+    there is no network between application and database - the N+1 timings here **understate** what you'd see
+    against a server, where each query also pays a network round trip.
+  - **PostgreSQL 18 manual:** [Chapter 11. Indexes](https://www.postgresql.org/docs/18/indexes.html) -
+    [11.1 Introduction](https://www.postgresql.org/docs/18/indexes-intro.html),
+    [11.2 Index Types](https://www.postgresql.org/docs/18/indexes-types.html),
+    [11.3 Multicolumn Indexes](https://www.postgresql.org/docs/18/indexes-multicolumn.html) (including the B-tree
+    **skip scan** that is new in PostgreSQL 18), [11.4 Indexes and ORDER BY](https://www.postgresql.org/docs/18/indexes-ordering.html),
+    [11.6 Unique Indexes](https://www.postgresql.org/docs/18/indexes-unique.html),
+    [11.7 Indexes on Expressions](https://www.postgresql.org/docs/18/indexes-expressional.html),
+    [11.8 Partial Indexes](https://www.postgresql.org/docs/18/indexes-partial.html),
+    [11.9 Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/18/indexes-index-only-scans.html),
+    [11.12 Examining Index Usage](https://www.postgresql.org/docs/18/indexes-examine.html);
+    [Chapter 14. Performance Tips](https://www.postgresql.org/docs/18/performance-tips.html) -
+    [14.1 Using EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html) and
+    [14.2 Statistics Used by the Planner](https://www.postgresql.org/docs/18/planner-stats.html);
+    the [EXPLAIN](https://www.postgresql.org/docs/18/sql-explain.html) and
+    [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html) reference pages;
+    [5.5.5 Foreign Keys](https://www.postgresql.org/docs/18/ddl-constraints.html#DDL-CONSTRAINTS-FK);
+    [65.4 GIN Indexes](https://www.postgresql.org/docs/18/gin.html).
+  - **Version notes:** `EXPLAIN ANALYZE` includes buffer counts by default from PostgreSQL 18 ("Buffers information
+    is automatically included when ANALYZE is used"); earlier versions need `EXPLAIN (ANALYZE, BUFFERS)`. The
+    `Index Searches` line and fractional `rows=20.00` in actual counts are also PostgreSQL 18 output.
+  - **Fictional:** SandPay, its merchants, orders, payments and customer emails. Amounts are integer minor units.
+  - **Not covered here:** designing the tables ([Relational modelling and SQL](#/lesson/relational-modelling-and-sql)),
+    transactions and locking ([Transactions, isolation and concurrency](#/lesson/transactions-and-isolation)) and
+    running queries from Node.js ([Migrations and data access](#/lesson/migrations-and-data-access)).
+
+prerequisites:
+  - relational-modelling-and-sql
+
+concepts:
+  - id: pg-btree-index-design
+    name: What a B-tree index can serve, and designing one for a query
+    summary: A B-tree keeps keys sorted, so it serves equality, ranges and ORDER BY - including LIMIT without a sort. In a multicolumn index the equality columns go first and the sort columns follow in the query's order and direction; constraints on leading columns limit the scan. Every index costs time on every write.
+  - id: pg-reading-explain
+    name: Reading EXPLAIN and EXPLAIN ANALYZE
+    summary: EXPLAIN shows the plan tree the planner chose with estimated costs and rows; EXPLAIN ANALYZE runs it and adds actual rows, loops, time and buffers. The most important check is whether estimated rows are close to actual rows. The planner ignores an index when a scan is cheaper, when statistics are stale, or when the query condition doesn't match the index.
+  - id: pg-special-indexes
+    name: Partial, expression, covering and GIN indexes
+    summary: A partial index holds only rows matching its WHERE clause, so it is small and only usable by queries implying that predicate. An expression index serves a condition on lower(col) and the like. INCLUDE adds payload columns so an index-only scan can skip the table, if the visibility map allows. GIN indexes the parts of composite values such as jsonb and full-text documents.
+  - id: n-plus-one-queries
+    name: The N+1 query problem
+    summary: Loading a list with one query and then one more query per item multiplies round trips - 101 queries for a page of 100. No index fixes it; fetch the related rows in one query with a join or = ANY($1) and group them in memory.
+
+objectives:
+  - Trace how PostgreSQL answers a query with a sequential scan, an index scan, a bitmap scan or an index-only scan, and say what each costs.
+  - Read an EXPLAIN ANALYZE plan - node types, estimated versus actual rows, loops, Rows Removed by Filter and buffers - and name the step that makes the query slow.
+  - Design a multicolumn B-tree index for a query with equality, range and ORDER BY ... LIMIT, choosing column order and direction.
+  - Explain five reasons the planner ignores an index - selectivity, a tiny table, a function on the column, a type mismatch and missing statistics - and confirm which one applies.
+  - Choose between partial, expression, covering (INCLUDE) and GIN indexes for a given query, and weigh what each index costs on writes.
+  - Detect an N+1 query pattern from a query log and rewrite it to a fixed number of queries.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [pg-btree-index-design, pg-reading-explain]
+    title: The idea in plain language
+    body: |
+      A table is a stack of pages in no useful order. To find "every order of merchant 42", PostgreSQL can
+      always **read every page** and keep the matching rows - a sequential scan. It is simple, reliable and,
+      for a large table, slow.
+
+      An **index** is like the index at the back of a book: a separate, **sorted** list of keys, each pointing
+      to where the row lives. To find merchant 42 you jump into the sorted list, read the entries for 42, and
+      fetch just those rows. Because the list is sorted, it can also hand rows back **already in order** -
+      so "the 20 newest orders" can stop after 20 entries instead of sorting a thousand.
+
+      Nothing is free. Every index is another structure to update on every insert and update, and fetching
+      rows one by one through an index is only cheaper than reading everything when you want **a few** of
+      them. So PostgreSQL has a **planner** that estimates the cost of each way to answer a query and picks
+      the cheapest. `EXPLAIN` shows you what it picked and why it thought so. Performance work is mostly
+      reading that answer honestly - not guessing.
+
+  - id: what
+    kind: what
+    concepts: [pg-btree-index-design, pg-reading-explain]
+    title: Heap, scans, indexes and the planner
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Heap** | The table's main data area - rows stored in 8 kB pages, in no guaranteed order. "All indexes in PostgreSQL are secondary indexes" (manual 11.9): they live apart from the heap and point into it. |
+      | **Sequential scan** (`Seq Scan`) | Read every page of the table, test every row against the condition. |
+      | **B-tree index** | The default index type (`CREATE INDEX` without `USING`). Keeps keys sorted; serves `<`, `<=`, `=`, `>=`, `>`, `BETWEEN`, `IN`, `IS NULL` and sorted output. |
+      | **Index Scan** | Walk the index for matching keys and fetch each row from the heap - random reads, but only for the matching rows, and in index order. |
+      | **Bitmap Index Scan + Bitmap Heap Scan** | Collect matching row locations from the index into a bitmap first, then read the heap pages in physical order. Good for "more than a few, fewer than most" rows; loses index order. |
+      | **Index Only Scan** | Answer from the index alone, without visiting the heap - possible when every column the query needs is in the index and the pages are marked all-visible. |
+      | **Planner** | Generates candidate plans and estimates each one's cost from table **statistics** (row counts, most common values, histograms) gathered by `ANALYZE`. |
+      | **EXPLAIN** | Shows the chosen plan with **estimated** costs and rows. `EXPLAIN ANALYZE` **runs** the query and adds actual rows, loops, time and (from PostgreSQL 18, by default) buffers. |
+
+      Two facts that surprise people:
+
+      - **A primary key or unique constraint creates an index automatically** ("PostgreSQL automatically
+        creates a unique index when a unique constraint or primary key is defined", 11.6). A **foreign key
+        does not**: "the declaration of a foreign key constraint does not automatically create an index on the
+        referencing columns" (5.5.5). `payments.order_id REFERENCES orders(id)` gives you no index on
+        `payments.order_id`.
+      - `EXPLAIN` **costs** "are measured in arbitrary units" (14.1), conventionally one sequential page read =
+        1.0. They compare plans; they are not milliseconds.
+
+  - id: why
+    kind: why
+    concepts: [pg-btree-index-design, n-plus-one-queries]
+    title: Why a full stack developer has to know this
+    body: |
+      In development the tables hold fifty rows and every query is instant. In production the same dashboard
+      query reads 200,000 rows on every page view, the database CPU climbs, and the API's p95 latency follows
+      it. The first symptom usually lands on your desk as "the orders page is slow" - not as a database
+      ticket.
+
+      The fixes are small - one well-shaped `CREATE INDEX`, or replacing a loop of queries with one - but only
+      if you can **prove** where the time goes. Adding indexes by guesswork makes every write slower and
+      often doesn't help the query at all; "it used an index" is not the same as "it is fast". This lesson
+      gives you the evidence-first method: read the plan, change one thing, read the plan again.
+
+      For testers moving to full stack work: this is the database side of the performance test. When a
+      load test shows one endpoint degrading with data volume, the plan of its query is where the root cause
+      is confirmed - in the same spirit as [Defect isolation](#/lesson/defect-isolation-decision-trees).
+
+  - id: internals-btree
+    kind: internals
+    concepts: [pg-btree-index-design]
+    title: What a B-tree can serve - and the multicolumn rule
+    body: |
+      A B-tree stores its keys **sorted**, in a tree a few levels deep. Finding a key is a walk from the root
+      to a leaf page; from there, neighbouring keys sit next to each other. That gives it three abilities:
+
+      1. **Equality and ranges.** `merchant_id = 42`, `created_at >= '2026-03-01'`, `id BETWEEN 1 AND 99`.
+      2. **Sorted output.** Walking the leaves returns rows in key order, forwards or **backwards**. An
+         `ORDER BY` that matches the index needs no sort, and with `LIMIT` the scan stops early - "if there is
+         an index matching the ORDER BY, the first n rows can be retrieved directly, without scanning the
+         remainder at all" (11.4).
+      3. **Uniqueness.** "Currently, only B-tree indexes can be declared unique" (11.6).
+
+      **Multicolumn indexes** sort by the first column, then by the second within equal first values, and so
+      on - like a phone book sorted by surname, then first name. The manual's exact rule (11.3):
+
+      > equality constraints on leading columns, plus any inequality constraints on the first column that does
+      > not have an equality constraint, will always be used to limit the portion of the index that is scanned.
+
+      So for `WHERE merchant_id = 42 ORDER BY created_at DESC, id DESC LIMIT 20`, the index
+      `(merchant_id, created_at DESC, id DESC)` is ideal: equality column first, then the sort columns **in
+      the query's order and direction**. All of merchant 42's entries are adjacent, already newest first.
+
+      **New in PostgreSQL 18 - skip scan.** Before 18, an index whose first column had no condition was
+      nearly useless for the later columns. PostgreSQL 18 can **skip**: it repeats the search once per
+      distinct value of the leading column. That pays off only when the leading column has **few** distinct
+      values. Here a range on `created_at` alone used the `(merchant_id, created_at DESC)` index by searching
+      it once for each of the 200 merchants:
+
+      ```plaintext
+      ->  Bitmap Index Scan on orders_merchant_created_idx  (cost=0.00..810.49 rows=1478 width=0) (actual time=3.105..3.106 rows=1440.00 loops=1)
+            Index Cond: ((created_at >= '2026-03-01 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-03-02 00:00:00+00'::timestamp with time zone))
+            Index Searches: 202
+      ```
+
+      `Index Searches: 202` is the skipping. It worked, but it is still 202 descents where an index led by
+      `created_at` needs one - and with many distinct leading values the manual warns "the entire index will
+      have to be scanned, so in most cases the planner will prefer a sequential table scan". Skip scan is a
+      safety net, not a reason to ignore column order.
+
+  - id: visual
+    kind: visual
+    concepts: [pg-reading-explain, pg-btree-index-design]
+    title: "From a slow endpoint to a confirmed fix"
+    body: |
+      The loop every fix in this lesson follows. The two diamonds are where most guesses go wrong.
+
+      ```mermaid
+      flowchart TD
+        A[Endpoint is slow] --> B[Find the query - query log or count queries per request]
+        B --> C{Many similar queries per request?}
+        C -->|yes| N[N+1 - batch them into one query]
+        C -->|no| D[Run ANALYZE, then EXPLAIN ANALYZE the query]
+        D --> E{Estimated rows close to actual rows?}
+        E -->|no| S[Fix statistics first - ANALYZE, or check the condition]
+        S --> D
+        E -->|yes| F[Find the node where the time and the removed rows are]
+        F --> G[Change one thing - an index, or the query]
+        G --> H[EXPLAIN ANALYZE again and compare]
+        H -->|faster and writes still acceptable| I[Keep it - add a test or a monitor]
+        H -->|no better| J[Drop the index again]
+        J --> F
+      ```
+
+      What to notice: the index is the **last** step, not the first. Estimates are checked before plans are
+      judged, and every change ends with a second measurement - including dropping an index that didn't help.
+
+  - id: code-explain
+    kind: code
+    concepts: [pg-reading-explain, pg-btree-index-design]
+    title: One query, before and after an index - real EXPLAIN output
+    body: |
+      The SandPay dashboard query, on 200,000 orders spread over 200 merchants, with only the primary key
+      indexed. Plain `EXPLAIN` shows the plan without running it:
+
+      ```sql
+      EXPLAIN SELECT id, status, amount_minor FROM orders
+      WHERE merchant_id = 42 ORDER BY created_at DESC LIMIT 20;
+      ```
+
+      ```plaintext
+      Limit  (cost=4609.56..4609.61 rows=20 width=25)
+        ->  Sort  (cost=4609.56..4612.05 rows=998 width=25)
+              Sort Key: created_at DESC
+              ->  Seq Scan on orders  (cost=0.00..4583.00 rows=998 width=25)
+                    Filter: (merchant_id = 42)
+      ```
+
+      Read it **from the innermost node outwards**: scan every row, keep merchant 42's (about 998, the planner
+      estimates), sort them, keep 20. `EXPLAIN (ANALYZE, BUFFERS)` runs it and adds what really happened:
+
+      ```plaintext
+      Limit  (cost=4609.56..4609.61 rows=20 width=25) (actual time=34.012..34.043 rows=20.00 loops=1)
+        Buffers: shared hit=2083
+        ->  Sort  (cost=4609.56..4612.05 rows=998 width=25) (actual time=33.998..34.009 rows=20.00 loops=1)
+              Sort Key: created_at DESC
+              Sort Method: top-N heapsort  Memory: 19kB
+              Buffers: shared hit=2083
+              ->  Seq Scan on orders  (cost=0.00..4583.00 rows=998 width=25) (actual time=0.095..32.665 rows=1000.00 loops=1)
+                    Filter: (merchant_id = 42)
+                    Rows Removed by Filter: 199000
+                    Buffers: shared hit=2083
+      Planning Time: 0.194 ms
+      Execution Time: 34.222 ms
+      ```
+
+      Then one index, shaped by the query - equality column first, sort column after, in the same direction:
+
+      ```sql
+      CREATE INDEX orders_merchant_created_idx ON orders (merchant_id, created_at DESC);
+      ANALYZE orders;
+      ```
+
+      ```plaintext
+      Limit  (cost=0.42..65.66 rows=20 width=25) (actual time=0.076..0.144 rows=20.00 loops=1)
+        Buffers: shared hit=20 read=3
+        ->  Index Scan using orders_merchant_created_idx on orders  (cost=0.42..3249.60 rows=996 width=25) (actual time=0.071..0.119 rows=20.00 loops=1)
+              Index Cond: (merchant_id = 42)
+              Index Searches: 1
+              Buffers: shared hit=20 read=3
+      Planning:
+        Buffers: shared hit=40 read=1
+      Planning Time: 0.564 ms
+      Execution Time: 0.191 ms
+      ```
+
+      34 ms and 2,083 pages became 0.19 ms and 23 pages. The `Sort` is gone because the index returns rows
+      in the order asked for, and the scan stopped after 20 rows because of `LIMIT`. (Timings are from one run
+      on one machine; the page counts are the steadier evidence.)
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [pg-reading-explain]
+    title: What each part of a plan line tells you
+    body: |
+      Take `Seq Scan on orders  (cost=0.00..4583.00 rows=998 width=25) (actual time=0.095..32.665 rows=1000.00 loops=1)`:
+
+      - **`Seq Scan on orders`** - the node type and its table. Nodes nest; each feeds the one above it.
+      - **`cost=0.00..4583.00`** - estimated **startup** cost (before the first row) and **total** cost, in the
+        planner's arbitrary units. The manual works the formula for a sequential scan: "(disk pages read \*
+        seq_page_cost) + (rows scanned \* cpu_tuple_cost)" - here 2,083 pages + 200,000 rows x 0.01 = 4,083,
+        plus 0.0025 per row for evaluating the filter = 4,583.
+      - **`rows=998`** - **estimated** rows this node will output. **`width=25`** - estimated average row
+        size in bytes.
+      - **`actual time=0.095..32.665`** - milliseconds to the first and the last row, **per loop**.
+      - **`rows=1000.00`** - rows actually output (per loop; fractional averages appear from PostgreSQL 18).
+        998 estimated against 1,000 actual is a good estimate - "the thing that's usually most important to
+        look for is whether the estimated row counts are reasonably close to reality" (14.1).
+      - **`loops=1`** - how many times the node ran. The inner side of a nested loop runs once per outer row;
+        multiply its time and rows by `loops` to get the total.
+      - **`Rows Removed by Filter: 199000`** - rows read and thrown away. Large numbers here are the
+        signature of a missing or unusable index.
+      - **`Buffers: shared hit=20 read=3`** - 8 kB pages found in PostgreSQL's cache (`hit`) or read from the
+        operating system (`read`). Pages touched are steadier evidence than milliseconds.
+      - **`Index Searches: 1`** - (PostgreSQL 18) how many times the index was descended; more than one
+        means skip scan or repeated lookups.
+      - **`Planning Time` / `Execution Time`** - the whole query. `EXPLAIN ANALYZE` really executes the
+        statement, so wrap an `INSERT`, `UPDATE` or `DELETE` in `BEGIN; ... ROLLBACK;`.
+
+      Joins have their own nodes. Real examples from the same data:
+
+      ```plaintext
+      Hash Join  (cost=6.50..4638.34 rows=18220 width=16) (actual time=0.698..62.834 rows=18000.00 loops=1)
+        Hash Cond: (o.merchant_id = m.id)
+        ->  Seq Scan on orders o  (cost=0.00..4583.00 rows=18220 width=8) (actual time=0.071..46.629 rows=18000.00 loops=1)
+              Filter: (status = 'FAILED'::text)
+              Rows Removed by Filter: 182000
+        ->  Hash  (cost=4.00..4.00 rows=200 width=16) (actual time=0.612..0.616 rows=200.00 loops=1)
+      ```
+
+      ```plaintext
+      Nested Loop  (cost=0.42..38.26 rows=4 width=20) (actual time=0.358..0.415 rows=4.00 loops=1)
+        ->  Seq Scan on merchants m  (cost=0.00..4.50 rows=4 width=16) (actual time=0.022..0.048 rows=4.00 loops=1)
+              Filter: (id < 5)
+              Rows Removed by Filter: 196
+        ->  Index Only Scan using orders_pkey on orders o  (cost=0.42..8.44 rows=1 width=8) (actual time=0.078..0.078 rows=1.00 loops=4)
+      ```
+
+      A **Hash Join** builds a hash table from the smaller input (200 merchants) and probes it with each row
+      of the larger one - good when both sides are big or unsorted. A **Nested Loop** runs its inner side once
+      per outer row (`loops=4`) - good when the outer side is small and the inner side has an index.
+
+  - id: internals-ignored
+    kind: internals
+    concepts: [pg-reading-explain, pg-special-indexes]
+    title: Five reasons the planner ignores your index - with the evidence for each
+    body: |
+      "There's an index, why is it doing a Seq Scan?" has a short list of answers. Each was reproduced on the
+      SandPay data.
+
+      **1. The condition matches most of the table.** 90% of orders are `PAID`. With an index on `status`:
+
+      ```plaintext
+      Seq Scan on orders  (cost=0.00..4583.00 rows=179907 width=55)
+        Filter: (status = 'PAID'::text)
+      ```
+
+      Fetching 180,000 rows one by one through an index would cost more than reading every page once. For
+      the 1% that are `PENDING` the same index is used (`Index Scan using orders_status_idx`, 2,000 rows).
+      The planner knows the split from statistics - `pg_stats` showed `most_common_vals {PAID,FAILED,PENDING}`
+      with frequencies `{0.89953333,0.08996667,0.0105}`. This Seq Scan is **correct**.
+
+      **2. The table is tiny.** A four-row `currencies` table with a primary key:
+
+      ```plaintext
+      Seq Scan on currencies  (cost=0.00..1.05 rows=1 width=8)
+        Filter: (code = 'JPY'::text)
+      ```
+
+      One page; nothing beats reading it. This is why plans from a development database with fifty rows tell
+      you nothing about production - "It is especially fatal to use very small test data sets" (11.12).
+
+      **3. A function or expression is applied to the column.** With a plain index on `customer_email`:
+
+      ```plaintext
+      Seq Scan on orders  (cost=0.00..5083.00 rows=1000 width=8)
+        Filter: (lower(customer_email) = 'customer777@example.test'::text)
+      ```
+
+      The index is sorted by `customer_email`, not by `lower(customer_email)`. Fix it with an expression
+      index (next section) - or compare the column as stored.
+
+      **4. The types don't match.** `id` is `bigint`; comparing it to a `numeric` casts the **column**:
+
+      ```plaintext
+      Seq Scan on orders  (cost=0.00..5083.00 rows=1000 width=55)
+        Filter: ((id)::numeric = '123456'::numeric)
+      ```
+
+      The same query with `WHERE id = '123456'` (an untyped literal, resolved to `bigint`) used
+      `Index Scan using orders_pkey`. Watch for this when a driver sends a JavaScript number as `numeric`, or
+      when two joined columns have different types.
+
+      **5. The statistics are missing or stale.** A fresh `refunds` table, 50,000 rows, before `ANALYZE`:
+
+      ```plaintext
+      Seq Scan on refunds  (cost=0.00..996.88 rows=18077 width=20) (actual time=0.130..12.405 rows=9999.00 loops=1)
+      ```
+
+      and after `ANALYZE refunds`:
+
+      ```plaintext
+      Seq Scan on refunds  (cost=0.00..944.00 rows=9923 width=20) (actual time=0.021..8.543 rows=9999.00 loops=1)
+      ```
+
+      The plan didn't change here, but the estimate went from 18,077 to 9,923 against 9,999 actual. On a
+      bigger or skewed table, an estimate that wrong picks the wrong join or scan. "Always run ANALYZE first"
+      (11.12) - autovacuum normally does it, but not straight after a bulk load in the same transaction.
+
+      To test whether an index **could** be used, the manual suggests turning plan types off for your session
+      (`SET enable_seqscan = off;`) and comparing timings - a diagnostic only, never a production setting.
+
+  - id: code-special
+    kind: code
+    concepts: [pg-special-indexes]
+    title: Partial, expression, covering and GIN indexes - real plans
+    body: |
+      **Partial index** - index only the rows a query asks for. The reconciliation job reads the oldest
+      `PENDING` orders, 1% of the table:
+
+      ```sql
+      CREATE INDEX orders_pending_idx ON orders (created_at) WHERE status = 'PENDING';
+      ```
+
+      ```plaintext
+      Limit  (cost=0.28..2.46 rows=50 width=16) (actual time=0.055..0.160 rows=50.00 loops=1)
+        ->  Index Scan using orders_pending_idx on orders  (cost=0.28..85.57 rows=1953 width=16) (actual time=0.048..0.127 rows=50.00 loops=1)
+      ```
+
+      It was **64 kB**, against **6,184 kB** for a full `(status, created_at)` index on the same table, and
+      it costs nothing when a `PAID` order is inserted. The catch: it can only serve queries whose `WHERE`
+      implies its predicate. `status = 'FAILED'` gets `Seq Scan` + `Sort` - the index has no failed orders in it.
+
+      **Expression index** - index the computed value the query filters on:
+
+      ```sql
+      CREATE INDEX orders_email_lower_idx ON orders (lower(customer_email));
+      ```
+
+      ```plaintext
+      Bitmap Heap Scan on orders  (cost=4.45..19.99 rows=4 width=8)
+        Recheck Cond: (lower(customer_email) = 'customer777@example.test'::text)
+        ->  Bitmap Index Scan on orders_email_lower_idx  (cost=0.00..4.45 rows=4 width=0)
+              Index Cond: (lower(customer_email) = 'customer777@example.test'::text)
+      ```
+
+      The query must use **the same expression**. Declared `UNIQUE`, an expression index also enforces
+      rules a plain constraint can't - here, one account per email whatever its case (11.7).
+
+      **Covering index (`INCLUDE`)** - carry extra columns so an **index-only scan** can skip the heap:
+
+      ```sql
+      CREATE INDEX orders_merchant_cover_idx ON orders (merchant_id) INCLUDE (amount_minor);
+      ```
+
+      Straight after creating it, `SELECT sum(amount_minor) FROM orders WHERE merchant_id = 42` still visited
+      1,000 heap blocks (`Bitmap Heap Scan`, 5.4 ms). After `VACUUM orders` set the **visibility map**:
+
+      ```plaintext
+      ->  Index Only Scan using orders_merchant_cover_idx on orders  (cost=0.42..29.80 rows=993 width=4) (actual time=0.067..0.521 rows=1000.00 loops=1)
+            Index Cond: (merchant_id = 42)
+            Heap Fetches: 0
+      ```
+
+      Visibility (is this row version visible to my transaction?) lives only in the heap, so an index-only
+      scan must check the heap for any page not marked all-visible - `Heap Fetches` counts those visits. On a
+      table that changes constantly, a covering index buys little (11.9).
+
+      **GIN** - for values with many parts: `jsonb`, arrays, full-text `tsvector`. On a `metadata jsonb`
+      column:
+
+      ```sql
+      CREATE INDEX orders_metadata_gin ON orders USING gin (metadata jsonb_path_ops);
+      SELECT count(*) FROM orders WHERE metadata @> '{"campaign":"diwali"}';
+      ```
+
+      ```plaintext
+      ->  Bitmap Heap Scan on orders  (cost=56.10..1338.22 rows=420 width=0) (actual time=1.184..2.590 rows=400.00 loops=1)
+            Recheck Cond: (metadata @> '{"campaign": "diwali"}'::jsonb)
+            ->  Bitmap Index Scan on orders_metadata_gin  (cost=0.00..55.99 rows=420 width=0) (actual time=1.016..1.018 rows=400.00 loops=1)
+      ```
+
+      Without it: `Seq Scan` with `Filter: (metadata @> ...)`. `jsonb_path_ops` is a smaller GIN operator class
+      that supports `@>` (and the jsonpath operators) but not the key-exists operators; the default `jsonb_ops`
+      supports more operators at a larger size (manual 8.14.4). GIN cannot do index-only scans (11.9).
+
+  - id: internals-n-plus-one
+    kind: internals
+    concepts: [n-plus-one-queries]
+    title: The N+1 query - slow without a single bad plan
+    body: |
+      Every query in this loop is fast - each uses an index:
+
+      ```typescript
+      const orders = await db.query('SELECT id FROM orders WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT 100', [42]);
+      for (const o of orders.rows) {
+        await db.query('SELECT * FROM payments WHERE order_id = $1', [o.id]); // once per order
+      }
+      ```
+
+      One query for the list, then **N** more - one per order. Measured in-process on PGlite, the page of
+      100 took **101 queries and 77 ms**; the same data with two queries took **2 queries and 5 ms**:
+
+      ```typescript
+      const ids = orders.rows.map((o) => o.id);
+      await db.query('SELECT * FROM payments WHERE order_id = ANY($1)', [ids]); // one round trip
+      ```
+
+      ```plaintext
+      Index Scan using payments_order_id_idx on payments  (cost=0.42..17.31 rows=3 width=24)
+        Index Cond: (order_id = ANY ('{1000,2000,3000}'::bigint[]))
+      ```
+
+      Against a real server each query also pays a network round trip, parsing and a connection-pool
+      checkout - at 1 ms per round trip the loop costs 100 ms before the database does any work. That is
+      why N+1 hides in development (database on localhost, ten rows) and appears in production.
+
+      It usually comes from **code structure**, not from SQL: a `for` loop over results, a React list where
+      each row fetches its own details, or an ORM loading a relation lazily on first access. The fixes:
+
+      - **Batch:** one query with `= ANY($1)` (or `IN`) for all the ids, then group in memory - always a fixed
+        **2 queries**.
+      - **Join:** fetch orders and payments in one query (a `JOIN`, or `json_agg` per order).
+      - **ORM eager loading:** most ORMs have an "include" or "eager load" option that does one of the above.
+
+      And remember the index the batch needs: `payments.order_id` is a foreign key, which PostgreSQL does
+      **not** index for you. Without it the lookup was `Seq Scan on payments ... Filter: (order_id = 1000)`.
+
+  - id: steps
+    kind: steps
+    concepts: [pg-reading-explain, pg-btree-index-design]
+    title: Fix a slow query, step by step
+    body: |
+      1. **Find the query.** From the slow request's log (with its request id), the database's slow-query
+         log, or by counting queries per request - many similar ones means N+1, not a plan problem.
+      2. **Use production-like data.** Same order of magnitude of rows and the same skew. Run `ANALYZE` on
+         the tables you loaded.
+      3. **`EXPLAIN ANALYZE` it** with realistic parameter values (a big merchant and a small one may get
+         different plans). For writes, inside `BEGIN; ... ROLLBACK;`.
+      4. **Check estimates against actuals,** node by node. If they are far apart, fix statistics or the
+         condition before anything else.
+      5. **Find the expensive node:** the biggest actual time (times `loops`), the largest `Rows Removed by
+         Filter`, a `Sort` on many rows, a nested loop with a huge `loops`.
+      6. **Design one index for the query:** equality columns first, then range or `ORDER BY` columns in order
+         and direction; consider partial (a fixed subset), expression (a function in `WHERE`) or `INCLUDE`
+         (index-only scan). Check an existing index can't be extended instead.
+      7. **Create it and measure again** - same query, same parameters. Compare pages and time, not just node
+         names. In production build it with `CREATE INDEX CONCURRENTLY`, which doesn't lock out writes (but
+         is slower and "CREATE INDEX CONCURRENTLY cannot" run inside a transaction block).
+      8. **Weigh the write cost** and check later that it is used (`pg_stat_user_indexes.idx_scan`); drop
+         indexes that aren't.
+
+  - id: example
+    kind: example
+    concepts: [pg-btree-index-design, n-plus-one-queries, pg-special-indexes]
+    title: "Project example: the SandPay dashboard gets slow at 200,000 orders"
+    body: |
+      The merchant dashboard was fast in staging. After a month in production its p95 rose to 900 ms. The
+      request log for one slow page, filtered by its request id, showed **21 queries**: the orders page, then
+      `SELECT ... FROM payments WHERE order_id = $1` twenty times.
+
+      The developer's first fix was the N+1: one `= ANY($1)` query for the payments. That took the page from
+      21 round trips to 2. `EXPLAIN ANALYZE` of the remaining two queries then showed:
+
+      - the orders query: `Seq Scan on orders`, `Rows Removed by Filter: 199000`, then a `Sort` - fixed with
+        `(merchant_id, created_at DESC, id DESC)`, which also serves the keyset pagination from
+        [REST API design](#/lesson/rest-api-design);
+      - the payments query: `Seq Scan on payments` - the foreign key had no index; `CREATE INDEX
+        CONCURRENTLY payments_order_id_idx ON payments (order_id)` fixed it.
+
+      Support's "find orders by email" screen was the third complaint: the code did `lower(customer_email) =
+      lower($1)` against a plain index. An expression index on `lower(customer_email)` fixed it; the plain one
+      was dropped after `pg_stat_user_indexes` showed nothing else used it.
+
+      What the tester added: a performance check that seeds 200,000 orders and asserts the dashboard sends at
+      most 2 queries and its plans contain no `Seq Scan` on `orders` - the same checks as this lesson's
+      practice tests.
+
+  - id: tests
+    kind: tests
+    concepts: [pg-reading-explain, n-plus-one-queries, pg-special-indexes]
+    title: Tests that keep queries fast
+    body: |
+      | Test | Steps | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | Dashboard query uses its index | Seed production-sized data, `ANALYZE`, `EXPLAIN (FORMAT JSON)` the dashboard query | No `Seq Scan` on `orders`, no `Sort` node | The plan JSON, saved with the test run |
+      | Fixed number of queries per page | Wrap the database client with a counter; load pages of 20 and 100 | At most 2 queries for both page sizes | The list of statements sent |
+      | Same result after the rewrite | Compare the batched version with the old version, or with an independent query | Identical orders and payments, in the same order | Test diff |
+      | Low-selectivity filter (negative) | `EXPLAIN` `WHERE status = 'PAID'` (90% of rows) | A `Seq Scan` is acceptable - don't fail the build on it | The plan and the `pg_stats` frequency |
+      | Partial index scope (negative) | `EXPLAIN` `WHERE status = 'FAILED' ORDER BY created_at` with only the `PENDING` partial index | Not served by the partial index | The plan |
+      | Write cost | Time a bulk insert of N rows with and without the new indexes | Within the agreed budget | Both timings, same machine |
+      | Plan under realistic statistics | Run the plan check after a bulk load **and** `ANALYZE` | Estimates within a small factor of actuals | `EXPLAIN ANALYZE` output |
+
+      Assert on **plan shape** (node types, index names) and **query counts** - they are stable. Don't assert
+      on milliseconds in CI; they vary with the machine.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [pg-btree-index-design, pg-reading-explain, pg-special-indexes, n-plus-one-queries]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Indexing every column "just in case".** Each index slows every insert and update. Inserting 200,000
+        rows into an empty table took **1,088 ms** with only a primary key and **3,457 ms** with four more
+        indexes (PGlite, one run each). Index for the queries you actually run.
+      - **Wrong column order.** `(created_at, merchant_id)` for `WHERE merchant_id = ? ORDER BY created_at`
+        makes the database walk the whole date range, filtering by merchant inside the index. Equality columns
+        first.
+      - **Sort direction or order that doesn't match.** With `(merchant_id, created_at DESC, id DESC)` (on the
+        50,000-order practice database), `ORDER BY created_at, id` was served by scanning **backward**
+        (`Index Only Scan Backward`), but `ORDER BY created_at DESC, id` (mixed) needed an `Incremental Sort`
+        on top - as did the index `(merchant_id, created_at DESC)` for `ORDER BY created_at DESC, id DESC`.
+      - **"It uses an index, so it's fine."** An index scan that reads 100,000 entries to return 20 is slow too.
+        Look at actual rows, `Rows Removed by Filter`, buffers and time.
+      - **Judging plans on development data or without `ANALYZE`.** Tiny tables always seq-scan; missing
+        statistics give wild estimates.
+      - **Forgetting foreign-key indexes.** Joins and `ON DELETE` checks on the referencing column need one;
+        PostgreSQL doesn't add it.
+      - **Expecting a partial or expression index to serve a different condition.** The query must imply the
+        predicate, or use the exact expression.
+      - **Building an index on a busy production table without `CONCURRENTLY`.** A normal `CREATE INDEX`
+        "locks out writes (but not reads) on the table until it's done".
+      - **Treating N+1 as a database problem.** The plans are fine; the code sends too many of them. Count
+        queries per request first.
+
+      **Debugging method:** count queries per request → `ANALYZE` → `EXPLAIN ANALYZE` with real parameters →
+      compare estimates and actuals → change one thing → measure again.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [pg-btree-index-design, pg-special-indexes]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **Read speed versus write speed and space.** Every index makes some reads much faster and every write
+        a little slower, and takes disk and cache memory. The 200,000-row table was 16 MB; its primary key
+        alone 4.4 MB.
+      - **Fewer, well-shaped indexes beat many narrow ones.** One `(merchant_id, created_at DESC, id DESC)`
+        index serves "orders of a merchant", "newest first" and keyset pages. The manual: "Multicolumn
+        indexes should be used sparingly... Indexes with more than three columns are unlikely to be helpful".
+      - **Partial indexes are small and cheap but narrow;** expression indexes cost a computation per write.
+      - **Covering indexes** only pay off on slowly changing tables, where the visibility map is mostly set.
+      - **Other index types** (11.2): Hash (equality only), GiST and SP-GiST (geometry, ranges, nearest
+        neighbour), BRIN (very large tables whose rows are physically ordered, such as append-only logs - tiny,
+        but approximate).
+      - **When indexes aren't the answer:** pagination with a large `OFFSET` still reads and discards every
+        skipped row (offset 900 read 920 index entries here) - use keyset pagination. Aggregates over the whole
+        table need summary tables or materialised views. Full-text search at scale may belong in a search
+        engine.
+      - **Unused indexes:** `pg_stat_user_indexes.idx_scan` counts index scans per index on a running server
+        (11.12 points to the statistics views); review it before dropping, and remember counters reset.
+
+  - id: summary
+    kind: summary
+    concepts: [pg-btree-index-design, pg-reading-explain, pg-special-indexes, n-plus-one-queries]
+    title: Quick reference
+    body: |
+      - **Seq Scan** reads everything; **Index Scan** walks the index and fetches rows; **Bitmap** scans
+        collect locations first, then read pages in order; **Index Only Scan** skips the heap.
+      - B-tree serves `=`, ranges, `IN`, `IS NULL`, `ORDER BY` (forwards or backwards) and `LIMIT` early stops.
+      - Multicolumn: **equality columns first, then range or sort columns** in the query's order and
+        direction. PostgreSQL 18 skip scan helps only when leading columns have few values.
+      - `EXPLAIN` = estimated plan; `EXPLAIN ANALYZE` = runs it (buffers included from 18). Check
+        **estimated versus actual rows** first.
+      - Index ignored? Most rows match, tiny table, function on the column, type mismatch, stale statistics.
+      - **Partial** = subset, small; **expression** = `lower(col)` and friends; **INCLUDE** = index-only scans
+        (needs `VACUUM`); **GIN** = `jsonb`, arrays, full text.
+      - Primary keys and unique constraints get indexes; **foreign keys don't**.
+      - **N+1:** count queries per request; batch with `= ANY($1)` or join - 2 queries, whatever the page size.
+      - Build production indexes with `CREATE INDEX CONCURRENTLY`; measure before and after; drop what isn't used.
+
+exercises:
+  - id: index-column-order
+    type: mcq
+    concept: pg-btree-index-design
+    skill: application
+    title: One index for the refunds screen
+    prompt: |
+      The refunds screen runs this on a large `refunds` table:
+
+      ```sql
+      SELECT id, amount_minor, created_at FROM refunds
+      WHERE merchant_id = $1 AND status = 'REQUESTED'
+      ORDER BY created_at DESC
+      LIMIT 50;
+      ```
+
+      Which single index lets PostgreSQL find the rows **and** return them in order, stopping after 50?
+    options:
+      - id: equality-then-sort
+        text: "(merchant_id, status, created_at DESC)"
+        feedback: Correct - both equality columns lead, so the matching entries are adjacent and already sorted by created_at DESC; LIMIT 50 stops after 50 entries with no Sort node.
+      - id: sort-first
+        text: "(created_at DESC, merchant_id, status)"
+        feedback: The rows come out in date order, but the scan walks every merchant's refunds in date order and filters inside the index until it finds 50 matches - equality columns belong first.
+      - id: three-indexes
+        text: Three single-column indexes, one each on merchant_id, status and created_at
+        feedback: PostgreSQL can combine single-column indexes with a bitmap, but bitmap scans lose index order, so a Sort is still needed - and you pay for three indexes on every write.
+      - id: status-only
+        text: "(status)"
+        feedback: If REQUESTED is rare this narrows the rows, but it ignores the merchant and still needs a sort; it serves this query poorly and only by luck of the data.
+    correct: [equality-then-sort]
+    hints:
+      - Which columns have an equality condition, and which column is only used for ordering?
+      - The manual's rule - equality constraints on leading columns limit the scanned portion.
+      - Once merchant_id and status are fixed, in what order are the remaining entries?
+    solution: |
+      **`(merchant_id, status, created_at DESC)`.** Equality columns first (their order between themselves
+      matters little here; put the one other queries also use first), then the `ORDER BY` column in the
+      query's direction. All entries for one merchant and status sit together, newest first, so the plan is
+      `Limit -> Index Scan` with no `Sort`, reading about 50 entries. Confirm with `EXPLAIN ANALYZE`: no
+      `Sort` node, actual rows 50, few buffers.
+    followUp: |
+      The screen adds a second sort key for stable pagination: `ORDER BY created_at DESC, id DESC`. What
+      changes in the index, and what would `EXPLAIN` show if you didn't change it?
+
+  - id: diagnose-order
+    type: order
+    concept: pg-reading-explain
+    skill: application
+    title: Investigate a slow query in the right order
+    prompt: |
+      The `GET /merchants/:id/orders` endpoint takes 2 seconds in production. Put these steps in the order
+      you should do them.
+    items:
+      - id: count
+        text: Count the queries the request sends (rule out N+1)
+      - id: data
+        text: Reproduce with production-sized, production-shaped data
+      - id: analyze
+        text: Run ANALYZE on the tables involved
+      - id: explain
+        text: Run EXPLAIN ANALYZE with realistic parameter values
+      - id: estimates
+        text: Compare estimated and actual rows for each node
+      - id: change
+        text: Change one thing - create one index or rewrite the query
+      - id: remeasure
+        text: Run EXPLAIN ANALYZE again and compare pages and time
+    hints:
+      - Before reading any plan, make sure you are looking at the right problem - one slow query, or many quick ones?
+      - A plan from wrong data or without statistics misleads you.
+      - Change one thing at a time, and the last step must be evidence.
+    solution: |
+      Count queries → production-like data → `ANALYZE` → `EXPLAIN ANALYZE` → check estimates → change one
+      thing → measure again. Counting first avoids tuning a query that isn't the problem (an N+1 has fast
+      plans). Data and statistics come before plans because "Examining an application's index usage without
+      having run ANALYZE is therefore a lost cause" (11.12). Estimates come before conclusions because a bad
+      estimate explains a bad plan. And without the second measurement you don't know the change helped.
+
+  - id: read-the-plan
+    type: mcq
+    concept: pg-reading-explain
+    skill: analysis
+    title: What does this plan tell you?
+    prompt: |
+      ```plaintext
+      Limit  (cost=4609.56..4609.61 rows=20 width=25) (actual time=34.012..34.043 rows=20.00 loops=1)
+        ->  Sort  (cost=4609.56..4612.05 rows=998 width=25) (actual time=33.998..34.009 rows=20.00 loops=1)
+              Sort Key: created_at DESC
+              Sort Method: top-N heapsort  Memory: 19kB
+              ->  Seq Scan on orders  (cost=0.00..4583.00 rows=998 width=25) (actual time=0.095..32.665 rows=1000.00 loops=1)
+                    Filter: (merchant_id = 42)
+                    Rows Removed by Filter: 199000
+      ```
+
+      Which statement is supported by this evidence?
+    options:
+      - id: scan-is-cost
+        text: Almost all the time is in the Seq Scan, which reads 200,000 rows to keep 1,000; the estimates are accurate, so an index on merchant_id with created_at is the fix to try.
+        feedback: Correct - 32.7 of 34 ms is the scan, Rows Removed by Filter is 199,000, and 998 estimated against 1,000 actual means statistics are fine.
+      - id: sort-is-cost
+        text: The Sort is the slow part; raising work_mem would fix it.
+        feedback: The Sort finished 1.3 ms after its input did and used 19 kB in memory (top-N heapsort) - it isn't spilling or slow. Read the actual times of the child node.
+      - id: stale-stats
+        text: The statistics are stale - run ANALYZE.
+        feedback: Estimated 998 rows against 1,000 actual is an excellent estimate; stale statistics show up as estimates that are off by a large factor.
+      - id: limit-is-broken
+        text: LIMIT 20 is ignored because the plan returns 1,000 rows.
+        feedback: The Seq Scan outputs 1,000 rows, but the Limit outputs 20 - it just can't stop early, because the rows must be sorted before the first 20 are known.
+    correct: [scan-is-cost]
+    hints:
+      - Actual times are cumulative - a parent's time includes its children's.
+      - Compare rows= in the cost part with rows= in the actual part.
+      - Where are rows read and thrown away?
+    solution: |
+      The Seq Scan ends at 32.7 ms of the 34 ms total and discards 199,000 rows - that's the cost. The
+      estimate (998) matches reality (1,000), so the planner chose well **given the indexes available**; the
+      fix is an index that finds merchant 42's rows and returns them sorted: `(merchant_id, created_at DESC)`.
+      A real run of exactly that took the query to 0.19 ms and 23 pages.
+    followUp: |
+      After adding the index, the plan shows `Index Scan ... (actual ... rows=20.00 loops=1)` but the
+      endpoint is still slow. What do you check next?
+
+  - id: index-not-used-debug
+    type: debug
+    concept: pg-special-indexes
+    skill: analysis
+    title: Two lines that can't use their index
+    prompt: |
+      The `orders` table has a B-tree index on `customer_email` and the primary key index on `id` (a
+      `bigint`). This report query does a Seq Scan on `orders` twice. Click the **two** lines whose
+      conditions stop an index being used.
+    language: sql
+    code: |
+      SELECT o.id, o.status, o.amount_minor
+      FROM orders o
+      JOIN merchants m ON m.id = o.merchant_id
+      WHERE lower(o.customer_email) = 'customer777@example.test'
+         OR o.id = 123456::numeric
+      ORDER BY o.created_at DESC
+      LIMIT 50;
+    correctLines: [4, 5]
+    lineNotes:
+      - line: 3
+        note: Joining on merchant_id is fine; at worst it needs an index on o.merchant_id, but it doesn't cause the problem described.
+      - line: 6
+        note: ORDER BY without a matching index adds a Sort, but it doesn't prevent the WHERE conditions from using an index.
+    hints:
+      - The index is sorted by the column's stored value. What does each condition compare?
+      - Look for a function applied to a column, and for a cast applied to a column.
+      - "A real run showed `Filter: ((id)::numeric = '123456'::numeric)`."
+    solution: |
+      **Line 4** applies `lower()` to the column; the index holds `customer_email`, not
+      `lower(customer_email)` - add an expression index on `lower(customer_email)` (or store emails
+      normalised). **Line 5** compares a `bigint` column with a `numeric`, so PostgreSQL casts the **column** to
+      `numeric` - `Filter: ((id)::numeric = '123456'::numeric)` in a real run - and the primary key index can't
+      be used; pass a `bigint` (or an untyped parameter). Confirm each fix with `EXPLAIN`: the Seq Scan becomes
+      an index or bitmap scan. (With `OR`, PostgreSQL can combine two indexes with a `BitmapOr` once both
+      conditions are indexable.)
+    followUp: |
+      Your Node.js code passes `123456` as a parameter (`$1`) instead of the literal. Does the cast problem
+      still happen? How would you check?
+
+  - id: paid-seq-scan
+    type: mcq
+    concept: pg-reading-explain
+    skill: analysis
+    title: The index on status is ignored
+    prompt: |
+      There is an index on `orders(status)`. `pg_stats` shows `most_common_vals {PAID,FAILED,PENDING}` with
+      `most_common_freqs {0.8995,0.0900,0.0105}`. `EXPLAIN SELECT * FROM orders WHERE status = 'PAID'` shows
+      `Seq Scan on orders ... rows=179907`. What is the right conclusion?
+    options:
+      - id: correct-choice
+        text: The planner is right - fetching 90% of the rows through an index costs more than reading every page once. Leave it.
+        feedback: Correct - an index pays off when a query wants a small fraction of the rows; the same index was used for PENDING (1%) in the real run.
+      - id: force-index
+        text: Disable sequential scans with SET enable_seqscan = off in the application.
+        feedback: That forces a plan that is slower for this query and affects every other query on the connection; the manual offers it only as a test.
+      - id: reindex
+        text: The index is corrupt - REINDEX it.
+        feedback: Nothing suggests corruption; the estimate (179,907) matches the frequency, and the plan follows from it.
+      - id: wrong-type
+        text: status should be an enum type for the index to work.
+        feedback: A text column is indexed perfectly well; the type isn't the reason, the selectivity is.
+    correct: [correct-choice]
+    hints:
+      - How many rows does the query return?
+      - What does an Index Scan do for each matching row?
+    solution: |
+      With 90% of rows matching, an index scan would visit almost every heap page anyway, in random order,
+      on top of reading the index. A sequential scan reads each page once. The planner knows the fraction
+      from statistics and correctly prefers the scan. The index still serves rare values: `status = 'PENDING'`
+      used `Index Scan using orders_status_idx` in the real run. If only the rare value matters, a **partial
+      index** for it is smaller still.
+    followUp: |
+      Which index would you keep if the only status query in the application is "oldest PENDING orders first"?
+
+  - id: partial-scope
+    type: mcq
+    concept: pg-special-indexes
+    skill: analysis
+    title: Why isn't the partial index used?
+    prompt: |
+      `CREATE INDEX orders_pending_idx ON orders (created_at) WHERE status = 'PENDING';` makes the
+      reconciliation job fast. A new report runs
+      `SELECT id FROM orders WHERE status = 'FAILED' ORDER BY created_at LIMIT 50` and gets
+      `Seq Scan` + `Sort`. Why?
+    options:
+      - id: predicate
+        text: The index only contains PENDING orders; a query for FAILED orders can't be answered from it.
+        feedback: Correct - the planner can use a partial index only when the query's WHERE implies the index predicate.
+      - id: stats
+        text: The statistics for the new index haven't been collected yet.
+        feedback: Statistics wouldn't make FAILED rows appear in an index built only from PENDING rows.
+      - id: limit
+        text: Partial indexes can't be combined with ORDER BY ... LIMIT.
+        feedback: They can - the PENDING query uses exactly that and returns 50 rows without a sort.
+      - id: column
+        text: created_at must come second in a partial index.
+        feedback: Column order isn't the issue; status isn't an index column at all - it's the predicate.
+    correct: [predicate]
+    hints:
+      - Which rows are physically in the partial index?
+      - When may the planner use a partial index?
+    solution: |
+      A partial index holds only the rows that satisfy its `WHERE`. The planner uses it only when it can
+      prove the query's condition implies that predicate - `status = 'PENDING'` does, `status = 'FAILED'`
+      doesn't. Options: a second partial index for FAILED if the report is important, or a full
+      `(status, created_at)` index if many statuses are queried (6,184 kB here, against 64 kB for the partial one).
+
+  - id: covering-heap-fetches
+    type: short
+    concept: pg-special-indexes
+    skill: analysis
+    title: The covering index that still reads the table
+    prompt: |
+      You created `CREATE INDEX orders_merchant_cover_idx ON orders (merchant_id) INCLUDE (amount_minor);`
+      for `SELECT sum(amount_minor) FROM orders WHERE merchant_id = 42`. Straight afterwards the plan is a
+      `Bitmap Heap Scan` with `Heap Blocks: exact=1000`. After `VACUUM orders` it becomes
+      `Index Only Scan ... Heap Fetches: 0`. Explain what changed, and when this index is worth having.
+    modelAnswer: |
+      An index-only scan still has to know whether each row version is **visible** to the query's snapshot,
+      and visibility lives only in the heap. PostgreSQL keeps a **visibility map** with one bit per heap page
+      meaning "every row here is visible to everyone". Right after loading, those bits weren't set, so the
+      planner expected to visit the heap anyway and chose a bitmap scan. `VACUUM` set the bits; then the
+      index alone answered and `Heap Fetches: 0` confirms no heap visit was needed.
+
+      The index is worth it when the table's pages are mostly all-visible - data that changes slowly, like
+      settled orders - and the query needs only the indexed and included columns. On a table with constant
+      updates, pages keep losing their bit, heap fetches return, and the `INCLUDE` column is just extra size.
+    rubric:
+      - Says visibility information is stored in the heap, not the index.
+      - Names the visibility map and that VACUUM sets its all-visible bits.
+      - Reads Heap Fetches 0 as evidence that the heap wasn't visited.
+      - Says covering indexes pay off on slowly changing data and only for queries using the included columns.
+    hints:
+      - What must every scan check for each row, besides the WHERE condition?
+      - Where is that information stored?
+    solution: |
+      See the model answer: visibility is checked in the heap unless the visibility map marks the page
+      all-visible; `VACUUM` sets those bits, which is what allowed `Heap Fetches: 0`.
+
+  - id: dashboard-indexes
+    type: coding
+    concept: pg-btree-index-design
+    skill: application
+    title: Create the dashboard's indexes
+    prompt: |
+      In `exercises/indexes/indexes.sql`, write at most four `CREATE INDEX` statements so the four slow
+      SandPay queries listed in the file avoid a sequential scan of their big table: the merchant's latest
+      orders (without a Sort, from an index led by `merchant_id`), lookup by email in any case, the oldest PENDING orders (from a **partial**
+      index under a tenth of the primary key's size, and without a Sort), and the payments of a page of
+      orders. The test seeds 50,000 orders in PGlite, runs your file, then `ANALYZE` and
+      `EXPLAIN (FORMAT JSON)` on each query.
+    project: fullstack
+    files:
+      - exercises/indexes/indexes.sql
+    test: tests/indexes/dashboard-indexes.test.ts
+    command: npx vitest run tests/indexes/dashboard-indexes.test.ts
+    solution: |
+      One index per query: `(merchant_id, created_at DESC, id DESC)`, an expression index on
+      `lower(customer_email)`, a partial index `(created_at) WHERE status = 'PENDING'` and an index on
+      `payments(order_id)`. The model answer shows the SQL and why each index has its shape; the reference file
+      is `solutions/indexes/indexes.sql`.
+    hints:
+      - Read each query's WHERE and ORDER BY - one index per query, shaped by it.
+      - Query 1 - equality column first, then created_at and id in the query's directions.
+      - Query 2 filters on lower(customer_email), so index that expression. Query 3 - `CREATE INDEX ... (created_at) WHERE status = 'PENDING'`.
+      - Query 4 looks payments up by a foreign key column. Does PostgreSQL index foreign keys for you?
+    modelAnswer: |
+      ```sql
+      CREATE INDEX orders_merchant_created_id_idx ON orders (merchant_id, created_at DESC, id DESC);
+      CREATE INDEX orders_lower_email_idx ON orders (lower(customer_email));
+      CREATE INDEX orders_pending_created_idx ON orders (created_at) WHERE status = 'PENDING';
+      CREATE INDEX payments_order_id_idx ON payments (order_id);
+      ```
+
+      Each index is shaped by one query. The first puts the equality column before the sort columns, in the
+      same directions, so the plan is `Limit -> Index Scan` with no `Sort`. The second indexes the exact
+      expression the query uses. The third holds only the ~1% pending rows, sorted by `created_at`, so it is
+      tiny and needs no sort. The fourth exists because a foreign key gets no index automatically.
+
+      Why the test also checks the **leading column**: an index like `(created_at DESC, id DESC, merchant_id)`
+      avoids a Seq Scan and a Sort too, and its plan even shows `Index Cond: (merchant_id = 42)` - but it walks
+      every merchant's orders in date order and tests `merchant_id` inside the index until 20 match. "It uses
+      an index" isn't enough, so test 1 requires `merchant_id` as the first key column. Check
+      `EXPLAIN ANALYZE` yourself for rows and pages read, not only for node names.
+    rubric:
+      - Every test in tests/indexes/dashboard-indexes.test.ts passes.
+      - The multicolumn index starts with merchant_id, followed by the sort columns in the query's direction.
+      - No more indexes than queries, and none on low-selectivity columns alone (such as status).
+      - You can explain, for each index, the EXPLAIN node it produces and why.
+
+  - id: fix-n-plus-one
+    type: coding
+    concept: n-plus-one-queries
+    skill: application
+    title: Fix the N+1 in loadOrdersWithPayments
+    prompt: |
+      `exercises/indexes/orders-with-payments.ts` loads a merchant's latest orders and then each order's
+      payment attempts **one query per order**. It returns the right data, but a page of 100 sends 101
+      queries. Rewrite it to send **at most 2 queries** whatever the page size, with exactly the same result
+      (payments sorted by id, `[]` for orders without attempts, `[]` for a merchant without orders), passing
+      every value as a query parameter. The test counts the statements your function sends.
+    project: fullstack
+    files:
+      - exercises/indexes/orders-with-payments.ts
+    test: tests/indexes/orders-with-payments.test.ts
+    command: npx vitest run tests/indexes/orders-with-payments.test.ts
+    solution: |
+      Keep the orders query, then load every payment of the page in one query with
+      `WHERE order_id = ANY($1::int[])` and group the rows by order id in a `Map` - two queries for any page
+      size. The model answer shows the code; the reference file is `solutions/indexes/orders-with-payments.ts`.
+    hints:
+      - Keep the first query; replace the loop.
+      - "PostgreSQL compares a column with every element of an array parameter: `WHERE order_id = ANY($1::int[])`."
+      - Build a `Map` from order id to an empty array, fill it from the payment rows, then map the orders in their original order.
+      - Return early when the merchant has no orders - there is nothing to look up.
+    modelAnswer: |
+      ```typescript
+      const orders = await db.query<OrderRow>(
+        `SELECT id, status, amount_minor, created_at FROM orders
+         WHERE merchant_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+        [merchantId, limit],
+      );
+      if (orders.rows.length === 0) return [];
+
+      const ids = orders.rows.map((o) => o.id);
+      const payments = await db.query<PaymentRow>(
+        `SELECT id, order_id, method, status, amount_minor FROM payments
+         WHERE order_id = ANY($1::int[]) ORDER BY id`,
+        [ids],
+      );
+
+      const byOrder = new Map<number, Payment[]>(ids.map((id) => [id, []]));
+      for (const p of payments.rows) {
+        byOrder.get(p.order_id)?.push({ id: p.id, method: p.method, status: p.status, amountMinor: p.amount_minor });
+      }
+      return orders.rows.map((o) => ({
+        id: o.id, status: o.status, amountMinor: o.amount_minor, createdAt: o.created_at,
+        payments: byOrder.get(o.id) ?? [],
+      }));
+      ```
+
+      Two queries for any page size: the ids travel as **one array parameter**, so the statement is the same
+      for 20 or 100 orders and nothing is concatenated into SQL. The `Map` keeps grouping linear and keeps
+      the orders in the first query's order. A single `LEFT JOIN` (or `json_agg` per order) also works - one
+      query, but the order columns repeat once per payment row.
+    rubric:
+      - Every test in tests/indexes/orders-with-payments.test.ts passes.
+      - The ids are passed as an array parameter, not formatted into the SQL string.
+      - Grouping is done with a Map (or equivalent), not by filtering the payment list once per order.
+      - You can say which index the second query needs, and why PostgreSQL didn't create it.
+
+  - id: spot-n-plus-one
+    type: mcq
+    concept: n-plus-one-queries
+    skill: application
+    title: Read the query log
+    prompt: |
+      One request to `GET /merchants/42/orders?limit=50` logs something like this (an illustrative log):
+
+      ```plaintext
+      12:00:01.004 SELECT id, status FROM orders WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT $2   0.4 ms
+      12:00:01.006 SELECT * FROM payments WHERE order_id = $1   0.2 ms
+      12:00:01.008 SELECT * FROM payments WHERE order_id = $1   0.2 ms
+      ... 47 more identical statements ...
+      12:00:01.106 SELECT * FROM payments WHERE order_id = $1   0.2 ms
+      ```
+
+      Every query is fast, yet the request takes 110 ms. What is the fix?
+    options:
+      - id: batch
+        text: Load all 50 orders' payments in one query with order_id = ANY($1), then group them in code.
+        feedback: Correct - 51 round trips become 2; the time is in the round trips between queries, not in the queries.
+      - id: index
+        text: Add an index on payments.order_id.
+        feedback: Each payment query already takes 0.2 ms - the time is in the gaps between them (about 2 ms per round trip). An index can't remove round trips.
+      - id: parallel
+        text: Run the 50 payment queries in parallel with Promise.all.
+        feedback: That may shorten the wall time but still sends 51 queries, occupies pool connections and loads the database - it hides the N+1 instead of fixing it.
+      - id: cache
+        text: Cache each order's payments in memory for an hour.
+        feedback: Payments change (captures, refunds), so a long cache shows stale money states, and the first view is still slow.
+    correct: [batch]
+    hints:
+      - Add up the query times, then compare with the request time.
+      - How many statements does one request send, and how many would it need?
+    solution: |
+      51 queries of under 0.5 ms each add up to about 10 ms; the rest of the 110 ms is round trips, one per
+      statement. That is the N+1 signature: a list query followed by one identical query per item. Fetch the
+      related rows with one `= ANY($1)` query (or a join) and group in memory - 2 queries whatever the page
+      size. Then check the plan of the batched query uses an index on `payments.order_id`.
+
+  - id: slow-query-interview
+    type: interview
+    concept: pg-reading-explain
+    skill: analysis
+    title: "\"A query got slow in production - what do you do?\""
+    prompt: |
+      An interviewer asks: "The orders endpoint was fine at launch. Now, with a few million rows, it takes
+      seconds. Walk me through how you find and fix the cause - and how you make sure it doesn't come back."
+    modelAnswer: |
+      First I confirm where the time goes: the request's logs or traces with its request id, and how many
+      queries it sends. If it's many similar queries, it's an N+1 and I batch them - no index will help.
+
+      If it's one slow query, I reproduce it with production-like data and realistic parameters, make sure
+      statistics are current (`ANALYZE`), and run `EXPLAIN ANALYZE` (with buffers). I read it from the inside
+      out: compare estimated and actual rows - if they're far apart, statistics or a non-sargable condition
+      are the root cause. Then I find the expensive node: a Seq Scan with a huge `Rows Removed by Filter`, a
+      big Sort, or a nested loop with many loops.
+
+      The fix is usually one index shaped by the query - equality columns first, then range or ORDER BY
+      columns in order and direction - or a partial or expression index when the query targets a subset or a
+      function; sometimes it's rewriting the query, such as keyset instead of OFFSET pagination. I measure
+      again with the same parameters, create the index in production with `CREATE INDEX CONCURRENTLY`, and
+      weigh the write cost.
+
+      To keep it from coming back: a test that seeds realistic volume and asserts the plan has no Seq Scan on
+      the big table and the endpoint sends a fixed number of queries, plus monitoring of slow queries, and a
+      periodic review of unused indexes with `pg_stat_user_indexes`.
+    rubric:
+      - Distinguishes N+1 (many queries) from one slow plan before tuning.
+      - Uses EXPLAIN ANALYZE on production-like data with current statistics.
+      - Compares estimated and actual rows, and identifies the expensive node with evidence.
+      - Designs the index from the query (column order, partial or expression) rather than indexing columns blindly.
+      - Mentions measuring again, CREATE INDEX CONCURRENTLY and write cost.
+      - Proposes a regression check (plan shape or query count) and monitoring.
+    followUps:
+      - The plan uses an index scan but is still slow. What would you look at?
+      - Why might the same query be fast for one merchant and slow for another?
+      - When would you not add an index even though it makes the query faster?
+    hints:
+      - Separate "many queries" from "one slow query" first.
+      - What evidence proves the fix worked?
+    solution: |
+      See the model answer. The interviewer listens for evidence at each step - query counts, EXPLAIN ANALYZE
+      with estimates checked, a measured before and after - and for awareness of costs (writes, locking during
+      index builds) and of keeping it fixed with tests and monitoring.
+
+placement:
+  - id: place-multicolumn
+    type: mcq
+    concept: pg-btree-index-design
+    skill: application
+    title: Which index serves the query?
+    prompt: |
+      ```sql
+      SELECT id FROM payments WHERE order_id = $1 ORDER BY created_at DESC LIMIT 5;
+      ```
+
+      Which index lets PostgreSQL answer without a Sort node?
+    options:
+      - id: right
+        text: "(order_id, created_at DESC)"
+        feedback: Correct - the equality column first, then the sort column; one order's payments are adjacent and already newest first.
+      - id: reversed
+        text: "(created_at DESC, order_id)"
+        feedback: The rows come out by date, but every payment of every order must be walked through until five match - equality columns go first.
+      - id: separate
+        text: Two indexes, one on order_id and one on created_at
+        feedback: Bitmap scans combining indexes lose order, so a Sort is still needed; at best one index is used and the sort remains.
+      - id: hash
+        text: A hash index on order_id
+        feedback: Hash indexes support equality only and return no order, so the Sort stays.
+    correct: [right]
+    solution: |
+      `(order_id, created_at DESC)`: equality columns lead, then the `ORDER BY` column in the query's
+      direction. The plan is `Limit -> Index Scan` with no `Sort`.
+
+  - id: place-estimates
+    type: mcq
+    concept: pg-reading-explain
+    skill: analysis
+    title: Estimated 18,077, actual 9,999
+    prompt: |
+      A table was bulk-loaded a minute ago. `EXPLAIN ANALYZE` shows
+      `Seq Scan on refunds (cost=0.00..996.88 rows=18077 ...) (actual ... rows=9999.00 loops=1)`.
+      What do you do first?
+    options:
+      - id: analyze
+        text: Run ANALYZE on the table, then look at the plan again.
+        feedback: Correct - an estimate nearly twice the actual on a freshly loaded table points to missing statistics; a real run went to 9,923 estimated after ANALYZE.
+      - id: index
+        text: Add an index on the filtered column.
+        feedback: Maybe later - but with wrong estimates you can't judge any plan, including one that uses your new index.
+      - id: vacuum-full
+        text: Run VACUUM FULL to compact the table.
+        feedback: VACUUM FULL rewrites the table under an exclusive lock; it doesn't gather planner statistics.
+      - id: ignore
+        text: Nothing - estimates are always rough.
+        feedback: Checking estimates against actuals is the first thing the manual says to do; large gaps lead to wrong join and scan choices.
+    correct: [analyze]
+    solution: |
+      Run `ANALYZE refunds`. Planner estimates come from statistics gathered by `ANALYZE`; right after a bulk
+      load they are missing or stale. In the real run the estimate moved from 18,077 to 9,923 rows against
+      9,999 actual.
+
+  - id: place-expression
+    type: mcq
+    concept: pg-special-indexes
+    skill: application
+    title: Case-insensitive lookup
+    prompt: |
+      Login runs `SELECT id FROM accounts WHERE lower(email) = lower($1)` and does a Seq Scan, although
+      `accounts(email)` has a B-tree index. What fixes it?
+    options:
+      - id: expression
+        text: CREATE INDEX ON accounts (lower(email));
+        feedback: Correct - the index must hold the expression the query compares.
+      - id: analyze
+        text: ANALYZE accounts;
+        feedback: Statistics don't change what the index contains; it is sorted by email, not by lower(email).
+      - id: gin
+        text: A GIN index on email
+        feedback: GIN suits composite values such as jsonb or full text, not equality on a computed lowercase string.
+      - id: include
+        text: CREATE INDEX ON accounts (email) INCLUDE (id);
+        feedback: That helps index-only scans on email, but the query still filters on lower(email), which this index can't serve.
+    correct: [expression]
+    solution: |
+      An index on `email` is sorted by the stored value. A condition on `lower(email)` needs an **expression
+      index** on `lower(email)` - declared `UNIQUE`, it also stops two accounts that differ only in case.
+
+  - id: place-n-plus-one
+    type: mcq
+    concept: n-plus-one-queries
+    skill: application
+    title: 101 queries for one page
+    prompt: |
+      Loading a page of 100 invoices sends 1 query for the invoices and 100 queries for their line items,
+      each using an index and taking under 1 ms. What is the right fix?
+    options:
+      - id: batch
+        text: Fetch all line items of the 100 invoices in one query (invoice_id = ANY($1) or a join) and group them in memory.
+        feedback: Correct - two queries for any page size.
+      - id: index
+        text: Add a composite index on line_items.
+        feedback: Each query is already indexed and fast; the cost is the 100 round trips.
+      - id: smaller-page
+        text: Reduce the page size to 10.
+        feedback: That shrinks the symptom (11 queries) but keeps the pattern, and changes the product.
+      - id: parallel
+        text: Send the 100 queries in parallel.
+        feedback: Still 101 queries and 100 pool checkouts; it moves the load rather than removing it.
+    correct: [batch]
+    solution: |
+      This is an N+1. Batch the child rows into one query with `= ANY($1)` (or join), then group by invoice id
+      - always 2 queries.
+
+recall:
+  - id: recall-scans
+    concept: pg-reading-explain
+    prompt: Name four scan node types and when each is chosen.
+    answer: Seq Scan (many rows or tiny table - read every page), Index Scan (few rows, or ordered output - walk index and fetch rows), Bitmap Heap Scan (a moderate number of rows - collect locations, read pages in order), Index Only Scan (all needed columns in the index and pages all-visible).
+  - id: recall-multicolumn
+    concept: pg-btree-index-design
+    prompt: How do you order the columns of a multicolumn B-tree index for WHERE a = ? ORDER BY b DESC LIMIT n?
+    answer: Equality columns first, then the sort columns in the query's order and direction - (a, b DESC). Equality on leading columns limits the scanned portion; the rest come out already sorted, so LIMIT stops early with no Sort.
+  - id: recall-explain-check
+    concept: pg-reading-explain
+    prompt: What is the first thing to check in EXPLAIN ANALYZE output?
+    answer: Whether the estimated rows are close to the actual rows for each node. Big gaps mean missing or stale statistics or a condition the planner can't estimate, and explain bad plan choices.
+  - id: recall-ignored
+    concept: pg-reading-explain
+    prompt: Give five reasons the planner doesn't use an index.
+    answer: The condition matches a large fraction of rows; the table is tiny; a function or expression is applied to the column; a type mismatch casts the column; statistics are missing or stale. (Also - the query's condition doesn't match the index, such as a non-leading column.)
+  - id: recall-partial-expression
+    concept: pg-special-indexes
+    prompt: When do you use a partial index, and when an expression index?
+    answer: Partial - queries always target a fixed subset (status = 'PENDING'); the index is small and cheap to maintain but only serves queries whose WHERE implies its predicate. Expression - the query filters on a computed value (lower(email)); the query must use the same expression.
+  - id: recall-covering
+    concept: pg-special-indexes
+    prompt: What does INCLUDE do, and what makes it pay off?
+    answer: Adds non-key payload columns to a B-tree so an index-only scan can answer without the heap. It pays off when pages are all-visible in the visibility map (after VACUUM, slowly changing data) - Heap Fetches near 0.
+  - id: recall-fk
+    concept: pg-btree-index-design
+    prompt: Which constraints create an index automatically in PostgreSQL, and which doesn't?
+    answer: PRIMARY KEY and UNIQUE create a unique B-tree index automatically. A FOREIGN KEY does not index the referencing column - add one yourself when you join or delete through it.
+  - id: recall-n-plus-one
+    concept: n-plus-one-queries
+    prompt: How do you recognise and fix an N+1 query?
+    answer: The log shows one list query followed by one near-identical query per item; every query is fast but the request is slow. Fix by loading the related rows in one query (= ANY($1) or a join) and grouping in memory - a fixed 2 queries.
+
+next:
+  - transactions-and-isolation
+  - migrations-and-data-access

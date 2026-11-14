@@ -1,0 +1,1424 @@
+id: transactions-and-isolation
+title: Transactions, isolation and concurrency
+subject: fullstack
+module: databases
+level: advanced
+status: published
+estimatedMinutes: 75
+summary: Keep money correct when requests run at the same time - ACID transactions and savepoints, PostgreSQL's MVCC snapshots and isolation levels, the anomalies each level allows, the three cures for lost updates, and retrying serialization failures and deadlocks.
+tags:
+  [
+    transactions,
+    acid,
+    savepoint,
+    mvcc,
+    isolation levels,
+    read committed,
+    repeatable read,
+    serializable,
+    ssi,
+    lost update,
+    write skew,
+    select for update,
+    optimistic locking,
+    "40001",
+    "40P01",
+    deadlock,
+    retry,
+    outbox,
+    postgresql,
+  ]
+
+environment: |
+  - **PostgreSQL 18 manual (primary source):** [3.4 Transactions](https://www.postgresql.org/docs/18/tutorial-transactions.html)
+    (all-or-nothing, savepoints), [13.1 Introduction to MVCC](https://www.postgresql.org/docs/18/mvcc-intro.html),
+    [13.2 Transaction Isolation](https://www.postgresql.org/docs/18/transaction-iso.html) (the phenomena, Table 13.1,
+    sections 13.2.1-13.2.3), [13.3 Explicit Locking](https://www.postgresql.org/docs/18/explicit-locking.html)
+    (row-level locks, 13.3.4 deadlocks), [13.4 Data Consistency Checks at the Application Level](https://www.postgresql.org/docs/18/applevel-consistency.html),
+    [13.6 Serialization Failure Handling](https://www.postgresql.org/docs/18/mvcc-serialization-failure-handling.html),
+    [SET TRANSACTION](https://www.postgresql.org/docs/18/sql-set-transaction.html),
+    [SELECT - the locking clause](https://www.postgresql.org/docs/18/sql-select.html) (NOWAIT, SKIP LOCKED) and
+    [Appendix A - error codes](https://www.postgresql.org/docs/18/errcodes-appendix.html). Quotes were checked
+    against the pages, fetched November 2026.
+  - **The SQL standard's levels** are described here as the PostgreSQL manual summarises them (the ISO standard
+    itself is paid). **The critique of them:** H. Berenson, P. Bernstein, J. Gray, J. Melton, E. O'Neil and P. O'Neil,
+    [_A Critique of ANSI SQL Isolation Levels_](https://arxiv.org/abs/cs/0701157), Proc. ACM SIGMOD 1995 - it defines
+    Lost Update (P4), Write Skew (A5B) and Snapshot Isolation. **SSI in PostgreSQL:** D. Ports and K. Grittner,
+    [_Serializable Snapshot Isolation in PostgreSQL_](https://vldb.org/pvldb/vol5/p1850_danrkports_vldb2012.pdf),
+    VLDB 2012 (the manual's reference [ports12]).
+  - **Every two-session transcript was run** on PostgreSQL 18.6 (the official server binaries, started with the
+    `embedded-postgres` npm package) through two separate `pg` (node-postgres) connections, with
+    `lc_messages = 'C'` so the messages are the server's English originals. Statements run in the order shown;
+    "waiting" means the statement had not finished 500 ms later. Process and transaction numbers in deadlock
+    messages differ on every run.
+  - **Practice:** `practice/fullstack` uses PGlite 0.5 - PostgreSQL 18.6 compiled to WebAssembly - with Node.js 24
+    and TypeScript 6. PGlite has **one** connection and runs transactions one after another, so the exercises
+    test atomicity and lost updates between interleaved async calls; true two-connection races are shown in the
+    transcripts above instead.
+  - **Fictional:** SandPay, its payments (`pay_1001`), refunds and amounts are invented for this course. Amounts
+    are integers in minor units (10000 = 100.00).
+
+prerequisites:
+  - relational-modelling-and-sql
+  - partial-refunds-and-invariants
+  - node-runtime-and-npm
+
+concepts:
+  - id: acid-transactions-savepoints
+    name: ACID transactions and savepoints
+    summary: A transaction bundles statements into one all-or-nothing unit (atomicity) that moves the database between valid states (consistency), hides its intermediate states from others (isolation) and survives a crash once committed (durability). In PostgreSQL an error aborts the whole transaction - later statements fail with 25P02 and COMMIT becomes ROLLBACK - unless you roll back to a savepoint.
+  - id: postgres-isolation-levels
+    name: MVCC snapshots and PostgreSQL's isolation levels
+    summary: PostgreSQL keeps several versions of each row and gives each statement (Read Committed) or each transaction (Repeatable Read, Serializable) a snapshot, so readers and writers don't block each other. The levels differ in which phenomena they allow - nonrepeatable reads, phantoms, serialization anomalies such as write skew; Read Uncommitted behaves like Read Committed, and Serializable uses Serializable Snapshot Isolation.
+  - id: lost-update-prevention
+    name: Preventing lost updates
+    summary: A read-modify-write done as a SELECT, a calculation in the application and an UPDATE lets two transactions overwrite each other's change. The cures are a single conditional atomic UPDATE (the row lock plus WHERE re-evaluation does the check), a pessimistic SELECT ... FOR UPDATE, or an optimistic version column checked in the UPDATE's WHERE clause.
+  - id: serialization-retries-deadlocks
+    name: Serialization failures, deadlocks and retries
+    summary: Repeatable Read and Serializable abort a transaction with SQLSTATE 40001 instead of letting an anomaly through, and any level can deadlock (40P01). The application must retry the whole transaction - reads and decisions included - with backoff; deadlocks are avoided by taking locks in a consistent order, and transactions are kept short, never spanning user think-time or a call to another system (use an outbox).
+
+objectives:
+  - Explain each ACID property with a refund example, and predict what happens to a PostgreSQL transaction after an error, with and without a savepoint.
+  - Describe how MVCC snapshots work at Read Committed and Repeatable Read, and name the phenomena each PostgreSQL isolation level allows.
+  - Diagnose a lost update and a write skew from a two-session transcript, and choose the isolation level or locking that prevents each.
+  - Implement a refund that keeps "refunded never exceeds captured" under concurrency with a single conditional UPDATE, inside one transaction with its outbox event.
+  - Write a retry wrapper that re-runs the whole transaction only on SQLSTATE 40001 and 40P01, with capped exponential backoff and jitter.
+  - Prevent deadlocks with a consistent lock order, and keep network calls and user think-time out of transactions.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [acid-transactions-savepoints, lost-update-prevention]
+    title: The idea in plain language
+    body: |
+      Two cashiers share one cash drawer. A customer wants 60.00 back on a 100.00 purchase; at the same
+      moment a second customer, on the phone with a colleague, also gets 60.00 refunded on **the same**
+      purchase. Each cashier looks at the receipt ("nothing refunded yet - fine"), hands out the money, and
+      writes the new total on the receipt. Both looked before either wrote. The shop has now refunded 120.00 on a
+      100.00 sale, and the receipt says 60.00.
+
+      Nobody made an arithmetic mistake. The bug is **timing**: the check and the change were two separate
+      moments, and someone else acted in between.
+
+      A database **transaction** is the rule "do these steps as one unit": all of them happen or none do, and
+      while you're working, others see either the before or the after - never your half-finished state. How
+      strictly the database keeps concurrent transactions out of each other's way is the **isolation level**.
+      PostgreSQL's default is not the strictest, so the two-cashier bug is entirely possible in real code -
+      unless you write the check and the change so the database can't interleave them.
+
+      As a tester you hunted this bug with parallel requests (see [Partial refunds and invariants](#/lesson/partial-refunds-and-invariants)).
+      In this lesson you learn to make it impossible.
+
+  - id: why
+    kind: why
+    concepts: [lost-update-prevention, serialization-retries-deadlocks]
+    title: Why this matters for a full stack developer
+    body: |
+      - **Every web server is concurrent.** Node.js runs one request's JavaScript at a time, but every `await`
+        on the database lets another request run - and with several app instances and a connection pool, many
+        transactions really do run at once. Double-clicks, client retries, two support agents and a batch job
+        are all "concurrent users" of the same row.
+      - **The default doesn't protect you.** PostgreSQL's default level, Read Committed, allows the
+        read-then-write race in this lesson. Code that passes every single-user test can over-refund under
+        load.
+      - **The failures are silent.** A lost update returns 200 to everyone; it shows up days later as a total
+        that doesn't match its detail rows, which is exactly what reconciliation in
+        [Reconciliation for testers](#/lesson/reconciliation-for-testers) catches after the fact.
+      - **The stricter levels need code.** Repeatable Read and Serializable turn races into errors (40001), and
+        deadlocks (40P01) can happen at any level. Without a retry loop, the user gets a 500 instead.
+      - **Interviewers ask.** "How do you stop a double refund / an oversold item / a negative balance?" is a
+        standard backend question; the answer is in this lesson.
+
+  - id: what-acid
+    kind: what
+    concepts: [acid-transactions-savepoints]
+    title: ACID, BEGIN, COMMIT, ROLLBACK and savepoints
+    body: |
+      | Property | Meaning | For a SandPay refund |
+      | --- | --- | --- |
+      | **Atomicity** | all statements take effect, or none | the refund row, the new total and the outbox event appear together or not at all |
+      | **Consistency** | a committed transaction leaves every constraint true | `CHECK (refunded_minor <= captured_minor)` holds after every commit |
+      | **Isolation** | concurrent transactions don't see each other's unfinished work - how much they can interfere is the isolation level | another request never sees the refund row without the new total |
+      | **Durability** | once COMMIT returns, the change survives a crash | the refund isn't lost if the server restarts a second later |
+
+      The manual's tutorial (section 3.4) puts the essential point as: a transaction "bundles multiple steps
+      into a single, all-or-nothing operation. The intermediate states between the steps are not visible to
+      other concurrent transactions, and if some failure occurs that prevents the transaction from completing,
+      then none of the steps affect the database at all."
+
+      ```sql
+      BEGIN;                                   -- start a transaction block
+      UPDATE payments SET refunded_minor = refunded_minor + 2500 WHERE id = 'pay_1001';
+      INSERT INTO refunds (payment_id, amount_minor, reason) VALUES ('pay_1001', 2500, 'damaged');
+      COMMIT;                                  -- or ROLLBACK to discard everything since BEGIN
+      ```
+
+      Without `BEGIN`, PostgreSQL runs **each statement in its own transaction** (autocommit). That is why
+      two separate `db.query()` calls in your code are two transactions unless you wrap them.
+
+      **Savepoints** mark a point inside a transaction you can return to: "All the transaction's database
+      changes between defining the savepoint and rolling back to it are discarded, but changes earlier than the
+      savepoint are kept" (section 3.4).
+
+      **One error aborts the whole transaction.** In PostgreSQL, after any error inside a transaction block,
+      every further statement fails with SQLSTATE `25P02` (`in_failed_sql_transaction`) until the block ends -
+      and `COMMIT` then performs a rollback. Only `ROLLBACK TO SAVEPOINT` rescues the work done before the
+      savepoint.
+
+  - id: code-acid
+    kind: code
+    concepts: [acid-transactions-savepoints]
+    title: "Run on PostgreSQL 18.6: an aborted transaction, and a savepoint"
+    body: |
+      Tables: `payments(id, captured_minor, refunded_minor, version)` with `pay_1001` captured 10000, and
+      `refunds(id, payment_id REFERENCES payments, amount_minor CHECK (amount_minor > 0))`.
+
+      **An error with no savepoint** - the second insert names a payment that doesn't exist:
+
+      ```plaintext
+      A> BEGIN
+      A> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 1000)
+            INSERT 1
+      A> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_9999', 1000)
+            ERROR 23503: insert or update on table "refunds" violates foreign key constraint "refunds_payment_id_fkey"
+            DETAIL: Key (payment_id)=(pay_9999) is not present in table "payments".
+      A> SELECT 1
+            ERROR 25P02: current transaction is aborted, commands ignored until end of transaction block
+      A> COMMIT
+            ROLLBACK
+      A> SELECT count(*) FROM refunds
+            [{"count":"0"}]
+      ```
+
+      The server answered `COMMIT` with the command tag **`ROLLBACK`**: the first, valid insert is gone too.
+      A driver that ignores the tag would report success for work that was discarded.
+
+      **The same failure after a savepoint:**
+
+      ```plaintext
+      A> BEGIN
+      A> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 1000)
+            INSERT 1
+      A> SAVEPOINT before_second
+      A> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', -5)
+            ERROR 23514: new row for relation "refunds" violates check constraint "refunds_amount_minor_check"
+            DETAIL: Failing row contains (2, pay_1001, -5).
+      A> SELECT count(*) FROM refunds
+            ERROR 25P02: current transaction is aborted, commands ignored until end of transaction block
+      A> ROLLBACK TO SAVEPOINT before_second
+      A> SELECT count(*) FROM refunds
+            [{"count":"1"}]
+      A> COMMIT
+      A> SELECT payment_id, amount_minor FROM refunds
+            [{"payment_id":"pay_1001","amount_minor":"1000"}]
+      ```
+
+      Even with a savepoint, the transaction stays aborted **until** you roll back to it. Savepoints suit
+      "try this optional step, carry on without it if it fails" - for example, inserting an optional audit
+      detail. Most application code doesn't need them: if anything fails, roll the whole transaction back.
+
+  - id: internals-mvcc
+    kind: internals
+    concepts: [postgres-isolation-levels]
+    title: MVCC - every statement reads a snapshot
+    body: |
+      PostgreSQL uses **multiversion concurrency control**: an UPDATE writes a **new version** of the row and
+      leaves the old one in place for transactions that still need it. The manual (13.1): "each SQL statement
+      sees a snapshot of data (a database version) as it was some time ago, regardless of the current state of
+      the underlying data." The headline consequence: "reading never blocks writing and writing never blocks
+      reading."
+
+      What a **snapshot** contains depends on the isolation level:
+
+      | Level | Snapshot taken | What a SELECT sees |
+      | --- | --- | --- |
+      | Read Committed (the default) | at the start of **each statement** | everything committed before that statement began - so two SELECTs in one transaction can disagree |
+      | Repeatable Read | at the **first statement** of the transaction | only data committed before the transaction began, for its whole life |
+      | Serializable | like Repeatable Read | the same snapshot, plus tracking of read/write dependencies to detect anomalies |
+
+      Both levels also see the transaction's **own** uncommitted changes.
+
+      **Writes are different from reads.** Two transactions can't both change the same row version: the second
+      one to UPDATE (or DELETE, or SELECT ... FOR UPDATE) a row that the first has changed but not yet committed
+      **waits** for the first to commit or roll back. What it does next is where the levels differ - and it is
+      the key to the rest of this lesson:
+
+      - **Read Committed:** "If the first updater commits, the second updater will ignore the row if the first
+        updater deleted it, otherwise it will attempt to apply its operation to the updated version of the row.
+        The search condition of the command (the WHERE clause) is re-evaluated to see if the updated version of
+        the row still matches" (13.2.1).
+      - **Repeatable Read and Serializable:** the second transaction is "rolled back with the message ERROR:
+        could not serialize access due to concurrent update" (13.2.2), because it may not change a row that was
+        modified after its snapshot was taken.
+
+      You can check your default with `SHOW default_transaction_isolation` - on a fresh PostgreSQL 18.6 it
+      returned `read committed`. Choose a level per transaction with `BEGIN ISOLATION LEVEL REPEATABLE READ`
+      (or `SET TRANSACTION` as the first statement - the level "cannot be changed after the first query or
+      data-modification statement").
+
+  - id: what-levels
+    kind: what
+    concepts: [postgres-isolation-levels]
+    title: The phenomena, and PostgreSQL's Table 13.1
+    body: |
+      The SQL standard defines isolation levels by the **phenomena** they must prevent. The manual's definitions
+      (13.2):
+
+      - **Dirty read** - "A transaction reads data written by a concurrent uncommitted transaction."
+      - **Nonrepeatable read** - "A transaction re-reads data it has previously read and finds that data has been
+        modified by another transaction (that committed since the initial read)."
+      - **Phantom read** - "A transaction re-executes a query returning a set of rows that satisfy a search
+        condition and finds that the set of rows satisfying the condition has changed due to another
+        recently-committed transaction."
+      - **Serialization anomaly** - "The result of successfully committing a group of transactions is
+        inconsistent with all possible orderings of running those transactions one at a time."
+
+      PostgreSQL's Table 13.1:
+
+      | Isolation level | Dirty read | Nonrepeatable read | Phantom read | Serialization anomaly |
+      | --- | --- | --- | --- | --- |
+      | Read uncommitted | Allowed, but not in PG | Possible | Possible | Possible |
+      | Read committed | Not possible | Possible | Possible | Possible |
+      | Repeatable read | Not possible | Not possible | Allowed, but not in PG | Possible |
+      | Serializable | Not possible | Not possible | Not possible | Not possible |
+
+      Two PostgreSQL facts hide in that table:
+
+      1. "PostgreSQL's Read Uncommitted mode behaves like Read Committed" - there are only three distinct
+         levels. Dirty reads never happen.
+      2. PostgreSQL's Repeatable Read is **snapshot isolation**: stronger than the standard requires (no
+         phantoms), but it still allows **serialization anomalies**.
+
+      **Why the phenomena aren't the whole story.** Berenson et al. (1995) showed that the standard's
+      phenomena "fail to characterize several popular isolation levels" and added new ones. Two matter for
+      money:
+
+      - **Lost Update (P4):** "transaction T1 reads a data item and then T2 updates the data item (possibly
+        based on a previous read), then T1 (based on its earlier read value) updates the data item and commits."
+      - **Write Skew (A5B):** two transactions each read overlapping data, each makes a change that is valid on
+        its own snapshot, and together they break a constraint that spans rows - for example "the sum of a
+        payment's refunds never exceeds the captured amount" when each refund is a **new row**.
+
+      Snapshot isolation (PostgreSQL's Repeatable Read) prevents lost updates on the same row - the second
+      writer gets the 40001 error above - but **not** write skew. Only Serializable does.
+
+  - id: example-levels
+    kind: example
+    concepts: [postgres-isolation-levels, serialization-retries-deadlocks]
+    title: "Run on PostgreSQL 18.6: what each level lets you see"
+    body: |
+      **No dirty reads, even when you ask for Read Uncommitted.** A has changed the row and not committed:
+
+      ```plaintext
+      A> BEGIN
+      A> UPDATE payments SET refunded_minor = 9999 WHERE id = 'pay_1001'
+            UPDATE 1
+      B> BEGIN ISOLATION LEVEL READ UNCOMMITTED
+      B> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      ```
+
+      **Read Committed: a nonrepeatable read.** A reads twice in one transaction; B commits in between:
+
+      ```plaintext
+      A> BEGIN
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      B> UPDATE payments SET refunded_minor = 2500 WHERE id = 'pay_1001'
+            UPDATE 1
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"2500"}]
+      ```
+
+      **Repeatable Read: a stable snapshot - and a refusal to write over a newer version.**
+
+      ```plaintext
+      A> BEGIN ISOLATION LEVEL REPEATABLE READ
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      B> UPDATE payments SET refunded_minor = 2500 WHERE id = 'pay_1001'
+            UPDATE 1
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      A> UPDATE payments SET refunded_minor = refunded_minor + 1000 WHERE id = 'pay_1001'
+            ERROR 40001: could not serialize access due to concurrent update
+      A> ROLLBACK
+      ```
+
+      A still sees 0 after B's commit - that is the snapshot. When A tries to change the row B changed, it gets
+      SQLSTATE **40001** (`serialization_failure`). The manual: "When an application receives this error
+      message, it should abort the current transaction and retry the whole transaction from the beginning. The
+      second time through, the transaction will see the previously-committed change as part of its initial view
+      of the database."
+
+  - id: visual-lost-update
+    kind: visual
+    concepts: [lost-update-prevention]
+    title: The lost update, step by step
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant A as Session A - agent refund
+        participant DB as PostgreSQL - Read Committed
+        participant B as Session B - chargeback team
+        A->>DB: SELECT refunded_minor - sees 0
+        B->>DB: SELECT refunded_minor - sees 0
+        A->>DB: UPDATE SET refunded_minor = 3000
+        B->>DB: UPDATE SET refunded_minor = 4000
+        Note over B,DB: B waits for A's row lock
+        A->>DB: COMMIT
+        DB-->>B: UPDATE 1 - applied to A's version
+        B->>DB: COMMIT
+        Note over DB: refunded_minor = 4000 - A's 3000 is lost
+      ```
+
+      Notice that PostgreSQL **did** make B wait, and **did** apply B's UPDATE to A's committed version - but
+      B's UPDATE sets a constant the application computed from its stale read (0 + 4000). The database can't
+      know that 4000 was based on an old value. The lock protected the row; nothing protected the decision.
+
+  - id: code-lost-update
+    kind: code
+    concepts: [lost-update-prevention]
+    title: "Run on PostgreSQL 18.6: the lost update, and the one-statement fix"
+    body: |
+      **Read-modify-write in the application** (the computed values are what each session would compute from
+      its read):
+
+      ```plaintext
+      A> BEGIN
+      B> BEGIN
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      B> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0"}]
+      A> UPDATE payments SET refunded_minor = 3000 WHERE id = 'pay_1001'
+            UPDATE 1
+      B> UPDATE payments SET refunded_minor = 4000 WHERE id = 'pay_1001'
+            ... waiting (blocked)
+      A> COMMIT
+         B unblocked: UPDATE 1
+      B> COMMIT
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"4000"}]
+      ```
+
+      Two refunds of 3000 and 4000 were approved; the total says 4000.
+
+      **The check and the change in one conditional UPDATE.** Two refunds of 6000 against 10000 captured:
+
+      ```plaintext
+      A> BEGIN
+      B> BEGIN
+      A> UPDATE payments SET refunded_minor = refunded_minor + 6000 WHERE id = 'pay_1001' AND refunded_minor + 6000 <= captured_minor RETURNING refunded_minor
+            UPDATE 1 [{"refunded_minor":"6000"}]
+      B> UPDATE payments SET refunded_minor = refunded_minor + 6000 WHERE id = 'pay_1001' AND refunded_minor + 6000 <= captured_minor RETURNING refunded_minor
+            ... waiting (blocked)
+      A> COMMIT
+         B unblocked: UPDATE 0
+      B> COMMIT
+      A> SELECT refunded_minor FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"6000"}]
+      ```
+
+      B waited for A's row lock; when A committed, PostgreSQL **re-evaluated B's WHERE clause on the new
+      version** (6000 + 6000 is not <= 10000) and B updated **0 rows**. The application reads "0 rows" as
+      "not enough left to refund". This works at the default Read Committed level - no extra locking, no retry.
+
+  - id: when-cures
+    kind: when
+    concepts: [lost-update-prevention]
+    title: Three cures for lost updates - and when to use each
+    body: |
+      | Cure | How | Use when | Watch out |
+      | --- | --- | --- | --- |
+      | **Atomic conditional UPDATE** | `UPDATE ... SET x = x + $1 WHERE id = $2 AND <rule> RETURNING ...` | the rule fits in one statement on one row (counters, balances, stock, "refunded <= captured") | the rule must be in the WHERE clause; check `rowCount` |
+      | **Pessimistic lock** | `SELECT ... FOR UPDATE`, decide in code, then UPDATE in the same transaction | the decision needs logic that can't be expressed in SQL, or several statements | others wait while you hold the lock - keep it short; deadlocks become possible |
+      | **Optimistic version** | read `version`; `UPDATE ... SET ..., version = version + 1 WHERE id = $1 AND version = $2` | the read and the write are far apart - across HTTP requests, user think-time | 0 rows means "someone changed it" - tell the user or retry; the HTTP twin is ETag + If-Match ([REST API design](#/lesson/rest-api-design)) |
+
+      **`FOR UPDATE`** (13.3.2): "causes the rows retrieved by the SELECT statement to be locked as though for
+      update. This prevents them from being locked, modified or deleted by other transactions until the current
+      transaction ends." Run:
+
+      ```plaintext
+      A> BEGIN
+      B> BEGIN
+      A> SELECT captured_minor, refunded_minor FROM payments WHERE id = 'pay_1001' FOR UPDATE
+            [{"captured_minor":"10000","refunded_minor":"0"}]
+      B> SELECT captured_minor, refunded_minor FROM payments WHERE id = 'pay_1001' FOR UPDATE
+            ... waiting (blocked)
+      A> UPDATE payments SET refunded_minor = refunded_minor + 6000 WHERE id = 'pay_1001'
+            UPDATE 1
+      A> COMMIT
+         B unblocked: [{"captured_minor":"10000","refunded_minor":"6000"}]
+      ```
+
+      B's locking read waited and then returned the **updated** row, so B decides from current data. A plain
+      `SELECT` (without `FOR UPDATE`) would not have waited and would have returned the stale 0.
+
+      `NOWAIT` makes the locking read fail at once instead of waiting; `SKIP LOCKED` skips locked rows - the
+      manual warns it "provides an inconsistent view of the data", suitable for queue-like tables with several
+      workers, not for money checks.
+
+      **Optimistic version column** (no transaction held between read and write):
+
+      ```plaintext
+      A> SELECT refunded_minor, version FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0","version":1}]
+      B> SELECT refunded_minor, version FROM payments WHERE id = 'pay_1001'
+            [{"refunded_minor":"0","version":1}]
+      A> UPDATE payments SET refunded_minor = 3000, version = version + 1 WHERE id = 'pay_1001' AND version = 1
+            UPDATE 1
+      B> UPDATE payments SET refunded_minor = 4000, version = version + 1 WHERE id = 'pay_1001' AND version = 1
+            UPDATE 0
+      ```
+
+      **What none of them replaces:** a `CHECK` constraint. `CHECK (refunded_minor <= captured_minor)` won't
+      stop a lost update (4000 is a valid value), but it stops any bug from over-refunding - keep it as the
+      last line of defence.
+
+  - id: example-write-skew
+    kind: example
+    concepts: [postgres-isolation-levels, serialization-retries-deadlocks]
+    title: "Run on PostgreSQL 18.6: write skew across rows, and what Serializable does"
+    body: |
+      Now each refund is its own row and there is no running total to lock. Both sessions check the
+      refundable amount, then insert a 7000 refund against 10000 captured. The check:
+
+      ```sql
+      SELECT p.captured_minor - coalesce(sum(r.amount_minor), 0) AS refundable
+        FROM payments p LEFT JOIN refunds r ON r.payment_id = p.id
+       WHERE p.id = 'pay_1001' GROUP BY p.captured_minor;
+      ```
+
+      **At Repeatable Read** (the same result was observed at Read Committed):
+
+      ```plaintext
+      A> BEGIN ISOLATION LEVEL REPEATABLE READ
+      B> BEGIN ISOLATION LEVEL REPEATABLE READ
+      A> SELECT ... AS refundable ...          -> [{"refundable":"10000"}]
+      B> SELECT ... AS refundable ...          -> [{"refundable":"10000"}]
+      A> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 7000)
+            INSERT 1
+      B> INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 7000)
+            INSERT 1
+      A> COMMIT
+      B> COMMIT
+      A> SELECT count(*), sum(amount_minor) FROM refunds WHERE payment_id = 'pay_1001'
+            [{"count":"2","sum":"14000"}]
+      ```
+
+      No row was written by both, so snapshot isolation saw no conflict: **14000 refunded on 10000 captured**.
+
+      **At Serializable**, the same statements:
+
+      ```plaintext
+      A> BEGIN ISOLATION LEVEL SERIALIZABLE
+      B> BEGIN ISOLATION LEVEL SERIALIZABLE
+      A> SELECT ... AS refundable ...          -> [{"refundable":"10000"}]
+      B> SELECT ... AS refundable ...          -> [{"refundable":"10000"}]
+      A> INSERT ... 7000                       -> INSERT 1
+      B> INSERT ... 7000                       -> INSERT 1
+      A> COMMIT
+      B> COMMIT
+            ERROR 40001: could not serialize access due to read/write dependencies among transactions
+            DETAIL: Reason code: Canceled on identification as a pivot, during commit attempt.
+            HINT: The transaction might succeed if retried.
+      A> SELECT count(*), sum(amount_minor) FROM refunds WHERE payment_id = 'pay_1001'
+            [{"count":"1","sum":"7000"}]
+      ```
+
+      Serializable is implemented with **Serializable Snapshot Isolation** (13.2.3): it runs on the same
+      snapshots but keeps **predicate locks** - "In PostgreSQL these locks do not cause any blocking and therefore
+      can not play any part in causing a deadlock" - to notice when the result could not have come from any
+      one-at-a-time order, and then cancels a transaction. Nobody waited; B was refused at COMMIT with 40001
+      and the HINT says what to do: retry. On retry, B's snapshot includes A's refund, the check returns 3000,
+      and B's code refuses the 7000 refund.
+
+      Fixes for write skew, in order of preference: give the rule **one row to lock** (a running total updated
+      by a conditional UPDATE - the exercise's design), lock the parent row with `SELECT ... FOR UPDATE` before
+      checking, or run the transaction at **Serializable** and retry on 40001.
+
+  - id: code-deadlock
+    kind: code
+    concepts: [serialization-retries-deadlocks]
+    title: "Run on PostgreSQL 18.6: a deadlock"
+    body: |
+      A batch job touches `pay_1001` then `pay_1002`; a second job touches them in the opposite order:
+
+      ```plaintext
+      A> BEGIN
+      B> BEGIN
+      A> UPDATE payments SET version = version + 1 WHERE id = 'pay_1001'
+            UPDATE 1
+      B> UPDATE payments SET version = version + 1 WHERE id = 'pay_1002'
+            UPDATE 1
+      A> UPDATE payments SET version = version + 1 WHERE id = 'pay_1002'
+            ... waiting (blocked)
+      B> UPDATE payments SET version = version + 1 WHERE id = 'pay_1001'
+            UPDATE 1
+         A unblocked: ERROR 40P01: deadlock detected | DETAIL: Process 202391 waits for ShareLock on transaction 782; blocked by process 202392.
+      Process 202392 waits for ShareLock on transaction 781; blocked by process 202391.
+      ```
+
+      Each waited for a lock the other held. PostgreSQL "automatically detects deadlock situations and resolves
+      them by aborting one of the transactions involved, allowing the other(s) to complete. (Exactly which
+      transaction will be aborted is difficult to predict and should not be relied upon.)" (13.3.4). Here A
+      was aborted with SQLSTATE **40P01** (`deadlock_detected`) and B's statement went through.
+
+      The manual's advice: "The best defense against deadlocks is generally to avoid them by being certain that
+      all applications using a database acquire locks on multiple objects in a consistent order." For example,
+      always lock payments in ascending id order:
+
+      ```sql
+      SELECT id FROM payments WHERE id = ANY($1) ORDER BY id FOR UPDATE;
+      ```
+
+  - id: visual-retry
+    kind: visual
+    concepts: [serialization-retries-deadlocks]
+    title: Retrying the whole transaction
+    body: |
+      ```mermaid
+      flowchart TD
+        start([attempt = 1]) --> run[BEGIN, read, decide, write, COMMIT]
+        run -->|committed| done([return the result])
+        run -->|error| code{SQLSTATE 40001 or 40P01?}
+        code -->|no - constraint, syntax, network| fail([rethrow at once])
+        code -->|yes| left{attempts left?}
+        left -->|no| giveup([rethrow the last error])
+        left -->|yes| wait[sleep with capped backoff and jitter]
+        wait --> again[attempt + 1] --> run
+      ```
+
+      The loop re-runs **everything** - including the reads and the decisions made from them. Retrying only the
+      failed statement would reuse values computed from a snapshot that is now known to be stale.
+
+  - id: steps-retry
+    kind: steps
+    concepts: [serialization-retries-deadlocks]
+    title: Writing transactions that survive concurrency
+    body: |
+      1. **Put the whole unit of work in one function** that receives the transaction and returns a result:
+         reads, decisions and writes. Nothing outside it depends on values read inside.
+      2. **Retry that function on SQLSTATE 40001 and 40P01** - the manual (13.6): "It is important to retry
+         the complete transaction, including all logic that decides which SQL to issue and/or which values to
+         use. Therefore, PostgreSQL does not offer an automatic retry facility, since it cannot do so with any
+         guarantee of correctness." The message text varies; the **code** is stable - match on `error.code`.
+      3. **Cap the attempts** (three to five is common) and **back off with jitter**, so two clients that
+         collided don't collide again in lock step. "Transaction retry does not guarantee that the retried
+         transaction will complete; multiple retries may be needed."
+      4. **Don't retry other errors blindly.** A check violation (`23514`) or a foreign key violation (`23503`)
+         will fail again. The manual notes that a unique violation (`23505`) can be worth retrying in some cases -
+         for example when the application picked a new key from what it read.
+      5. **Keep transactions short.** Locks and snapshots live until COMMIT. Never wait for a user ("click
+         confirm") or call another system - the card processor, an email service - **inside** a transaction: a
+         slow network call holds locks for its whole duration, and if the transaction rolls back after the
+         call succeeded, the outside world has changed but your database hasn't.
+      6. **Use an outbox for side effects.** Insert an `outbox` row ("refund.created", with its data) in the same
+         transaction as the refund; a separate worker publishes it after commit and marks it sent. The event
+         exists if and only if the refund does. See [Synchronous and asynchronous payments](#/lesson/sync-vs-async-payments)
+         for why the processor call itself is asynchronous.
+      7. **Keep the CHECK constraint** as the database's own guard, and **test with real concurrency** (parallel
+         requests, two connections) - see the test cases below.
+
+  - id: code-refund
+    kind: code
+    concepts: [lost-update-prevention, acid-transactions-savepoints]
+    title: The refund in TypeScript (PGlite and node-postgres)
+    collapsed: true
+    body: |
+      The shape of the exercise's reference solution (`practice/fullstack/solutions/transactions/refunds.ts`):
+
+      ```typescript
+      export async function refund(db: PGlite, paymentId: string, amountMinor: number, reason: string,
+                                   hooks: RefundHooks = {}): Promise<RefundResult> {
+        if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) return { ok: false, reason: 'invalid_amount' };
+
+        return db.transaction(async (tx): Promise<RefundResult> => {
+          const updated = await tx.query<{ refunded_minor: number; currency: string }>(
+            `UPDATE payments
+                SET refunded_minor = refunded_minor + $2
+              WHERE id = $1 AND refunded_minor + $2 <= captured_minor
+          RETURNING refunded_minor, currency`,
+            [paymentId, amountMinor],
+          );
+          const payment = updated.rows[0];
+          if (!payment) {
+            const current = await tx.query<{ captured_minor: number; refunded_minor: number }>(
+              'SELECT captured_minor, refunded_minor FROM payments WHERE id = $1', [paymentId]);
+            const row = current.rows[0];
+            if (!row) return { ok: false, reason: 'not_found' };
+            return { ok: false, reason: 'exceeds_refundable', refundableMinor: row.captured_minor - row.refunded_minor };
+          }
+          const inserted = await tx.query<{ id: number }>(
+            'INSERT INTO refunds (payment_id, amount_minor, reason) VALUES ($1, $2, $3) RETURNING id',
+            [paymentId, amountMinor, reason]);
+          const refundId = inserted.rows[0]!.id;
+          await hooks.afterRefundRow?.(tx);
+          await tx.query('INSERT INTO outbox (event_type, payload) VALUES ($1, $2)', [
+            'refund.created', JSON.stringify({ refundId, paymentId, amountMinor, currency: payment.currency })]);
+          return { ok: true, refundId, refundedMinor: payment.refunded_minor };
+        });
+      }
+      ```
+
+      PGlite's `db.transaction(callback)` runs `BEGIN`, your callback, and `COMMIT` - or `ROLLBACK` if the
+      callback throws (the error is rethrown). With **node-postgres** and a pool, the same thing is written by
+      hand, and every statement must use the **same client** - a pool hands each `pool.query` call to whichever
+      connection is free, so `BEGIN` and `COMMIT` on `pool.query` are not one transaction (illustrative):
+
+      ```typescript
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await work(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [lost-update-prevention, acid-transactions-savepoints]
+    title: Why the important lines are written that way
+    body: |
+      - **Validate before `db.transaction`.** An invalid amount needs no database work; the test checks that
+        neither `query` nor `transaction` is called.
+      - **`SET refunded_minor = refunded_minor + $2`**, not `= $computed`. The new value is computed by the
+        database from the row version it locked, never from an earlier read.
+      - **`AND refunded_minor + $2 <= captured_minor`** puts the business rule where PostgreSQL re-evaluates it
+        after waiting for a concurrent writer. That one clause is what stops the double refund.
+      - **`RETURNING refunded_minor, currency`** gives the new total and the data for the event without a
+        second read.
+      - **The follow-up SELECT runs only when 0 rows changed**, inside the same transaction, to tell
+        "no such payment" from "not enough left" - the error the user sees depends on it.
+      - **`tx.query`, never `db.query`, inside the callback.** Statements on another handle are not part of
+        the transaction (with a pool, they run on another connection).
+      - **The outbox insert is in the transaction**, so a crash after the refund row leaves neither row; the
+        failure test injects exactly that crash through `afterRefundRow`.
+      - **`$1, $2, $3` parameters** for every value: SQL injection is impossible and the plan can be reused.
+
+  - id: tests
+    kind: tests
+    concepts: [lost-update-prevention, serialization-retries-deadlocks, acid-transactions-savepoints]
+    title: Testing concurrency and atomicity
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Two refunds that together exceed captured | fire two `POST /payments/pay_1001/refunds` of 6000 **in parallel** (10000 captured) | one 201, one 409 with `refundableMinor: 4000` | both responses; `refunded_minor = 6000`; one refund row |
+      | 2 | Many small concurrent refunds | 20 parallel refunds of 500 | all 201; total exactly 10000 | `refunded_minor`, `count(*)`, `sum(amount_minor)` agree |
+      | 3 | Crash half-way | inject a failure after the refund insert (test hook, or a failing outbox insert) | 500; nothing persisted | no refund row, no outbox row, total unchanged |
+      | 4 | Invariant on refund rows | two concurrent refunds in the **rows-only** design | never `sum > captured` | `SELECT sum(...)`; repeat 100 times - races are probabilistic |
+      | 5 | Serialization failure | force a 40001 (two Serializable transactions as in the transcript, or a fake error) | the request is retried and succeeds once; no duplicate rows | logs show the retry; one refund row |
+      | 6 | Non-retryable error | trigger a check violation | no retry; 4xx/5xx at once | one attempt in the logs |
+      | 7 | Deadlock-prone batch | run two batch jobs over overlapping payments in opposite input order | no `40P01` in the logs (locks taken in id order) | database log, job results |
+      | 8 | Long transaction | slow down the processor stub | no database locks held while waiting | `pg_stat_activity` shows no `idle in transaction` session during the call |
+
+      Run concurrency tests against a **real PostgreSQL** with several connections - an in-memory fake or a
+      single connection serialises everything and hides the bug. Repeat them: a race that loses one run in
+      fifty is still a production incident.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [lost-update-prevention, serialization-retries-deadlocks, acid-transactions-savepoints, postgres-isolation-levels]
+    title: Common mistakes and how to debug them
+    body: |
+      - **SELECT, compute in JavaScript, UPDATE with the result.** Lost updates. Move the arithmetic and the
+        rule into one UPDATE, or lock with `FOR UPDATE`.
+      - **`BEGIN` on `pool.query`.** Each call may get a different connection: the "transaction" isn't one, and
+        a connection may be returned to the pool still inside an open transaction. Use one client.
+      - **Ignoring "0 rows updated".** A conditional or versioned UPDATE reports failure only through
+        `rowCount`; treating it as success loses the refusal.
+      - **"We'll use Serializable" without retry code.** Serializable turns anomalies into 40001 errors - users
+        then see 500s instead of wrong data. Every Serializable or Repeatable Read transaction needs the retry
+        loop.
+      - **Retrying the failed statement only.** The decision was made from a stale snapshot; retry the whole
+        function.
+      - **Retrying everything.** A constraint violation retried five times is five identical failures and a
+        slower error.
+      - **A processor call inside the transaction.** Locks held for seconds, and a committed charge with a
+        rolled-back database row. Use an outbox, or commit a "pending" state first.
+      - **Locks in different orders** across code paths - deadlocks under load only. Sort ids before locking.
+      - **Catching an error and carrying on in the same transaction.** Every later statement fails with 25P02
+        and `COMMIT` rolls back. Roll back (or to a savepoint) first.
+
+      **Debugging method.** Reproduce with two `psql` sessions (or a script with two connections) and write the
+      interleaving down step by step, as in this lesson's transcripts. In production, look for `40001`,
+      `40P01` and `25P02` in the logs, check `pg_stat_activity` for sessions `idle in transaction` and
+      `pg_locks` for who waits on whom, and compare totals with their detail rows
+      (`refunded_minor` against `sum(refunds.amount_minor)`) - a mismatch is the fingerprint of a lost update.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [postgres-isolation-levels, lost-update-prevention, serialization-retries-deadlocks]
+    title: Trade-offs and alternatives
+    body: |
+      - **Read Committed + careful statements** (conditional UPDATEs, `FOR UPDATE` on a parent row): fast, no
+        retries for most code, but every developer must spot every read-modify-write. Most PostgreSQL
+        applications live here.
+      - **Serializable everywhere:** anomalies become errors you retry, so correctness no longer depends on
+        spotting every pattern - at the cost of some aborted work, retry code everywhere and possible false
+        positives (SSI is conservative). The manual notes "only updating transactions might need to be
+        retried; read-only transactions will never have serialization conflicts" at Repeatable Read.
+      - **Pessimistic vs optimistic:** `FOR UPDATE` makes others wait (good when conflicts are frequent and
+        short); version columns never wait and fail fast (good when conflicts are rare or the read and write are
+        far apart, as in HTTP edits).
+      - **Constraints vs application checks:** a `CHECK` or `UNIQUE` constraint is enforced by the database
+        for every writer, including the ones you didn't write; application checks give friendlier errors. Use
+        both.
+      - **Other databases differ.** "Repeatable Read" or "Serializable" mean different things in other
+        engines (some use locking rather than snapshots); this lesson describes PostgreSQL 18. Check your
+        database's documentation before relying on a level's name.
+
+  - id: summary
+    kind: summary
+    concepts: [acid-transactions-savepoints, postgres-isolation-levels, lost-update-prevention, serialization-retries-deadlocks]
+    title: Quick reference
+    body: |
+      - A transaction is all-or-nothing. In PostgreSQL an error aborts it: later statements get **25P02**,
+        `COMMIT` becomes `ROLLBACK`; savepoints rescue earlier work.
+      - MVCC: readers don't block writers. Read Committed takes a snapshot per **statement**, Repeatable Read and
+        Serializable per **transaction**.
+      - Table 13.1: no dirty reads in PostgreSQL at any level; Repeatable Read has no phantoms but allows
+        serialization anomalies such as **write skew**; only Serializable (SSI) prevents them.
+      - Lost update = read, compute, write. Cure it with a **conditional atomic UPDATE**, **`SELECT ... FOR
+        UPDATE`**, or a **version column** - and keep a **CHECK** constraint.
+      - At Read Committed a waiting UPDATE **re-evaluates its WHERE clause** on the new row version.
+      - **40001** (`serialization_failure`) and **40P01** (`deadlock_detected`): retry the **whole**
+        transaction with capped, jittered backoff; don't retry other errors blindly.
+      - Lock rows in a **consistent order**; keep transactions short; no user waits or network calls inside -
+        use an **outbox**.
+
+exercises:
+  - id: diagnose-lost-update
+    type: mcq
+    concept: lost-update-prevention
+    skill: analysis
+    title: Where did the 3000 go?
+    prompt: |
+      The refunds service logs two approved refunds on `pay_1001` (captured 10000): 3000 at 10:02:01.120 and
+      4000 at 10:02:01.180. Both requests returned 201. The database now shows `refunded_minor = 4000` and two
+      refund rows. The code is:
+
+      ```typescript
+      const { rows } = await db.query('SELECT refunded_minor FROM payments WHERE id = $1', [id]);
+      const total = rows[0].refunded_minor + amount;
+      if (total > captured) return conflict();
+      await db.query('UPDATE payments SET refunded_minor = $2 WHERE id = $1', [id, total]);
+      await db.query('INSERT INTO refunds (payment_id, amount_minor) VALUES ($1, $2)', [id, amount]);
+      ```
+
+      What happened?
+    options:
+      - id: lost-update
+        text: Both requests read 0 before either wrote; the second UPDATE wrote 0 + 4000 over the first one's 3000
+        feedback: Correct - a lost update (Berenson's P4). Each write was computed from a stale read; the row lock only made the second write wait, it didn't change the value it wrote.
+      - id: dirty-read
+        text: The second request read the first one's uncommitted 3000 and then it was rolled back
+        feedback: PostgreSQL never allows dirty reads - and if it had read 3000 it would have written 7000, not 4000.
+      - id: missing-index
+        text: Without an index on payments.id the UPDATE matched the wrong row
+        feedback: id is the primary key, so it is indexed; and the refund rows show both requests targeted pay_1001. An index changes speed, not results.
+      - id: driver-cache
+        text: node-postgres cached the SELECT result between requests
+        feedback: The driver doesn't cache query results. Two requests reading the same committed value is exactly what Read Committed allows.
+    correct: [lost-update]
+    hints:
+      - What would the final value be if the requests had run one after the other?
+      - Which value did the 4000-request compute its total from?
+    solution: |
+      **A lost update.** Run one at a time, the total would be 7000. Both requests read `refunded_minor = 0`
+      (60 ms apart, before either committed), computed 3000 and 4000, and wrote those **constants**. To confirm,
+      compare `refunded_minor` with `SELECT sum(amount_minor) FROM refunds WHERE payment_id = 'pay_1001'`
+      (7000): the detail rows and the total disagree. Fix: `UPDATE ... SET refunded_minor = refunded_minor + $2
+      WHERE id = $1 AND refunded_minor + $2 <= captured_minor` in a transaction with the insert.
+    followUp: |
+      The same code, but each refund is only a row in `refunds` and there is no total column. Can it still
+      over-refund? Which anomaly is that, and which isolation level stops it?
+
+  - id: choose-fix
+    type: mcq
+    concept: lost-update-prevention
+    skill: application
+    title: The smallest correct fix
+    prompt: |
+      SandPay's stock of gift cards is a row `gift_card_batches(id, remaining int CHECK (remaining >= 0))`.
+      Checkout reserves `n` cards. The service runs at Read Committed, and two checkouts often hit the same
+      batch at once. Which change keeps `remaining` correct with the least extra machinery?
+    options:
+      - id: atomic
+        text: "UPDATE gift_card_batches SET remaining = remaining - $2 WHERE id = $1 AND remaining >= $2 RETURNING remaining - and treat 0 rows as sold out"
+        feedback: Correct - one statement does the check and the change on the locked row version; no retry and no explicit lock needed.
+      - id: serializable-only
+        text: Switch the database default to Serializable and keep the SELECT-then-UPDATE code
+        feedback: That turns the race into 40001 errors - correct only if every caller also gets retry code, which is more machinery than one conditional UPDATE.
+      - id: check-only
+        text: Rely on the CHECK constraint (remaining >= 0)
+        feedback: The constraint stops negative stock, but a lost update can still leave remaining too HIGH (two reservations, one decrement) - a valid but wrong value.
+      - id: app-mutex
+        text: Wrap the code in an in-process mutex in Node.js
+        feedback: Works for one process only; with two app instances (or a cron job writing too) the race is back. The database is the shared point.
+    correct: [atomic]
+    hints:
+      - Can the rule "enough remaining" be written in a WHERE clause?
+      - Which fix still works with three app servers?
+    solution: |
+      **The conditional atomic UPDATE.** At Read Committed the second checkout waits for the first one's row
+      lock, then PostgreSQL re-evaluates `remaining >= $2` on the new version. `rowCount = 0` means "not enough
+      left". Keep the CHECK as a safety net; it alone can't prevent a lost update that leaves a wrong but valid
+      number.
+
+  - id: order-reevaluation
+    type: order
+    concept: lost-update-prevention
+    skill: recall
+    title: What a waiting UPDATE does at Read Committed
+    prompt: |
+      Session A has updated `pay_1001` and not committed. Session B now runs
+      `UPDATE payments SET refunded_minor = refunded_minor + 6000 WHERE id = 'pay_1001' AND refunded_minor + 6000 <= captured_minor`.
+      Put what happens in order (first at the top).
+    items:
+      - id: find
+        text: B finds the row version visible to its statement's snapshot
+      - id: wait
+        text: B sees A has changed the row and waits for A to commit or roll back
+      - id: commit
+        text: A commits
+      - id: reevaluate
+        text: B re-evaluates its WHERE clause against A's new version of the row
+      - id: apply
+        text: B updates the row if it still matches, or skips it (reporting 0 rows) if not
+    hints:
+      - Read Committed section 13.2.1 - "the would-be updater will wait..."
+    solution: |
+      B can't overwrite an uncommitted change, so it waits. When A commits, B "will attempt to apply its
+      operation to the updated version of the row", re-evaluating the WHERE clause first (13.2.1). That's why
+      the conditional UPDATE in the transcript reported `UPDATE 0`. (If A had rolled back, B would proceed
+      with the original row.)
+
+  - id: debug-refund-handler
+    type: debug
+    concept: serialization-retries-deadlocks
+    skill: analysis
+    title: Find the transaction mistakes
+    prompt: |
+      This Express handler uses node-postgres with a pool. Under load the team sees connections stuck
+      `idle in transaction`, refunds recorded although the processor rejected them, and occasional
+      over-refunds. Click **every** line that is wrong.
+    language: typescript
+    code: |
+      app.post('/payments/:id/refunds', async (req, res) => {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const { rows } = await pool.query('SELECT captured_minor, refunded_minor FROM payments WHERE id = $1', [req.params.id]);
+          if (rows[0].refunded_minor + req.body.amountMinor > rows[0].captured_minor) return res.status(409).end();
+          await client.query('INSERT INTO refunds (payment_id, amount_minor) VALUES ($1, $2)', [req.params.id, req.body.amountMinor]);
+          const result = await processor.refund(req.params.id, req.body.amountMinor);
+          await client.query('UPDATE payments SET refunded_minor = refunded_minor + $2 WHERE id = $1', [req.params.id, req.body.amountMinor]);
+          await client.query('COMMIT');
+          res.status(201).json(result);
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      });
+    correctLines: [5, 6, 8]
+    lineNotes:
+      - line: 4
+        note: BEGIN on the checked-out client is right - the problem is what runs on other handles and what returns early.
+      - line: 9
+        note: The increment itself is computed by the database (refunded_minor + $2), which is good; the race comes from the separate check on lines 5-6.
+      - line: 13
+        note: Rolling back on error and rethrowing is correct.
+    hints:
+      - Which handle does line 5 use - is it part of the transaction?
+      - What happens to the open transaction when line 6 returns early?
+      - What should never happen between BEGIN and COMMIT?
+    solution: |
+      - **Line 5** reads with `pool.query` - another connection, outside the transaction - and without a lock,
+        so two requests both pass the check (and it's a separate SELECT anyway).
+      - **Line 6** checks in JavaScript (a read-modify-write race) **and returns without COMMIT or ROLLBACK**;
+        `finally` releases a connection that is still inside an open transaction - the `idle in transaction`
+        sessions.
+      - **Line 8** calls the processor inside the transaction: locks are held for the network call, and if the
+        processor fails after the refund row was inserted, or the COMMIT fails after the processor succeeded,
+        the database and the processor disagree.
+
+      Fix: one conditional UPDATE (`... AND refunded_minor + $2 <= captured_minor`) on `client` and the insert of
+      a `pending` refund plus an outbox row in the transaction; commit; let a worker call the processor and
+      record the outcome.
+
+  - id: write-skew-level
+    type: mcq
+    concept: postgres-isolation-levels
+    skill: analysis
+    title: Which level stops this?
+    prompt: |
+      SandPay stores refunds only as rows. Two transactions each run
+      `SELECT captured - sum(refunds)` for `pay_1001`, both see 10000 refundable, and each inserts a 7000
+      refund row. On PostgreSQL 18, at which isolation level does one of them fail instead of both committing?
+    options:
+      - id: serializable
+        text: Serializable only - one transaction gets SQLSTATE 40001 (read/write dependencies)
+        feedback: Correct - this is write skew. No row is written by both, so only SSI's dependency tracking detects it.
+      - id: repeatable
+        text: Repeatable Read and Serializable - Repeatable Read refuses concurrent updates
+        feedback: Repeatable Read refuses to modify a row someone else changed after the snapshot; here each transaction inserts a NEW row, so there is no such row. Both commit (14000 refunded in the run above).
+      - id: read-committed
+        text: All levels - the INSERTs conflict on the refunds table
+        feedback: Inserting different rows doesn't conflict; there is no unique constraint involved.
+      - id: read-uncommitted
+        text: Read Uncommitted, because each transaction sees the other's uncommitted insert
+        feedback: PostgreSQL's Read Uncommitted behaves like Read Committed - it never shows uncommitted data.
+    correct: [serializable]
+    hints:
+      - Is there any single row that both transactions modify?
+      - Table 13.1 - which level makes serialization anomalies "not possible"?
+    solution: |
+      **Serializable.** This is **write skew** (Berenson's A5B): each transaction's decision is valid on its
+      snapshot, but together they break a rule that spans rows. Snapshot isolation (PostgreSQL's Repeatable
+      Read) only refuses writes to the **same row**. At Serializable, SSI's predicate locks notice the
+      read/write dependencies and cancel one transaction with 40001 at COMMIT - so the application must retry.
+      Alternatives at lower levels: a running total row updated conditionally, or `SELECT ... FOR UPDATE` on the
+      payment row before checking.
+
+  - id: retry-what
+    type: mcq
+    concept: serialization-retries-deadlocks
+    skill: application
+    title: The right reaction to 40001
+    prompt: |
+      A Serializable transaction reads the refundable amount, decides to refund 3000, inserts the refund and
+      gets `ERROR 40001: could not serialize access due to read/write dependencies among transactions` at
+      COMMIT. What should the code do?
+    options:
+      - id: rerun-all
+        text: Roll back, wait a short random time, and run the whole function again - read, decide and write - up to a few attempts
+        feedback: Correct - the manual says to retry the complete transaction, including the logic that decides what to write.
+      - id: rerun-insert
+        text: Run just the INSERT and COMMIT again
+        feedback: The transaction is aborted, and the decision to refund 3000 was made from a snapshot that is now known to be inconsistent.
+      - id: lower-level
+        text: Catch it and retry at Read Committed, where it can't happen
+        feedback: Read Committed would let the write skew through - exactly the anomaly Serializable just prevented.
+      - id: return-500
+        text: Return 500 - serialization failures mean a database bug
+        feedback: 40001 is expected behaviour at Serializable; the HINT even says "The transaction might succeed if retried."
+    correct: [rerun-all]
+    hints:
+      - "Manual 13.6: retry \"the complete transaction, including all logic that decides which SQL to issue\"."
+    solution: |
+      **Retry the whole unit of work** with backoff and a cap. On the next attempt the snapshot includes the
+      transaction that won, so the read returns the new refundable amount and the decision may change (here, a
+      refusal). Only after the cap is reached should the user see an error.
+
+  - id: atomicity-mcq
+    type: mcq
+    concept: acid-transactions-savepoints
+    skill: analysis
+    title: What did this transaction commit?
+    prompt: |
+      A migration script runs, in one connection:
+
+      ```sql
+      BEGIN;
+      INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 500);
+      INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 0);   -- violates CHECK (amount_minor > 0)
+      INSERT INTO refunds (payment_id, amount_minor) VALUES ('pay_1001', 700);
+      COMMIT;
+      ```
+
+      The script ignores errors and prints "done". How many of these rows are in the table afterwards?
+    options:
+      - id: none
+        text: None - after the error every statement fails, and COMMIT performs a rollback
+        feedback: Correct - the third insert fails with 25P02 and COMMIT answers ROLLBACK, discarding the first insert too.
+      - id: two
+        text: Two - the 500 and the 700 rows; only the failing statement is skipped
+        feedback: That's how some other databases or client tools behave, not PostgreSQL inside a transaction block - one error aborts the whole transaction.
+      - id: one
+        text: One - the 500 row, committed before the error
+        feedback: Nothing is committed before COMMIT. The 500 row was part of the aborted transaction.
+      - id: error-on-commit
+        text: COMMIT raises an error and the script stops
+        feedback: In the run above COMMIT returned the command tag ROLLBACK, not an error - which is why a script that ignores tags prints "done".
+    correct: [none]
+    hints:
+      - Look at the run in "an aborted transaction, and a savepoint".
+    solution: |
+      **None.** The CHECK violation aborts the transaction; the 700 insert fails with SQLSTATE 25P02, and
+      `COMMIT` is answered with `ROLLBACK`. To keep the good rows you'd need a `SAVEPOINT` before each insert
+      and `ROLLBACK TO SAVEPOINT` after a failure - or, better, validate the data before the transaction and
+      check every result.
+
+  - id: coding-refund
+    type: coding
+    concept: lost-update-prevention
+    skill: application
+    title: A refund that stays correct under concurrency and failure
+    prompt: |
+      `exercises/transactions/refunds.ts` contains the "obvious" refund: a SELECT, a check in TypeScript, an
+      UPDATE with the computed total, then the inserts - all outside a transaction. Rewrite `refund` so that
+      concurrent refunds never exceed the captured amount and a failure half-way leaves no trace. The comment
+      at the top of the file is the full contract (validation, one transaction, one conditional UPDATE, the
+      outbox row, the `afterRefundRow` hook, the result types). The schema is in `schema.ts`.
+    project: fullstack
+    files:
+      - exercises/transactions/refunds.ts
+    test: tests/transactions/refunds.test.ts
+    command: npx vitest run tests/transactions/refunds.test.ts
+    hints:
+      - Run the tests first - "two refunds at the same time" and "five small refunds" fail because the awaits between the SELECT and the UPDATE let two calls interleave, even on one connection.
+      - "`db.transaction(async (tx) => { ... })` commits when the callback resolves and rolls back when it throws - use `tx.query` for every statement inside."
+      - "Write the check into the UPDATE: `WHERE id = $1 AND refunded_minor + $2 <= captured_minor RETURNING refunded_minor, currency`."
+      - "If `rows` is empty, SELECT the payment (still on `tx`) to choose between not_found and exceeds_refundable."
+      - "`Number.isSafeInteger(amountMinor) && amountMinor > 0` - and return before calling any database method."
+    modelAnswer: |
+      Validate first, then do everything in `db.transaction`. The single statement
+      `UPDATE payments SET refunded_minor = refunded_minor + $2 WHERE id = $1 AND refunded_minor + $2 <= captured_minor RETURNING refunded_minor, currency`
+      does the check and the change on the row the transaction locks; with zero rows, a SELECT on `tx` tells
+      `not_found` from `exceeds_refundable`. Insert the refund, call `hooks.afterRefundRow?.(tx)`, insert the
+      outbox event and return the new total. Because the callback throws when the hook throws, PGlite rolls
+      back the total, the refund row and (never reached) the outbox row together. The full code is in the
+      section "The refund in TypeScript" and in `solutions/transactions/refunds.ts`.
+    solution: |
+      The race in the given code is the gap between the SELECT and the UPDATE: two calls both read 0 and both
+      write their own total. Moving the rule into `WHERE id = $1 AND refunded_minor + $2 <= captured_minor`
+      makes PostgreSQL decide on the locked, current row; wrapping every statement in `db.transaction` makes
+      the total, the refund row and the outbox event commit together, so the hook's failure rolls all of them
+      back. Compare with `solutions/transactions/refunds.ts`.
+    rubric:
+      - Every test in tests/transactions/refunds.test.ts passes
+      - The check and the change are one conditional UPDATE - no SELECT-then-UPDATE of a computed total
+      - All statements after validation run on tx inside one db.transaction call
+      - Every value is a $n parameter
+      - The CHECK constraint stays in the schema as a last line of defence
+
+  - id: coding-retry
+    type: coding
+    concept: serialization-retries-deadlocks
+    skill: application
+    title: Retry serialization failures and deadlocks
+    prompt: |
+      Implement `isRetryable`, `withTransactionRetry` and `exponentialBackoff` in
+      `exercises/transactions/retry.ts`. Retry the **whole** function on SQLSTATE 40001 and 40P01 only, sleep
+      with the injected backoff before each retry, rethrow other errors at once and the last error after
+      `maxAttempts` (default 3). The file's comment is the full contract.
+    project: fullstack
+    files:
+      - exercises/transactions/retry.ts
+    test: tests/transactions/retry.test.ts
+    command: npx vitest run tests/transactions/retry.test.ts
+    hints:
+      - "Check the shape before reading `code`: `typeof error === 'object' && error !== null && 'code' in error`, and compare the string."
+      - "A `for (let attempt = 1; ; attempt++)` loop with `try { return await run(attempt) } catch (error) { ... }` keeps the logic flat."
+      - Rethrow when the error isn't retryable OR attempt >= maxAttempts; otherwise sleep, call onRetry, and loop.
+      - "Full jitter: `random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))`."
+    modelAnswer: |
+      ```typescript
+      const RETRYABLE = new Set(['40001', '40P01']);
+      export function isRetryable(error: unknown): boolean {
+        if (typeof error !== 'object' || error === null || !('code' in error)) return false;
+        const { code } = error as { code: unknown };
+        return typeof code === 'string' && RETRYABLE.has(code);
+      }
+      export async function withTransactionRetry<T>(run: (attempt: number) => Promise<T>, options: RetryOptions): Promise<T> {
+        const maxAttempts = options.maxAttempts ?? 3;
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await run(attempt);
+          } catch (error) {
+            if (!isRetryable(error) || attempt >= maxAttempts) throw error;
+            await options.sleep(options.backoffMs(attempt));
+            options.onRetry?.(attempt, error);
+          }
+        }
+      }
+      export const exponentialBackoff = (baseMs: number, capMs: number, random: () => number) =>
+        (attempt: number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1));
+      ```
+
+      `return await` inside `try` is essential: without `await`, a rejected promise escapes the `catch`. The
+      wrapper takes a **function**, not a promise, so each attempt starts the work again from the beginning -
+      in real code, `run` opens its own transaction (`() => db.transaction(tx => refundWork(tx))`).
+    solution: |
+      Match the SQLSTATE in `error.code` against `40001` and `40P01` only; loop calling `run(attempt)` again
+      from the start; rethrow non-retryable errors immediately and the last error when attempts run out; sleep
+      for `backoffMs(attempt)` before each retry. The backoff is full jitter under a doubling, capped ceiling.
+      Compare with `solutions/transactions/retry.ts`.
+    rubric:
+      - Every test in tests/transactions/retry.test.ts passes
+      - Matches on error.code (stable), not on the message text (varies)
+      - Retries by calling the whole function again, never a single statement
+      - The delay is capped and randomised (jitter), and sleep and random are injected for testing
+
+  - id: testdesign-concurrency
+    type: testdesign
+    concept: lost-update-prevention
+    skill: application
+    title: Prove the refund endpoint has no race
+    prompt: |
+      A developer says the refund endpoint is "fixed for concurrency". Design the tests you would run against
+      the deployed API and a real PostgreSQL to accept that claim. Give preconditions, steps, expected results
+      and the **evidence** you'd collect - including how you make a race likely enough to catch.
+    hints:
+      - Which invariants can you check directly in the database after the run?
+      - A race that appears once in 50 runs needs a loop, not a single attempt.
+    modelAnswer: |
+      **Preconditions:** a test payment `pay_t1` captured 10000 with no refunds; DB read access; the API
+      running with production-like pool size (several connections) and at least two app instances.
+
+      1. **Over-refund race:** send two refunds of 6000 truly in parallel (a script firing both after a shared
+         barrier), 100 iterations with a fresh payment each. Expected: exactly one 201 and one 409 per pair.
+         Evidence: response codes per iteration; for every payment `refunded_minor = sum(refunds.amount_minor) <= captured_minor`.
+      2. **Lost-update race:** 20 parallel refunds of 500 on a fresh payment. Expected: 20 × 201 and a total of
+         exactly 10000. Evidence: the same SQL invariant, row count 20.
+      3. **Atomicity:** make the outbox insert fail (feature flag or a temporary constraint in the test DB).
+         Expected: 5xx and no refund row, no total change. Evidence: before/after queries.
+      4. **Retry path** (if Serializable is used): force contention and check logs for 40001 followed by a
+         successful retry, with no duplicate rows.
+      5. **No long transactions:** slow the processor stub to 5 s; during the call `pg_stat_activity` shows no
+         `idle in transaction` session for the service.
+
+      Pass only if every iteration of every invariant query holds.
+    solution: |
+      A convincing test plan uses real parallelism (a barrier, several connections and instances) repeated
+      many times, and checks invariants in the database - `refunded_minor = sum(refunds) <= captured` - not
+      only HTTP codes. It covers the over-refund race, the lost-update race, atomicity under an injected
+      failure, the retry path and the absence of long transactions during the processor call.
+    rubric:
+      - Real parallelism (barrier, several connections/instances) and many iterations
+      - Invariants checked in the database, not only HTTP codes
+      - Covers both over-refund (rule) and lost update (total) races
+      - Tests atomicity by injecting a failure mid-transaction
+      - Checks that no transaction is held across the processor call
+
+  - id: deadlock-short
+    type: short
+    concept: serialization-retries-deadlocks
+    skill: application
+    title: The nightly deadlocks
+    prompt: |
+      Every night, two jobs - settlement and fee adjustment - each update a list of payments in one
+      transaction. A few times a week one of them fails with `ERROR 40P01: deadlock detected`. Explain what is
+      happening and give two changes, one that prevents the deadlock and one that makes the job survive it.
+    hints:
+      - In which order does each job visit the payments?
+      - What does the manual call "the best defense"?
+    modelAnswer: |
+      Each job locks rows (by UPDATE) in the order of its own input list. When job A holds `pay_1001` and wants
+      `pay_1002` while job B holds `pay_1002` and wants `pay_1001`, each waits for the other; PostgreSQL detects
+      the cycle and aborts one with 40P01 - which one is not predictable.
+
+      **Prevent:** take locks in a consistent order - sort the ids and lock them first
+      (`SELECT id FROM payments WHERE id = ANY($1) ORDER BY id FOR UPDATE`), or process them in sorted order;
+      also keep each transaction small (batches of, say, 500 instead of the whole night's list).
+      **Survive:** wrap each batch in the retry wrapper for 40001/40P01 with backoff, so an occasional deadlock
+      costs one retry instead of a failed job.
+    solution: |
+      The two jobs lock the same rows in different orders, so each ends up waiting for the other and
+      PostgreSQL aborts one with 40P01. Lock in a consistent order (sorted ids, `ORDER BY id FOR UPDATE`) and
+      keep batches small to prevent it; retry the whole batch on 40P01 (and 40001) with backoff to survive the
+      rare case that remains.
+    rubric:
+      - Explains the cycle of two transactions each holding what the other needs
+      - Consistent lock order (sorted ids) as the prevention
+      - Retrying the whole batch on 40P01 as the recovery
+      - Mentions smaller or shorter transactions as reducing the window
+
+  - id: interview-never-over-refund
+    type: interview
+    concept: lost-update-prevention
+    skill: application
+    title: "Interview: guarantee we never refund more than was captured"
+    prompt: |
+      *"Our refund service runs on three instances against PostgreSQL. How do you guarantee we never refund
+      more than was captured - even with concurrent requests and crashes?"*
+    hints:
+      - Name the race, then the database mechanism, then failure handling and verification.
+    modelAnswer: |
+      The danger is a read-modify-write race: two requests read the same refunded total and both approve. An
+      in-process lock doesn't help across three instances, so the guarantee has to live in the database.
+
+      I'd keep a running `refunded_minor` on the payment and change it with one conditional statement in the
+      same transaction as the refund row: `UPDATE payments SET refunded_minor = refunded_minor + $2 WHERE id =
+      $1 AND refunded_minor + $2 <= captured_minor RETURNING ...`. At Read Committed a concurrent request waits
+      for the row lock and PostgreSQL re-evaluates the WHERE clause on the new version, so the second one
+      updates zero rows and we answer 409 with what is left. A `CHECK (refunded_minor <= captured_minor)`
+      backs it up.
+
+      For crashes: the total, the refund row and an outbox event are in one transaction, so they commit
+      together or not at all; the processor is called by a worker reading the outbox, never inside the
+      transaction. Retries from clients are deduplicated with an idempotency key.
+
+      If the rule couldn't be one row - refunds only as rows - I'd lock the payment with `SELECT ... FOR UPDATE`
+      first, or run Serializable with a retry loop on 40001, because Repeatable Read alone allows write skew.
+
+      And I'd prove it: parallel-request tests in a loop against real PostgreSQL, checking
+      `refunded_minor = sum(refunds) <= captured` after every run, plus a nightly reconciliation query in
+      production.
+    solution: |
+      A strong answer names the read-modify-write race, puts the guarantee in the database (one conditional
+      UPDATE on a running total, or FOR UPDATE, or Serializable with retries), backs it with a CHECK
+      constraint, keeps the refund, total and outbox event in one short transaction with no processor call
+      inside, and proves it with concurrent tests and reconciliation.
+    rubric:
+      - Names the race (lost update / read-modify-write) and why app-level locks fail across instances
+      - Conditional atomic UPDATE (or FOR UPDATE / Serializable with retry) with the reasoning
+      - CHECK constraint as a backstop
+      - Atomic transaction with outbox; no processor call inside the transaction
+      - Verification - concurrent tests and reconciliation
+    followUps:
+      - What changes if two different payments' refunds must be updated together (a split refund)? How do you avoid deadlocks?
+      - Why not just set the database default to Serializable?
+      - How would you detect in production that the invariant was ever broken?
+
+placement:
+  - id: place-aborted
+    type: mcq
+    concept: acid-transactions-savepoints
+    skill: application
+    title: After the error
+    prompt: |
+      Inside `BEGIN`, a statement fails with a unique violation. The code catches the error, runs one more
+      valid `UPDATE`, then `COMMIT`. What does PostgreSQL do?
+    options:
+      - id: aborted
+        text: The UPDATE fails with 25P02 and COMMIT rolls back everything since BEGIN
+        feedback: Correct - one error aborts the transaction; only ROLLBACK TO SAVEPOINT could have rescued it.
+      - id: skip
+        text: Only the failing statement is discarded; the UPDATE and earlier work commit
+        feedback: That is not PostgreSQL's behaviour inside a transaction block - the whole transaction is aborted.
+      - id: autocommit
+        text: The UPDATE runs in a new automatic transaction and commits
+        feedback: The session is still inside the failed transaction block until ROLLBACK or COMMIT ends it.
+    correct: [aborted]
+    solution: |
+      After any error in a transaction block PostgreSQL ignores further commands ("current transaction is
+      aborted", SQLSTATE 25P02), and COMMIT ends the block with a rollback. Use a savepoint before a statement
+      you expect might fail, or roll back and start again.
+
+  - id: place-snapshot
+    type: mcq
+    concept: postgres-isolation-levels
+    skill: application
+    title: What does the second read return?
+    prompt: |
+      Session A: `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT refunded_minor ...` returns 0. Session B then
+      runs (autocommit) `UPDATE payments SET refunded_minor = 2500 ...`. Session A runs the same SELECT again.
+      What does A see, and what happens if A now updates that row?
+    options:
+      - id: zero-40001
+        text: A sees 0 again; updating the row fails with 40001 could not serialize access due to concurrent update
+        feedback: Correct - the transaction keeps its snapshot, and may not modify a row changed after it.
+      - id: new-value
+        text: A sees 2500, because B committed
+        feedback: That is Read Committed (a snapshot per statement). Repeatable Read keeps the transaction's first snapshot.
+      - id: blocks
+        text: A's second SELECT waits until B commits
+        feedback: With MVCC reading never blocks writing - and B has already committed.
+    correct: [zero-40001]
+    solution: |
+      Repeatable Read takes one snapshot for the whole transaction, so A reads 0 again. When A tries to update
+      the row B changed after that snapshot, PostgreSQL raises SQLSTATE 40001 and the transaction must be
+      retried from the start.
+
+  - id: place-conditional
+    type: mcq
+    concept: lost-update-prevention
+    skill: application
+    title: The second conditional UPDATE
+    prompt: |
+      Captured 10000, refunded 0. Two transactions at Read Committed each run
+      `UPDATE payments SET refunded_minor = refunded_minor + 7000 WHERE id = 'pay_1001' AND refunded_minor + 7000 <= captured_minor`.
+      The first commits. What does the second one's UPDATE report?
+    options:
+      - id: zero
+        text: "UPDATE 0 - after waiting, it re-checks the WHERE clause on the new row (7000 + 7000 > 10000)"
+        feedback: Correct - this is why one conditional statement prevents the double refund.
+      - id: one
+        text: UPDATE 1 - it checked the condition against the snapshot where refunded was 0
+        feedback: At Read Committed a waiting updater re-evaluates its WHERE clause on the updated version of the row.
+      - id: error
+        text: ERROR 40001 - the row was changed by a concurrent transaction
+        feedback: That happens at Repeatable Read and Serializable. Read Committed waits and re-evaluates instead.
+      - id: check
+        text: A CHECK violation, because refunded would be 14000
+        feedback: The WHERE clause no longer matches, so no row is changed and no constraint is tested.
+    correct: [zero]
+    solution: |
+      At Read Committed the second UPDATE waits for the first one's row lock, then re-evaluates its WHERE
+      clause against the committed version (refunded 7000) - it no longer matches, so 0 rows are updated.
+
+  - id: place-retry
+    type: mcq
+    concept: serialization-retries-deadlocks
+    skill: application
+    title: Which errors to retry
+    prompt: |
+      Which of these errors should a transaction retry wrapper retry automatically?
+    options:
+      - id: right
+        text: 40001 serialization_failure and 40P01 deadlock_detected
+        feedback: Correct - both mean "this transaction lost a concurrency conflict"; re-running it may well succeed.
+      - id: all
+        text: Every database error, up to three times
+        feedback: A check or foreign key violation will fail identically every time - retrying wastes time and hides the real error.
+      - id: check
+        text: 23514 check_violation and 23503 foreign_key_violation
+        feedback: These are data errors - the same input fails again. Report them.
+      - id: none
+        text: None - PostgreSQL retries serialization failures itself
+        feedback: The manual says PostgreSQL "does not offer an automatic retry facility, since it cannot do so with any guarantee of correctness".
+    correct: [right]
+    solution: |
+      Retry the whole transaction on SQLSTATE 40001 and 40P01 (with backoff and a cap). Constraint violations
+      and syntax errors are not transient. The manual adds that a unique violation (23505) can be worth
+      retrying in specific cases, such as a key chosen from data that was read.
+
+recall:
+  - id: recall-acid
+    concept: acid-transactions-savepoints
+    prompt: What do the four letters of ACID guarantee?
+    answer: Atomicity (all or nothing), Consistency (constraints hold after commit), Isolation (concurrent transactions don't see each other's unfinished work, to the degree the level allows), Durability (committed work survives a crash).
+  - id: recall-aborted
+    concept: acid-transactions-savepoints
+    prompt: What happens in PostgreSQL after an error inside a transaction block?
+    answer: The transaction is aborted - further statements fail with 25P02 and COMMIT performs a ROLLBACK - unless you ROLLBACK TO a savepoint taken before the error.
+  - id: recall-snapshots
+    concept: postgres-isolation-levels
+    prompt: When is the snapshot taken at Read Committed, and at Repeatable Read?
+    answer: Read Committed - at the start of each statement. Repeatable Read (and Serializable) - at the first statement of the transaction, for its whole life.
+  - id: recall-table
+    concept: postgres-isolation-levels
+    prompt: Which anomalies does PostgreSQL's Repeatable Read still allow, and which level prevents them?
+    answer: Serialization anomalies such as write skew (no dirty reads, nonrepeatable reads or phantoms). Only Serializable, implemented as Serializable Snapshot Isolation, prevents them - by aborting a transaction with 40001.
+  - id: recall-lost-update
+    concept: lost-update-prevention
+    prompt: Name three ways to prevent a lost update.
+    answer: A single conditional atomic UPDATE (SET x = x + $1 WHERE ... AND rule), a pessimistic SELECT ... FOR UPDATE before deciding, or an optimistic version column checked in the UPDATE's WHERE clause (0 rows = conflict).
+  - id: recall-reevaluate
+    concept: lost-update-prevention
+    prompt: At Read Committed, what does an UPDATE do when the row was changed by a transaction that has since committed?
+    answer: It waits for the other transaction, then re-evaluates its WHERE clause on the new row version and updates it only if it still matches.
+  - id: recall-retry
+    concept: serialization-retries-deadlocks
+    prompt: Which SQLSTATEs should be retried, and what exactly is retried?
+    answer: 40001 (serialization_failure) and 40P01 (deadlock_detected); the complete transaction including its reads and decisions, with capped backoff and jitter.
+  - id: recall-deadlock
+    concept: serialization-retries-deadlocks
+    prompt: How do you prevent deadlocks, and what must never happen inside a transaction?
+    answer: Acquire locks in a consistent order (for example sorted ids); keep transactions short and never wait for a user or call another system inside one - use an outbox.
+
+next:
+  - migrations-and-data-access
+  - postgres-indexes-and-query-plans
+  - idempotency-keys
