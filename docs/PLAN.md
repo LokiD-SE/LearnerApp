@@ -205,12 +205,15 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
       runtime and npm, React components and JSX, React state and effects. Batch 3 done: React forms and validation, routing and data
       fetching (React Router 8), frontend state management, an Express HTTP API, REST API design. Batch 4 done: input validation
       and error handling (zod 4), contract-first OpenAPI, relational modelling and SQL, PostgreSQL indexes and query
-      plans, transactions and isolation (two-session runs on real PostgreSQL 18.6). Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
+      plans, transactions and isolation (two-session runs on real PostgreSQL 18.6). Batch 5 done: migrations
+      and data access, sessions/cookies/tokens, passwords + OAuth 2.0 + OIDC, the OWASP Top 10:2025, testing
+      strategy. Remaining: docker-and-compose, ci-cd-for-web-apps, deployment-and-configuration,
+      web-performance-and-caching, observability-for-web-apps, fullstack-capstone, fullstack-system-design-interview. Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
       Express, PostgreSQL, Docker, GitHub Actions, OWASP. Sources: WHATWG HTML, MDN, ECMA-262, the TypeScript
       handbook, react.dev, nodejs.org, expressjs.com, the PostgreSQL manual, RFCs, OWASP, OpenAPI 3.1, docs.docker.com.
 - [x] `practice/fullstack`: TypeScript, React 19 (Testing Library, jsdom), Express 5 (supertest) and PostgreSQL
       (PGlite, no server); exercise tests tagged `@exercise`; `npm run verify` in CI via `practice/verify.sh fullstack`.
-      30 exercises so far.
+      40 exercises so far.
 - [ ] Track J lessons, in batches of 4-6. Sources: the Model Context Protocol specification
       (modelcontextprotocol.io), Anthropic and OpenAI API docs, LangGraph and CrewAI docs, scikit-learn, NumPy,
       pandas and PyTorch docs, _Deep Learning_ (Goodfellow, Bengio, Courville), _Attention Is All You Need_,

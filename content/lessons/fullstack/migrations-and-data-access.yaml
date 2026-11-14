@@ -1,0 +1,1252 @@
+id: migrations-and-data-access
+title: Migrations and data access from Node.js
+subject: fullstack
+module: databases
+level: intermediate
+status: published
+estimatedMinutes: 70
+summary: Talk to PostgreSQL from Node.js safely and change its schema without breaking production - connection pools and leaks, parameterised queries and SQL injection, type mapping, a small repository layer, versioned migrations, locks, expand and contract, and where ORMs and query builders fit.
+tags:
+  [
+    node-postgres,
+    pg,
+    connection pool,
+    pool leak,
+    max_connections,
+    parameterised queries,
+    sql injection,
+    cwe-89,
+    bigint,
+    repository,
+    data access layer,
+    migrations,
+    schema_migrations,
+    transactional ddl,
+    create index concurrently,
+    alter table,
+    lock_timeout,
+    expand and contract,
+    parallel change,
+    backfill,
+    not valid,
+    orm,
+    prisma,
+    drizzle,
+    kysely,
+    knex,
+    typeorm,
+    postgresql,
+  ]
+
+environment: |
+  - **node-postgres (`pg`) documentation (primary source):** [Pooling](https://node-postgres.com/features/pooling)
+    (always release a checked-out client; `pool.query` for single queries),
+    [pg.Pool](https://node-postgres.com/apis/pool) (the defaults: `max` 10, `idleTimeoutMillis` 10000,
+    `connectionTimeoutMillis` 0 - no timeout), [Pool sizing](https://node-postgres.com/guides/pool-sizing),
+    [Queries](https://node-postgres.com/features/queries) (parameterised queries; "PostgreSQL does not support
+    parameters for identifiers"), [Transactions](https://node-postgres.com/features/transactions) ("You must
+    use the same client instance for all statements within a transaction"),
+    [Data types](https://node-postgres.com/features/types) and the
+    [pg-types README](https://github.com/brianc/node-pg-types) (`int8` is returned as a string). Read
+    November 2026.
+  - **PostgreSQL 18 manual:** [ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html) (lock
+    levels, `NOT VALID` / `VALIDATE CONSTRAINT`, which `ADD COLUMN` forms rewrite the table),
+    [CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html) (building indexes concurrently),
+    [13.3 Explicit Locking](https://www.postgresql.org/docs/18/explicit-locking.html) (table lock modes, 13.3.5
+    advisory locks), [19.3 Connections](https://www.postgresql.org/docs/18/runtime-config-connection.html)
+    (`max_connections`, "typically 100") and [19.11 Client Connection Defaults](https://www.postgresql.org/docs/18/runtime-config-client.html)
+    (`lock_timeout`).
+  - **Security:** [CWE-89, Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')](https://cwe.mitre.org/data/definitions/89.html).
+  - **Expand and contract:** Danilo Sato, [ParallelChange](https://martinfowler.com/bliki/ParallelChange.html),
+    on Martin Fowler's bliki (13 May 2014) - an article, not a standard.
+  - **ORMs and query builders** are described from their own documentation, none installed or run here:
+    [Prisma ORM](https://www.prisma.io/docs/orm/overview/introduction/what-is-prisma),
+    [Drizzle ORM](https://orm.drizzle.team/docs/overview), [Kysely](https://kysely.dev/docs/intro),
+    [Knex.js](https://knexjs.org/) and [TypeORM](https://typeorm.io/). Their APIs change between major
+    versions - check the current docs.
+  - **Real output:** the node-postgres transcripts were run with `pg` 8.23 against PostgreSQL 18.6 (the official
+    server binaries, started with the `embedded-postgres` npm package), `lc_messages = 'C'`, on Node.js 24.
+    "Waiting" means a statement had not finished 500 ms later. The migration-runner output was run on PGlite
+    0.5 (PostgreSQL 18.6 compiled to WebAssembly), which is what the practice project uses; PGlite returns
+    `bigint` columns as JavaScript numbers, node-postgres as strings.
+  - **Fictional:** SandPay, its merchants (`m_42`), orders and e-mail addresses (`example.test`) are invented.
+    Amounts are integers in minor units (2599 = 25.99).
+
+prerequisites:
+  - relational-modelling-and-sql
+  - transactions-and-isolation
+  - node-runtime-and-npm
+
+concepts:
+  - id: pg-pool-and-clients
+    name: Connection pools and clients
+    summary: A connection to PostgreSQL is an expensive server process, and the server allows only max_connections of them (typically 100). A pool keeps a few open and lends them out - pool.query borrows and returns one for a single statement; pool.connect hands you a client that you must release in finally, and every statement of a transaction must run on that one client. A client that is never released is a leak - the pool empties and every later request waits.
+  - id: sql-parameters-and-mapping
+    name: Parameterised queries and type mapping
+    summary: Values go to the server separately from the SQL text as $1, $2 parameters, so input can never change the statement - concatenating input into SQL is SQL injection (CWE-89). Identifiers such as column names can't be parameters, so they come from an allow-list; LIKE wildcards in user text need escaping. Drivers map types differently - node-postgres returns bigint and numeric as strings - so a data-access layer converts rows deliberately.
+  - id: versioned-schema-migrations
+    name: Versioned schema migrations
+    summary: Every schema change is a numbered migration file kept in version control and applied in order by a runner that records what it ran in a table (schema_migrations), with a checksum so an edited migration is refused. PostgreSQL DDL is transactional, so each migration and its record commit together or not at all - except statements such as CREATE INDEX CONCURRENTLY, which can't run in a transaction block. Applied migrations are never edited; you fix forward with a new one.
+  - id: zero-downtime-schema-changes
+    name: Zero-downtime schema changes
+    summary: Most ALTER TABLE forms take an ACCESS EXCLUSIVE lock, and a waiting lock blocks every query queued behind it, so even a fast change needs a lock_timeout. Safe changes avoid table rewrites and long locks (constant defaults, NOT VALID then VALIDATE, CREATE INDEX CONCURRENTLY), and breaking changes such as a rename are split into expand, migrate and contract releases with batched backfills, so old and new code both work at every step.
+
+objectives:
+  - Explain why an application uses a connection pool, size it against max_connections, and diagnose a pool leak from its symptoms and pool counters.
+  - Write data-access code that sends every value as a $n parameter, chooses identifiers from an allow-list, escapes LIKE wildcards and maps driver types to safe integers.
+  - Demonstrate how string-built SQL is exploited, including a stacked statement, and explain why parameters prevent it.
+  - Implement a migration runner that applies ordered migrations once, each in its own transaction, and refuses edited or out-of-order migrations.
+  - Predict which schema changes lock or rewrite a table, and use lock_timeout, NOT VALID, CREATE INDEX CONCURRENTLY and batched backfills to avoid outages.
+  - Plan a column rename as expand, migrate and contract steps that keep old and new application versions working.
+  - Compare raw SQL, query builders and ORMs and choose one for a given team and system.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [pg-pool-and-clients, versioned-schema-migrations]
+    title: The idea in plain language
+    body: |
+      A busy restaurant has a few phone lines to its supplier. Waiters don't each get a private line - they pick
+      up whichever line is free, place an order and **hang up**. If one waiter keeps a line off the hook "in
+      case he needs it again", the next waiter finds one line fewer. When every line is off the hook, the
+      kitchen stops, even though the supplier is perfectly fine. That is a **connection pool**, and the waiter
+      who forgets to hang up is a **leak**.
+
+      The order itself must be unambiguous. "Two crates of tomatoes" read out exactly as written is safe. If a
+      waiter reads out whatever a customer scribbled - "two crates of tomatoes, and also cancel all our other
+      orders" - the supplier obeys. Sending **values separately from the instructions** is what parameterised
+      queries do.
+
+      And the kitchen's layout changes over time: a new fridge, a wall moved. Each change is a numbered work
+      order, done once, recorded in a logbook, and never "re-done differently" - if the fridge is in the wrong
+      place, you write a new work order to move it. You also don't knock down a wall during the dinner
+      service. Those are **migrations** and **zero-downtime changes**.
+
+  - id: why
+    kind: why
+    concepts: [pg-pool-and-clients, sql-parameters-and-mapping, versioned-schema-migrations, zero-downtime-schema-changes]
+    title: Why this matters
+    body: |
+      The database layer is where full stack apps fail in the most expensive ways, and almost never because
+      of PostgreSQL itself:
+
+      - **The app hangs, the database is idle.** One code path forgets to release a client after an early
+        `return`. Under load the pool's ten clients are all checked out; every request waits for a free one
+        until the platform's health check kills the instance. Restarting "fixes" it until the next spike.
+      - **A search box returns another merchant's orders.** A query was built by gluing user input into SQL.
+        That is SQL injection, [CWE-89](https://cwe.mitre.org/data/definitions/89.html), still one of the most
+        exploited weaknesses. It also breaks for honest users - the customer `o'brien@example.test` can't sign
+        up.
+      - **"It worked on staging."** Someone edited a migration that had already run in production, so staging
+        and production now have different schemas under the same version number.
+      - **A two-second migration takes the site down for minutes.** An `ALTER TABLE` waited for a long report
+        query, and every request queued behind it.
+
+      As a tester you have seen these as symptoms - timeouts, wrong data, failed deploys (see
+      [Defect isolation decision trees](#/lesson/defect-isolation-decision-trees)). This lesson is the
+      developer's side: the habits that prevent them.
+
+  - id: what-pool
+    kind: what
+    concepts: [pg-pool-and-clients]
+    title: Pools, clients and the connection budget
+    body: |
+      Each PostgreSQL connection is a server process with its own memory, and opening one costs a network
+      round trip, TLS and authentication. The server caps them with **`max_connections`** - "typically 100
+      connections" by default, set only at server start (manual, 19.3). An application therefore keeps a small
+      **pool** of open connections and lends them out.
+
+      node-postgres (`pg`) gives you three objects:
+
+      | Object | What it is | Use it for |
+      | --- | --- | --- |
+      | `new Client()` | one connection you open and close yourself | scripts, migrations, `LISTEN` |
+      | `new Pool()` | a set of clients, created lazily up to `max` | every web application |
+      | `pool.query(text, values)` | borrows a client, runs **one** statement, returns the client | most queries - the docs call it "the preferred way ... as it removes the risk of leaking a client" |
+      | `pool.connect()` | lends you a client until you call `client.release()` | transactions and several statements that must share a session |
+
+      **The two rules from the node-postgres docs:**
+
+      1. "You must always return the client to the pool if you successfully check it out, regardless of
+         whether or not there was an error" - so `release()` goes in `finally`. Otherwise "your pool will be
+         empty forever and all future requests to check out a client from the pool will wait forever".
+      2. "You must use the same client instance for all statements within a transaction." `pool.query('BEGIN')`
+         and a later `pool.query('COMMIT')` may run on **different** connections - the transaction is not
+         where you think it is (see [Transactions, isolation and concurrency](#/lesson/transactions-and-isolation)).
+
+      **Pool settings that matter** (`pg.Pool` defaults): `max` 10 clients; `idleTimeoutMillis` 10000 (an
+      idle client is closed after 10 s); `connectionTimeoutMillis` **0 - wait forever** for a free client. Set
+      a connection timeout, so a starved pool fails fast with an error you can see instead of hanging.
+
+      **Sizing is a budget across every instance.** Four instances with `max: 25` can open 100 connections -
+      the whole default `max_connections`, leaving none for migrations, admin tools or a fifth instance during
+      a deploy. The node-postgres sizing guide suggests headroom (it gives `max` 20-25 for 4 instances against
+      a 200-connection server) and notes that if the app is starved for connections, faster queries usually
+      help more than a bigger pool. Serverless platforms that start many short-lived instances usually need an
+      external pooler such as PgBouncer or a cloud provider's proxy.
+
+  - id: code-pool
+    kind: code
+    concepts: [pg-pool-and-clients]
+    title: A pool leak, reproduced
+    body: |
+      A pool of two, a one-second connection timeout, and a function that "forgets" `release()`:
+
+      ```javascript
+      const pool = new pg.Pool({ ...config, max: 2, connectionTimeoutMillis: 1000 });
+      const leak = async () => {
+        const client = await pool.connect();
+        await client.query('SELECT 1');
+        // forgot client.release()
+      };
+      await leak();
+      await leak();
+      console.log({ total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount });
+      await pool.query('SELECT 1');
+      ```
+
+      Run with `pg` 8.23 against PostgreSQL 18.6:
+
+      ```plaintext
+      { total: 2, idle: 0, waiting: 0 }
+      after 1s: timeout exceeded when trying to connect
+      ```
+
+      Both clients are checked out and none is idle, so the third query - a harmless `pool.query` - can't get
+      a connection. With the default `connectionTimeoutMillis: 0` it would wait forever instead of failing.
+      **What to watch in production:** `totalCount` stuck at `max` with `idleCount` 0 and `waitingCount`
+      growing, while the database itself is quiet. In PostgreSQL, a leaked client in the middle of a
+      transaction shows up in `pg_stat_activity` as `idle in transaction`.
+
+      The fix is structural - acquire and release in one place:
+
+      ```typescript
+      // Illustrative helper: every pool.connect() goes through it, so release() can't be forgotten.
+      export async function withClient<T>(pool: pg.Pool, work: (client: pg.PoolClient) => Promise<T>) {
+        const client = await pool.connect();
+        try {
+          return await work(client);
+        } finally {
+          client.release();
+        }
+      }
+      ```
+
+  - id: what-params
+    kind: what
+    concepts: [sql-parameters-and-mapping]
+    title: Parameters, identifiers and type mapping
+    body: |
+      With a parameterised query the SQL text has placeholders - `$1`, `$2` - and the values travel in a
+      separate array. node-postgres passes "your query text unaltered as well as your parameters to the
+      PostgreSQL server where the parameters are safely substituted ... within the server itself". The server
+      parses the statement **before** it sees the values, so a value can never become SQL.
+
+      ```typescript
+      await pool.query('SELECT id, amount_minor FROM orders WHERE merchant_id = $1 AND id = $2', [merchantId, id]);
+      ```
+
+      **What can't be a parameter.** "PostgreSQL does not support parameters for identifiers" (node-postgres
+      docs) - table names, column names, `ASC`/`DESC`. A sort option from the UI therefore maps through an
+      **allow-list** to a fixed piece of SQL; anything else is rejected:
+
+      ```typescript
+      const ORDER_BY = { newest: 'created_at DESC, id DESC', largest: 'amount_minor DESC, id DESC' } as const;
+      ```
+
+      **LIKE wildcards are data too.** In `customer_email LIKE '%' || $1 || '%'`, a user who types `%` or `_`
+      gets wildcard behaviour - `ravi_` also matches `raviak@...`. Escape `\`, `%` and `_` with a backslash
+      (the default LIKE escape character) before passing the text.
+
+      **Type mapping.** Drivers decide what JavaScript type a column becomes:
+
+      | PostgreSQL type | node-postgres 8 gives you | Why |
+      | --- | --- | --- |
+      | `integer` (`int4`) | `number` | always fits |
+      | `bigint` (`int8`), `count(*)` | **`string`** | a JavaScript number can't hold every 64-bit integer, so "node-postgres just returns int8 results as strings and leaves the parsing up to you" (pg-types README) |
+      | `numeric` | `string` | exact decimals don't fit a binary float |
+      | `timestamptz` | `Date` | millisecond precision only |
+      | `json` / `jsonb` | parsed object | `JSON.parse` |
+
+      PGlite returns `bigint` as a JavaScript number - so code tested only on one driver can break on the
+      other. Convert deliberately in one place: `Number(value)`, then `Number.isSafeInteger` - or keep money as
+      `bigint`/string end to end. Never let `id + 1` silently become string concatenation (`'12' + 1` is
+      `'121'`).
+
+  - id: code-injection
+    kind: code
+    concepts: [sql-parameters-and-mapping]
+    title: SQL injection, reproduced
+    body: |
+      Three orders, two merchants. The first query glues the input into the SQL text; the second passes it as
+      a parameter. The input is `x' OR '1'='1`:
+
+      ```javascript
+      const email = "x' OR '1'='1";
+      await client.query("SELECT id, customer_email FROM orders WHERE customer_email = '" + email + "'");
+      await client.query('SELECT id, customer_email FROM orders WHERE customer_email = $1', [email]);
+      ```
+
+      ```plaintext
+      concatenated: [
+        { id: '1', customer_email: 'asha@example.test' },
+        { id: '2', customer_email: 'li@example.test' },
+        { id: '3', customer_email: 'sam@example.test' }
+      ]
+      parameterised: []
+      ```
+
+      The quote in the input closed the string literal, and `OR '1'='1'` became part of the WHERE clause:
+      every row came back. As a parameter, the same text is just an e-mail address nobody has. (Note the ids:
+      `bigint`, so strings.)
+
+      **Stacked statements.** A query **without** parameters goes over the simple query protocol, which allows
+      several statements in one string. Input `x'; DELETE FROM orders; --`:
+
+      ```plaintext
+      stacked result is array: true [ 'SELECT 0', 'DELETE 3' ]
+      orders left: { count: '0' }
+      with params: 42601 cannot insert multiple commands into a prepared statement
+      ```
+
+      The concatenated query ran a `DELETE`. A query **with** parameters uses the extended protocol, where
+      PostgreSQL refuses more than one command - an extra layer of protection, not the main one.
+
+      **Identifiers can't be parameters:**
+
+      ```plaintext
+      SELECT id FROM $1                  ->  42601 syntax error at or near "$1"
+      SELECT id FROM orders ORDER BY $1  ->  runs, but sorts by a constant - the order is not what you wanted
+      ```
+
+      The second one is the dangerous mistake: no error, just a sort that silently does nothing. Hence the
+      allow-list.
+
+  - id: visual-params
+    kind: visual
+    concepts: [sql-parameters-and-mapping, pg-pool-and-clients]
+    title: One request, one borrowed connection, values sent apart
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant H as Express handler
+        participant R as Orders repository
+        participant P as pg Pool (max 10)
+        participant DB as PostgreSQL
+        H->>R: search("m_42", emailContains, sortBy)
+        R->>R: sortBy through the allow-list, escape LIKE wildcards
+        R->>P: pool.query(text with $1 and $2, [values])
+        P->>DB: Parse - SQL text only
+        P->>DB: Bind - the values, separately
+        DB-->>P: rows (bigint as text)
+        P-->>R: rows - the client goes back to the pool
+        R-->>H: Order objects with safe integer ids
+      ```
+
+      What to notice: the statement is parsed before the values arrive, so no value can change its meaning;
+      and the connection is borrowed for exactly one statement. The repository is the single place that
+      knows SQL, identifiers and type conversion.
+
+  - id: example-repository
+    kind: example
+    concepts: [sql-parameters-and-mapping]
+    title: A small repository layer
+    body: |
+      Instead of SQL scattered through route handlers, SandPay keeps one module per table that exposes
+      intention-revealing functions and returns typed objects. An excerpt of the practice solution
+      (`solutions/migrations/orders-repository.ts`):
+
+      ```typescript
+      export interface Queryable {
+        query<T>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
+      }
+
+      function toSafeInteger(value: number | string, column: string): number {
+        const n = typeof value === 'number' ? value : Number(value);
+        if (!Number.isSafeInteger(n)) throw new RangeError(`${column} ${String(value)} is not a safe integer`);
+        return n;
+      }
+
+      export function createOrdersRepository(db: Queryable) {
+        return {
+          async listByMerchant(merchantId: string, options: { limit: number; after?: Cursor }): Promise<Page> {
+            // ... validate limit 1-100 ...
+            const { rows } = options.after
+              ? await db.query<OrderRow>(
+                  `SELECT ${COLUMNS} FROM orders
+                   WHERE merchant_id = $1 AND (created_at, id) < ($2, $3)
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT $4`,
+                  [merchantId, options.after.createdAt, options.after.id, options.limit + 1],
+                )
+              : /* the same without the cursor condition */ ...;
+            // fetch one extra row to know whether a next page exists
+          },
+        };
+      }
+      ```
+
+      What a reviewer checks:
+
+      - **The `Queryable` interface** - the repository works with a `pg.Pool`, a transaction's client or PGlite
+        in tests. Inside a transaction you pass the client, so all statements share it.
+      - **`${COLUMNS}` and the ORDER BY** are constants written by the developer, never input.
+      - **Keyset pagination** with `(created_at, id)` uses the index `(merchant_id, created_at DESC, id DESC)`
+        (see [PostgreSQL indexes and query plans](#/lesson/postgres-indexes-and-query-plans) and
+        [REST API design](#/lesson/rest-api-design)).
+      - **Mapping in one function** (`toOrder`): snake_case columns to camelCase fields, `bigint` to a checked
+        number.
+
+  - id: what-migrations
+    kind: what
+    concepts: [versioned-schema-migrations]
+    title: Versioned migrations
+    body: |
+      A **migration** is one schema change - `CREATE TABLE`, `ALTER TABLE`, `CREATE INDEX`, sometimes a data
+      fix - stored as a file with an increasing version (`0001_create_orders.sql`, or a timestamp), reviewed
+      and committed like code. A **runner** applies them:
+
+      - It keeps a table - commonly `schema_migrations` - with the version, name, a **checksum** of the file
+        and when it ran.
+      - On every deploy it applies the **pending** ones in version order and records each.
+      - It refuses to continue if an applied migration's checksum changed (someone edited history) or if a
+        migration the database has applied is missing from the code.
+
+      **Transactional DDL.** In PostgreSQL, `CREATE TABLE` and most `ALTER TABLE` forms are transactional, so
+      a migration and its `schema_migrations` row can commit together - or roll back together. Real run:
+
+      ```plaintext
+      BEGIN
+      CREATE TABLE refunds (...)                    -- ok
+      ALTER TABLE orders ADD COLUMN status text     -- ok
+      ALTER TABLE orders ADD COLUMN status text     -- 42701 column "status" of relation "orders" already exists
+      ROLLBACK
+      { refunds_table: null, status_columns: '0' }  -- neither change survived
+      ```
+
+      **The exceptions** can't run inside a transaction block - most importantly `CREATE INDEX CONCURRENTLY`:
+
+      ```plaintext
+      25001 CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+      ```
+
+      Runners have an option to run such a migration without a transaction; keep it alone in its own file.
+
+      **Forward-only or up/down?** Many tools let each migration have a `down` script. In production, rolling
+      back a schema change after data was written in the new shape often loses that data, so many teams
+      treat migrations as **forward-only** and fix a mistake with a new migration - and design each change so
+      the previous application version still works (next sections).
+
+      **Seeds are not migrations.** Reference data every environment needs (currencies, status codes) can be
+      a migration. Demo merchants and test orders are **seed** scripts for development and tests only - never
+      in the migration history.
+
+      **Only one runner at a time.** If several instances start together and each runs migrations, two can
+      try to apply the same file. Run migrations as a separate deploy step, or have the runner take a
+      PostgreSQL **advisory lock** first (manual 13.3.5: locks "that have application-defined meanings").
+
+  - id: visual-runner
+    kind: visual
+    concepts: [versioned-schema-migrations]
+    title: What a migration runner decides
+    body: |
+      ```mermaid
+      flowchart TD
+        A[Load migration files, sort by version] --> B{Duplicate or invalid version?}
+        B -- yes --> X[Stop with an error - nothing runs]
+        B -- no --> C[Read schema_migrations]
+        C --> D{Applied migration missing from code, or its checksum changed?}
+        D -- yes --> X
+        D -- no --> E{A pending version older than the newest applied one?}
+        E -- yes --> X
+        E -- no --> F[Next pending migration]
+        F --> G[BEGIN - run its SQL - insert its schema_migrations row - COMMIT]
+        G -- error --> H[ROLLBACK - stop and report this version]
+        G -- ok --> I{More pending?}
+        I -- yes --> F
+        I -- no --> J[Done - report the versions applied]
+      ```
+
+      What to notice: every check happens **before** anything runs, and each migration is its own
+      transaction, so a failure leaves the database at the last good version - never half-way through a
+      file.
+
+  - id: code-runner
+    kind: code
+    concepts: [versioned-schema-migrations]
+    title: The runner's behaviour, run
+    body: |
+      The practice solution (`solutions/migrations/migrate.ts`) on PGlite, PostgreSQL 18.6:
+
+      ```plaintext
+      first run applied: [1,2]
+      second run applied: []
+      [{"version":1,"name":"create_orders","checksum":"860010191b55"},
+       {"version":2,"name":"add_order_status","checksum":"7b3b60e6a250"}]
+
+      -- migration 2's SQL edited after it ran:
+      MigrationError: migration 2 (add_order_status) was edited after it was applied - add a new migration instead
+
+      -- migration 3 = ALTER TABLE orders ADD COLUMN channel text; UPDATE orders SET chanel = 'web';
+      MigrationError: migration 3 (add_channel) failed and was rolled back
+      cause: error: column "chanel" of relation "orders" does not exist
+      [{"n":0}]   -- the channel column is not there: the whole file was undone
+      ```
+
+      (Checksums are shortened to 12 characters for the page.) The heart of it:
+
+      ```typescript
+      await db.transaction(async (tx) => {
+        await tx.exec(m.sql);
+        await tx.query('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)', [
+          m.version,
+          m.name,
+          checksum(m.sql),
+        ]);
+      });
+      ```
+
+  - id: internals-locks
+    kind: internals
+    concepts: [zero-downtime-schema-changes]
+    title: Locks, the lock queue and table rewrites
+    body: |
+      "An ACCESS EXCLUSIVE lock is acquired unless explicitly noted" (ALTER TABLE, manual) - and ACCESS
+      EXCLUSIVE conflicts with every other mode, including the ACCESS SHARE lock a plain `SELECT` takes. The
+      `ALTER` itself may take milliseconds, but it first has to **wait** for every transaction already using
+      the table - and while it waits, it sits in the lock queue **ahead** of new queries. Real run, three
+      sessions:
+
+      ```plaintext
+      A: BEGIN; SELECT count(*) FROM orders  -- transaction left open
+      B: ALTER TABLE orders ADD COLUMN note text  -> waiting
+      C: SELECT count(*) FROM orders  -> waiting
+      A AccessShareLock granted=true
+      B AccessExclusiveLock granted=false
+      C AccessShareLock granted=false
+      A: COMMIT
+      B: ALTER finished
+      C: SELECT finished
+      ```
+
+      Session C's simple `SELECT` doesn't conflict with A at all - it waits because it is queued behind B. In
+      production, A is a slow report or a connection leaked `idle in transaction`, B is your migration, and C
+      is every request to the site. **Always set a `lock_timeout` for migrations**, so the migration gives up
+      instead of freezing the table:
+
+      ```plaintext
+      B with lock_timeout 2s, after 2s: 55P03 canceling statement due to lock timeout
+      ```
+
+      Then retry it later. (`lock_timeout` "can only occur while waiting for locks"; the default 0 waits
+      forever.)
+
+      **Table rewrites.** Some changes rewrite every row while holding that lock. From the manual: adding a
+      column with no default or a non-volatile default needs no rewrite, but "adding a column with a volatile
+      DEFAULT (e.g., `clock_timestamp()`) ... will cause the entire table and its indexes to be rewritten", and
+      changing a column's type normally does too. Real run on 200,003 rows (the table's file number tells
+      whether it was rewritten):
+
+      ```plaintext
+      constant default: same file true (1 ms)
+      volatile default: same file false (513 ms)
+      ```
+
+      Half a second here; minutes on a large production table - all of it under ACCESS EXCLUSIVE.
+
+      **Gentler tools the manual offers:**
+
+      | Instead of | Use | Lock while it works |
+      | --- | --- | --- |
+      | `CREATE INDEX` (blocks writes for the whole build) | `CREATE INDEX CONCURRENTLY` (two scans, no transaction block; a failure leaves an `INVALID` index to drop and retry) | SHARE UPDATE EXCLUSIVE - reads and writes continue |
+      | `ADD CONSTRAINT ... CHECK (...)` (scans the table under ACCESS EXCLUSIVE) | `ADD CONSTRAINT ... NOT VALID`, later `VALIDATE CONSTRAINT` | the validation takes SHARE UPDATE EXCLUSIVE |
+      | `ADD FOREIGN KEY` | `... NOT VALID`, then `VALIDATE CONSTRAINT` | ADD FOREIGN KEY needs only SHARE ROW EXCLUSIVE |
+
+  - id: example-expand-contract
+    kind: example
+    concepts: [zero-downtime-schema-changes]
+    title: "Renaming a column without downtime: expand, migrate, contract"
+    body: |
+      SandPay wants `orders.customer_email` renamed to `email`. `ALTER TABLE ... RENAME COLUMN` is instant -
+      and it instantly breaks every running instance of the old code, because during a rolling deploy old and
+      new versions run side by side. **Parallel change** (also called expand and contract) splits a breaking
+      change into "three distinct phases: expand, migrate, and contract"; the article notes that "most
+      database refactorings follow the parallel change pattern".
+
+      | Release | Schema change | Application |
+      | --- | --- | --- |
+      | 1 - expand | `ADD COLUMN email text` (nullable, no rewrite) | writes **both** columns, reads the old one |
+      | 2 - backfill | copy old values in batches; then `CHECK (email IS NOT NULL) NOT VALID` + `VALIDATE` | unchanged |
+      | 3 - migrate | none | reads `email`, still writes both |
+      | 4 - contract | `DROP COLUMN customer_email` | uses only `email` |
+
+      The batched backfill, real run on 2,500 rows - each batch is a short transaction holding row locks on
+      at most 1,000 rows, instead of one huge UPDATE locking them all:
+
+      ```sql
+      UPDATE orders SET email = customer_email
+      WHERE id IN (SELECT id FROM orders WHERE email IS NULL ORDER BY id LIMIT 1000);
+      ```
+
+      ```plaintext
+      batch: UPDATE 1000
+      batch: UPDATE 1000
+      batch: UPDATE 500
+      batch: UPDATE 0
+      ADD CONSTRAINT ... NOT VALID: ok
+      VALIDATE CONSTRAINT: ok
+      old-code insert: 23514 new row for relation "orders" violates check constraint "orders_email_not_null"
+      ```
+
+      The last line is the lesson: an instance still running code from **before** release 1 (it doesn't
+      write `email`) now fails. That is why the order matters - every instance must be writing both columns
+      before the constraint arrives, and each step ships only when the previous one is everywhere.
+
+  - id: when-tools
+    kind: when
+    concepts: [sql-parameters-and-mapping, versioned-schema-migrations]
+    title: Raw SQL, query builders or an ORM?
+    body: |
+      All of these send parameterised SQL underneath; they differ in how you write it and how much they
+      decide for you. Descriptions are from each project's own docs (check current versions):
+
+      | Tool | What it says it is | Migrations |
+      | --- | --- | --- |
+      | **node-postgres + SQL files** | a low-level client; you write SQL | your own runner or a library |
+      | **Knex.js** | "a 'batteries included' SQL query builder" for several databases, with schema builders and transactions | built in |
+      | **Kysely** | "a type-safe and autocompletion-friendly TypeScript SQL query builder", inspired by Knex | built in |
+      | **Drizzle ORM** | "a headless TypeScript ORM" with "both relational and SQL-like query APIs" | the `drizzle-kit` CLI generates SQL migration files from the schema (`drizzle-kit generate`, `drizzle-kit migrate`) |
+      | **Prisma ORM** | Prisma Client, an "auto-generated and type-safe query builder", plus Prisma Migrate, from a Prisma schema file | Prisma Migrate |
+      | **TypeORM** | supports DataMapper and ActiveRecord patterns, with entity classes and decorators | generated or hand-written |
+
+      **When each fits:**
+
+      - **Raw SQL + a thin repository** - full control, every PostgreSQL feature, easy to read in a query log;
+        you write the mapping and types yourself. Good for teams fluent in SQL and for performance-critical
+        paths.
+      - **A typed query builder** (Kysely, Drizzle's SQL-like API) - SQL-shaped code with compile-time checks of
+        table and column names; a good middle ground for TypeScript teams.
+      - **A full ORM** (Prisma, TypeORM) - fastest for CRUD and relations, with generated types and
+        migrations; the SQL is hidden, so watch for N+1 queries and inefficient generated SQL, and keep raw
+        SQL for the hard queries.
+
+      **What none of them replaces:** understanding transactions, indexes, locks and what the generated
+      migration will do to a big table. Read the SQL a tool generates before you ship it.
+
+  - id: tests
+    kind: tests
+    concepts: [pg-pool-and-clients, sql-parameters-and-mapping, versioned-schema-migrations, zero-downtime-schema-changes]
+    title: What to test
+    body: |
+      | # | Case | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | 50 parallel requests, each hitting a code path that returns early | no request waits for a connection; pool `idleCount` returns to its usual level | pool counters before and after; no `idle in transaction` in `pg_stat_activity` |
+      | 2 | search with `' OR merchant_id <> '` | no rows from other merchants | response body; SQL log shows `$1` placeholders |
+      | 3 | sign up `o'brien@example.test` | stored and found again | row in the table |
+      | 4 | search text `%` and `ravi_` | match literally | result list |
+      | 5 | an unknown `sortBy` value | 400 or a validation error; no query runs | response; query log |
+      | 6 | a `bigint` id above `Number.MAX_SAFE_INTEGER` | a clear error, not a wrong id | test with a driver returning strings |
+      | 7 | run migrations on an empty database, then again | all applied once; second run applies nothing | `schema_migrations` rows |
+      | 8 | edit an applied migration and run | the runner refuses, naming the version | runner error; schema unchanged |
+      | 9 | a migration that fails half-way | nothing from that file remains; earlier ones stay | schema and `schema_migrations` |
+      | 10 | migrate while a long transaction holds the table | the migration fails after `lock_timeout`; the site stays up | `55P03` in the log; request latency during the run |
+      | 11 | old and new app versions against the expanded schema | both read and write correctly | the test suite of release N-1 run against schema N |
+
+      Case 11 is the one teams forget: in CI, run the **previous** release's tests against the **new** schema
+      to prove the change is backward compatible.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [pg-pool-and-clients, sql-parameters-and-mapping, versioned-schema-migrations, zero-downtime-schema-changes]
+    title: Common mistakes and how to debug them
+    body: |
+      - **`release()` not in `finally`** - an exception or early `return` leaks the client. Use a `withClient`
+        helper, or `pool.query` when you need one statement.
+      - **A transaction on `pool.query`** - `BEGIN` and `COMMIT` may land on different connections.
+      - **`connectionTimeoutMillis` left at 0** - a starved pool hangs instead of erroring.
+      - **A pool per request** (`new Pool()` inside a handler) - connections are never shared and soon hit
+        `max_connections`. Create one pool per process.
+      - **"Escaping" input by hand** instead of parameters - there is always a case you missed.
+      - **Interpolating identifiers** - `ORDER BY ${req.query.sort}`. Use an allow-list.
+      - **Trusting `typeof id === 'number'`** after switching drivers - node-postgres gives strings for `bigint`.
+      - **Editing an applied migration** - environments drift silently. Add a new migration.
+      - **Data migrations that call application code** - the code changes later and the old migration breaks
+        on a fresh database. Keep migrations as plain SQL that will run the same way forever.
+      - **No `lock_timeout`** - a migration freezes the site behind one slow query.
+      - **Rename, retype or `NOT NULL` in one release** - breaks instances still running the previous version.
+
+      **Debugging method.** "The app hangs": look at the pool counters and at `pg_stat_activity` (state,
+      `wait_event`, `xact_start`) before blaming the database. "The migration hangs": query `pg_locks` joined to
+      `pg_stat_activity` for `granted = false`, and find the session holding the conflicting lock.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [versioned-schema-migrations, zero-downtime-schema-changes]
+    title: Trade-offs
+    body: |
+      - **Forward-only vs down migrations.** Down scripts are convenient on a laptop, but in production a
+        rollback after new data was written can lose it; forward-only plus backward-compatible changes is
+        safer, at the cost of more releases.
+      - **Expand and contract costs time.** One rename becomes three or four releases and a period of
+        duplicated writes. For a table nobody else reads, in a maintenance window, a direct change can be
+        acceptable - decide deliberately.
+      - **Migrations at application start-up** are simple for one instance, risky for many (races, slow
+        start-ups, health checks failing mid-migration). A separate step in the deployment pipeline is easier
+        to observe and retry.
+      - **A bigger pool is not more throughput.** Past a point, more concurrent queries make PostgreSQL slower
+        overall; fix slow queries first, then size the pool, then add a pooler.
+
+  - id: summary
+    kind: summary
+    concepts: [pg-pool-and-clients, sql-parameters-and-mapping, versioned-schema-migrations, zero-downtime-schema-changes]
+    title: Quick reference
+    body: |
+      - One `Pool` per process; `pool.query` for single statements; `pool.connect()` + `release()` in
+        `finally` for transactions, all on that client. Set `connectionTimeoutMillis`.
+      - Budget connections: instances × `max` + headroom ≤ `max_connections` (typically 100).
+      - Every value is a `$n` parameter; identifiers come from an allow-list; escape `%` `_` `\` in LIKE input.
+      - node-postgres returns `bigint` and `numeric` as strings - convert and check in one mapping function.
+      - Migrations: numbered, committed, applied once in order, recorded with a checksum, never edited.
+      - PostgreSQL DDL is transactional - except `CREATE INDEX CONCURRENTLY` and a few others.
+      - Most `ALTER TABLE` forms take ACCESS EXCLUSIVE; set `lock_timeout` and retry.
+      - Avoid rewrites (volatile defaults, type changes); use `NOT VALID` + `VALIDATE` and `CONCURRENTLY`.
+      - Breaking changes: expand, backfill in batches, migrate reads, contract - one release at a time.
+
+exercises:
+  - id: diagnose-pool
+    type: mcq
+    concept: pg-pool-and-clients
+    skill: analysis
+    title: The app is down, the database is idle
+    prompt: |
+      After a release, SandPay's API stops answering every few hours. Evidence collected during an outage:
+
+      ```plaintext
+      pool: { total: 10, idle: 0, waiting: 37 }
+      PostgreSQL CPU 3%; pg_stat_activity for the app user: 10 sessions, state "idle in transaction",
+      the oldest xact_start 2 hours ago, last query: SELECT ... FROM refunds WHERE payment_id = $1
+      ```
+
+      The release added a refund-preview endpoint. What is the most likely cause?
+    options:
+      - id: leak
+        text: The new endpoint checks out a client, starts a transaction and returns on some path without COMMIT/ROLLBACK and release()
+        feedback: Correct - every client is checked out (idle 0) and stuck "idle in transaction" on the new endpoint's query, while the database does nothing. That is a leak, not load.
+      - id: small-pool
+        text: The pool is too small - raise max to 50
+        feedback: A bigger pool would only take longer to leak dry, and with several instances could exhaust max_connections. The sessions are idle, not busy.
+      - id: slow-query
+        text: The refunds query is slow and needs an index
+        feedback: A slow query would show state "active", not "idle in transaction" for two hours, and CPU wouldn't be 3%.
+      - id: db-limit
+        text: PostgreSQL has reached max_connections
+        feedback: Only 10 sessions exist for the app; the waiting happens inside the application's pool.
+    correct: [leak]
+    hints:
+      - Compare idle, waiting and the database's CPU - is anything actually working?
+      - What does "idle in transaction" say about the client that holds the session?
+    solution: |
+      `idle: 0` and a growing `waiting` mean every client is checked out; `idle in transaction` for hours with
+      a quiet database means nobody is using them. The common query points to the new endpoint, which opens a
+      transaction on a checked-out client and leaves on some path without finishing it or releasing the
+      client. **Confirm** by reproducing the early-return path in a test and watching `pool.idleCount`; fix
+      with `release()` in `finally` (a `withClient` helper) and a `connectionTimeoutMillis` so the next leak
+      fails fast. PostgreSQL's `idle_in_transaction_session_timeout` can also end such sessions.
+
+  - id: debug-repository
+    type: debug
+    concept: sql-parameters-and-mapping
+    skill: analysis
+    title: Find the unsafe lines
+    prompt: |
+      A teammate's search function for the merchant dashboard. Click **every** line that lets input change the
+      SQL or returns wrong results for ordinary input.
+    language: typescript
+    code: |
+      const SORTS = { newest: 'created_at DESC', largest: 'amount_minor DESC' };
+      export async function searchOrders(pool: pg.Pool, merchantId: string, q: string, sort: string) {
+        const orderBy = SORTS[sort as keyof typeof SORTS] ?? sort;
+        const { rows } = await pool.query(
+          `SELECT id, customer_email, amount_minor FROM orders
+           WHERE merchant_id = $1 AND customer_email LIKE '%' || $2 || '%'
+           ORDER BY ${orderBy}`,
+          [merchantId, q],
+        );
+        return rows.map((r) => ({ id: r.id + 0, email: r.customer_email, amountMinor: r.amount_minor }));
+      }
+    correctLines: [3, 6, 10]
+    lineNotes:
+      - line: 1
+        note: A map of fixed ORDER BY clauses is exactly the allow-list you want - the problem is what line 3 does when the key isn't in it.
+      - line: 4
+        note: pool.query is right for a single statement - it borrows and returns a client.
+      - line: 7
+        note: Interpolating a constant from the allow-list is fine - the bug is that line 3 lets a non-constant through.
+      - line: 8
+        note: merchantId and q are passed as parameters - correct.
+    hints:
+      - What happens on line 3 when sort is not "newest" or "largest"?
+      - What do % and _ in q do inside LIKE?
+      - What type does node-postgres return for a bigint id, and what is "12" + 0?
+    solution: |
+      - **Line 3** falls back to the raw `sort` value (`?? sort`), which line 7 interpolates into the SQL -
+        `sort=amount_minor; DROP TABLE orders` is injection. Reject unknown keys instead (throw / 400).
+      - **Line 6** passes `q` as a parameter (good) but doesn't escape LIKE wildcards: a search for `_` or `%`
+        matches everything. Escape `\`, `%`, `_` first.
+      - **Line 10** - `r.id` is a string for `bigint`, so `r.id + 0` is `"120"` for id `"12"`, and
+        `amount_minor` stays a string. Convert with `Number()` and check `Number.isSafeInteger`.
+
+  - id: order-expand-contract
+    type: order
+    concept: zero-downtime-schema-changes
+    skill: application
+    title: Rename a column without downtime
+    prompt: Put the releases for renaming `orders.customer_email` to `email` in a safe order.
+    items:
+      - id: expand
+        text: "Migration: ADD COLUMN email text (nullable); app writes both columns, reads customer_email"
+      - id: backfill
+        text: Backfill email from customer_email in batches of 1,000
+      - id: constrain
+        text: "Migration: CHECK (email IS NOT NULL) NOT VALID, then VALIDATE CONSTRAINT"
+      - id: read-new
+        text: App reads email, still writes both columns
+      - id: stop-old
+        text: App stops writing customer_email
+      - id: contract
+        text: "Migration: DROP COLUMN customer_email"
+    hints:
+      - Every instance must write the new column before old rows are copied, or new rows will be missed.
+      - The constraint can only be validated once no NULLs are left - and no old code is still inserting.
+      - You can only drop what nobody reads or writes any more.
+    solution: |
+      Expand first (new nullable column, dual writes), then backfill, then constrain - the constraint would
+      reject inserts from any instance not yet writing `email`. Switch reads, then stop the old writes, and
+      only then contract by dropping the column. Each step ships when the previous one runs on every instance.
+
+  - id: lock-queue-mcq
+    type: mcq
+    concept: zero-downtime-schema-changes
+    skill: analysis
+    title: Why did every page time out?
+    prompt: |
+      A migration `ALTER TABLE orders ADD COLUMN note text` ran at 10:00 and finished at 10:03. It usually
+      takes milliseconds. From 10:00 to 10:03 every request touching `orders` - even plain SELECTs - timed out.
+      A finance export with an open transaction on `orders` ran from 09:58 to 10:03. What happened?
+    options:
+      - id: queue
+        text: The ALTER waited for the export's lock, and every new query on orders queued behind the waiting ALTER
+        feedback: Correct - ACCESS EXCLUSIVE conflicts with the export's ACCESS SHARE, and new requests' locks conflict with the queued ACCESS EXCLUSIVE, so they waited too.
+      - id: rewrite
+        text: Adding a column rewrote the whole table for three minutes
+        feedback: A nullable column with no default needs no rewrite - and it finished exactly when the export ended, which points to waiting, not work.
+      - id: export-slow
+        text: The export used all the CPU
+        feedback: Plain SELECTs don't conflict with another SELECT; they waited for a lock, not for CPU.
+      - id: pool
+        text: The migration leaked a pool client
+        feedback: A leak wouldn't end exactly when the export committed.
+    correct: [queue]
+    hints:
+      - What lock does this ALTER TABLE need, and what does it conflict with?
+      - Why would a SELECT that doesn't conflict with the export still wait?
+    solution: |
+      Most ALTER TABLE forms need ACCESS EXCLUSIVE, which conflicts with the export's ACCESS SHARE, so the ALTER
+      waited. While waiting it sat at the head of the lock queue, and every later query's ACCESS SHARE
+      conflicted with it - so the whole table was effectively blocked for three minutes. **Confirm** in
+      `pg_locks` (`granted = false` rows) joined to `pg_stat_activity`. Fix: `SET lock_timeout = '2s'` in the
+      migration and retry later, and keep long exports off the primary or out of migration windows.
+
+  - id: bigint-mcq
+    type: mcq
+    concept: sql-parameters-and-mapping
+    skill: application
+    title: The total that became a string
+    prompt: |
+      With node-postgres, `const { rows } = await pool.query('SELECT count(*) AS n, sum(amount_minor) AS total FROM orders')`
+      returns rows for 3 orders. The dashboard shows "Orders: 3" but "Next order number: 31". Why?
+    options:
+      - id: strings
+        text: count(*) is bigint and sum of bigint is numeric - node-postgres returns both as strings, so n + 1 is "31"
+        feedback: Correct - int8 and numeric come back as strings; + with a string concatenates.
+      - id: float
+        text: PostgreSQL returned 3.0 as a float
+        feedback: count(*) returns bigint, an integer type - the issue is the JavaScript type, not the value.
+      - id: bug-pg
+        text: A bug in node-postgres
+        feedback: It's documented and deliberate - a JavaScript number can't hold every 64-bit integer, so pg doesn't guess.
+      - id: cast
+        text: The query needs ::text
+        feedback: That would make it a string on purpose; the fix is to convert to a number (or cast to int) and check it is safe.
+    correct: [strings]
+    hints:
+      - What PostgreSQL type does count(*) return?
+      - What does node-postgres do with int8?
+    solution: |
+      `count(*)` returns `bigint`; node-postgres "returns int8 results as strings and leaves the parsing up to
+      you". `"3" + 1` is `"31"`. Convert in the mapping layer (`Number(n)` and `Number.isSafeInteger`), cast in
+      SQL (`count(*)::int`) when the value is known to be small, or register a type parser on purpose.
+
+  - id: coding-migrate
+    type: coding
+    concept: versioned-schema-migrations
+    skill: application
+    title: Write a migration runner
+    prompt: |
+      `exercises/migrations/migrate.ts` contains a first draft that runs every migration, every time, in the
+      order given, outside any transaction, and remembers nothing. Rewrite `migrate(db, migrations)` to meet
+      the contract in the comment at the top of the file: a `schema_migrations` table with checksums; refuse
+      duplicate or invalid versions, missing or edited applied migrations and out-of-order pending ones
+      before running anything; apply pending migrations in version order, each in its own transaction with its
+      record; wrap a failure in a `MigrationError` naming the version.
+    project: fullstack
+    files:
+      - exercises/migrations/migrate.ts
+    test: tests/migrations/migrate.test.ts
+    command: npx vitest run tests/migrations/migrate.test.ts
+    hints:
+      - Sort a copy of the list by version first and validate it before you touch the database.
+      - "`CREATE TABLE IF NOT EXISTS schema_migrations (version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`"
+      - Compare every applied row with the code's migration of the same version - missing or a different `checksum(sql)` is an error.
+      - "Inside `db.transaction(async (tx) => { ... })` use `tx.exec(m.sql)` (several statements) and `tx.query` with $1, $2, $3 for the record."
+      - "Catch the error around each transaction and `throw new MigrationError(message, { cause: error })`."
+    modelAnswer: |
+      Sort and validate the list (positive safe integers, no duplicates). Create `schema_migrations` if
+      needed and read it. For each applied row: the code must have that version and `checksum(sql)` must
+      equal the stored one. Compute the newest applied version; any pending version below it is an
+      out-of-order error. Then for each pending migration in order:
+
+      ```typescript
+      try {
+        await db.transaction(async (tx) => {
+          await tx.exec(m.sql);
+          await tx.query('INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)', [
+            m.version, m.name, checksum(m.sql),
+          ]);
+        });
+      } catch (error) {
+        throw new MigrationError(`migration ${m.version} (${m.name}) failed and was rolled back`, { cause: error });
+      }
+      ```
+
+      Return the versions applied. The full file is `solutions/migrations/migrate.ts`.
+    solution: |
+      The draft fails because it has no memory (a second run re-creates tables), no order (versions given out
+      of order run out of order) and no atomicity (a failing second statement leaves the first one's table).
+      Recording each migration in the same transaction as its SQL makes "applied" and "recorded" the same
+      event; the checksum check stops environments drifting apart; validating everything first means a bad
+      history is reported before any change is made.
+    rubric:
+      - Every test in tests/migrations/migrate.test.ts passes
+      - All checks (versions, missing, edited, out of order) happen before any migration runs
+      - Each migration and its schema_migrations row are in one transaction
+      - The record is inserted with $n parameters
+      - The error names the version and keeps the database error as cause
+
+  - id: coding-repository
+    type: coding
+    concept: sql-parameters-and-mapping
+    skill: application
+    title: A parameterised orders repository
+    prompt: |
+      `exercises/migrations/orders-repository.ts` builds SQL by gluing strings together. It works for a quick
+      manual check with ordinary input. Rewrite it to meet the contract at the top of the file: every caller
+      value as a `$n` parameter, `sortBy` through an allow-list, literal matching for `%` and `_`, keyset
+      pagination newest first with a `next` cursor, `limit` from 1 to 100, and a mapping that accepts
+      node-postgres strings and PGlite numbers and rejects unsafe integers. The tests record every statement
+      the repository sends and try several injections.
+    project: fullstack
+    files:
+      - exercises/migrations/orders-repository.ts
+    test: tests/migrations/orders-repository.test.ts
+    command: npx vitest run tests/migrations/orders-repository.test.ts
+    hints:
+      - Start with findById and create - `WHERE id = $1`, `VALUES ($1, $2, $3) RETURNING ...`.
+      - "For search: `customer_email LIKE '%' || $2 || '%'`, and pass the text with `\\`, `%` and `_` escaped by a backslash."
+      - "An allow-list: `const ORDER_BY = { newest: 'created_at DESC, id DESC', largest: 'amount_minor DESC, id DESC' }` - and check with `Object.hasOwn`, so `toString` isn't a valid key."
+      - "Keyset: `WHERE merchant_id = $1 AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4` with limit + 1 to detect a next page."
+      - "Mapping: `const n = typeof v === 'number' ? v : Number(v); if (!Number.isSafeInteger(n)) throw new RangeError(...)`."
+    modelAnswer: |
+      Keep the SQL text constant and move every value to the params array. `search` looks `sortBy` up in a
+      frozen map with `Object.hasOwn` and throws `RangeError` for anything else, and passes
+      `emailContains.replace(/[\\%_]/g, (c) => '\\' + c)` as `$2`. `listByMerchant` validates `limit`, queries
+      `limit + 1` rows ordered by `created_at DESC, id DESC` (with the `(created_at, id) < ($2, $3)` condition
+      when a cursor is given), returns the first `limit` rows and a cursor from the last one only if the extra
+      row exists. One `toOrder` function maps columns to camelCase and converts `id` and `amount_minor` with a
+      safe-integer check. The full file is `solutions/migrations/orders-repository.ts`.
+    solution: |
+      The draft fails in four ways: input becomes SQL (the apostrophe in `o'brien`, an `OR` that leaks another
+      merchant's orders, a stacked `DELETE`), user text is treated as LIKE wildcards, unknown sort values are
+      interpolated, and OFFSET-style paging with an always-present cursor never ends. Parameters fix the
+      first; escaping fixes the second; an allow-list fixes the third; keyset pagination with a "one extra
+      row" check fixes the last.
+    rubric:
+      - Every test in tests/migrations/orders-repository.test.ts passes
+      - No caller value is ever part of the SQL text
+      - Identifiers come only from a fixed allow-list checked with Object.hasOwn (or equivalent)
+      - Pagination is keyset with a tie-breaker, not OFFSET
+      - Type conversion happens in one mapping function with a safe-integer check
+
+  - id: testdesign-migrations
+    type: testdesign
+    concept: versioned-schema-migrations
+    skill: application
+    title: Test the migrations in CI
+    prompt: |
+      SandPay's pipeline runs unit tests against PGlite only. Two incidents last quarter: a migration that
+      worked on an empty database failed in production on existing data, and an edited migration made staging
+      and production differ. Design the CI checks that would have caught both. Give preconditions, steps,
+      expected results and the evidence each check leaves.
+    hints:
+      - What is different between an empty database and production?
+      - How would CI notice that a file in the migration history changed?
+    modelAnswer: |
+      **Check 1 - from scratch.** Preconditions: a fresh PostgreSQL of the production major version (a
+      container in CI). Steps: run all migrations; run the test suite. Expected: all applied once; second run
+      applies nothing. Evidence: the runner's log and `schema_migrations`.
+
+      **Check 2 - upgrade from the last release with data.** Preconditions: a database migrated to the
+      previous release's version and loaded with realistic, anonymised data (NULLs, duplicates, long text,
+      old formats). Steps: run only the new migrations, with the production `lock_timeout`. Expected: they
+      succeed; constraints validate; timings recorded. Evidence: runner log with durations, row counts before
+      and after.
+
+      **Check 3 - history unchanged.** Steps: compare the checksums of migrations already in the main branch's
+      history with the branch's files (or let the runner, which refuses edited migrations, run against a
+      database built from main). Expected: any edit to an applied file fails the build. Evidence: the failing
+      check names the file.
+
+      **Check 4 - backward compatibility.** Steps: run the previous release's API tests against the new
+      schema. Expected: they pass. Evidence: test report.
+    solution: |
+      Test both paths a schema takes - from empty and from the last release with real-shaped data - make
+      edits to applied migrations fail the build, and prove the previous app version still works on the new
+      schema.
+    rubric:
+      - A from-scratch run and an upgrade from the previous version, on the production PostgreSQL version
+      - Realistic existing data (NULLs, edge values) for the upgrade
+      - Detects edited applied migrations automatically
+      - Previous release's tests against the new schema
+      - Each check names its evidence (logs, schema_migrations, timings)
+
+  - id: edited-migration-short
+    type: short
+    concept: versioned-schema-migrations
+    skill: application
+    title: "\"I'll just fix the migration\""
+    prompt: |
+      Migration `0042_add_refund_reason` created `refunds.reason varchar(50)`. It has run on staging and
+      production. A developer notices 50 is too short and changes the file to `varchar(200)`. What happens on
+      each environment, and what should they have done?
+    hints:
+      - Which environments will run 0042 again?
+      - What does a runner with checksums do?
+    modelAnswer: |
+      Without checksums, 0042 is already recorded everywhere it ran, so staging and production keep
+      `varchar(50)` while every new database (developers, CI) gets `varchar(200)` - the environments differ
+      under the same version, and tests pass on a schema production doesn't have. With checksums, the runner
+      refuses to start because 0042 changed.
+
+      The right fix is a new migration, `0043_widen_refund_reason`:
+      `ALTER TABLE refunds ALTER COLUMN reason TYPE varchar(200);` - and check its cost first: the manual says
+      a type change normally rewrites the table, except when the old type is binary coercible to the new one,
+      which is worth confirming on a copy of production data.
+    solution: |
+      Editing an applied migration splits the environments silently (or, with checksums, blocks deploys). Fix
+      forward with a new migration and check whether that change rewrites the table.
+    rubric:
+      - Explains that environments that already ran 0042 won't see the change
+      - Names the drift between new and existing databases (or the checksum refusal)
+      - Proposes a new migration instead of editing
+      - Considers the lock or rewrite cost of the new change
+
+  - id: interview-zero-downtime
+    type: interview
+    concept: zero-downtime-schema-changes
+    skill: application
+    title: "Interview: change the schema of a busy table"
+    prompt: |
+      *"Our `payments` table has 300 million rows and takes writes all day. We need to make `currency` NOT NULL
+      and add an index on `(merchant_id, created_at)`. How do you ship that without downtime?"*
+    hints:
+      - Which locks and scans would a direct ALTER and CREATE INDEX take?
+      - What can be done concurrently or validated separately?
+    modelAnswer: |
+      Both direct commands are dangerous on a busy table. `SET NOT NULL` normally scans the whole table under
+      ACCESS EXCLUSIVE, and a plain `CREATE INDEX` blocks writes for the whole build. So:
+
+      1. **Make sure nothing writes NULL:** application validation and a default for new rows; backfill
+         existing NULLs in small batches (for example 1,000-10,000 rows per transaction, with a pause), so
+         locks stay short and replicas keep up.
+      2. **Constrain cheaply:** `ADD CONSTRAINT payments_currency_not_null CHECK (currency IS NOT NULL) NOT
+         VALID` - fast, applies to new rows - then `VALIDATE CONSTRAINT`, which takes only SHARE UPDATE
+         EXCLUSIVE, so reads and writes continue. In PostgreSQL 18 the manual also describes NOT VALID for
+         not-null constraints, and `SET NOT NULL` can skip its scan when a valid CHECK already proves no NULLs.
+      3. **Index without blocking writes:** `CREATE INDEX CONCURRENTLY` in its own non-transactional
+         migration; if it fails it leaves an INVALID index - drop it and retry.
+      4. **Every DDL statement gets a `lock_timeout`** (a few seconds) and a retry, because even fast ACCESS
+         EXCLUSIVE statements wait behind long transactions and block everything queued after them.
+      5. **Rehearse** on a production-sized copy, watch replication lag and lock waits during the run, and
+         ship it in steps that the previous app version tolerates.
+    solution: |
+      Backfill in batches, add the constraint NOT VALID and validate it separately, build the index
+      CONCURRENTLY outside a transaction, put a lock_timeout with retries on every DDL statement, and rehearse
+      on production-sized data.
+    rubric:
+      - Names the locks/scans of the naive commands (ACCESS EXCLUSIVE scan, write-blocking index build)
+      - Batched backfill with short transactions
+      - NOT VALID then VALIDATE CONSTRAINT
+      - CREATE INDEX CONCURRENTLY outside a transaction, and the INVALID-index recovery
+      - lock_timeout and retries; rehearsal and monitoring
+    followUps:
+      - How do you choose the batch size for the backfill, and how do you know it is hurting production?
+      - What would you do if the index build has to happen during peak hours?
+      - How do you roll this back if the application release that depends on it fails?
+
+placement:
+  - id: place-pool
+    type: mcq
+    concept: pg-pool-and-clients
+    skill: application
+    title: Where the transaction runs
+    prompt: |
+      ```typescript
+      await pool.query('BEGIN');
+      await pool.query('UPDATE payments SET refunded_minor = refunded_minor + $1 WHERE id = $2', [500, id]);
+      await pool.query('INSERT INTO refunds (payment_id, amount_minor) VALUES ($1, $2)', [id, 500]);
+      await pool.query('COMMIT');
+      ```
+      What is wrong?
+    options:
+      - id: clients
+        text: Each pool.query may use a different connection, so the statements are not in one transaction
+        feedback: Correct - node-postgres says to use the same client for every statement of a transaction (pool.connect, then release).
+      - id: nothing
+        text: Nothing - the pool keeps the transaction open between calls
+        feedback: The pool returns the client after each query; the next call can get another one.
+      - id: params
+        text: BEGIN and COMMIT need parameters
+        feedback: They take no values; the problem is which connection runs them.
+      - id: slow
+        text: It is correct but slow because of four round trips
+        feedback: Speed isn't the issue - atomicity is lost, and a BEGIN may be left open on a pooled connection.
+    correct: [clients]
+    solution: |
+      `pool.query` borrows and returns a client per call, so BEGIN, the UPDATE, the INSERT and COMMIT may run on
+      different connections - the UPDATE and INSERT aren't atomic, and a connection can be returned with an
+      open transaction. Check out one client with `pool.connect()`, run all four statements on it, and release
+      it in `finally`.
+
+  - id: place-params
+    type: mcq
+    concept: sql-parameters-and-mapping
+    skill: application
+    title: A safe sort option
+    prompt: The orders list lets users sort by "date" or "amount". Which implementation is safe?
+    options:
+      - id: allow
+        text: Map "date" and "amount" to fixed ORDER BY strings in code; reject any other value
+        feedback: Correct - identifiers can't be parameters, so an allow-list is the safe way.
+      - id: param
+        text: "ORDER BY $1 with the column name as a parameter"
+        feedback: It runs, but $1 is a constant value, so the rows are not sorted by the column at all.
+      - id: escape
+        text: Remove quotes and semicolons from the value, then interpolate it
+        feedback: Hand-made escaping misses cases (comments, expressions, functions); never interpolate input into SQL.
+      - id: quote
+        text: Wrap the value in double quotes as an identifier
+        feedback: Quoting helps with a name you control, but still lets a user choose any column, including ones they shouldn't see sorted or probed.
+    correct: [allow]
+    solution: |
+      Values can be parameters, identifiers can't - `ORDER BY $1` silently sorts by a constant. Map the
+      user's choice through a fixed allow-list and reject everything else.
+
+  - id: place-migration
+    type: mcq
+    concept: versioned-schema-migrations
+    skill: application
+    title: A failing migration
+    prompt: |
+      A migration file contains `CREATE TABLE payouts (...)` followed by an `UPDATE` that fails. The runner
+      wraps each migration in a transaction with its `schema_migrations` row. What is the state afterwards?
+    options:
+      - id: none
+        text: No payouts table and no record of the migration; earlier migrations are still applied
+        feedback: Correct - PostgreSQL DDL is transactional, so the whole file and its record roll back together.
+      - id: half
+        text: The payouts table exists, but the migration isn't recorded
+        feedback: That's what happens without a transaction (or on databases without transactional DDL) - not here.
+      - id: recorded
+        text: The migration is recorded as applied
+        feedback: The record is inserted in the same transaction, so it rolls back too.
+      - id: all-rolled
+        text: All migrations ever applied are rolled back
+        feedback: Each migration is its own transaction; earlier ones stay committed.
+    correct: [none]
+    solution: |
+      Each migration and its record are one transaction, and PostgreSQL's CREATE TABLE is transactional, so a
+      failure leaves no trace of that file. Statements that can't run in a transaction block, such as
+      `CREATE INDEX CONCURRENTLY`, need their own migration without one.
+
+  - id: place-lock
+    type: mcq
+    concept: zero-downtime-schema-changes
+    skill: application
+    title: The safest first step
+    prompt: You need to add an index on `orders (merchant_id, created_at)` to a large table that takes writes all day. Which command?
+    options:
+      - id: concurrently
+        text: CREATE INDEX CONCURRENTLY, in a migration that runs outside a transaction block
+        feedback: Correct - it builds without blocking writes; it can't run inside a transaction.
+      - id: plain
+        text: CREATE INDEX inside the usual migration transaction
+        feedback: A standard build locks out inserts, updates and deletes until it finishes - minutes or hours on a large table.
+      - id: begin
+        text: BEGIN; CREATE INDEX CONCURRENTLY ...; COMMIT;
+        feedback: "PostgreSQL refuses: 25001 CREATE INDEX CONCURRENTLY cannot run inside a transaction block."
+      - id: reindex
+        text: REINDEX TABLE orders
+        feedback: That rebuilds existing indexes; it doesn't create the new one.
+    correct: [concurrently]
+    solution: |
+      `CREATE INDEX CONCURRENTLY` takes SHARE UPDATE EXCLUSIVE, so writes continue; it does more work and
+      can't run in a transaction block, and a failed build leaves an INVALID index to drop and retry.
+
+recall:
+  - id: recall-pool-rules
+    concept: pg-pool-and-clients
+    prompt: What are the two rules for clients checked out of a node-postgres pool?
+    answer: Always release the client (in finally), even after an error; and run every statement of a transaction on that same client - never transactions on pool.query.
+  - id: recall-pool-budget
+    concept: pg-pool-and-clients
+    prompt: How do you size a pool, and what is PostgreSQL's usual max_connections default?
+    answer: Typically 100. All instances × pool max, plus headroom for deploys, migrations and admin tools, must stay below it; node-postgres defaults to max 10.
+  - id: recall-params
+    concept: sql-parameters-and-mapping
+    prompt: Why does a $1 parameter prevent SQL injection, and what can't be a parameter?
+    answer: The server parses the SQL text before it receives the values, so a value can never become SQL. Identifiers - table and column names, sort direction - can't be parameters; use an allow-list.
+  - id: recall-bigint
+    concept: sql-parameters-and-mapping
+    prompt: What JavaScript type does node-postgres return for bigint and numeric columns, and why?
+    answer: Strings - a JavaScript number can't represent every 64-bit integer or exact decimal, so pg doesn't guess. Convert and check (Number.isSafeInteger) in one mapping function.
+  - id: recall-runner
+    concept: versioned-schema-migrations
+    prompt: What does a migration runner record, and what must it refuse?
+    answer: Each applied version with its name, checksum and time (schema_migrations). It refuses edited applied migrations, applied ones missing from the code, duplicate versions and pending ones older than the newest applied.
+  - id: recall-ddl-tx
+    concept: versioned-schema-migrations
+    prompt: Is DDL transactional in PostgreSQL, and what is the notable exception?
+    answer: Yes - CREATE TABLE and most ALTER TABLE forms roll back with the transaction. CREATE INDEX CONCURRENTLY (among others) can't run inside a transaction block.
+  - id: recall-lock-queue
+    concept: zero-downtime-schema-changes
+    prompt: Why can a millisecond ALTER TABLE block a site for minutes, and what prevents it?
+    answer: It needs ACCESS EXCLUSIVE, waits for a long transaction, and every new query queues behind it. Set lock_timeout so it fails fast, and retry.
+  - id: recall-expand
+    concept: zero-downtime-schema-changes
+    prompt: What are the phases of a zero-downtime column rename?
+    answer: Expand (add the new column, write both), backfill in batches and add the constraint NOT VALID then VALIDATE, migrate reads to the new column, then contract (stop old writes, drop the old column).
+
+next:
+  - owasp-top-10-for-developers
+  - fullstack-testing-strategy
+  - deployment-and-configuration
