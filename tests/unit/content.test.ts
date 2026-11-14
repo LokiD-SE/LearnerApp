@@ -162,8 +162,10 @@ describe('every coding exercise', () => {
         expect(existsSync(inProject(exercise.test)), `${project.path}/${exercise.test} is missing`).toBe(
           true,
         );
-        // JUnit: @Tag("exercise"); Playwright: { tag: '@exercise' }
-        expect(readFileSync(inProject(exercise.test), 'utf8')).toMatch(/@Tag\("exercise"\)|'@exercise'/);
+        // JUnit: @Tag("exercise"); Playwright and Vitest: '@exercise'; pytest: pytest.mark.exercise
+        expect(readFileSync(inProject(exercise.test), 'utf8')).toMatch(
+          /@Tag\("exercise"\)|'@exercise'|pytest\.mark\.exercise/,
+        );
         const testClass = exercise.test
           .split('/')
           .pop()!

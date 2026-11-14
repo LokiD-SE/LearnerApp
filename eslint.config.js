@@ -11,6 +11,7 @@ export default tseslint.config(
       'playwright-report',
       'node_modules',
       'practice/**/target',
+      'practice/**/.venv',
       'practice/**/node_modules',
       'practice/**/test-results',
       'practice/**/playwright-report',

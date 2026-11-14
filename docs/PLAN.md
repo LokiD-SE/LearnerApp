@@ -215,7 +215,10 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
 - [x] `practice/fullstack`: TypeScript, React 19 (Testing Library, jsdom), Express 5 (supertest) and PostgreSQL
       (PGlite, no server); exercise tests tagged `@exercise`; `npm run verify` in CI via `practice/verify.sh fullstack`.
       54 exercises.
-- [ ] Track J lessons, in batches of 4-6. Sources: the Model Context Protocol specification
+- [ ] Track J lessons, in batches of 4-6. Batch 1 done: python-numpy-pandas, ml-maths-essentials,
+      linear-regression-gradient-descent, logistic-regression-classification, model-evaluation-and-overfitting,
+      scikit-learn-pipelines (6 of 36). Next: decision-trees-and-ensembles, unsupervised-learning, then the deep
+      learning module (needs PyTorch CPU in practice/ai). Sources: the Model Context Protocol specification
       (modelcontextprotocol.io), Anthropic and OpenAI API docs, LangGraph and CrewAI docs, scikit-learn, NumPy,
       pandas and PyTorch docs, _Deep Learning_ (Goodfellow, Bengio, Courville), _Attention Is All You Need_,
       Stanford CS229 notes, OWASP Top 10 for LLM applications, NIST AI RMF. The courses the owner named
@@ -224,7 +227,9 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
       cite primary sources.
 - [ ] `practice/ai`: a Python project (NumPy, scikit-learn, PyTorch CPU, the MCP Python SDK) with pytest
       exercises; agent exercises run against a scripted fake model so they pass offline and free; real API calls
-      are optional and illustrative.
+      are optional and illustrative. Started: Python 3.12 venv (`.venv`, pinned `requirements.txt`: NumPy 2.5.4,
+      pandas 3.1.1, scikit-learn 1.9.1, pytest 9.2.0), `AI_TARGET=solutions` switches the import path,
+      `scripts/verify.py` via `practice/verify.sh ai` in CI; 13 exercises so far.
 - [ ] Interview question bank entries for both tracks. Track I done (20 questions in
       `content/interviews/questions/fullstack.yaml`); Track J to do.
 

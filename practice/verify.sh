@@ -17,6 +17,13 @@ if [ -f package.json ]; then
   exec npm run verify -- "$@"
 fi
 
+# Python projects (practice/ai) verify themselves too: scripts/verify.py in a project virtual environment
+if [ -f pyproject.toml ]; then
+  [ -x .venv/bin/python ] || python3 -m venv .venv
+  .venv/bin/pip install -q --disable-pip-version-check -r requirements.txt
+  exec .venv/bin/python scripts/verify.py "$@"
+fi
+
 mvn=(mvn -B -ntp "$@")
 
 echo "== $project: reference solutions must pass every test"
