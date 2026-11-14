@@ -41,9 +41,20 @@ describe('the bundled content', () => {
 
   it('lists every stage and track', () => {
     if (!contentResult.ok) throw new Error('invalid');
-    expect(contentResult.index.curriculum.stages).toHaveLength(7);
+    expect(contentResult.index.curriculum.stages).toHaveLength(15);
     expect(contentResult.index.curriculum.subjects.map((s) => s.track)).toEqual(
-      expect.arrayContaining(['Track A', 'Track B', 'Track C', 'Track D', 'Track E', 'Track F', 'Track G']),
+      expect.arrayContaining([
+        'Track A',
+        'Track B',
+        'Track C',
+        'Track D',
+        'Track E',
+        'Track F',
+        'Track G',
+        'Track H',
+        'Track I',
+        'Track J',
+      ]),
     );
   });
 });

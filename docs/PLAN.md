@@ -194,6 +194,30 @@ course.
       the manifest and icons, every diagram type offline, and the shop staying uncached. The update flow was
       also checked by hand in Chrome (banner, Reload, old cache removed).
 
+## Increment 9 - Track I (full stack) and Track J (AI engineering) (in progress)
+
+Goal: two end-to-end courses to the same standard as tracks A-H - every lesson from official sources, cited in
+`environment:`, with runnable practice projects that need no paid API key.
+
+- [x] Outline: 32 full stack lessons (stages 8-10) and 36 AI lessons (stages 11-15) as planned lessons, with a
+      **Full stack developer (TypeScript)** path and an **AI engineer - LLM apps, RAG and agents** path.
+- [ ] Track I lessons, in batches of 4-6. Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
+      Express, PostgreSQL, Docker, GitHub Actions, OWASP. Sources: WHATWG HTML, MDN, ECMA-262, the TypeScript
+      handbook, react.dev, nodejs.org, expressjs.com, the PostgreSQL manual, RFCs, OWASP, OpenAPI 3.1, docs.docker.com.
+- [ ] `practice/fullstack`: a TypeScript project (React + Express + PostgreSQL-compatible tests) with exercises,
+      solutions and `npm run verify`, run by `practice/verify.sh fullstack`.
+- [ ] Track J lessons, in batches of 4-6. Sources: the Model Context Protocol specification
+      (modelcontextprotocol.io), Anthropic and OpenAI API docs, LangGraph and CrewAI docs, scikit-learn, NumPy,
+      pandas and PyTorch docs, _Deep Learning_ (Goodfellow, Bengio, Courville), _Attention Is All You Need_,
+      Stanford CS229 notes, OWASP Top 10 for LLM applications, NIST AI RMF. The courses the owner named
+      (IBM Generative AI Engineering, DeepLearning.AI Machine Learning / Deep Learning specialisations, AI Agents
+      in LangGraph, MCP with Anthropic, Coursera AI Agent Architecture with MCP) shape the outline only; lessons
+      cite primary sources.
+- [ ] `practice/ai`: a Python project (NumPy, scikit-learn, PyTorch CPU, the MCP Python SDK) with pytest
+      exercises; agent exercises run against a scripted fake model so they pass offline and free; real API calls
+      are optional and illustrative.
+- [ ] Interview question bank entries for both tracks.
+
 ## Next increments
 
 Each increment ends with `npm run check` green (and `practice/verify.sh` for practice projects).
