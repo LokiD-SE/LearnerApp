@@ -1,0 +1,1022 @@
+id: dom-events-event-loop
+title: The DOM, events and the event loop
+subject: fullstack
+module: web-platform
+level: intermediate
+status: published
+estimatedMinutes: 60
+summary: How the browser runs your JavaScript, dispatches events and renders - the DOM tree, capture and bubble, delegation, preventDefault versus stopPropagation, tasks and microtasks, requestAnimationFrame, and why one long task freezes the whole page.
+tags: [dom, events, event loop, microtask, bubbling, event delegation, preventDefault, requestAnimationFrame, long tasks]
+
+environment: |
+  - **Standards:** the **WHATWG DOM Standard** ([dom.spec.whatwg.org](https://dom.spec.whatwg.org/)) -
+    section 2 "Events": dispatching events, the event path, `stopPropagation()`, `preventDefault()`, "set the
+    canceled flag", `AddEventListenerOptions` (`capture`, `passive`, `once`, `signal`) and the default passive
+    value. The **WHATWG HTML Living Standard**, section 8.1.7 "Event loops"
+    ([html.spec.whatwg.org/multipage/webappapis.html](https://html.spec.whatwg.org/multipage/webappapis.html#event-loops)) -
+    task queues, the microtask queue, "perform a microtask checkpoint", "update the rendering",
+    `HostEnqueuePromiseJob`, `queueMicrotask()`, and the timer rules in
+    [timers-and-user-prompts](https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers)
+    (nested timeouts clamped to 4 ms). **ECMA-262** ([tc39.es/ecma262](https://tc39.es/ecma262/)), 9.5
+    "Jobs and Host Operations to Enqueue Jobs" - `HostEnqueuePromiseJob`. All read on 2026-11-14; living
+    standards change, so section numbers may move.
+  - **Reference:** MDN -
+    [Event bubbling](https://developer.mozilla.org/en-US/docs/Learn_web_development/Core/Scripting/Event_bubbling),
+    [addEventListener](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener),
+    [Element.closest](https://developer.mozilla.org/en-US/docs/Web/API/Element/closest),
+    [JavaScript execution model](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model),
+    [Using microtasks](https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide),
+    [requestAnimationFrame](https://developer.mozilla.org/en-US/docs/Web/API/Window/requestAnimationFrame).
+    The "long task" threshold (50 ms) is from web.dev,
+    [Optimize long tasks](https://web.dev/articles/optimize-long-tasks) - a Chrome team guide, not a standard.
+  - **Outputs were really run.** Task and microtask ordering: **Node.js 24.21** (`node file.mjs`). Event
+    dispatch, `preventDefault`, passive listeners, delegation and `requestAnimationFrame`: **Google Chrome
+    157** driven by Playwright. Node has no DOM and no rendering, so every DOM and rAF output in this lesson
+    comes from the Chrome run, not from Node.
+  - **Browser-specific:** the order of a `setTimeout(0)` callback and a `requestAnimationFrame` callback is
+    **not** fixed by the standard - it depends on when the browser's next rendering opportunity comes. The
+    order shown is one Chrome run.
+  - **Practice shop:** the SandPay Demo Shop (`practice/shop/shop.js`) is fictional; the catalog code quoted
+    below is from this repository.
+
+prerequisites: [html-semantics-and-forms]
+
+concepts:
+  - id: dom-event-dispatch
+    name: The DOM tree and event dispatch
+    summary: The DOM is a tree of nodes your code queries and changes; an event travels down it (capture), reaches the target, then back up (bubble), which makes delegation possible and separates stopping propagation from cancelling the default action.
+  - id: event-loop-task-ordering
+    name: Tasks and microtasks
+    summary: The event loop runs one task at a time to completion, then drains the whole microtask queue (promise reactions, await continuations, queueMicrotask) before anything else - so microtasks always beat timers queued earlier.
+  - id: rendering-and-long-tasks
+    name: Rendering and long tasks
+    summary: The browser can only render, and handle input, between tasks; requestAnimationFrame runs just before a render, and any task longer than about 50 ms makes the page feel frozen until it ends.
+
+objectives:
+  - Trace the path of a click event through the capture, target and bubble phases, and predict which listeners run and in what order.
+  - Write a delegated event listener with `closest()` that keeps working when the list is re-rendered.
+  - Explain the difference between `preventDefault()` and `stopPropagation()`, and when `preventDefault()` silently does nothing.
+  - Predict the console output order of synchronous code, promise reactions, `await`, `queueMicrotask` and `setTimeout`, and justify it from the event loop's steps.
+  - Diagnose a frozen UI as a long task, and choose between splitting work, yielding, `requestAnimationFrame` and a Web Worker.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [dom-event-dispatch, event-loop-task-ordering]
+    title: The idea in plain language
+    body: |
+      Think of the page as a **company org chart** (the DOM tree). When a customer complains to one employee
+      (a click on a button), the message first goes **down** from the CEO through each manager to that
+      employee (capture), the employee deals with it (target), and then it goes back **up** the chain so every
+      manager hears about it (bubble). A manager can say "don't pass this further up" (`stopPropagation`) -
+      but that doesn't undo what the company does by policy, such as sending a refund form (the browser's
+      **default action**, cancelled only by `preventDefault`).
+
+      The whole company has **one receptionist** (the main thread). She takes **one job at a time** from the
+      in-tray (a **task**) and finishes it completely. Before picking up the next job she clears her
+      **sticky notes** - the small follow-ups that job created (**microtasks**). Repainting the office
+      noticeboard (rendering) is just another job on her list. If one job takes her ten minutes, nobody else
+      is served and the noticeboard isn't updated for ten minutes: that is a frozen page.
+
+  - id: what
+    kind: what
+    concepts: [dom-event-dispatch, event-loop-task-ordering, rendering-and-long-tasks]
+    title: The terms, precisely
+    body: |
+      | Term | Meaning (source) |
+      |---|---|
+      | **DOM** | the tree of `Node` objects (document, elements, text) that represents the page; scripts read and change it (DOM Standard section 4) |
+      | **Event target** | the node an event is dispatched at - `event.target`; the node whose listener is running now is `event.currentTarget` |
+      | **Event path** | the target and its ancestors up to the `Document` and `Window`, computed **once** when dispatch starts |
+      | **Phases** | `CAPTURING_PHASE` (1) down the path, `AT_TARGET` (2), `BUBBLING_PHASE` (3) back up - only if `event.bubbles` is true |
+      | **Default action** | what the browser does after dispatch - follow a link, submit a form, scroll on a wheel |
+      | **`preventDefault()`** | sets the event's **canceled flag** - only if the event is `cancelable` and the listener is not `passive` |
+      | **`stopPropagation()`** | stops the event reaching **other objects** on the path; other listeners on the current object still run (`stopImmediatePropagation()` stops those too) |
+      | **Task** | a unit of work in a task queue - running a script, dispatching most events, a timer callback, rendering (HTML 8.1.7) |
+      | **Microtask** | a job in the single **microtask queue** - promise reactions (HTML implements ECMA-262's `HostEnqueuePromiseJob` this way), `await` continuations, `queueMicrotask()`, `MutationObserver` callbacks |
+      | **Microtask checkpoint** | after every task (and whenever the script stack empties) the loop runs microtasks **until the queue is empty** - including ones added meanwhile |
+      | **Rendering opportunity** | a moment when the browser can present a frame - typically every ~16.7 ms at 60 Hz; it then queues an "update the rendering" task |
+      | **Long task** | a task longer than **50 ms** (web.dev's definition, used by Chrome's tooling) |
+
+      The DOM and events are **browser** APIs. Node.js has an event loop with timers and microtasks too, but
+      no DOM and no rendering steps.
+
+  - id: why
+    kind: why
+    concepts: [dom-event-dispatch, rendering-and-long-tasks]
+    title: Why a full stack developer needs this
+    body: |
+      Most "random" frontend bugs are this model misunderstood:
+
+      - a click handler **stops working after the list re-sorts**, because the button it was attached to was
+        replaced by a new node;
+      - a form **still submits** although the handler called `stopPropagation()`;
+      - "the spinner never appears" - the code shows it, does 2 seconds of work and hides it **in the same
+        task**, so the browser never gets a chance to paint it;
+      - a value is "undefined, then correct" because code read it **before** a promise callback had run;
+      - an analytics listener on `document` never fires because a component stopped propagation.
+
+      Frameworks such as React build on exactly these rules (React attaches its listeners at the root and
+      delegates), so you need them to debug React too.
+
+  - id: dom-basics
+    kind: code
+    concepts: [dom-event-dispatch]
+    title: Querying and changing the DOM
+    body: |
+      ```javascript
+      // Query: CSS selectors. querySelector returns the first match or null.
+      const list = document.querySelector('[data-testid="product-list"]');
+      const cards = list.querySelectorAll('li.product-card'); // a static NodeList
+
+      // Read and change.
+      const card = cards[0];
+      card.dataset.sku;                 // reads data-sku
+      card.classList.add('selected');   // class without string surgery
+      card.querySelector('h2').textContent = 'Mug'; // text - never parsed as HTML
+
+      // Create and insert nodes.
+      const li = document.createElement('li');
+      li.textContent = 'Out of stock';
+      list.append(li);                  // add at the end
+      list.replaceChildren(li);         // remove every child, then insert
+
+      // Walk the tree.
+      card.parentElement;               // up one level
+      card.closest('ul');               // nearest ancestor (or itself) matching a selector
+      ```
+
+      Use `textContent` for text you didn't write: assigning user input to `innerHTML` parses it as HTML,
+      which is how cross-site scripting gets in (see the OWASP lesson later in this course). Changing the DOM
+      is **synchronous** - the tree is updated at once - but the **screen** is updated only at the next
+      rendering step.
+
+  - id: visual-dispatch
+    kind: visual
+    concepts: [dom-event-dispatch]
+    title: "Diagram: one click, three phases"
+    body: |
+      A click on the button inside a list. Capture listeners run from the top down, then the target, then
+      bubble listeners from the bottom up. Notice that `target` stays the button the whole time while
+      `currentTarget` changes.
+
+      ```mermaid
+      flowchart TB
+          W[Window] -->|1 capture| D[Document]
+          D -->|2 capture| U["ul#list"]
+          U -->|3 at target| B["button#buy"]
+          B -->|4 bubble| U2["ul#list"]
+          U2 -->|5 bubble| D2[Document]
+          D2 -->|6 bubble| W2[Window]
+          B -.->|after dispatch, if not canceled| DA[Default action]
+      ```
+
+  - id: internals-dispatch
+    kind: internals
+    concepts: [dom-event-dispatch]
+    title: "How dispatch works: the DOM Standard's algorithm"
+    body: |
+      The DOM Standard's "dispatch" algorithm, simplified:
+
+      1. Build the **event path**: the target, then each parent up to the document, then the `Window`. The
+         path is fixed now - removing a node from the tree during dispatch doesn't change who receives this
+         event.
+      2. Walk the path **in reverse** (window first) and invoke listeners registered with `capture: true`.
+         `eventPhase` is `CAPTURING_PHASE`, or `AT_TARGET` on the target itself.
+      3. Walk the path **forwards** (target first). At the target, invoke the non-capture listeners
+         (`AT_TARGET`). For the ancestors, **only if `event.bubbles` is true**, invoke non-capture listeners
+         (`BUBBLING_PHASE`). `focus`, `blur`, `mouseenter` and `load` do not bubble; `click`, `input`,
+         `submit` and `keydown` do.
+      4. Before each object, check the **stop propagation flag** - once set, no further objects receive the
+         event.
+      5. After dispatch, the code that fired the event checks the **canceled flag** and skips the default
+         action if it is set.
+
+      Two details that cause real bugs:
+
+      - `preventDefault()` only "sets the canceled flag" when `event.cancelable` is true **and** the listener
+        is not passive; otherwise it does nothing (the standard encourages browsers to log a console
+        warning).
+      - The **default passive value** is `true` for `touchstart`, `touchmove`, `wheel` and `mousewheel`
+        listeners added to the `Window`, the `Document`, `<html>` or `<body>`. Browsers do that so they can
+        scroll without waiting for your script. To cancel scrolling there, pass `{ passive: false }`
+        explicitly - or better, don't.
+
+      Run in Chrome 157 (listeners on `document` and the `ul`, both phases, then `buy.click()`):
+
+      ```plaintext
+      document capture CAPTURING
+      ul capture CAPTURING
+      button AT_TARGET
+      ul bubble BUBBLING target=buy currentTarget=list
+      document bubble BUBBLING
+      ```
+
+  - id: delegation
+    kind: example
+    concepts: [dom-event-dispatch]
+    title: "Example: the shop's catalog, and event delegation"
+    body: |
+      The SandPay Demo Shop's catalog (`practice/shop/shop.js`) attaches **one listener per button**, inside
+      `render`:
+
+      ```javascript
+      const button = el('button', { type: 'button', /* ... */ }, 'Add to cart');
+      button.addEventListener('click', async () => { /* add product.sku to the cart */ });
+      ```
+
+      and every re-sort calls `list.replaceChildren(...)` with **new** buttons. That works, because `render`
+      creates the listeners again each time - but it is easy to break: code that adds listeners **once** at
+      start-up and re-renders later leaves the new buttons dead. (The shop also gives the buttons generated ids
+      on purpose, as a trap for automation.)
+
+      **Event delegation** uses bubbling instead: one listener on the stable parent, and the target decides
+      what was clicked.
+
+      ```javascript
+      list.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-sku]');
+        if (!button || !list.contains(button)) return; // a click elsewhere in the list
+        cart.add(button.dataset.sku);
+      });
+      ```
+
+      `closest()` matters: the user may click a `<span>` or icon **inside** the button, so `event.target` is
+      not always the button itself. In the Chrome run, clicking a `<span>` inside the MUG button, then
+      re-rendering the list with new nodes and clicking TSHIRT, then clicking the empty list, logged:
+
+      ```plaintext
+      add MUG
+      add TSHIRT
+      ```
+
+      - the listener survived the re-render, and the click on the list itself was ignored.
+
+  - id: prevent-vs-stop
+    kind: mistakes
+    concepts: [dom-event-dispatch]
+    title: preventDefault versus stopPropagation
+    body: |
+      They control **different things**, and mixing them up is the most common event bug.
+
+      | You want to... | Use | It does not... |
+      |---|---|---|
+      | stop the browser following the link / submitting the form | `event.preventDefault()` | stop other listeners from hearing the event |
+      | stop ancestors' listeners from hearing the event | `event.stopPropagation()` | stop the default action |
+      | also stop later listeners on this same element | `event.stopImmediatePropagation()` | stop the default action |
+
+      Measured in Chrome 157 on a `<form>` with a submit button:
+
+      ```plaintext
+      stopPropagation in button click
+      submit events after stopPropagation: 1
+      stopPropagation in button click
+      preventDefault in button click
+      submit events after preventDefault too: 1
+      non-cancelable event defaultPrevented=false
+      passive listener defaultPrevented=false
+      ```
+
+      The first click only stopped propagation, and the form **still submitted** (one `submit` event). The
+      second click also called `preventDefault()`, and no second submit happened. The last two lines show
+      `preventDefault()` silently doing nothing - on an event created with `cancelable: false`, and in a
+      `passive` listener.
+
+      Habits that avoid trouble:
+
+      - For forms, listen for **`submit` on the form** and call `preventDefault()` there - it covers the
+        button, the Enter key and `requestSubmit()`.
+      - Avoid `stopPropagation()` in components: it silently breaks delegated listeners, analytics and
+        "click outside to close" handlers higher up. Check `event.defaultPrevented` or the target instead.
+      - Debug a listener that "never runs" in DevTools: Elements panel, **Event Listeners** tab, shows every
+        listener on a node and its ancestors, with the phase.
+
+  - id: event-loop
+    kind: internals
+    concepts: [event-loop-task-ordering, rendering-and-long-tasks]
+    title: "The event loop: the HTML Standard's processing model"
+    body: |
+      HTML section 8.1.7 defines what a window's event loop does, again and again:
+
+      1. Pick a **task queue** that has a runnable task - which queue is implementation-defined, so browsers
+         may favour input over timers - and take its **oldest runnable task**.
+      2. **Run that task to completion.** Nothing interrupts JavaScript that is running: no event handler,
+         no timer, no repaint.
+      3. **Perform a microtask checkpoint:** while the microtask queue is not empty, take the oldest microtask
+         and run it. Microtasks added during the checkpoint run in the **same** checkpoint.
+      4. Repeat. When the browser has a **rendering opportunity** (about every 16.7 ms at 60 Hz, less often in
+         background tabs), it queues an **"update the rendering"** task. That task runs resize and scroll
+         steps, media queries, animations, **`requestAnimationFrame` callbacks**, style and layout,
+         intersection observers, and then paints.
+
+      Where common callbacks go:
+
+      | Code | Queue |
+      |---|---|
+      | `<script>` evaluation, most user-input events, `postMessage`, network callbacks | a task |
+      | `setTimeout(fn, 0)`, `setInterval` | a task, after at least the delay (nested more than 5 deep, clamped to 4 ms) |
+      | `promise.then(fn)`, code after `await`, `queueMicrotask(fn)` | a microtask |
+      | `requestAnimationFrame(fn)` | the next "update the rendering" task, before style, layout and paint |
+
+      ECMA-262 itself doesn't say "microtask": it says the host must provide `HostEnqueuePromiseJob`, and HTML
+      says "HTML schedules these operations in the microtask queue". Node.js does the same for promises.
+
+  - id: visual-loop
+    kind: visual
+    concepts: [event-loop-task-ordering, rendering-and-long-tasks]
+    title: "Diagram: one turn of the event loop"
+    body: |
+      Notice the inner loop - microtasks are drained **completely** before the next task, and rendering is
+      only one of the tasks the loop chooses between.
+
+      ```mermaid
+      flowchart TD
+          A[Pick the oldest runnable task from a task queue] --> B[Run it to completion]
+          B --> C{Microtask queue empty?}
+          C -- no --> D[Run the oldest microtask]
+          D --> C
+          C -- yes --> E{Rendering opportunity and update-the-rendering task chosen?}
+          E -- yes --> F[rAF callbacks, style, layout, paint]
+          F --> A
+          E -- no --> A
+      ```
+
+  - id: ordering-code
+    kind: code
+    concepts: [event-loop-task-ordering]
+    title: "Predicting the order: examples run in Node.js 24"
+    body: |
+      ```javascript
+      console.log('1 script start');
+      setTimeout(() => console.log('5 timeout'), 0);
+      Promise.resolve().then(() => console.log('3 promise then'));
+      queueMicrotask(() => console.log('4 queueMicrotask'));
+      console.log('2 script end');
+      ```
+
+      Output (Node.js 24.21):
+
+      ```plaintext
+      1 script start
+      2 script end
+      3 promise then
+      4 queueMicrotask
+      5 timeout
+      ```
+
+      A harder one, with `await` and a timer queued **from** a microtask:
+
+      ```javascript
+      setTimeout(() => console.log('timeout A'), 0);
+      setTimeout(() => console.log('timeout B'), 0);
+      Promise.resolve()
+        .then(() => {
+          console.log('then 1');
+          setTimeout(() => console.log('timeout C'), 0);
+        })
+        .then(() => console.log('then 2'));
+      (async () => {
+        console.log('async start');
+        await null;
+        console.log('after await');
+      })();
+      console.log('sync end');
+      ```
+
+      ```plaintext
+      async start
+      sync end
+      then 1
+      after await
+      then 2
+      timeout A
+      timeout B
+      timeout C
+      ```
+
+      And a microtask queued **inside** a task runs before the next task:
+
+      ```javascript
+      setTimeout(() => {
+        console.log('task 1');
+        Promise.resolve().then(() => console.log('microtask from task 1'));
+      }, 0);
+      setTimeout(() => console.log('task 2'), 0);
+      ```
+
+      ```plaintext
+      task 1
+      microtask from task 1
+      task 2
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [event-loop-task-ordering]
+    title: Why the second example prints in that order
+    body: |
+      - **`async start`** - calling an `async` function runs its body **synchronously** up to the first
+        `await`.
+      - **`sync end`** - the rest of the script is part of the same task, so it finishes before any
+        microtask.
+      - **`then 1`** - the script task ended, so the checkpoint starts. `then 1` was queued first (the
+        promise was already resolved when `.then` was called).
+      - **`after await`** - `await null` queued its continuation **after** `then 1` was queued, so it runs
+        next. (`await` on a non-promise value still waits for one microtask.)
+      - **`then 2`** - queued only when `then 1` **finished**; still the same checkpoint, because the loop
+        drains until the queue is empty.
+      - **`timeout A`, `timeout B`, `timeout C`** - tasks, in the order their timers were set. `C` was set
+        during a microtask, after A and B.
+
+      The rule to remember: **synchronous code, then all microtasks (including new ones), then the next
+      task.** For promise chains and `async`/`await` themselves, see
+      [JavaScript and TypeScript for testers](#/lesson/js-ts-async-and-types).
+
+  - id: rendering
+    kind: when
+    concepts: [rendering-and-long-tasks]
+    title: Rendering, requestAnimationFrame and long tasks
+    body: |
+      Because rendering is a step **between** tasks, a DOM change is not visible until the current task and
+      its microtasks are done:
+
+      ```javascript
+      spinner.hidden = false;
+      const report = buildReport(rows);   // 2 seconds of synchronous work
+      spinner.hidden = true;              // the spinner was never painted
+      ```
+
+      The same is true for clicks: while that task runs, input events wait in their queue, so the page
+      **looks frozen**. web.dev calls a task over **50 ms** a long task, and Chrome's Performance panel marks
+      them with a red corner. In Node.js 24 this was easy to measure - a `setTimeout(..., 0)` behind a 200 ms
+      busy loop:
+
+      ```plaintext
+      busy loop done
+      timeout ran after 205 ms
+      ```
+
+      What to do instead:
+
+      | Situation | Tool |
+      |---|---|
+      | change styles or positions for the **next frame** (animation, measuring then moving) | `requestAnimationFrame(callback)` - runs right before style, layout and paint |
+      | show a spinner, then do heavy work | yield first - `await new Promise((r) => setTimeout(r, 0))` - so a render can happen |
+      | process 10,000 rows | split into chunks and yield between them (`scheduler.yield()` where supported - check browser support) |
+      | CPU-heavy work (parsing, image processing) | a **Web Worker** - its own thread and event loop, no DOM access |
+      | waiting for the network | nothing - `fetch` doesn't block; only your synchronous code does |
+
+      Order seen in one Chrome 157 run (sync, then `requestAnimationFrame`, `setTimeout(0)` and a promise
+      scheduled in the same script):
+
+      ```plaintext
+      sync
+      microtask
+      timeout
+      rAF
+      microtask from rAF
+      ```
+
+      The microtask always comes first. Whether `timeout` or `rAF` comes next depends on when the browser's
+      next rendering opportunity is - **don't rely on it**. A microtask queued inside the rAF callback runs
+      right after it, before the paint.
+
+      Microtasks can freeze the page too: a microtask that keeps queuing another microtask never lets the
+      loop reach the next task or the render. A `setTimeout` loop does not have that problem.
+
+  - id: steps
+    kind: steps
+    concepts: [rendering-and-long-tasks, dom-event-dispatch]
+    title: Debugging "the click does nothing" and "the page freezes"
+    body: |
+      **The click does nothing:**
+
+      1. Open DevTools, select the element, open **Event Listeners** - is there a listener on it or an
+         ancestor? With which phase?
+      2. Check that the node you attached to is the node on screen now - re-renders replace nodes. In the
+         Console, compare `$0` (the selected element) with your saved reference.
+      3. Add `{ capture: true }` logging on `document` - does the event arrive at all? If it arrives in
+         capture but not in bubble, something called `stopPropagation()`.
+      4. Check `event.target` - is it a child (icon, `<span>`) your code doesn't expect? Use `closest()`.
+
+      **The page freezes:**
+
+      1. Record in the **Performance** panel while reproducing; look for long tasks (red corners) on the Main
+         track.
+      2. Open the longest task - the bottom-up view names the function that used the time.
+      3. Decide: split and yield, move to a worker, or do less (pagination, virtualised lists).
+      4. Re-record and confirm no task over 50 ms remains on that interaction.
+
+  - id: tests
+    kind: tests
+    concepts: [dom-event-dispatch, rendering-and-long-tasks]
+    title: What to test
+    body: |
+      | Case | Expected result | Evidence |
+      |---|---|---|
+      | Re-sort the catalog, then click Add to cart on the first item | the correct product is added | cart count and toast name the clicked product |
+      | Click the icon or text **inside** a delegated button | same as clicking the button | the handler runs once |
+      | Press Enter in a form field | the form's submit handler runs, the page does not reload | no navigation in the Network panel |
+      | Open a menu, click outside it | the menu closes, even if the click target stops propagation | the "outside" listener uses capture or checks targets |
+      | Start a long export | a spinner is visible during the work, and the page still scrolls | Performance panel - no task over 50 ms |
+      | Double-click a pay button | one payment request | Network panel - a single POST; the button is disabled after the first click |
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [dom-event-dispatch, event-loop-task-ordering]
+    title: Trade-offs and limits
+    body: |
+      - **Delegation** saves listeners and survives re-renders, but needs `closest()` and a check that the
+        match is inside the container; events that don't bubble (`focus`, `mouseenter`) need their bubbling
+        cousins (`focusin`, `mouseover`) or capture.
+      - **Capture listeners** see events first, which is useful for "click outside" and logging - but they run
+        before the component itself and can surprise its authors.
+      - **Microtasks** are the fastest way to run "after the current code", but a flood of them delays input
+        and rendering as surely as a long task.
+      - **Timers** are not precise: the delay is a minimum, nested timers are clamped to 4 ms, and background
+        tabs are throttled.
+      - The **task source** a browser picks first is implementation-defined; only the ordering within one
+        queue and the microtask rules are guaranteed.
+
+  - id: summary
+    kind: summary
+    concepts: [dom-event-dispatch, event-loop-task-ordering, rendering-and-long-tasks]
+    title: Quick reference
+    body: |
+      - Dispatch: **capture** (window → target), **target**, **bubble** (target → window, if `bubbles`).
+      - `target` = where it happened; `currentTarget` = whose listener is running.
+      - Delegation: one listener on a stable parent + `event.target.closest(selector)`.
+      - `preventDefault()` cancels the **default action** (only if cancelable and not passive);
+        `stopPropagation()` stops **other objects**; neither does the other's job.
+      - Event loop: one **task** to completion → **all microtasks** → maybe **render** → next task.
+      - Microtasks: `.then`, `await` continuations, `queueMicrotask`. Tasks: timers, most events, messages.
+      - `requestAnimationFrame` runs right before the next paint.
+      - A task over **50 ms** is a long task: split it, yield, or use a Web Worker.
+
+exercises:
+  - id: predict-order-basic
+    type: order
+    concept: event-loop-task-ordering
+    skill: application
+    title: Predict the console output
+    prompt: |
+      Put the lines in the order they are printed (in a browser or Node.js):
+
+      ```javascript
+      setTimeout(() => console.log('timer'), 0);
+      queueMicrotask(() => console.log('micro'));
+      Promise.resolve().then(() => console.log('then'));
+      console.log('sync');
+      ```
+    items:
+      - id: sync
+        text: sync
+      - id: micro
+        text: micro
+      - id: then
+        text: then
+      - id: timer
+        text: timer
+    hints:
+      - Which line runs as part of the current script task?
+      - Both `queueMicrotask` and `.then` on a resolved promise add to the same queue - in what order were they added?
+      - The timer is a task. When can the next task start?
+    solution: |
+      **sync → micro → then → timer.** `sync` is part of the running task. When it ends, the microtask
+      checkpoint runs the microtask queue in **order of queuing**: `micro` was queued before `then`. Only then
+      can the loop pick the next task - the timer, even with a 0 ms delay.
+    followUp: |
+      Change the `.then` callback so it also calls `setTimeout(() => console.log('timer 2'), 0)`. Where does
+      `timer 2` appear, and why not before `timer`?
+
+  - id: predict-order-await
+    type: order
+    concept: event-loop-task-ordering
+    skill: analysis
+    title: async/await and a promise chain together
+    prompt: |
+      Put the output in order:
+
+      ```javascript
+      async function save() {
+        console.log('save start');
+        await Promise.resolve();
+        console.log('save done');
+      }
+      setTimeout(() => console.log('timeout'), 0);
+      save();
+      Promise.resolve()
+        .then(() => console.log('then 1'))
+        .then(() => console.log('then 2'));
+      console.log('end');
+      ```
+    items:
+      - id: save-start
+        text: save start
+      - id: end
+        text: end
+      - id: save-done
+        text: save done
+      - id: then-1
+        text: then 1
+      - id: then-2
+        text: then 2
+      - id: timeout
+        text: timeout
+    hints:
+      - The body of an `async` function runs synchronously until its first `await`.
+      - Which continuation was queued first - the one after `await`, or `then 1`?
+      - "`then 2` can only be queued when `then 1` has finished."
+    solution: |
+      **save start → end → save done → then 1 → then 2 → timeout.** `save()` prints `save start`
+      synchronously, then awaits an already-resolved promise, which queues its continuation. The chain's
+      first `.then` is queued **after** that, so `save done` runs before `then 1`. `then 2` is queued when
+      `then 1` finishes, still in the same checkpoint. The timer is a task, so it is last. (The same pattern
+      was run in Node.js 24 for this lesson; any engine following ECMA-262 gives this order.)
+    followUp: |
+      If `save()` awaited `fetch('/api/cart')` instead, would `save done` still print before `then 1`? Why
+      not?
+
+  - id: delegation-bug
+    type: debug
+    concept: dom-event-dispatch
+    skill: analysis
+    title: Why do clicks stop working after sorting?
+    prompt: |
+      After the user changes the sort order, the Add to cart buttons stop responding. No errors appear in the
+      console. Click the line that causes it.
+    language: javascript
+    code: |
+      const list = document.querySelector('[data-testid="product-list"]');
+
+      function render(products) {
+        list.replaceChildren(...products.map(toCard));
+      }
+
+      render(products);
+      for (const button of list.querySelectorAll('button[data-sku]')) {
+        button.addEventListener('click', () => cart.add(button.dataset.sku));
+      }
+
+      sort.addEventListener('change', () => render(sortBy(products, sort.value)));
+    correctLines: [8]
+    lineNotes:
+      - line: 4
+        note: replaceChildren is the right call - removing the old nodes is expected. The problem is that the listeners were attached to those old nodes.
+      - line: 12
+        note: The sort listener is on the select, which is never replaced, so it keeps working. It is the buttons that lose their listeners.
+    hints:
+      - Which nodes have the listeners after the first render? Which nodes are on screen after a sort?
+      - The loop runs once.
+    solution: |
+      **Line 8.** The listeners are attached once, to the buttons of the **first** render. `render` replaces
+      them with new buttons that have no listeners, so clicks after a sort reach nothing. Fix it with
+      delegation - one listener on `list` (which is never replaced) that finds the button with
+      `event.target.closest('button[data-sku]')` - or attach the listener inside `render`, as the practice
+      shop does.
+    followUp: |
+      With the delegated version, a click on a `<svg>` cart icon inside the button does nothing. What is
+      `event.target` in that case, and which call fixes it?
+
+  - id: prevent-or-stop
+    type: mcq
+    concept: dom-event-dispatch
+    skill: application
+    title: The form keeps reloading the page
+    prompt: |
+      A checkout form should send its data with `fetch` and stay on the page. The developer wrote:
+
+      ```javascript
+      payButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        submitWithFetch(new FormData(form));
+      });
+      ```
+
+      The request is sent, but the page then reloads. What is the right fix?
+    options:
+      - id: submit-prevent
+        text: Listen for `submit` on the form and call `event.preventDefault()` there.
+        feedback: Correct - the reload is the form's default action. Cancelling it on `submit` also covers pressing Enter and `requestSubmit()`.
+      - id: stop-immediate
+        text: Use `stopImmediatePropagation()` instead of `stopPropagation()`.
+        feedback: That only stops other listeners. Propagation methods never cancel the default action, so the form still submits.
+      - id: capture
+        text: "Register the listener with `{ capture: true }` so it runs first."
+        feedback: Running earlier doesn't help - no listener cancelled the default action, which happens after dispatch whatever the order.
+      - id: return-false
+        text: "Add `return false;` at the end of the listener."
+        feedback: Returning false cancels the event only for some inline event handler attributes (onclick="..."), not for listeners added with addEventListener.
+    correct: [submit-prevent]
+    hints:
+      - Is the reload a listener, or something the browser does by itself?
+      - Which method cancels the browser's default action?
+    solution: |
+      **Handle `submit` on the form and call `preventDefault()`.** Submitting is the form's default action;
+      `stopPropagation()` only stops ancestors' listeners hearing the click. Measured in Chrome 157: with only
+      `stopPropagation()` the form still fired `submit`; with `preventDefault()` it did not. Listening on
+      `submit` rather than the button's `click` also handles the Enter key.
+    followUp: |
+      Your handler calls `preventDefault()` but the page still reloads, and the console shows an error from
+      `submitWithFetch` thrown before that line. Why does the order of the lines matter?
+
+  - id: passive-scroll
+    type: mcq
+    concept: dom-event-dispatch
+    skill: analysis
+    title: preventDefault that does nothing
+    prompt: |
+      To build a custom zoom, a developer stops the page scrolling on the mouse wheel:
+
+      ```javascript
+      window.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        zoomBy(event.deltaY);
+      });
+      ```
+
+      The zoom works, but the page **also** scrolls, and Chrome's console shows a warning about a passive
+      listener. Why?
+    options:
+      - id: default-passive
+        text: For `wheel` listeners on the window, the DOM Standard's default `passive` value is true, so `preventDefault()` is ignored.
+        feedback: Correct - for touchstart, touchmove, wheel and mousewheel on the window, document, html or body, passive defaults to true unless you pass passive false.
+      - id: not-cancelable
+        text: Wheel events are never cancelable.
+        feedback: Wheel events can be cancelable; the cancel is ignored here because the listener is passive by default.
+      - id: bubble-late
+        text: The listener runs in the bubble phase, after scrolling has already happened.
+        feedback: The default action happens after dispatch, whatever the phase. The problem is that this listener isn't allowed to cancel.
+      - id: needs-stop
+        text: It also needs `stopPropagation()`.
+        feedback: Stopping propagation affects other listeners, never the browser's scroll.
+    correct: [default-passive]
+    hints:
+      - What does the console warning mention?
+      - Look at the DOM Standard's "default passive value" - which event types and targets?
+    solution: |
+      **The listener is passive by default.** The DOM Standard sets `passive` to true for `touchstart`,
+      `touchmove`, `wheel` and `mousewheel` listeners on the window, document, `<html>` and `<body>` when you
+      don't specify it, so browsers can scroll without waiting for JavaScript. "Set the canceled flag" then
+      does nothing. Fix: register on the zoomable element itself, or pass `{ passive: false }` - and accept
+      that scrolling over that area now waits for your handler.
+
+  - id: frozen-spinner
+    type: mcq
+    concept: rendering-and-long-tasks
+    skill: analysis
+    title: The spinner that never appears
+    prompt: |
+      ```javascript
+      exportButton.addEventListener('click', () => {
+        spinner.hidden = false;
+        const csv = toCsv(allOrders);   // about 1.5 seconds
+        download(csv);
+        spinner.hidden = true;
+      });
+      ```
+
+      Users see no spinner, and the page ignores clicks for 1.5 seconds. The Performance panel shows one
+      1.5-second task. What explains both symptoms?
+    options:
+      - id: one-task
+        text: Rendering and input handling only happen between tasks; the spinner is shown and hidden again inside one long task, so no frame ever shows it.
+        feedback: Correct - DOM changes are applied at once, but painting is a separate step the loop can only reach after the task ends.
+      - id: hidden-css
+        text: The CSS for `hidden` is overriding the spinner.
+        feedback: The spinner works on other pages. And CSS wouldn't explain the ignored clicks.
+      - id: async-dom
+        text: DOM updates are asynchronous, so `hidden = false` hasn't taken effect yet.
+        feedback: DOM updates are synchronous - reading spinner.hidden right after gives false. It is the paint that is deferred.
+      - id: needs-raf
+        text: The spinner must be shown with requestAnimationFrame; otherwise browsers ignore it.
+        feedback: rAF runs before the next paint, but the next paint can't come until the 1.5-second task ends. The fix is to give the browser a chance to render before the heavy work.
+    correct: [one-task]
+    hints:
+      - When does the "update the rendering" step get a chance to run?
+      - Is the DOM change itself delayed, or only what is on screen?
+    solution: |
+      **One long task.** The event loop runs a task to completion; rendering and new input events wait.
+      Show the spinner, **yield** so a frame can be painted (for example
+      `await new Promise((r) => setTimeout(r, 0))`, in an `async` handler), then do the work in chunks that
+      yield between them - or move `toCsv` to a Web Worker. Confirm in the Performance panel that no task
+      over 50 ms remains.
+    followUp: |
+      Would replacing the 1.5 s loop with `await Promise.resolve()` between chunks let the browser paint?
+      Explain with the microtask checkpoint.
+
+  - id: explain-microtask-starvation
+    type: short
+    concept: rendering-and-long-tasks
+    skill: analysis
+    title: Why a microtask loop freezes the page
+    prompt: |
+      A developer "splits" a long job into chunks with `queueMicrotask(nextChunk)` instead of
+      `setTimeout(nextChunk, 0)`. Each chunk takes 5 ms, but the page still freezes until all 400 chunks are
+      done. Explain why, referring to the event loop's steps, and give a fix.
+    modelAnswer: |
+      After each task, the event loop performs a **microtask checkpoint**, which runs microtasks **until the
+      queue is empty** - including microtasks queued during the checkpoint. Each chunk queues the next one, so
+      the queue is never empty until all 400 chunks (2 seconds) have run. Until then the loop can't pick
+      another task: no input events, no timers and no "update the rendering" task. The chunks are small, but
+      together they behave as one long task. Fix: yield to the **task** queue between chunks - `setTimeout`
+      (or `scheduler.yield()` where supported), or a `MessageChannel` message - so input and rendering can
+      run in between; or move the work to a Web Worker.
+    rubric:
+      - Said the microtask checkpoint drains the queue completely, including newly queued microtasks
+      - Said input, timers and rendering only run as tasks, after the checkpoint
+      - Proposed yielding with a task (setTimeout, scheduler.yield, MessageChannel) or a Web Worker
+    hints:
+      - When does a microtask checkpoint end?
+      - Is rendering a microtask or a task?
+    solution: |
+      Microtasks queued from microtasks run in the **same** checkpoint, so the loop never reaches input
+      handling or rendering. Use a task-based yield between chunks, or a worker.
+
+  - id: interview-event-loop
+    type: interview
+    concept: event-loop-task-ordering
+    skill: analysis
+    title: "Interview: explain the event loop"
+    prompt: |
+      "Explain the JavaScript event loop in the browser. Why does `setTimeout(fn, 0)` not run immediately,
+      and why does a resolved promise's `.then` run before it?"
+    modelAnswer: |
+      JavaScript in a page runs on one main thread. The HTML Standard's event loop repeatedly takes **one
+      task** from a task queue - running a script, dispatching an event, a timer callback - and runs it **to
+      completion**; nothing interrupts it. After each task it performs a **microtask checkpoint**: it runs
+      every queued microtask until the queue is empty. Promise reactions and `await` continuations are
+      microtasks (HTML implements ECMA-262's `HostEnqueuePromiseJob` with the microtask queue), as is
+      `queueMicrotask`. Rendering happens in an "update the rendering" task at rendering opportunities, with
+      `requestAnimationFrame` callbacks just before style, layout and paint.
+
+      `setTimeout(fn, 0)` queues a **task** after a minimum delay, so it waits for the current task to finish
+      **and** for all microtasks. A resolved promise's `.then` is a microtask, so it runs at the end of the
+      current task, before any other task. Consequence: synchronous code and long microtask chains block
+      input and rendering - a task over 50 ms is a "long task" - so heavy work should be chunked with real
+      yields or moved to a Web Worker.
+    rubric:
+      - One thread, one task at a time, run to completion
+      - Microtask checkpoint after each task drains the whole queue
+      - Promise callbacks and await are microtasks; setTimeout is a task with a minimum delay
+      - Rendering happens between tasks, with rAF before paint
+      - Practical consequence - long tasks freeze input and rendering, and how to avoid them
+    followUps:
+      - Where does `requestAnimationFrame` fit, and when would you use it instead of `setTimeout`?
+      - How does Node.js's event loop differ from the browser's?
+      - How would you find what is causing a 300 ms delay after a click?
+    hints:
+      - Start with "one thread, tasks run to completion".
+      - Then the microtask checkpoint, then rendering.
+    solution: |
+      A strong answer names tasks, the microtask checkpoint and rendering, places promises, `await`,
+      `setTimeout` and rAF correctly, and ends with what it means for real code - long tasks and how to
+      split or move them.
+
+  - id: test-delegation
+    type: testdesign
+    concept: dom-event-dispatch
+    skill: application
+    title: Test a delegated product list
+    prompt: |
+      The catalog was refactored to use one delegated click listener on the product list. Design three test
+      cases that would catch the typical delegation and re-render bugs. Give preconditions, steps, expected
+      result and evidence for each.
+    modelAnswer: |
+      1. **Click after re-sort.** Precondition: catalog loaded with at least three products. Steps: sort by
+         price descending; click Add to cart on the first card. Expected: the product named on that card is
+         added - toast and cart line name it. Evidence: screenshot of toast and the cart page line.
+      2. **Click on the inner text or icon.** Steps: click exactly on the label or icon element inside the
+         button (in automation, target the inner element). Expected: one item added, as for a click on the
+         button's edge. Evidence: cart count goes up by exactly 1.
+      3. **Click on the list outside any button.** Steps: click the gap between cards and on a product name.
+         Expected: nothing is added and no console error. Evidence: cart count unchanged; console clean.
+      (Also worth it: double-click - one add per click, or the button disabled while adding.)
+    rubric:
+      - A case that re-renders the list (sort or reload) before clicking
+      - A case that clicks a child element inside the button
+      - A negative case that clicks inside the container but not on a button
+      - Each case has an expected result and concrete evidence
+    hints:
+      - Delegation fails in three places - after re-renders, with child targets, and with matches outside the intended element.
+    solution: |
+      Cover re-render, child targets and non-button clicks inside the container, each with a measurable
+      expected result (cart count, toast text) and evidence.
+
+placement:
+  - id: place-dispatch-order
+    type: order
+    concept: dom-event-dispatch
+    skill: application
+    title: Which listener runs first?
+    prompt: |
+      Listeners for `click` are registered on: `document` (capture), the `<ul>` (bubble), the `<button>`
+      inside it, and `document` (bubble). The user clicks the button. Order the listeners.
+    items:
+      - id: doc-capture
+        text: document - capture listener
+      - id: button
+        text: button - its own listener (at target)
+      - id: ul-bubble
+        text: ul - bubble listener
+      - id: doc-bubble
+        text: document - bubble listener
+    solution: |
+      **document (capture) → button → ul (bubble) → document (bubble).** Capture listeners run from the top
+      down before the target; bubble listeners run from the target upwards. This order was confirmed in
+      Chrome 157.
+
+  - id: place-microtask
+    type: mcq
+    concept: event-loop-task-ordering
+    skill: application
+    title: What prints second?
+    prompt: |
+      ```javascript
+      setTimeout(() => console.log('A'), 0);
+      Promise.resolve().then(() => console.log('B'));
+      console.log('C');
+      ```
+
+      What is printed **second**?
+    options:
+      - id: b
+        text: B
+        feedback: Correct - C is synchronous, then the microtask checkpoint runs B, then the next task (A).
+      - id: a
+        text: A
+        feedback: A zero delay still makes a task, which waits for the current task and every microtask.
+      - id: c
+        text: C
+        feedback: C is printed first - it runs as part of the current script.
+      - id: random
+        text: It varies between runs.
+        feedback: This order is defined by the HTML and ECMAScript specifications and doesn't vary.
+    correct: [b]
+    solution: |
+      **C, B, A.** Synchronous code, then all microtasks, then the next task.
+
+  - id: place-long-task
+    type: mcq
+    concept: rendering-and-long-tasks
+    skill: analysis
+    title: A slow filter
+    prompt: |
+      Typing in a search box freezes the page for a moment on each key press. The Performance panel shows a
+      400 ms task for each `input` event, almost all in a function that filters 50,000 rows synchronously.
+      Which change addresses the cause?
+    options:
+      - id: worker-or-chunk
+        text: Do the filtering in a Web Worker (or in chunks that yield to the event loop), and update the list when it is done.
+        feedback: Correct - the freeze is a long task on the main thread; moving or splitting it lets input and rendering run.
+      - id: raf
+        text: Wrap the filtering in requestAnimationFrame.
+        feedback: That only moves the same 400 ms of work into the rendering step - the frame is still blocked.
+      - id: promise
+        text: Wrap the filtering in Promise.resolve().then(...).
+        feedback: A microtask runs straight after the current task, before input or rendering, so the page still freezes.
+      - id: passive
+        text: Make the input listener passive.
+        feedback: Passive only stops the listener cancelling the event; it doesn't make the listener's work faster or move it off the main thread.
+    correct: [worker-or-chunk]
+    solution: |
+      **Move the work off the main thread, or split it with real yields.** Debouncing the input also helps by
+      running the filter less often - but each run would still freeze the page for 400 ms.
+
+recall:
+  - id: recall-phases
+    concept: dom-event-dispatch
+    prompt: In what order do the phases of a bubbling event run?
+    answer: Capture from the window down to the target's parent, at target, then bubble from the target's parent back up to the window.
+  - id: recall-target-current
+    concept: dom-event-dispatch
+    prompt: What is the difference between event.target and event.currentTarget?
+    answer: target is the node the event was dispatched at (where it happened); currentTarget is the node whose listener is running now.
+  - id: recall-prevent-stop
+    concept: dom-event-dispatch
+    prompt: What does preventDefault do that stopPropagation doesn't - and when does preventDefault do nothing?
+    answer: preventDefault cancels the browser's default action (submit, follow link, scroll); stopPropagation only stops other objects' listeners. preventDefault does nothing if the event isn't cancelable or the listener is passive.
+  - id: recall-delegation
+    concept: dom-event-dispatch
+    prompt: How does event delegation work, and why does it survive re-renders?
+    answer: One listener on a stable ancestor uses bubbling and event.target.closest(selector) to find the item; new child nodes need no listeners of their own.
+  - id: recall-checkpoint
+    concept: event-loop-task-ordering
+    prompt: What happens after every task in the event loop?
+    answer: A microtask checkpoint - microtasks run until the queue is empty, including ones queued during the checkpoint.
+  - id: recall-microtask-sources
+    concept: event-loop-task-ordering
+    prompt: Name three sources of microtasks and two of tasks.
+    answer: Microtasks - promise reactions (.then), await continuations, queueMicrotask (also MutationObserver). Tasks - setTimeout/setInterval callbacks, most user-input events, postMessage, running a script.
+  - id: recall-raf
+    concept: rendering-and-long-tasks
+    prompt: When does a requestAnimationFrame callback run?
+    answer: In the next "update the rendering" step, before style, layout and paint.
+  - id: recall-long-task
+    concept: rendering-and-long-tasks
+    prompt: What is a long task, and what are the main fixes?
+    answer: A task over 50 ms (web.dev's definition); it blocks input and rendering. Split it with real yields (setTimeout, scheduler.yield), move it to a Web Worker, or do less work.
+
+next:
+  - modern-javascript-core
+  - react-state-and-effects

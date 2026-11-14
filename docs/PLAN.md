@@ -201,7 +201,7 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
 
 - [x] Outline: 32 full stack lessons (stages 8-10) and 36 AI lessons (stages 11-15) as planned lessons, with a
       **Full stack developer (TypeScript)** path and an **AI engineer - LLM apps, RAG and agents** path.
-- [ ] Track I lessons, in batches of 4-6. Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
+- [ ] Track I lessons, in batches of 4-6. Batch 1 done: the web platform module (semantic HTML and forms, CSS layout, responsive design, WCAG 2.2 accessibility, DOM events and the event loop). Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
       Express, PostgreSQL, Docker, GitHub Actions, OWASP. Sources: WHATWG HTML, MDN, ECMA-262, the TypeScript
       handbook, react.dev, nodejs.org, expressjs.com, the PostgreSQL manual, RFCs, OWASP, OpenAPI 3.1, docs.docker.com.
 - [ ] `practice/fullstack`: a TypeScript project (React + Express + PostgreSQL-compatible tests) with exercises,
