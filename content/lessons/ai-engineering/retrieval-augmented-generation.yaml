@@ -1,0 +1,1424 @@
+id: retrieval-augmented-generation
+title: Retrieval-augmented generation (RAG)
+subject: ai-engineering
+module: genai-engineering
+level: intermediate
+status: published
+estimatedMinutes: 125
+summary: Build a retrieval-augmented question answerer for a synthetic SandPay help centre and measure every step - chunking (fixed size with and without overlap, or by heading) and what it does to recall@k, BM25 you write yourself, toy dense vectors, reciprocal rank fusion, a simple reranker, a relevance gate that refuses instead of guessing, a prompt with numbered sources, and a checker that rejects any answer citing a source it was not given or leaving a sentence uncited. Every number shown was produced by the code shown, against an offline scripted model; provider features (Anthropic citations, OpenAI file search) are quoted from their documentation and labelled.
+tags:
+  [
+    RAG,
+    retrieval-augmented generation,
+    retrieval,
+    chunking,
+    chunk overlap,
+    recall@k,
+    BM25,
+    Okapi BM25,
+    idf,
+    sparse retrieval,
+    dense retrieval,
+    hybrid search,
+    reciprocal rank fusion,
+    RRF,
+    reranking,
+    reranker,
+    cross-encoder,
+    grounding,
+    citations,
+    hallucination,
+    refusal,
+    lost in the middle,
+    contextual retrieval,
+    file search,
+    vector store,
+    knowledge base,
+    LLM,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv` with NumPy 2.5.4; pytest for the exercises. Every output in
+    this lesson was printed by the code shown, run on Linux in November 2026 with
+    `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2`. Nothing is random, so the numbers are the same on any machine.
+  - **No real model, no network.** The "LLM" is `ScriptedLLM` from `practice/ai/support/llm_fake.py`, which replays
+    replies you script and records every request; the dense vectors come from `practice/ai/support/toy_embeddings.py`
+    (hashed words and word pairs, 256 dimensions, L2-normalised) - it knows nothing about meaning, so synonyms score
+    0. The scripted replies show what the **pipeline** does with good and bad answers; they say nothing about how
+    often a real model cites correctly. The functions used are the reference solutions of this lesson's exercises
+    (`practice/ai/solutions/genai/chunking.py`, `hybrid_search.py`, `rag_pipeline.py`).
+  - **Synthetic data:** the SandPay help centre (8 short articles, 624 words) and its 14 questions and 2 unanswerable
+    questions were written for this lesson. SandPay is a fictional payments company; its fees, schedules and error
+    codes (SP-4012, SP-4090) are invented. 14 questions are far too few to compare methods with confidence - they
+    show **how** to measure, not which method wins in general.
+  - **Papers:** Lewis et al., [*Retrieval-Augmented Generation for Knowledge-Intensive NLP
+    Tasks*](https://arxiv.org/abs/2005.11401), NeurIPS 2020 (arXiv 2005.11401v4; abstract, sections 2 and 4.5 "Index
+    hot-swapping"); Robertson and Zaragoza, [*The Probabilistic Relevance Framework: BM25 and
+    Beyond*](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf), Foundations and Trends in
+    Information Retrieval 3(4), 2009 (equations 3.3 and 3.12-3.15, section 3.5 on k1 and b); Cormack, Clarke and
+    Büttcher, [*Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning
+    Methods*](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), SIGIR 2009; Liu et al., [*Lost in the
+    Middle: How Language Models Use Long Contexts*](https://arxiv.org/abs/2307.03172), TACL 2024 (arXiv
+    2307.03172v3). Quotations are from those texts.
+  - **Library documentation:** Apache Lucene 9.12
+    [`BM25Similarity`](https://lucene.apache.org/core/9_12_0/core/org/apache/lucene/search/similarities/BM25Similarity.html)
+    (defaults k1 = 1.2, b = 0.75; idf `log(1 + (docCount - docFreq + 0.5)/(docFreq + 0.5))`).
+  - **Provider-specific, as documented on 2026-11-14 (not run here - no API key is used):** Anthropic
+    [Citations](https://platform.claude.com/docs/en/build-with-claude/citations) (document blocks with
+    `citations: {"enabled": true}`, `char_location` citations with `cited_text`, sentence chunking of plain-text
+    documents, custom content documents, the incompatibility with structured outputs); Anthropic's research article
+    [Contextual Retrieval](https://www.anthropic.com/research/contextual-retrieval) (a provider's own published
+    experiment, not a peer-reviewed paper); OpenAI [Retrieval](https://platform.openai.com/docs/guides/retrieval)
+    (vector stores, default chunking, `ranking_options`, hybrid search weights) and [File
+    search](https://platform.openai.com/docs/guides/tools-file-search) (`file_citation` annotations). These change;
+    check the pages before you rely on a detail.
+  - **Security:** OWASP [LLM01:2025 Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
+    (indirect injection through retrieved content) and [LLM08:2025 Vector and Embedding
+    Weaknesses](https://genai.owasp.org/llmrisk/llm082025-vector-and-embedding-weaknesses/).
+  - **Not repeated here:** what embeddings are, cosine similarity and vector indexes
+    ([Embeddings and vector search](#/lesson/embeddings-and-vector-search)); messages, parameters and errors of an
+    LLM API ([LLM APIs, streaming and structured output](#/lesson/llm-apis-and-structured-output)); delimiting
+    untrusted text in prompts ([Prompt engineering](#/lesson/prompt-engineering)).
+
+prerequisites:
+  - embeddings-and-vector-search
+  - prompt-engineering
+
+concepts:
+  - id: rag-chunking
+    name: Chunking and retrieval recall
+    summary: A RAG system retrieves chunks, not documents, so the chunk is the unit that must contain the answer. Fixed-size chunks ignore structure and can cut a fact in two, so neither half matches; overlap repeats words across boundaries so a short fact lands whole in some chunk. Splitting by heading keeps sections intact and lets each chunk carry its title. Measure the choice with recall@k on questions whose answering text you know - and remember that bigger chunks raise recall@k partly by putting more of the corpus into the prompt.
+  - id: hybrid-retrieval
+    name: BM25, dense retrieval and reciprocal rank fusion
+    summary: BM25 scores a chunk by the query terms it contains, weighted by rarity (idf), with term frequency that saturates (k1) and a length penalty (b); it is exact on identifiers such as error codes and blind to synonyms. Dense retrieval compares embedding vectors and can match meaning when the model knows it. Reciprocal rank fusion merges ranked lists by summing 1 / (k + rank), so it needs no score calibration - but it cannot tell a strong retriever from a weak one, and adding a weak list can push the best chunk down.
+  - id: rerank-and-context
+    name: Reranking, relevance gates and context assembly
+    summary: A first stage retrieves cheaply and broadly (say the top 10); a reranker reads the query and each candidate together and reorders them, and only the best few go into the prompt. Fusion scores are ranks, not relevance, so a refuse-or-answer gate needs a score that means something on its own, such as the reranker's. The prompt numbers each source and puts the most relevant first; models use the start and end of a long context better than the middle (Liu et al.), so fewer, better chunks beat many.
+  - id: grounded-citations
+    name: Grounded answers with checked citations
+    summary: Ask the model to answer only from the numbered sources, to cite a source after every sentence and to reply with a fixed refusal when the sources do not contain the answer. Then check in code - every cited number must be one of the sources sent, every sentence must cite something - and show a refusal instead of an answer that fails. Refuse before calling the model when retrieval found nothing relevant. A valid citation proves the source exists, not that it supports the sentence; that needs evaluation.
+
+objectives:
+  - Chunk documents by fixed size with overlap and by heading, and measure the effect on recall@k with a labelled question set.
+  - Implement BM25 from its formula, explain what idf, k1 and b do, and predict where BM25 and dense retrieval each fail.
+  - Fuse rankings with reciprocal rank fusion by hand and in code, and diagnose a hybrid search that ranks worse than one of its inputs.
+  - Rerank first-stage candidates, choose a relevance threshold from measured scores, and refuse without calling the model when nothing passes it.
+  - Assemble a prompt with numbered sources in a deliberate order, and write a checker that rejects answers citing sources that were not retrieved or leaving sentences uncited.
+  - Design positive and negative tests for a RAG answer path with a scripted model, including refusal, bad citations and prompt contents.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [grounded-citations, rerank-and-context]
+    title: The idea in plain language
+    body: |
+      A new SandPay support agent knows a lot about payments in general, but not this week's fee table or the
+      exact refund rules. A good agent does not answer from memory. They search the help centre, open the two or
+      three most relevant pages, answer from those pages, and paste the link next to each claim so the customer -
+      and their team lead - can check it. If the help centre has nothing on the question, they say so instead of
+      improvising.
+
+      Retrieval-augmented generation (RAG) builds exactly that habit into a language-model application:
+
+      - **search** a knowledge base for passages relevant to the question (retrieval);
+      - **pick** the few best passages (reranking) and paste them into the prompt, numbered;
+      - **ask** the model to answer only from them and to cite the number after each sentence;
+      - **check** the answer in code before anyone sees it, and **refuse** when the search found nothing.
+
+      The model writes the sentences; the retrieval decides what it can know. Most RAG failures are search
+      failures, so most of this lesson is about measuring the search.
+
+  - id: what
+    kind: what
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context, grounded-citations]
+    title: The vocabulary
+    body: |
+      Lewis et al. (2020) introduced the name for "models which combine pre-trained parametric and non-parametric
+      memory for language generation": the **parametric** memory is what the model learned in its weights, the
+      **non-parametric** memory is an index of documents searched at answer time. Their system trained the
+      retriever and generator together; today "RAG" usually means the looser pattern below, with an off-the-shelf
+      model that is not trained at all.
+
+      | Term | Meaning in this lesson |
+      | --- | --- |
+      | **Corpus / knowledge base** | The documents you may answer from - here 8 SandPay help articles |
+      | **Chunk** | A piece of a document that is indexed, retrieved and pasted into the prompt on its own |
+      | **Sparse retrieval** | Matching on words: each text is a mostly-zero vector over the vocabulary. **BM25** is the standard scoring function |
+      | **Dense retrieval** | Matching embedding vectors by cosine similarity (see [Embeddings and vector search](#/lesson/embeddings-and-vector-search)) |
+      | **Hybrid retrieval** | Running both and merging the ranked lists, here with **reciprocal rank fusion (RRF)** |
+      | **Reranker** | A second, slower scorer that reads the query and one candidate together and reorders the shortlist |
+      | **recall@k** | Share of test questions for which a chunk containing the answer is among the top k retrieved |
+      | **Grounding** | Answering only from supplied sources |
+      | **Citation** | A pointer from a sentence of the answer to the source that supports it - here `[n]` |
+      | **Refusal** | A fixed reply for "the sources do not answer this", which code can recognise |
+
+      Two stages happen at different times. **Index time** (offline, whenever documents change): split, chunk,
+      embed, build the BM25 statistics. **Query time** (per question): retrieve, fuse, rerank, gate, prompt,
+      generate, check.
+
+  - id: why
+    kind: why
+    concepts: [grounded-citations]
+    title: Why not just ask the model?
+    body: |
+      - **The model does not know your data.** SandPay's refund limit or dispute fee is not in any model's
+        training data, and a fluent guess is worse than no answer for a payments company.
+      - **Knowledge changes.** Lewis et al. showed the non-parametric memory "can be replaced to update the models'
+        knowledge as the world changes" (section 4.5, "Index hot-swapping"): swapping a 2016 Wikipedia index for a
+        2018 one changed the answers without retraining. For you that means: change the fee page, re-index, and
+        the next answer uses the new fee.
+      - **Provenance.** The same paper lists "providing provenance for their decisions" as an open problem for
+        models that answer from their weights. A citation to a retrieved chunk lets a user, a reviewer or a test
+        check where a sentence came from.
+      - **Context windows are finite and not free.** You could paste the whole help centre into every prompt
+        while it is 624 words; at 10,000 articles you cannot, and every extra token costs money and latency.
+        Retrieval decides which few hundred words matter.
+
+      RAG does not make a model truthful. It moves the main risk from "the model invented it" to "the search
+      returned the wrong chunk" and "the model ignored or misread the right chunk" - both of which you can test.
+
+  - id: visual-pipeline
+    kind: visual
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context, grounded-citations]
+    title: The pipeline built in this lesson
+    body: |
+      ```mermaid
+      flowchart LR
+        subgraph Index["Index time"]
+          D[Help articles] --> C[Chunk by heading]
+          C --> B[BM25 statistics]
+          C --> E[Embed chunks]
+        end
+        subgraph Query["Query time"]
+          Q[Question] --> S1[BM25 top 20]
+          Q --> S2[Dense top 20]
+          S1 --> F[RRF fuse, keep 10]
+          S2 --> F
+          F --> R[Rerank, keep 3]
+          R --> G{Best score >= 0.35?}
+          G -- no --> X[Refuse, no model call]
+          G -- yes --> P[Prompt with numbered sources]
+          P --> L[LLM]
+          L --> K{Citations valid?}
+          K -- no --> X
+          K -- yes --> A[Answer with citations]
+        end
+        B -.-> S1
+        E -.-> S2
+      ```
+
+      Notice the two exits to **Refuse**: one before the model is called (nothing relevant was found) and one
+      after (the model's answer could not be verified). Every box is a function you can test on its own.
+
+  - id: chunking
+    kind: internals
+    concepts: [rag-chunking]
+    title: Chunking - the unit that must contain the answer
+    body: |
+      Retrieval returns chunks, and the prompt receives chunks. If the sentence that answers a question is cut in
+      two, **neither half** contains the answer, and no retriever can fix that. Three common strategies:
+
+      - **Fixed size** - every `size` words (production systems count tokens), ignoring structure. Simple,
+        predictable prompt size, and blind to sentences and sections.
+      - **Fixed size with overlap** - windows start every `size - overlap` words, so the last `overlap` words of a
+        chunk are repeated at the start of the next. A fact shorter than the overlap always lands whole in some
+        chunk. The price is more chunks and duplicated text.
+      - **By structure** - one chunk per heading section (or paragraph), split further only if too long. Each
+        chunk can also carry where it came from: here `"Refunds > How long refunds take: ..."`. That prefix gives
+        BM25 and the embedding the article and section words even when the body never repeats them.
+
+      The help centre is Markdown-like text where `## ` starts a section:
+
+      ```plaintext
+      ## How long refunds take
+      SandPay sends the refund to the card network at once. The money usually reaches the customer within
+      5 to 10 business days, depending on the issuing bank. The refund fee is not returned.
+      ```
+
+      With 25-word chunks and no overlap, that answer is cut between two chunks (real output):
+
+      ```plaintext
+      refunds#2 'in minor units. ## How long refunds take SandPay sends the refund to the card network at once. The money usually reaches the customer within'
+      refunds#3 '5 to 10 business days, depending on the issuing bank. The refund fee is not returned. ## Refund limits You cannot refund a payment that'
+      ```
+
+      A question "How long does a refund take to reach the customer?" can retrieve `refunds#2` first and still
+      fail: the fact "within 5 to 10 business days" is in neither chunk.
+
+  - id: chunking-measured
+    kind: code
+    concepts: [rag-chunking]
+    title: Measuring chunking with recall@k
+    body: |
+      Each test question comes with the text that answers it, and recall@k counts a question as found when one of
+      the top k chunks **contains that whole text**. BM25 (next section) does the retrieving, so only the chunking
+      changes between rows:
+
+      ```python
+      from corpus import ARTICLES, QUESTIONS          # the synthetic help centre
+      from genai.chunking import chunk_fixed, chunk_by_heading, recall_at_k
+      from genai.hybrid_search import BM25
+
+      def strategies():
+          yield "fixed 25, overlap 0", [c for d, (ti, t) in ARTICLES.items() for c in chunk_fixed(d, t, 25, 0)]
+          yield "fixed 25, overlap 8", [c for d, (ti, t) in ARTICLES.items() for c in chunk_fixed(d, t, 25, 8)]
+          yield "fixed 80, overlap 20", [c for d, (ti, t) in ARTICLES.items() for c in chunk_fixed(d, t, 80, 20)]
+          yield "by heading", [c for d, (ti, t) in ARTICLES.items() for c in chunk_by_heading(d, ti, t)]
+
+      facts = [f for _, f, _ in QUESTIONS]
+      for name, chunks in strategies():
+          bm = BM25([c.text for c in chunks])
+          res = [[chunks[i] for i in bm.top_k(q, 3)] for q, _, _ in QUESTIONS]
+          split = sum(not any(" ".join(f.lower().split()) in " ".join(c.text.lower().split()) for c in chunks)
+                      for f in facts)                 # facts that are whole in NO chunk
+          avg = sum(len(c.text.split()) for c in chunks) / len(chunks)
+          print(f"{name:22} {len(chunks):>6} {avg:>9.1f} {split:>11} "
+                f"{recall_at_k(res, facts, 1):>5.2f} {recall_at_k(res, facts, 3):>5.2f}")
+      ```
+
+      ```plaintext
+      8 articles, 624 words, 14 questions
+      chunking               chunks avg words split facts   R@1   R@3
+      fixed 25, overlap 0        30      20.8           5  0.43  0.43
+      fixed 25, overlap 8        36      23.6           0  0.36  0.79
+      fixed 80, overlap 20       11      62.2           0  0.86  1.00
+      by heading                 23      28.8           0  0.86  0.86
+      ```
+
+      How to read it:
+
+      - **No overlap cut 5 of the 14 facts**, so recall@3 could never exceed 9/14 = 0.64, and reached 0.43.
+      - **Overlap 8 rescued every cut fact** and recall@3 rose to 0.79. Recall@1 fell slightly: overlapping
+        windows produce near-duplicate chunks that compete for the first place.
+      - **80-word chunks reached recall@3 = 1.00 - but read the "chunks" column.** There are only 11 chunks, so the
+        top 3 are 3 of 11 chunks - about 187 of the 624 words - and each is about 62 words. A bigger chunk is more likely to contain
+        the answer *and* puts more unrelated text in the prompt. Recall@k is only comparable between chunkings
+        when you also look at how much text k chunks are.
+      - **By heading** matched the 80-word chunks at recall@1 with chunks under half the size, and no cut facts.
+
+      Provider defaults show the same knobs. As documented on 2026-11-14, OpenAI vector stores chunk files into
+      800-token chunks with 400-token overlap by default, adjustable with `chunking_strategy`
+      (`max_chunk_size_tokens` between 100 and 4096, `chunk_overlap_tokens` at most half of it). Anthropic's
+      citations feature chunks plain-text documents into sentences, and takes "custom content" documents whose
+      blocks are used as-is. Neither default is right for every corpus - measure on yours.
+
+  - id: bm25
+    kind: internals
+    concepts: [hybrid-retrieval]
+    title: BM25 from its formula
+    body: |
+      BM25 scores a chunk `d` for a query `q` by adding one weight per query term `t` (Robertson and Zaragoza
+      2009, equations 3.3 and 3.15):
+
+      ```plaintext
+      score(q, d) = sum over t in q of   idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avdl))
+
+      tf    = how often t occurs in d          dl   = length of d     avdl = average length
+      idf(t)= ln(1 + (N - n_t + 0.5) / (n_t + 0.5))    N = number of chunks, n_t = chunks containing t
+      ```
+
+      - **idf** - rare terms count more. `4012` (from `SP-4012`) occurs in one chunk of 23: `ln(1 + 22.5 / 1.5) = ln 16 = 2.77`.
+        A term in 20 of 23 chunks: `ln(1 + 3.5 / 20.5) = 0.16`. The survey's equation 3.3 is
+        `ln((N - n + 0.5) / (n + 0.5))` without the `1 +`; that version goes **negative** for terms in more than
+        half the chunks (`ln(3.5 / 20.5) = -1.77`), so a common query word would lower a score. Lucene's
+        `BM25Similarity` documents the `log(1 + ...)` form, which is what this lesson uses.
+      - **k1 - saturation.** The second factor rises with `tf` but levels off at `k1 + 1`: the tenth "refund" in a
+        chunk adds much less than the first. `k1 = 0` ignores frequency entirely.
+      - **b - length normalisation.** `b = 1` fully normalises by length, `b = 0` switches it off (equation 3.12). A
+        long chunk mentions everything a bit; without normalisation it wins too often.
+      - **Defaults.** Lucene uses `k1 = 1.2`, `b = 0.75`. The survey says values "such as 0.5 < b < 0.8 and
+        1.2 < k1 < 2 are reasonably good in many circumstances" and that "the model provides no guidance on how
+        these should be set" - tune them on your own questions if you tune anything.
+
+      The part learners get wrong is the tokenizer, not the formula. This lesson lower-cases and splits on `\w+`,
+      so `SP-4012` becomes `sp` and `4012` - both rare, both matched. It does **not** stem, and that costs a
+      question below:
+
+      ```plaintext
+      ['how', 'long', 'does', 'sandpay', 'retry', 'a', 'webhook']
+      ['sandpay', 'retries', 'the', 'event', 'with', 'exponential', 'backoff']
+      ```
+
+      `retry` and `retries` are different terms to BM25, and so are `webhook` and the article's `Webhooks` heading.
+
+  - id: hybrid
+    kind: code
+    concepts: [hybrid-retrieval]
+    title: Dense, hybrid and reranked retrieval on the same questions
+    body: |
+      Reciprocal rank fusion (Cormack, Clarke and Büttcher 2009) merges ranked lists using only the ranks:
+
+      ```python
+      def rrf(rankings, k=60):
+          fused = {}
+          for ranking in rankings:                       # each ranking: chunk indexes, best first
+              for rank, doc in enumerate(ranking, start=1):
+                  fused[doc] = fused.get(doc, 0.0) + 1.0 / (k + rank)
+          return sorted(fused.items(), key=lambda item: (-item[1], item[0]))
+      ```
+
+      The paper's `k = 60` "was fixed during a pilot investigation"; their experiments found it "near-optimal, but
+      that the choice was not critical". The constant keeps a single first place from dominating: rank 1 is worth
+      1/61 and rank 2 is worth 1/62, so agreement between lists matters more than one list's favourite. Because
+      only ranks are used, BM25 scores (unbounded) and cosine similarities (-1 to 1) never need to be put on one
+      scale.
+
+      Chunks by heading, then four retrievers on the same 14 questions:
+
+      ```python
+      chunks = [c for d, (title, text) in ARTICLES.items() for c in chunk_by_heading(d, title, text)]
+      texts = [c.text for c in chunks]
+      bm25 = BM25(texts)
+      vectors = embed_many(texts)                       # toy embeddings, one row per chunk
+
+      evaluate("BM25", lambda q: bm25.top_k(q, 3))
+      evaluate("toy dense (cosine)", lambda q: dense_top_k(q, vectors, 3))
+      evaluate("hybrid (RRF k=60)", lambda q: hybrid_top_k(q, bm25, vectors, 3))   # fuses top 20 of each
+      evaluate("hybrid top 10 + rerank", lambda q: [i for i, _ in rerank(q, texts, hybrid_top_k(q, bm25, vectors, 10), 3)])
+      ```
+
+      ```plaintext
+      BM25                       R@1 0.86  R@3 0.86
+      toy dense (cosine)         R@1 0.64  R@3 0.71
+      hybrid (RRF k=60)          R@1 0.64  R@3 0.86
+      hybrid top 10 + rerank     R@1 0.93  R@3 0.93
+      ```
+
+      **Hybrid was worse than BM25 alone at recall@1.** RRF trusts every list equally; the toy embeddings are a
+      weak retriever here, and where they disagree with BM25 they pull a wrong chunk up to first place. With a
+      real embedding model the dense list is usually much stronger - but the lesson stands: fusion is not
+      automatically an improvement, so measure each input and the fusion. (As documented on 2026-11-14, OpenAI's
+      retrieval API exposes exactly this balance as `ranking_options.hybrid_search.embedding_weight` and
+      `text_weight` for its RRF.)
+
+      Where each list helps, for one question:
+
+      ```plaintext
+      query: Why did my refund fail with SP-4012?
+      BM25 : ['refunds#3', 'idempotency#0', 'refunds#1', 'refunds#0', 'refunds#2']
+      dense: ['refunds#3', 'refunds#2', 'fees#1', 'api-keys#1', 'payouts#2']
+      RRF  : [('refunds#3', 0.0328), ('refunds#2', 0.0315), ('idempotency#0', 0.0161), ('refunds#1', 0.0159), ('fees#1', 0.0159)]
+      ```
+
+      `refunds#3` is first in both lists, so it gets 1/61 + 1/61 = 0.0328. `idempotency#0` (which mentions error
+      SP-4090, so it shares `sp`) is second for BM25 but absent from the dense top 5, and falls to third.
+
+      The misses at recall@3 tell you what to fix next:
+
+      ```plaintext
+      BM25: ['Can I refund a payment from last year?', 'How long does SandPay retry a webhook?']
+      dense: ['Can I refund a payment from last year?', 'How do I verify a webhook signature?', 'How long does SandPay retry a webhook?', 'How long are idempotency keys remembered?']
+      hybrid: ['Can I refund a payment from last year?', 'How long does SandPay retry a webhook?']
+      hybrid+rerank: ['How long does SandPay retry a webhook?']
+      ```
+
+      "Last year" versus "older than 180 days" is a **vocabulary mismatch** - the question shares no content word
+      with the answer. A real embedding model may bridge it; hashed words cannot. "Retry" versus "retries" is a
+      **tokenizer** problem: stemming in the analyser fixes it for BM25. The reranker's rescue of "last year" was
+      luck - it preferred the chunk that contains both "refund" and "payment" - and is not evidence that it
+      understands dates.
+
+  - id: rerank-and-gate
+    kind: internals
+    concepts: [rerank-and-context]
+    title: Reranking and the relevance gate
+    body: |
+      First-stage retrievers must score every chunk for every question, so they rely on precomputed statistics or
+      vectors and must be cheap. A **reranker** looks at the query and **one candidate together** and can
+      afford to be slower, because it only sees the shortlist (here the fused top 10). Production rerankers are
+      usually cross-encoders - a transformer reading query and passage as one input. This lesson's reranker is a
+      transparent toy with the same shape:
+
+      ```plaintext
+      content terms = query words minus stopwords ("what", "is", "the", ...)
+      coverage      = share of the query's content terms found in the chunk
+      phrase        = share of adjacent content-term pairs of the query found adjacent in the chunk
+      score         = 0.8 * coverage + 0.2 * phrase          (0 to 1)
+      ```
+
+      Reranking lifted recall@1 from 0.64 (hybrid) to 0.93. Its other job matters as much: **deciding when there
+      is nothing to answer from.** RRF scores cannot do that - they only say how high a chunk ranked, and every
+      question has a first-ranked chunk, relevant or not. The reranker's score is computed from the query and the
+      chunk alone, so it can be compared with a threshold. Best reranker score per question (real output):
+
+      ```plaintext
+        0.64  refunds#2        How long does a refund take to reach the customer?
+        0.69  refunds#3        Why did my refund fail with SP-4012?
+        0.47  refunds#3        Can I refund a payment from last year?
+        0.53  disputes#2       How long do I have to submit evidence for a dispute?
+        0.63  disputes#1       How much is the dispute fee?
+        0.74  payouts#1        When do new accounts get paid out?
+        0.53  webhooks#1       How do I verify a webhook signature?
+        0.40  refunds#2        How long does SandPay retry a webhook?
+        0.47  idempotency#0    How long are idempotency keys remembered?
+        0.73  idempotency#0    What does error SP-4090 mean?
+        0.95  fees#0           What is the fee for cards issued outside Europe?
+        0.49  api-keys#2       How long does the old key work after I roll an API key?
+        0.53  verification#1   Which owners need to upload a photo ID?
+        0.69  verification#2   Can I take payments before my account is verified?
+        0.20  idempotency#0    Does SandPay support cryptocurrency payments?
+        0.16  payouts#2        What is the phone number of SandPay support in Brazil?
+      ```
+
+      The answerable questions score 0.40 to 0.95; the two the help centre cannot answer score 0.20 and 0.16. A
+      threshold of **0.35** separates them on this set. Note the 0.40 row: its best chunk (`refunds#2`) is the
+      **wrong** one - the gate is not a correctness check, only a "probably on topic" check. Choose the threshold
+      from scores of labelled answerable and unanswerable questions, and re-check it when the corpus, the
+      retriever or the reranker changes.
+
+      Anthropic's Contextual Retrieval article (a provider's own experiment, read on 2026-11-14) reports the same
+      direction at scale: prepending a short, model-written context to each chunk before embedding and BM25
+      indexing reduced its top-20 retrieval failure rate by 49%, and 67% with reranking added. This lesson's
+      `"Refunds > How long refunds take: "` prefix is a cheap, deterministic version of that idea.
+
+  - id: prompt-assembly
+    kind: code
+    concepts: [rerank-and-context, grounded-citations]
+    title: Prompt assembly with numbered sources
+    body: |
+      The chunks that pass the gate become numbered sources, most relevant first; the instructions go in the
+      system prompt and the sources and question in the user message (the split
+      [Prompt engineering](#/lesson/prompt-engineering) explains):
+
+      ```python
+      REFUSAL = "I can't find that in the SandPay help centre."
+
+      SYSTEM_PROMPT = (
+          "You answer questions about SandPay using ONLY the numbered sources in the user message. "
+          "Put the number of the source that supports each sentence in square brackets after it, like [2]. "
+          f'If the sources do not contain the answer, reply exactly: "{REFUSAL}"'
+      )
+
+      def build_prompt(question, sources):
+          blocks = [f"[{n}] {s.title}\n{s.text}" for n, s in enumerate(sources, start=1)]
+          return "<sources>\n" + "\n\n".join(blocks) + ("\n" if blocks else "") + f"</sources>\n\nQuestion: {question}"
+      ```
+
+      For "How long does a refund take to reach the customer?" the reranker returned three chunks, scored 0.64,
+      0.32 and 0.32. Only the first passes 0.35, so the prompt holds one source (real output):
+
+      ```plaintext
+      <sources>
+      [1] Refunds > How long refunds take
+      SandPay sends the refund to the card network at once. The money usually reaches the customer within 5 to 10 business days, depending on the issuing bank. The refund fee is not returned.
+      </sources>
+
+      Question: How long does a refund take to reach the customer?
+      ```
+
+      Why these choices:
+
+      - **Numbers, not chunk ids.** `[1]` is short for the model to write and easy to check: it must be between 1
+        and the number of sources sent. Your code maps the number back to the chunk id and URL.
+      - **A fixed refusal sentence**, so code can tell "no answer" from an answer.
+      - **Fewer, better sources, best first.** Liu et al. found that "performance is often highest when relevant
+        information occurs at the beginning or end of the input context, and significantly degrades when models
+        must access relevant information in the middle of long contexts". In their 20- and 30-document settings,
+        GPT-3.5-Turbo with the answer in the middle did, in the worst case, worse than with no documents at all
+        (56.1% closed-book).
+        Putting the best chunk first and keeping k small is a direct response; it is still worth testing on your
+        model.
+      - **Retrieved text is untrusted.** A help article - or a user-uploaded document in another product - can
+        contain "ignore your instructions...". OWASP LLM01:2025 calls this indirect prompt injection; delimit the
+        sources, escape them, and never give the answering call tools it does not need. OWASP LLM08:2025 adds that
+        a shared vector store can leak one tenant's or role's documents to another: filter by permission **at
+        retrieval**, not in the prompt.
+
+  - id: citations
+    kind: code
+    concepts: [grounded-citations]
+    title: Checking citations and refusing
+    body: |
+      The model is asked to cite; the code checks that it did. `check_citations` returns a list of problems -
+      empty means the answer may be shown:
+
+      ```python
+      def check_citations(answer, n_sources):
+          text = answer.strip()
+          if text == REFUSAL:
+              return []
+          cited = extract_citations(text)                        # [2] and [1, 3] forms
+          if not cited:
+              return ["no citations"]
+          problems = []
+          for n in dict.fromkeys(cited):                         # distinct, in order
+              if not 1 <= n <= n_sources:
+                  problems.append(f"cites [{n}]: no such source ({n_sources} given)")
+          # "... days. [2]" - move a citation after the full stop to before it, then split sentences
+          moved = re.sub(r"([.!?])((?:\s*\[\d+(?:\s*,\s*\d+)*\])+)", r"\2\1", text)
+          for sentence in re.split(r"(?<=[.!?])\s+", moved):
+              if sentence.strip() and not extract_citations(sentence):
+                  problems.append(f"uncited sentence: {sentence.strip()}")
+          return problems
+      ```
+
+      `answer_question` puts it together: retrieve, keep at most 3 sources scoring at least `min_score`, **refuse
+      without calling the model if none are left**, call the model with temperature 0, and show the refusal
+      instead of any answer that fails the check. The client is a parameter, so the test passes a `ScriptedLLM`
+      with the reply to try. Four scripted replies and one unanswerable question (real output):
+
+      ```python
+      good = ("Refunds usually reach the customer within 5 to 10 business days, depending on the issuing bank [1]. "
+              "The refund fee is not returned [1].")
+      bad_index = "Refunds usually reach the customer within 5 to 10 business days [4]."
+      uncited = "Refunds usually reach the customer within 5 to 10 business days [1]. You can also ask your bank to speed it up."
+      for name, reply in [("good", good), ("bad index", bad_index), ("uncited", uncited)]:
+          llm = ScriptedLLM([reply])
+          a = answer_question(q, retrieve, llm, min_score=0.35)
+          print(f"{name:10} -> {a.status:9} cited={a.cited} problems={a.problems}")
+          print(f"           shown: {a.text}")
+
+      llm = ScriptedLLM([])          # an empty script: any call would raise
+      a = answer_question("Does SandPay support cryptocurrency payments?", retrieve, llm, min_score=0.35)
+      print("crypto     ->", a.status, "| model calls:", len(llm.calls), "|", a.text)
+      ```
+
+      ```plaintext
+      good       -> answered  cited=[1] problems=[]
+                 shown: Refunds usually reach the customer within 5 to 10 business days, depending on the issuing bank [1]. The refund fee is not returned [1].
+      bad index  -> rejected  cited=[4] problems=['cites [4]: no such source (1 given)']
+                 shown: I can't find that in the SandPay help centre.
+      uncited    -> rejected  cited=[1] problems=['uncited sentence: You can also ask your bank to speed it up.']
+                 shown: I can't find that in the SandPay help centre.
+      crypto     -> refused | model calls: 0 | I can't find that in the SandPay help centre.
+      ```
+
+      The "uncited" reply is the dangerous one: its first sentence is grounded, and its second is advice from
+      nowhere. Rejecting the whole answer is strict; a gentler product could drop the uncited sentence - but it
+      must never show it as if it were sourced.
+
+      **What this check cannot see:** whether source [1] actually says what the sentence claims. "Refunds take 2
+      days [1]." passes. Catching that needs an evaluation step - comparing the sentence with the cited text, by
+      string overlap, a second model, or a human - covered in
+      [Evaluating LLM applications and guardrails](#/lesson/llm-evaluation-and-guardrails).
+
+  - id: provider-citations
+    kind: when
+    concepts: [grounded-citations, rag-chunking]
+    title: Build it yourself or use a provider's retrieval and citations
+    body: |
+      Hosted APIs now offer parts of this pipeline. **Provider-specific, as documented on 2026-11-14:**
+
+      | | Anthropic Messages API - Citations | OpenAI - Retrieval / file search |
+      | --- | --- | --- |
+      | You send | `document` content blocks with `"citations": {"enabled": true}` (plain text, PDF or custom content) | Files uploaded to a vector store; the `file_search` tool or the search endpoint queries it |
+      | Chunking | Plain text and PDFs are chunked into sentences; custom content blocks are used as-is | 800-token chunks, 400-token overlap by default; `chunking_strategy` changes it |
+      | Ranking | You choose what to send (your retrieval) | Hybrid search with RRF; `ranking_options` (`ranker`, `score_threshold` 0.0-1.0, hybrid weights) |
+      | Citations returned | Text blocks with `citations`, e.g. `char_location` with `cited_text`, `document_index`, start and end character indexes | `file_citation` annotations with `file_id`, `filename` and an `index` in the output text |
+
+      Two documented details matter for testing. Anthropic's page says that because the API extracts `cited_text`
+      itself, "citations are guaranteed to contain valid pointers to the provided documents" - which removes the
+      out-of-range check but not the "does it support the sentence" question. The same page says citations
+      cannot be combined with structured outputs: enabling both returns a 400 error. Its own advice for RAG is to
+      put each chunk into a plain text document if you want sentence-level citations within it, or into a
+      custom content document if you do not want further chunking.
+
+      **Build your own** when you need to measure and tune each step (as in this lesson), mix sources with
+      permissions, or keep the model provider swappable. **Use the provider's** when its defaults pass your
+      evaluation and you want less to run. Either way, keep the question set and the recall@k and citation tests:
+      they are how you notice when a default or a model changes under you.
+
+  - id: tests
+    kind: tests
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context, grounded-citations]
+    title: Tests for a RAG answer path
+    body: |
+      | # | Case | Setup | Expected result | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Chunking keeps facts whole | Every labelled answer text | Each fact is contained in at least one chunk | Count of "split facts" = 0 |
+      | 2 | Retrieval recall | 14 labelled questions | recall@3 at or above the agreed bar (here 0.86 for heading chunks + BM25) | recall@1 and @3 per retriever, list of misses |
+      | 3 | Identifier query | "Why did my refund fail with SP-4012?" | `refunds#3` first | Ranked chunk ids |
+      | 4 | Prompt contains the context | Scripted model | The request's user message is exactly `build_prompt(question, kept sources)`; system prompt and temperature 0 as specified | `llm.calls[0]` |
+      | 5 | Valid answer shown | Scripted reply citing [1] with 1 source | Status `answered`, text unchanged, `cited == [1]` | Returned `Answer` |
+      | 6 | Out-of-range citation (negative) | Reply cites [4], 1 source sent | Status `rejected`, refusal shown, problem names [4] | Returned `Answer` |
+      | 7 | Uncited sentence (negative) | Reply with one cited and one uncited sentence | Rejected; the uncited sentence is listed | Problems list |
+      | 8 | Nothing relevant (negative) | Question outside the corpus; all reranker scores < 0.35 | Status `refused`, **no model call** | `len(llm.calls) == 0` |
+      | 9 | Model refuses | Scripted reply is exactly the refusal | Status `refused` | Returned `Answer` |
+      | 10 | Re-index picks up a change | Edit the fee article, rebuild the index | The fee question retrieves the new text | Chunk text before and after |
+
+      Cases 4-9 run in milliseconds with a scripted model and belong in every build. Case 2 is a measurement:
+      record it and fail the build on a drop, not on a fixed number chosen once. Cases with a **real** model
+      (does it cite the right source, does it refuse when it should) are evaluations with many examples, not unit
+      tests.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context, grounded-citations]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Judging the answer, never the retrieval.** When an answer is wrong, first print the retrieved chunks. If
+        the answering text is not among them, no prompt change will help. Keep a labelled question set and track
+        recall@k for every change.
+      - **Comparing recall@k across chunk sizes without looking at size.** 80-word chunks "won" with recall@3 =
+        1.00 by sending about 30% of the corpus. Report tokens per prompt next to recall.
+      - **Assuming hybrid beats either input.** Here RRF lowered recall@1 from 0.86 to 0.64 because one input was
+        weak. Measure each list and the fusion; weight or drop a list that only adds noise.
+      - **Gating on fused scores.** A first place scores between 1/61 and 2/61 in RRF whether or not it is
+        relevant: 0.0315-0.0328 for the answerable questions here, 0.0320 and 0.0323 for the unanswerable ones. Gate on a score
+        that reads the query and the chunk, and pick the threshold from labelled answerable and unanswerable
+        questions.
+      - **Tokenizer mismatch.** Query and index must use the same analyser; stemming, lower-casing and how
+        `SP-4012` splits all decide what can match. Print both token lists when an obvious match is missed.
+      - **Trusting `[n]` without checking it.** A model can cite [4] when 3 sources were sent, or cite nothing.
+        Check every number against what was sent, and refuse when the check fails.
+      - **Stuffing 20 chunks "to be safe".** More context is more cost and, per Liu et al., can hurt use of the
+        relevant part when it lands in the middle.
+      - **Forgetting permissions and injection.** Retrieval must filter by what the user may see (OWASP LLM08), and
+        retrieved text must be treated as data, not instructions (OWASP LLM01).
+
+      **Debugging method:** for one failing question, print (1) the query tokens, (2) BM25 and dense top 5 with
+      scores, (3) the fused list, (4) reranker scores, (5) the exact prompt, (6) the raw reply, (7) the citation
+      problems. The first step where the right chunk disappears is where the bug is.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context]
+    title: Trade-offs and alternatives
+    body: |
+      - **Chunk size:** small chunks are precise and cheap to send but cut facts and lose context; large ones keep
+        context but dilute the prompt. Structure-aware chunking with a context prefix is a good default for
+        documents with headings.
+      - **Sparse vs dense:** BM25 needs no model, is explainable and exact on codes, ids and rare names; dense
+        retrieval handles paraphrase and other languages if the embedding model does. Hybrid usually helps when
+        both inputs are reasonable.
+      - **Reranking** adds latency per candidate (a cross-encoder is a model call per pair), so rerank tens, not
+        thousands.
+      - **Long context instead of RAG:** with a small, stable corpus you can paste everything; you lose
+        per-sentence provenance unless you still number sources, and pay for every token on every call.
+      - **Fine-tuning instead of RAG:** changes how the model behaves, not reliably what facts it can cite, and
+        must be redone when facts change - see
+        [Fine-tuning, RAG or prompting - choosing](#/lesson/fine-tuning-vs-rag-vs-prompting).
+      - **Provider-managed retrieval** removes infrastructure and hides knobs; keep your own evaluation either way.
+
+  - id: summary
+    kind: summary
+    concepts: [rag-chunking, hybrid-retrieval, rerank-and-context, grounded-citations]
+    title: Quick reference
+    body: |
+      - RAG = retrieve chunks from a knowledge base, put the best few in the prompt as numbered sources, answer
+        only from them, check the citations, refuse when unsupported.
+      - Chunk so facts stay whole: overlap or structure. Measure recall@k **and** prompt size.
+      - BM25: `idf * tf (k1 + 1) / (tf + k1 (1 - b + b dl/avdl))`, idf `ln(1 + (N - n + 0.5)/(n + 0.5))`,
+        k1 = 1.2, b = 0.75. Exact on codes; blind to synonyms; mind the tokenizer.
+      - RRF: score = sum of `1 / (60 + rank)`; no score calibration needed; can be worse than its best input.
+      - Rerank a shortlist; gate on the reranker's score, not on RRF; choose the threshold from labelled questions.
+      - Best source first, few sources; models use the middle of long contexts worst.
+      - Every `[n]` must be in 1..number of sources, every sentence must cite; otherwise show the refusal.
+      - A valid citation is not a supported claim - evaluate that separately.
+
+exercises:
+  - id: overlap-recall
+    type: mcq
+    concept: rag-chunking
+    skill: application
+    title: Which chunks can answer?
+    prompt: |
+      A help article is 10 words: `w0 ... w9`. The answer to a question is the three words `w2 w3 w4`. You chunk
+      with `size = 4`. Which overlap gives a chunk that contains the whole answer?
+    options:
+      - id: overlap-2
+        text: "overlap = 2 - windows start at 0, 2, 4, 6, and the window at 2 is w2 w3 w4 w5"
+        feedback: Correct - with step size - overlap = 2 one window starts at w2 and holds all three words. In general overlap >= m - 1 protects every m-word fact.
+      - id: overlap-0
+        text: "overlap = 0 - windows w0-w3, w4-w7, w8-w9"
+        feedback: w0-w3 ends before w4 and w4-w7 starts after w3, so the fact is cut and neither chunk contains it.
+      - id: overlap-1
+        text: "overlap = 1 - windows w0-w3, w3-w6, w6-w9"
+        feedback: w0-w3 lacks w4 and w3-w6 lacks w2. Overlap 1 only guarantees facts of up to 2 words.
+      - id: none
+        text: No size-4 chunking can keep a 3-word fact whole reliably.
+        feedback: An overlap of at least the fact length minus 1 (here 2) makes every 3-word span land inside some window.
+    correct: [overlap-2]
+    hints:
+      - Write out the windows for each setting.
+      - For a fact of m words to be whole in some window, consecutive windows must share at least m - 1 words.
+    solution: |
+      A fact of `m` words is guaranteed to sit wholly inside some window when `overlap >= m - 1` (and the fact is
+      not longer than the window). Here m = 3, so overlap 2 works: windows `0-3, 2-5, 4-7, 6-9`, and `w2-w5`
+      contains the fact. The lesson's 25-word chunks without overlap cut 5 of 14 real facts this way.
+    followUp: |
+      With overlap 0 and size 4, which 3-word facts in a 10-word text are cut? How many are there out of the 8
+      possible positions?
+
+  - id: big-chunks-recall
+    type: mcq
+    concept: rag-chunking
+    skill: analysis
+    title: The chunking that "won"
+    prompt: |
+      A teammate reports, on the 14 SandPay questions with BM25:
+
+      ```plaintext
+      chunking               chunks avg words  R@3
+      fixed 80, overlap 20       11      62.2  1.00
+      by heading                 23      28.8  0.86
+      ```
+
+      and proposes switching to 80-word chunks. What is the best response?
+    options:
+      - id: size
+        text: Not yet - the top 3 of 11 chunks is about 30% of the corpus and about twice the text per prompt; compare at equal prompt size (for example top 6 heading chunks) and check answer quality.
+        feedback: Correct - recall@k rises when k chunks cover more of the corpus. Hold the token budget fixed before comparing.
+      - id: agree
+        text: Yes - 1.00 is perfect recall, so the 80-word chunks are strictly better.
+        feedback: Perfect recall on 14 questions bought by sending about 30% of the corpus is not a fair win. Cost and the "lost in the middle" effect grow with prompt size.
+      - id: overlap
+        text: Yes, because overlap always improves recall.
+        feedback: The 25-word runs show overlap rescued cut facts, but here the gain mainly comes from chunk size versus corpus size.
+      - id: precision
+        text: No - recall@3 is meaningless for RAG; only precision matters.
+        feedback: Recall matters (the answer must be retrieved to be used); the issue is comparing it at unequal prompt sizes.
+    correct: [size]
+    hints:
+      - How much of the 624-word corpus do 3 chunks of 62 words cover?
+    solution: |
+      3 × 62 ≈ 187 words, 30% of 624. With 11 chunks in total almost any question's article lands in the top 3.
+      Compare strategies at a matched budget (about the same number of words or tokens sent), on more questions,
+      and look at end-to-end answers - the heading chunks also carry their titles, which the 80-word windows lose.
+    followUp: |
+      Write the line of code that would report average prompt words for the top 3 next to recall@3.
+
+  - id: order-query-time
+    type: order
+    concept: rerank-and-context
+    skill: application
+    title: Order the query-time steps
+    prompt: Put the query-time steps of this lesson's pipeline in order.
+    items:
+      - id: retrieve
+        text: Run BM25 and dense search for the question (top 20 each)
+      - id: fuse
+        text: Fuse the two lists with reciprocal rank fusion and keep 10
+      - id: rerank
+        text: Rerank the 10 and keep the best 3
+      - id: gate
+        text: Drop sources below the relevance threshold; refuse if none are left
+      - id: prompt
+        text: Build the prompt with numbered sources, best first
+      - id: call
+        text: Call the model with temperature 0
+      - id: check
+        text: Check every citation and sentence; show the answer or the refusal
+    hints:
+      - Cheap and broad first, expensive and narrow later.
+      - When can you refuse without spending a model call?
+    solution: |
+      Retrieval is cheap and broad, fusion merges, reranking is slower and narrow, the gate decides whether there
+      is anything to answer from (before any model cost), then prompt, generate and verify.
+    followUp: |
+      Where would you insert a permission filter so a user never sees a chunk they are not allowed to read, and
+      why there rather than in the prompt?
+
+  - id: idf-by-hand
+    type: mcq
+    concept: hybrid-retrieval
+    skill: application
+    title: idf by hand
+    prompt: |
+      The help centre has N = 23 chunks. "the" appears in 14 of them, "sp" in 2. Using the Lucene form
+      `idf = ln(1 + (N - n + 0.5) / (n + 0.5))`, what are the two idf values, and what would the form without
+      `1 +` give for "the"?
+    options:
+      - id: right
+        text: "the 0.50, sp 2.26; without 1 + the gets -0.42"
+        feedback: Correct - ln(1 + 9.5/14.5) = ln(1.655) = 0.50, ln(1 + 21.5/2.5) = ln(9.6) = 2.26, and ln(9.5/14.5) = -0.42, a negative weight.
+      - id: zero
+        text: "the 0, sp 2.26; without 1 + the also 0"
+        feedback: A term in most documents gets a small weight, not zero, with the Lucene form - and the classic form goes below zero.
+      - id: swapped
+        text: "the 2.26, sp 0.50"
+        feedback: Swapped - idf rewards RARE terms; "sp" is in 2 chunks, "the" in 14.
+      - id: tf
+        text: It depends on how often each word occurs in the chunk.
+        feedback: That is the tf part. idf only uses N and the number of chunks containing the term.
+    correct: [right]
+    hints:
+      - Plug in N - n + 0.5 and n + 0.5 for each term.
+      - ln(9.6) is about 2.26.
+    solution: |
+      the: `ln(1 + 9.5 / 14.5) = ln(1.655) = 0.50`. sp: `ln(1 + 21.5 / 2.5) = ln(9.6) = 2.26`. Without the
+      `1 +`: `ln(9.5 / 14.5) = -0.42` - a word in more than half the chunks would **lower** a chunk's score, which
+      is why Lucene and this lesson add 1.
+    followUp: |
+      What is the idf of a term that is in no chunk at all? Does it matter for the score?
+
+  - id: rrf-by-hand
+    type: mcq
+    concept: hybrid-retrieval
+    skill: application
+    title: Fuse two rankings
+    prompt: |
+      BM25 ranks chunks `[A, B, C]`; dense search ranks `[C, A, D]`. With RRF and k = 60, what is the fused order?
+    options:
+      - id: right
+        text: A, C, B, D
+        feedback: Correct - A = 1/61 + 1/62 = 0.03252, C = 1/63 + 1/61 = 0.03227, B = 1/62, D = 1/63.
+      - id: c-first
+        text: C, A, B, D
+        feedback: C is first for dense but only third for BM25; A is first and second. 1/61 + 1/62 beats 1/63 + 1/61.
+      - id: bm25
+        text: A, B, C, D
+        feedback: That is BM25's order with D appended. B appears in only one list, so A and C (in both) outrank it.
+      - id: scores
+        text: It depends on the BM25 scores and cosine similarities.
+        feedback: RRF uses only ranks - that is its point - so no scores are needed.
+    correct: [right]
+    hints:
+      - Sum 1 / (60 + rank) over the lists that contain each chunk.
+    solution: |
+      `A: 1/61 + 1/62 = 0.03252`, `C: 1/63 + 1/61 = 0.03227`, `B: 1/62 = 0.01613`, `D: 1/63 = 0.01587`. A chunk
+      that both lists rank highly beats a chunk that one list loves.
+    followUp: |
+      With k = 0 instead of 60, does the order change? What does a small k do to the weight of first places?
+
+  - id: hybrid-worse
+    type: mcq
+    concept: hybrid-retrieval
+    skill: analysis
+    title: Hybrid made it worse
+    prompt: |
+      On 14 labelled questions: BM25 recall@1 = 0.86, dense recall@1 = 0.64, hybrid (RRF of both) recall@1 = 0.64.
+      A colleague concludes the RRF code must be buggy. What do you check, and what is the most likely explanation?
+    options:
+      - id: weak-input
+        text: Check rrf against a hand-computed example, then compare the lists per question - most likely the weak dense list pulls wrong chunks to rank 1, since RRF weights both lists equally.
+        feedback: Correct - verify the code once by hand, then look at the questions where hybrid's first place differs from BM25's. Equal weighting of a weak list is the expected cause.
+      - id: bug
+        text: RRF can never be worse than its best input, so the code is wrong.
+        feedback: It can, and the lesson's run shows it. RRF has no idea which list is more reliable.
+      - id: k
+        text: k = 60 is wrong; RRF needs k = 1.
+        feedback: The paper found the choice "not critical"; changing k shifts how much first places dominate but does not fix an unreliable input.
+      - id: scores
+        text: The BM25 scores must be normalised to 0-1 before fusion.
+        feedback: RRF does not use scores at all, only ranks.
+    correct: [weak-input]
+    hints:
+      - Is there any property of RRF that guarantees it beats its inputs?
+      - How would you confirm the code is right independently of the data?
+    solution: |
+      First confirm the implementation on a tiny case you computed by hand (the previous exercise). Then print
+      both lists for the questions where hybrid and BM25 disagree at rank 1. Options: improve the dense input
+      (a real embedding model), weight the lists (OpenAI's API documents embedding and text weights for its RRF),
+      or rerank the fused shortlist - which here lifted recall@1 to 0.93.
+    followUp: |
+      Write a weighted RRF where each list has a weight w and contributes w / (k + rank). What weights would you try
+      first, and how would you choose?
+
+  - id: gate-score
+    type: mcq
+    concept: rerank-and-context
+    skill: analysis
+    title: Where should the refusal gate look?
+    prompt: |
+      You want to refuse when the help centre has nothing relevant. For "What is the phone number of SandPay
+      support in Brazil?" the fused list's first chunk has RRF score 0.0320, and the best reranker score is 0.16.
+      The 14 answerable questions have first-place RRF scores between 0.0315 and 0.0328. Which gate works?
+    options:
+      - id: rerank
+        text: Gate on the reranker score (for example 0.35), chosen from labelled answerable and unanswerable questions.
+        feedback: Correct - the reranker's score depends on the query and the chunk, so it can separate "on topic" from "nothing here". On the lesson's set answerable questions scored 0.40-0.95, unanswerable 0.16-0.20.
+      - id: rrf
+        text: Gate on the RRF score, for example refuse below 0.03.
+        feedback: Every question has a first place, worth about 1/61 + 1/61 when both lists agree - relevant or not. The unanswerable questions scored 0.0320 and 0.0323, inside the answerable range.
+      - id: model
+        text: No gate - the system prompt tells the model to refuse.
+        feedback: Keep the instruction, but a gate in code refuses with no model cost and does not depend on the model obeying.
+      - id: k
+        text: Always send the top 3 and let citation checking catch it.
+        feedback: The model could answer from an unrelated chunk with a valid-looking citation; the citation check only proves the source was sent.
+    correct: [rerank]
+    hints:
+      - Which score would be the same whether or not the corpus contained the answer?
+    solution: |
+      Rank-based scores are relative: something is always first. A gate needs an absolute score from a model that
+      reads the query and the chunk - here the reranker's. Pick the threshold from labelled questions, accept that
+      it is a "probably on topic" check (the 0.40 webhook-retry question passed with the wrong chunk), and re-check
+      it whenever the corpus or the reranker changes.
+    followUp: |
+      Your threshold makes 1 answerable question in 14 refuse. How do you decide whether to lower it, and what do
+      you measure on the unanswerable side?
+
+  - id: citation-checker-debug
+    type: debug
+    concept: grounded-citations
+    skill: analysis
+    title: A citation checker that lets bad answers through
+    prompt: |
+      `n_sources` sources were sent, numbered `[1]` to `[n_sources]`. Click **every** line that lets an
+      unsupported answer be shown (a line that only rejects good answers does not count).
+    language: python
+    code: |
+      def check_citations(answer, n_sources):
+          text = answer.strip()
+          if REFUSAL in text:
+              return []
+          cited = extract_citations(text)
+          if not cited:
+              return ["no citations"]
+          problems = []
+          for n in sorted(set(cited)):
+              if n not in range(n_sources):
+                  problems.append(f"cites [{n}]: no such source ({n_sources} given)")
+          for sentence in re.split(r"(?<=[.!?])\s+", text):
+              if sentence and not extract_citations(sentence):
+                  problems.append(f"uncited sentence: {sentence}")
+          return problems
+    correctLines: [3, 10]
+    lineNotes:
+      - line: 12
+        note: Splitting before moving "[2]" off the end of the previous sentence makes "... days. [2]" look like an uncited sentence - a false rejection. Annoying, but it never shows an unsupported answer.
+      - line: 6
+        note: Rejecting an answer with no citations at all is correct.
+    hints:
+      - What does `range(3)` contain?
+      - What answer contains the refusal text but is not a refusal?
+    solution: |
+      **Line 3** uses `in`: "I can't find that in the SandPay help centre. But fees are 1% anyway." passes with no
+      checks. Compare the stripped text for equality. **Line 10**: `range(n_sources)` is `0 .. n_sources - 1`, so
+      `[0]` - a source that does not exist - is accepted (and the last real source is wrongly rejected). Use
+      `1 <= n <= n_sources`. Line 12 is a strictness bug, not a safety bug; fix it by moving trailing citations
+      before the full stop.
+    followUp: |
+      Write two test cases that would have caught lines 3 and 10, with the exact answer strings.
+
+  - id: lost-in-middle
+    type: short
+    concept: rerank-and-context
+    skill: analysis
+    title: Twenty chunks "to be safe"
+    prompt: |
+      To raise recall, a teammate changes the pipeline to send the top 20 fused chunks, in fused order, to the
+      model. Recall@20 is 1.00. Using the "Lost in the Middle" findings and this lesson's measurements, argue what
+      may happen to answer quality and cost, and propose a change you would test.
+    modelAnswer: |
+      Recall@20 only says the right chunk is somewhere in the prompt. Liu et al. found performance "is often
+      highest when relevant information occurs at the beginning or end of the input context, and significantly
+      degrades" when it is in the middle; in their 20- and 30-document settings GPT-3.5-Turbo with the answer in
+      the middle scored, in the worst case, below its closed-book accuracy (56.1%). Twenty chunks also multiply input tokens - cost and
+      latency on every call - and give the model more unrelated text to cite. I would rerank the fused top 10-20,
+      gate on the reranker score, send the best 3-5 with the best first, and compare end-to-end answer accuracy and
+      citation validity on the labelled set, at the same time measuring tokens per request.
+    rubric:
+      - Separates retrieval recall from whether the model uses the chunk
+      - Cites the position effect (start/end better than middle) correctly
+      - Mentions token cost or latency
+      - Proposes a measurable experiment (rerank, fewer sources, best first) with an end-to-end metric
+    hints:
+      - Where does the correct chunk end up when it is fused rank 9 of 20?
+    solution: |
+      See the model answer. The key move is to measure answers, not only recall, and to hold prompt size in view.
+    followUp: |
+      Liu et al. also tried placing the question both before and after the documents. Where would you put the
+      question in this lesson's prompt layout, and how would you test the change?
+
+  - id: rag-test-design
+    type: testdesign
+    concept: grounded-citations
+    skill: application
+    title: Test plan for the SandPay help bot
+    prompt: |
+      SandPay's help bot uses this lesson's pipeline. Design five tests for `answer_question` with a scripted
+      model and a stub retriever - at least three negative. For each give preconditions, steps, the expected
+      result and the evidence you would capture.
+    modelAnswer: |
+      1. **Answer with a valid citation** - retriever returns (timing chunk, 0.9), (limits chunk, 0.6); script
+         replies "It usually takes 5 to 10 business days [1]." Expect status `answered`, text unchanged,
+         `cited == [1]`, sources = both chunks. Evidence: the `Answer`, and `llm.calls[0].messages[0]["content"] ==
+         build_prompt(question, sources)`, system prompt and temperature 0.
+      2. **Nothing relevant (negative)** - retriever returns only (fees chunk, 0.2) with `min_score=0.5`; script is
+         empty. Expect `refused`, the exact refusal text, **zero model calls**. Evidence: `len(llm.calls) == 0`.
+      3. **Out-of-range citation (negative)** - one source, reply cites [4]. Expect `rejected`, refusal shown,
+         problems `["cites [4]: no such source (1 given)"]`.
+      4. **Uncited sentence (negative)** - reply "It takes 5 to 10 days [1]. Banks may be faster." Expect
+         `rejected`, problem lists "Banks may be faster.".
+      5. **No citations at all (negative)** - reply "It takes 5 to 10 business days." Expect `rejected`, `["no
+         citations"]`.
+      Plus: the model's exact refusal is reported as `refused`; `max_sources` caps the prompt at 3 sources even if
+      more pass the gate.
+    rubric:
+      - Each test has preconditions (retriever output, script, threshold), steps, expected result and evidence
+      - Includes the no-call refusal with the call count as evidence
+      - Includes out-of-range and uncited-sentence negatives
+      - Asserts the prompt content (sources reach the model), not only the returned text
+    hints:
+      - The scripted model's `calls` list is your evidence of what was sent and whether anything was sent.
+    solution: |
+      See the model answer; `tests/genai/test_rag_pipeline.py` in the practice project contains these cases.
+    followUp: |
+      Which of these tests would still be meaningful with a real model, and what would you add for it?
+
+  - id: chunking-coding
+    type: coding
+    concept: rag-chunking
+    skill: application
+    title: Chunk by size and by heading, and measure recall@k
+    prompt: |
+      In `chunking.py`, `chunk_fixed` is a teammate's draft that ignores part of its docstring. Fix it (overlap,
+      the last window, and parameter validation), then implement `chunk_by_heading` (one chunk per `## ` section,
+      text prefixed with `"<title> > <heading>: "`, long sections split) and `recall_at_k` (a query counts when a
+      top-k chunk contains its whole fact, ignoring case and extra whitespace).
+    project: ai
+    files:
+      - exercises/genai/chunking.py
+    test: tests/genai/test_chunking.py
+    command: .venv/bin/python -m pytest tests/genai/test_chunking.py
+    hints:
+      - Windows start every size - overlap words; stop after the first window that reaches the last word.
+      - "Validate first: raise ValueError unless size >= 1 and 0 <= overlap < size."
+      - "chunk_by_heading: walk the lines, start a new (heading, lines) section on re.match(r'^## (.*)$', line), and skip sections whose body has no words."
+      - "recall_at_k: normalise with ' '.join(text.lower().split()) on both sides, then use `in`."
+    modelAnswer: |
+      ```python
+      def chunk_fixed(doc_id, text, size, overlap=0):
+          if size < 1 or not 0 <= overlap < size:
+              raise ValueError("need size >= 1 and 0 <= overlap < size")
+          words, step, chunks, start = text.split(), size - overlap, [], 0
+          while start < len(words):
+              chunks.append(Chunk(f"{doc_id}#{len(chunks)}", doc_id, "", " ".join(words[start : start + size])))
+              if start + size >= len(words):
+                  break
+              start += step
+          return chunks
+
+
+      def chunk_by_heading(doc_id, title, text, max_words=None):
+          sections = [("", [])]
+          for line in text.splitlines():
+              match = re.match(r"^## (.*)$", line)
+              if match:
+                  sections.append((match.group(1).strip(), []))
+              else:
+                  sections[-1][1].append(line)
+          chunks = []
+          for heading, lines in sections:
+              body = " ".join(" ".join(lines).split())
+              if not body:
+                  continue
+              pieces = [body]
+              if max_words is not None and len(body.split()) > max_words:
+                  pieces = [c.text for c in chunk_fixed(doc_id, body, max_words, 0)]
+              prefix = f"{title} > {heading}" if heading else title
+              for piece in pieces:
+                  chunks.append(Chunk(f"{doc_id}#{len(chunks)}", doc_id, heading, f"{prefix}: {piece}"))
+          return chunks
+
+
+      def recall_at_k(results, facts, k):
+          if len(results) != len(facts) or k < 1:
+              raise ValueError("results and facts must pair up, and k >= 1")
+          if not facts:
+              return 0.0
+          hits = sum(any(_normalise(f) in _normalise(c.text) for c in ranked[:k]) for ranked, f in zip(results, facts))
+          return hits / len(facts)
+      ```
+
+      The draft stepped by `size`, so overlap did nothing, and accepted any parameters. Stopping after the window
+      that reaches the end avoids a final window made only of words already sent.
+    rubric:
+      - Every test in test_chunking.py passes
+      - Overlap really repeats words and no window is only overlap
+      - Heading chunks carry the title and heading prefix
+      - recall_at_k treats a fact split across two chunks as a miss
+    solution: |
+      See the model answer. The tests check windows with and without overlap, validation, the exact heading chunks
+      of a small payouts article, splitting long sections, and that overlap rescues a fact on a boundary.
+    followUp: |
+      Change `chunk_fixed` to never cut inside a sentence: end each window at the last full stop before `size`
+      words when there is one. What happens to the number of split facts in the lesson's table?
+
+  - id: hybrid-coding
+    type: coding
+    concept: hybrid-retrieval
+    skill: application
+    title: Write BM25, reciprocal rank fusion and a reranker
+    prompt: |
+      In `hybrid_search.py`, implement `BM25.scores` from the formula in its docstring (the class already builds
+      the term counts, lengths and document frequencies), `rrf` (rank fusion with k = 60 by default) and `rerank`
+      (re-score candidates with the given `rerank_score`, keep top_n, ties in first-stage order).
+      `dense_top_k`, `hybrid_top_k` and `rerank_score` are provided.
+    project: ai
+    files:
+      - exercises/genai/hybrid_search.py
+    test: tests/genai/test_hybrid_search.py
+    command: .venv/bin/python -m pytest tests/genai/test_hybrid_search.py
+    hints:
+      - Loop over the query's tokens (repeats included); skip a term no chunk contains.
+      - "For one term, build tf as an array over chunks; the length part is k1 * (1 - b + b * lengths / avg_len)."
+      - "rrf: a dict from chunk index to score, += 1 / (k + rank) with rank starting at 1, then sort by (-score, index)."
+      - "rerank: score each candidate, then sort positions by (-score, position) so ties keep their order."
+    modelAnswer: |
+      ```python
+      def scores(self, query):
+          out = np.zeros(len(self.docs))
+          norm = self.k1 * (1 - self.b + self.b * self.lengths / self.avg_len)
+          for term in tokenize(query):
+              if term not in self.df:
+                  continue
+              tf = np.array([doc.get(term, 0) for doc in self.docs], dtype=float)
+              out += self.idf(term) * tf * (self.k1 + 1) / (tf + norm)
+          return out
+
+
+      def rrf(rankings, k=60):
+          fused = {}
+          for ranking in rankings:
+              for rank, doc in enumerate(ranking, start=1):
+                  fused[doc] = fused.get(doc, 0.0) + 1.0 / (k + rank)
+          return sorted(fused.items(), key=lambda item: (-item[1], item[0]))
+
+
+      def rerank(query, texts, candidates, top_n):
+          scored = [(i, rerank_score(query, texts[i])) for i in candidates]
+          order = sorted(range(len(scored)), key=lambda j: (-scored[j][1], j))
+          return [scored[j] for j in order[:top_n]]
+      ```
+
+      Vectorising over chunks per term keeps it short; a production index stores postings lists so only chunks
+      that contain the term are touched.
+    rubric:
+      - Every test in test_hybrid_search.py passes
+      - Uses the Lucene idf (never negative) and both k1 and b
+      - RRF uses ranks only, starting at 1
+      - Ties are broken deterministically
+    solution: |
+      See the model answer. The tests compare scores with a hand computation, check saturation and that b = 0
+      switches length normalisation off, compute RRF exactly, and pin the reranker's ordering.
+    followUp: |
+      Add a tiny suffix-stripping stemmer to `tokenize` (retries -> retri, retry -> retri) and re-run the lesson's
+      retrieval table. Which question does it fix, and does it break any?
+
+  - id: rag-pipeline-coding
+    type: coding
+    concept: grounded-citations
+    skill: application
+    title: Numbered sources, citation checks and refusal
+    prompt: |
+      In `rag_pipeline.py`, implement `build_prompt`, `extract_citations` and `check_citations` as their
+      docstrings describe, and fix the teammate's `answer_question`, which always calls the model and shows
+      whatever comes back. It must refuse without a model call when no source passes `min_score`, call the
+      client with temperature 0, and replace any answer that fails the citation check with the refusal.
+    project: ai
+    files:
+      - exercises/genai/rag_pipeline.py
+    test: tests/genai/test_rag_pipeline.py
+    command: .venv/bin/python -m pytest tests/genai/test_rag_pipeline.py
+    hints:
+      - "extract_citations: re.findall(r'\\[(\\d+(?:\\s*,\\s*\\d+)*)\\]', answer) finds [2] and [1, 3]."
+      - Compare the stripped answer with REFUSAL for equality, not with `in`.
+      - Before splitting into sentences, move a citation that follows the full stop to before it, so "days. [2]" belongs to its sentence.
+      - "answer_question: filter by score, slice to max_sources, return the refusal early if the list is empty."
+    modelAnswer: |
+      ```python
+      def answer_question(question, retrieve, client, min_score=0.5, max_sources=3):
+          kept = [source for source, score in retrieve(question) if score >= min_score][:max_sources]
+          if not kept:
+              return Answer("refused", REFUSAL)                      # no model call
+          reply = client.create(
+              system=SYSTEM_PROMPT,
+              messages=[{"role": "user", "content": build_prompt(question, kept)}],
+              max_tokens=300,
+              temperature=0,
+          ).text.strip()
+          cited = sorted(set(extract_citations(reply)))
+          if reply == REFUSAL:
+              return Answer("refused", REFUSAL, kept, cited)
+          problems = check_citations(reply, len(kept))
+          if problems:
+              return Answer("rejected", REFUSAL, kept, cited, problems)
+          return Answer("answered", reply, kept, cited)
+      ```
+
+      `build_prompt` and `check_citations` are shown in the lesson's sections. The client is a parameter, so the
+      tests pass a `ScriptedLLM` and inspect `llm.calls` for what was sent.
+    rubric:
+      - Every test in test_rag_pipeline.py passes
+      - No model call when nothing passes the gate
+      - An answer that fails the check is never shown
+      - Citations are checked against the number of sources actually sent
+    solution: |
+      See the model answer. The tests check the exact prompt layout, citation parsing, each problem message, the
+      no-call refusal, the model's refusal and three kinds of rejected answer.
+    followUp: |
+      Add a check that each cited sentence shares at least one content word with the source it cites. Which
+      unsupported answer does that catch, and which does it still miss?
+
+  - id: interview-rag
+    type: interview
+    concept: grounded-citations
+    skill: analysis
+    title: "Interview: the help bot gave a wrong answer"
+    prompt: |
+      *"Our RAG help bot told a merchant that disputes can be answered within 14 days. The policy says 7. Walk me
+      through how you would find the cause and what you would change so it does not happen again."*
+    hints:
+      - Separate retrieval, prompt and generation; collect evidence for each.
+    modelAnswer: |
+      First reproduce it and capture the trace: the question, the retrieved chunks with their scores at each stage,
+      the exact prompt and the raw reply. Then locate the failure:
+
+      - **Retrieval** - was the "Responding to a dispute" chunk with "within 7 calendar days" in the prompt? If not,
+        check chunking (is the fact cut across chunks?), tokenization, BM25 and dense rankings, fusion and the
+        reranker; add the question to the labelled set and track recall@k.
+      - **Stale or conflicting content** - is there an old article or a cached index that says 14? Re-index and
+        check that the corpus has one source of truth.
+      - **Generation** - the right chunk was there, but the model wrote 14: did it cite anything? If it cited the
+        dispute chunk, our citation check passed because it only checks that the source exists. Add a support
+        check (compare numbers and key phrases in the sentence with the cited text, or a grader model) and put the
+        best source first with fewer sources.
+      - **Gate** - if nothing relevant was retrieved, the bot should have refused before calling the model; check
+        the threshold.
+
+      Then make it a regression test: the question, its fact and the expected citation go into the evaluation set,
+      and the build fails if recall or answer accuracy on that set drops.
+    rubric:
+      - Collects a full trace before guessing
+      - Distinguishes retrieval failure, stale data and generation failure, with how to tell each apart
+      - Knows a valid citation does not prove support, and proposes a support check
+      - Turns the incident into a regression case with a metric
+    followUps:
+      - How would you choose the refusal threshold, and what does it cost to set it too high?
+      - When would you use a provider's built-in citations instead of your own checker?
+      - How do you stop one merchant's private documents from being retrieved for another merchant?
+    solution: |
+      See the model answer. Interviewers listen for evidence first, a clear split between retrieval and generation,
+      and a fix that becomes a measured regression test.
+
+placement:
+  - id: place-chunk-overlap
+    type: mcq
+    concept: rag-chunking
+    skill: application
+    title: Chunks and a cut fact
+    prompt: |
+      Answers in your help centre are at most 12 words long. You chunk into 100-word windows. What overlap
+      guarantees that every answer lies wholly inside at least one chunk?
+    options:
+      - id: eleven
+        text: At least 11 words
+        feedback: Correct - a span of m words is always inside some window when the overlap is at least m - 1.
+      - id: zero
+        text: None - 100 words is much longer than 12
+        feedback: Window length does not help at a boundary; an answer straddling word 100 is cut whatever the size.
+      - id: fifty
+        text: 50 words - overlap should always be half the chunk
+        feedback: Half is a common default (OpenAI's documented default is 400 of 800 tokens) but is not what the guarantee needs; it doubles the chunks.
+      - id: twelve
+        text: At least 24 words, twice the answer length
+        feedback: More than needed - m - 1 words already make every m-word span land in some window.
+    correct: [eleven]
+    solution: |
+      Windows start every `100 - overlap` words. A 12-word answer starting anywhere fits in the window that starts
+      at or before it as long as consecutive windows share at least 11 words.
+
+  - id: place-rrf
+    type: mcq
+    concept: hybrid-retrieval
+    skill: application
+    title: Reciprocal rank fusion
+    prompt: |
+      Ranking 1 is `[X, Y]`, ranking 2 is `[Y, Z]`. With RRF and k = 60, which chunk is first, and why does RRF
+      not need the two retrievers' scores?
+    options:
+      - id: y
+        text: Y (1/62 + 1/61); RRF only uses ranks, so scores on different scales never need normalising
+        feedback: Correct - Y appears in both lists.
+      - id: x
+        text: X, because it is first in ranking 1
+        feedback: X gets 1/61; Y gets 1/62 + 1/61, which is larger.
+      - id: tie
+        text: X, Y and Z tie, because each is first or second somewhere
+        feedback: Scores add across lists, so appearing twice matters.
+      - id: needs
+        text: It cannot be computed without the BM25 and cosine scores
+        feedback: RRF is designed to work from ranks alone.
+    correct: [y]
+    solution: |
+      `Y = 1/62 + 1/61 = 0.0325`, `X = 1/61 = 0.0164`, `Z = 1/62 = 0.0161`. Only ranks enter the formula.
+
+  - id: place-gate
+    type: mcq
+    concept: rerank-and-context
+    skill: analysis
+    title: Refusing before the model
+    prompt: |
+      Your pipeline fuses BM25 and dense results with RRF, reranks the top 10, and sends the best 3 to the model.
+      You must refuse questions the corpus cannot answer, without paying for a model call. What do you gate on?
+    options:
+      - id: rerank
+        text: The best reranker score, against a threshold chosen from labelled answerable and unanswerable questions
+        feedback: Correct - the reranker scores query and chunk together, so its score is meaningful on its own.
+      - id: rrf
+        text: The best RRF score
+        feedback: RRF scores reflect rank only - some chunk is always first - so they do not separate "relevant" from "nothing here".
+      - id: count
+        text: Whether retrieval returned at least 3 chunks
+        feedback: Dense search always returns k chunks; count says nothing about relevance.
+      - id: prompt
+        text: Nothing - the system prompt tells the model to refuse
+        feedback: That costs a call per question and relies on the model obeying; keep it as a second line of defence.
+    correct: [rerank]
+    solution: |
+      Gate in code on a relevance score that is absolute (a reranker or a calibrated similarity), with a threshold
+      measured on labelled questions; keep the model's own refusal as a fallback.
+
+  - id: place-citation
+    type: mcq
+    concept: grounded-citations
+    skill: application
+    title: Which answer may be shown?
+    prompt: |
+      Three sources were sent. The checker requires every `[n]` to be a sent source and every sentence to cite one.
+      Which reply passes?
+    options:
+      - id: ok
+        text: "\"Disputes cost 15.00 EUR [2]. The fee is returned if you win. [2]\""
+        feedback: Correct - both sentences cite [2], which was sent; the second citation follows the full stop and still belongs to its sentence.
+      - id: four
+        text: "\"Disputes cost 15.00 EUR [4].\""
+        feedback: Only sources 1-3 were sent; [4] points at nothing.
+      - id: uncited
+        text: "\"Disputes cost 15.00 EUR [2]. You usually win.\""
+        feedback: The second sentence cites nothing - it is unsupported advice.
+      - id: zero
+        text: "\"Disputes cost 15.00 EUR [0].\""
+        feedback: Sources are numbered from 1; [0] is not a sent source.
+    correct: [ok]
+    solution: |
+      Numbers must be in 1..3 and each sentence needs one. Remember the limit: passing proves the cited sources were
+      sent, not that source [2] says 15.00 EUR.
+
+recall:
+  - id: recall-rag
+    concept: grounded-citations
+    prompt: What are the steps of a RAG answer, and the two places it should refuse?
+    answer: Retrieve chunks (sparse and dense), fuse, rerank, gate, build a prompt with numbered sources, generate, check citations. Refuse before the model when no chunk passes the relevance gate, and after it when the answer's citations fail the check (or the model itself refuses).
+  - id: recall-overlap
+    concept: rag-chunking
+    prompt: Why use overlap or heading-based chunks, and what must you report next to recall@k?
+    answer: Fixed windows cut facts in two so neither chunk contains the answer (5 of 14 facts at 25 words, no overlap). Overlap of at least m - 1 words keeps m-word facts whole; headings keep sections whole. Report prompt size, because bigger chunks raise recall@k by sending more of the corpus.
+  - id: recall-bm25
+    concept: hybrid-retrieval
+    prompt: Write BM25 and say what idf, k1 and b do.
+    answer: Sum over query terms of idf * tf (k1 + 1) / (tf + k1 (1 - b + b dl/avdl)). idf = ln(1 + (N - n + 0.5)/(n + 0.5)) rewards rare terms; k1 (1.2) saturates term frequency; b (0.75) normalises by length (0 = off, 1 = full).
+  - id: recall-rrf
+    concept: hybrid-retrieval
+    prompt: What is reciprocal rank fusion, and what can go wrong with it?
+    answer: Each chunk scores the sum of 1 / (k + rank) over the lists that contain it, k = 60. It needs no score scaling, but it trusts every list equally, so a weak retriever can push the best chunk down (recall@1 fell from 0.86 to 0.64 in the lesson).
+  - id: recall-rerank
+    concept: rerank-and-context
+    prompt: What does a reranker add, and why gate on its score rather than the fused score?
+    answer: It reads the query and each shortlisted chunk together and reorders them (recall@1 0.64 to 0.93 in the lesson). Its score is absolute, so a threshold can separate on-topic from nothing-relevant; RRF scores only reflect rank, and something is always first.
+  - id: recall-middle
+    concept: rerank-and-context
+    prompt: What did "Lost in the Middle" find, and what does it mean for prompt assembly?
+    answer: Models used relevant information best at the start or end of a long context and worst in the middle, sometimes below closed-book accuracy. Send few, reranked sources with the best first.
+  - id: recall-citation-limit
+    concept: grounded-citations
+    prompt: What does a passing citation check prove, and what does it not?
+    answer: That every [n] names a source actually sent and every sentence cites one. It does not prove the source supports the sentence - that needs an evaluation step (overlap, grader model or human).
+
+next:
+  - llm-evaluation-and-guardrails
+  - fine-tuning-vs-rag-vs-prompting
+  - tool-use-and-function-calling

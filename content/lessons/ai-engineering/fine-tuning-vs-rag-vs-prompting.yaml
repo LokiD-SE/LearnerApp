@@ -1,0 +1,1427 @@
+id: fine-tuning-vs-rag-vs-prompting
+title: Fine-tuning, RAG or prompting - choosing
+subject: ai-engineering
+module: genai-engineering
+level: advanced
+status: published
+estimatedMinutes: 120
+summary: Three ways to make a language model do your job - change the prompt, change what it reads (retrieval-augmented generation) or change its weights (fine-tuning) - and how to choose between them with evidence instead of fashion. You implement a LoRA layer and count what it trains, watch full fine-tuning and LoRA forget an old task on a tiny PyTorch model (and see what actually prevents it), turn the sources' arguments into a transparent decision checklist, and build a comparison harness that decides from paired eval results, a sign test, cost and a regression guard. Every number shown was produced by the code shown.
+tags:
+  [
+    fine-tuning,
+    supervised fine-tuning,
+    SFT,
+    RAG,
+    retrieval-augmented generation,
+    prompt engineering,
+    few-shot,
+    LoRA,
+    low-rank adaptation,
+    QLoRA,
+    PEFT,
+    parameter-efficient fine-tuning,
+    adapters,
+    catastrophic forgetting,
+    alignment tax,
+    replay,
+    RLHF,
+    InstructGPT,
+    DPO,
+    evals,
+    sign test,
+    paired comparison,
+    cost per request,
+    latency,
+    knowledge freshness,
+    PyTorch,
+  ]
+
+environment: |
+  - **Runtime and libraries:** Python 3.12.3, **PyTorch 2.15.0+cpu** and NumPy 2.5.4 in `practice/ai/.venv`. Every
+    output in this lesson was printed by the code shown, run on Linux on 14 November 2026 with
+    `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2`, from `practice/ai` with `PYTHONPATH=solutions:support` so the scripts
+    import the reference solutions of this lesson's exercises. Every random step has a fixed seed.
+  - **Nothing hosted is called.** The "models" in the comparison harness are the offline `ScriptedLLM` from
+    `practice/ai/support/llm_fake.py`, whose behaviour **we wrote** to mimic the documented failure modes (a stale
+    memory, answers taken from the context when it is there); retrieval uses the hashed bag-of-words
+    `toy_embeddings.py`. Its token counts come from a toy tokenizer. The harness numbers show how to decide, not
+    how good any real approach is. The forgetting experiment trains a 4,866-parameter MLP on synthetic data -
+    a toy that shows the mechanism, not the size of the effect in a language model.
+  - **Papers (primary sources, checked against the arXiv PDFs):** Hu et al., [*LoRA: Low-Rank Adaptation of Large
+    Language Models*](https://arxiv.org/abs/2106.09685) (2106.09685v2) - section 4.1 (W0 + BA, initialisation,
+    alpha / r, merging and no added inference latency), 4.2 and "Practical Benefits and Limitations", section 5
+    (parameter formula), section 7 (Tables 5 and 6, which matrices and which rank); Dettmers et al., [*QLoRA:
+    Efficient Finetuning of Quantized LLMs*](https://arxiv.org/abs/2305.14314) (2305.14314v1) - abstract and
+    section 1 (4-bit NF4, double quantization, paged optimizers, data quality over size); Lewis et al.,
+    [*Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks*](https://arxiv.org/abs/2005.11401)
+    (2005.11401) - abstract, introduction and "Index hot-swapping"; Ouyang et al., [*Training language models to
+    follow instructions with human feedback*](https://arxiv.org/abs/2203.02155) (2203.02155) - abstract and the
+    "alignment tax" and PPO-ptx passage of section 1; Biderman et al., [*LoRA Learns Less and Forgets
+    Less*](https://arxiv.org/abs/2405.09673) (2405.09673v2, TMLR 2024) - abstract; Kirkpatrick et al.,
+    [*Overcoming catastrophic forgetting in neural networks*](https://arxiv.org/abs/1612.00796) (1612.00796v2) -
+    abstract and introduction.
+  - **Provider documentation - provider-specific, as documented on 14 November 2026:** OpenAI [Model
+    optimization](https://platform.openai.com/docs/guides/fine-tuning) (the evals - prompt - fine-tune loop, the
+    four benefits of fine-tuning listed there, and the notice that OpenAI "is winding down the fine-tuning
+    platform") and [Supervised fine-tuning](https://platform.openai.com/docs/guides/supervised-fine-tuning)
+    (minimum of 10 examples, "start with 50 well-crafted demonstrations", checkpoints and overfitting);
+    Anthropic (Claude) [Prompt engineering overview](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/overview)
+    (success criteria and evals before prompt engineering; latency and cost may be better fixed by another model),
+    [Embeddings](https://platform.claude.com/docs/en/build-with-claude/embeddings) ("Anthropic does not offer its
+    own embedding model") and [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+    These pages change; check them before relying on any detail. **No prices are quoted**: the prices in the
+    harness are illustrative numbers, not any provider's.
+  - **Library documentation:** Hugging Face PEFT [LoRA reference](https://huggingface.co/docs/peft/main/en/package_reference/lora)
+    (as documented on 14 November 2026) - `LoraConfig` with `r`, `lora_alpha`, `target_modules`; scaling
+    `lora_alpha/r`, or `lora_alpha/math.sqrt(r)` with `use_rslora=True`; default initialisation with B at zero;
+    `merge_and_unload()`. PEFT itself is not installed in the practice project; the lesson builds LoRA by hand.
+  - **Fictional data:** SandPay is a fictional payments company; its fee tables, scenarios and questions are
+    invented for this lesson. All data is synthetic.
+  - **Not repeated here:** prompts and few-shot examples ([Prompt engineering](#/lesson/prompt-engineering)),
+    chunking, retrieval and citations ([RAG](#/lesson/retrieval-augmented-generation)), test sets and graders
+    ([Evaluating LLM applications](#/lesson/llm-evaluation-and-guardrails)), tensors and training loops
+    ([PyTorch fundamentals](#/lesson/pytorch-fundamentals)).
+
+prerequisites:
+  - prompt-engineering
+  - retrieval-augmented-generation
+  - pytorch-fundamentals
+
+concepts:
+  - id: adaptation-levers
+    name: What prompting, RAG and fine-tuning each change
+    summary: Prompting changes the instructions and examples the model reads on each request; retrieval-augmented generation changes the facts it reads, fetched per request from an index you can update without training; fine-tuning changes the weights, so it changes behaviour - format, style, a narrow skill - on every request without spending prompt tokens. Missing or changing knowledge is a retrieval problem; consistent behaviour that a good prompt cannot reach is a fine-tuning problem; the three combine.
+  - id: lora-adapters
+    name: LoRA and parameter-efficient fine-tuning
+    summary: LoRA freezes a pretrained weight W0 and learns a low-rank update BA, with B (d × r) starting at zero and A (r × k) random, scaled by alpha / r. It trains r(d + k) numbers per matrix instead of d·k, so optimizer state and checkpoints shrink by orders of magnitude; the update can be merged into W0 for zero added latency or kept separate and swapped per task. QLoRA keeps the frozen base in 4-bit to fit larger models on one GPU.
+  - id: fine-tuning-forgetting
+    name: Catastrophic forgetting and the regression budget
+    summary: Training on a new task moves weights the old tasks depended on, so performance outside the target domain can fall - catastrophic forgetting, and the "alignment tax" InstructGPT measured on public benchmarks. LoRA tends to learn less and forget less, but the adapted model still forgets; what fully protects old behaviour is keeping the frozen base reachable (adapter off or routed), or mixing old data into training (replay). Every fine-tune needs a regression set.
+  - id: evidence-based-choice
+    name: Choosing with evidence
+    summary: Start from success criteria and an eval set, measure a good prompt as the baseline, form a hypothesis from the scenario (knowledge freshness, citations, format or style gaps, labelled data, latency, volume), then build the candidate and compare paired results on the same cases - wins and losses where they disagree, a sign test, cost per request and a regression guard. Ship a more complex approach only when it is measurably better.
+
+objectives:
+  - Explain what prompting, RAG and fine-tuning each change in the system, and match a failure (stale facts, missing citations, inconsistent format, wrong tone) to the lever that fixes it.
+  - Implement a LoRA linear layer in PyTorch, explain its initialisation and alpha / r scaling, and compute the trainable parameters of an adapter by hand.
+  - Demonstrate catastrophic forgetting on a toy task, compare full fine-tuning, LoRA, switching the adapter off and replay, and say which actually protects the old task.
+  - Score a scenario on knowledge freshness, citations, the kind of gap, labelled data, latency and volume, and state the hypothesis it gives and its limits.
+  - Build an evaluation harness that compares approaches on paired results with a sign test, cost per request and a regression guard, and decide whether to ship a candidate.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [adaptation-levers]
+    title: The idea in plain language
+    body: |
+      SandPay hires an experienced support agent. They already know how payments work. To make them useful for
+      SandPay specifically, you have three options:
+
+      - **Give better instructions** - a clear brief and a few example replies on a card next to the keyboard.
+        Cheap, instant to change, and limited by how much fits on the card. That is **prompting**.
+      - **Hand them the binder** - before each answer, they look up the relevant page of SandPay's current fee
+        table and policy documents and quote it. When fees change on 1 October, you swap the page; nobody is
+        retrained. That is **retrieval-augmented generation (RAG)**.
+      - **Send them on a training course** - weeks of practice until SandPay's tone and the format of a dispute
+        letter are second nature, with no card needed. Expensive, slow to repeat, and what they learned in July
+        does not include October's fee change. If the course is intense enough, they may even get rusty at
+        things they used to do well. That is **fine-tuning**.
+
+      A good manager does not pick one by fashion. They ask what is actually going wrong - the agent does not know
+      the facts, or knows them but writes the wrong way - try the cheapest fix first, and check whether customers'
+      answers really got better.
+
+  - id: what
+    kind: what
+    concepts: [adaptation-levers, lora-adapters, fine-tuning-forgetting]
+    title: The vocabulary
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **prompting** | changing the input text: instructions, examples (few-shot), output format, role |
+      | **context** | everything the model reads for one request: system prompt, conversation, retrieved text |
+      | **RAG** | retrieve passages relevant to the request from an index, put them in the context, generate an answer grounded in them |
+      | **parametric memory** | knowledge stored in the weights (Lewis et al.'s term) |
+      | **non-parametric memory** | knowledge stored outside the weights, in a retrievable index |
+      | **fine-tuning** | further training of a pretrained model's weights on your examples |
+      | **supervised fine-tuning (SFT)** | fine-tuning on input -> ideal output demonstrations |
+      | **preference fine-tuning** | fine-tuning on preferred versus rejected outputs (RLHF in InstructGPT; DPO in OpenAI's docs) |
+      | **full fine-tuning** | every weight is trainable |
+      | **PEFT** | parameter-efficient fine-tuning: freeze the model, train a small number of added parameters |
+      | **LoRA** | a PEFT method: learn a low-rank update `BA` next to each chosen weight matrix |
+      | **rank r** | the inner dimension of `B` (d × r) and `A` (r × k); the update has rank at most r |
+      | **adapter** | the small set of trained parameters (here, the LoRA matrices) that turns the base into the tuned model |
+      | **QLoRA** | LoRA on top of a base model stored in 4-bit precision |
+      | **catastrophic forgetting** | losing performance on earlier tasks after training on a new one |
+      | **alignment tax** | InstructGPT's name for the drop on public benchmarks caused by its alignment fine-tuning |
+      | **replay** | mixing examples of the old task(s) into the new training data |
+      | **eval set** | fixed cases with a grader, run against every candidate |
+      | **regression set** | cases for behaviour that must not get worse (old tasks, safety, general skills) |
+
+  - id: why
+    kind: why
+    concepts: [adaptation-levers, evidence-based-choice]
+    title: Why the choice matters
+    body: |
+      The three approaches fail differently, and a wrong choice costs months:
+
+      - **Fine-tuning to teach facts that change.** A model tuned in July on July's fee table answers October's
+        questions with July's numbers, confidently. Lewis et al. built RAG partly because parametric models
+        "cannot easily expand or revise their memory, can't straightforwardly provide insight into their
+        predictions, and may produce 'hallucinations'". They showed the fix directly: swapping a 2016 Wikipedia
+        index for a 2018 one updated their model's answers about world leaders with no retraining ("Index
+        hot-swapping").
+      - **RAG to fix a behaviour problem.** If every dispute letter has the wrong tone, retrieving more documents
+        changes nothing; the model has the facts and writes them badly.
+      - **Fine-tuning before you have a baseline.** Without an eval set you cannot tell whether the tuned model is
+        better than a good prompt - and both providers' guidance puts evals first. Anthropic's prompt engineering
+        overview assumes "a clear definition of the success criteria for your use case" and "some ways to
+        empirically test against those criteria" before you start; OpenAI's model optimization guide starts its
+        loop with "Write evals that measure model output, establishing a baseline".
+      - **Forgetting.** Training on a narrow task can damage what the model did well before; InstructGPT's authors
+        saw "performance regressions compared to GPT-3 on certain public NLP datasets" after their fine-tuning and
+        called it an "alignment tax".
+
+      The opposite is true too: fine-tuning can be worth a lot. In InstructGPT's human evaluations, "outputs from
+      the 1.3B parameter InstructGPT model are preferred to outputs from the 175B GPT-3, despite having 100x fewer
+      parameters" - behaviour learned from demonstrations and rankings beat sheer size.
+
+  - id: levers
+    kind: internals
+    concepts: [adaptation-levers]
+    title: What each approach changes, and what it costs
+    body: |
+      | | Prompting | RAG | Fine-tuning |
+      | --- | --- | --- | --- |
+      | **What changes** | the instructions and examples sent with each request | the facts in the context, fetched per request from an index | the weights (all, or an adapter) |
+      | **Fixes** | unclear task, wrong format, missing examples | missing, private or changing knowledge; answers that must cite sources | consistent format or style, a narrow skill, a shorter prompt, a smaller model |
+      | **Does not fix** | facts the model never saw (unless you paste them in); behaviour that needs more examples than fit | how the model writes; reasoning the model cannot do | knowledge that changes after training; provenance |
+      | **Update speed** | edit and redeploy a string | re-index the documents | collect data, train, evaluate, deploy |
+      | **Per-request cost** | prompt tokens on every request | prompt tokens for the retrieved text, plus a retrieval call | often fewer prompt tokens; provider-specific pricing for tuned models |
+      | **Up-front cost** | low | build and maintain the pipeline and index | labelled data, training runs, evaluation, a regression set |
+      | **Risk** | prompt grows; brittle across model versions | wrong chunk retrieved; prompt injection through documents | forgetting; overfitting; stale knowledge; retraining when the base model is retired |
+
+      What the providers themselves say fine-tuning is for, quoted from OpenAI's model optimization guide (as
+      documented on 14 November 2026; provider-specific): it "can also enable a model to consistently format
+      responses in a certain way or handle novel inputs", and used with prompting it lets you
+
+      - "provide more example inputs and outputs than could fit within the context window of a single request";
+      - "use shorter prompts with fewer examples and context data, which saves on token costs at scale and can be
+        lower latency";
+      - "train on proprietary or sensitive data without having to include it via examples in every request";
+      - "train a smaller, cheaper, faster model to excel at a particular task where a larger model is not
+        cost-effective".
+
+      None of those four is "teach it new facts that change". The same page lists supervised fine-tuning as "best
+      for" classification, nuanced translation, "generating content in a specific format" and "correcting
+      instruction-following failures", and preference fine-tuning (DPO) for summaries "focusing on the right
+      things" and "chat messages with the right tone and style".
+
+      **Availability is a real constraint and it changes.** On the same date the page says "OpenAI is winding down
+      the fine-tuning platform. The platform is no longer accessible to new users", with existing fine-tuned
+      models served "until their base models are deprecated". Anthropic's API documentation (same date) describes
+      prompt engineering, prompt caching and retrieval, and states "Anthropic does not offer its own embedding
+      model", pointing to a third-party provider for RAG embeddings; check each provider's current docs for what
+      it offers. Fine-tuning open-weight models yourself (with libraries such as Hugging Face PEFT) remains an
+      option whatever a hosted provider decides - at the price of running the training and the serving.
+
+      The approaches combine. The RAG paper itself fine-tunes the retriever's query encoder and the generator
+      together (keeping the document index fixed); a common production shape is a fine-tuned model for format and tone that reads retrieved facts.
+
+  - id: visual-decision
+    kind: visual
+    concepts: [adaptation-levers, evidence-based-choice]
+    title: The decision loop
+    body: |
+      ```mermaid
+      flowchart TD
+        A["Success criteria and an eval set"] --> B["Baseline: a good prompt, measured"]
+        B --> C{"What fails?"}
+        C -->|"facts missing, private or changing; citations needed"| D["Add retrieval (RAG)"]
+        C -->|"format, tone or a narrow skill, with enough examples"| E["Fine-tune (LoRA or provider SFT)"]
+        C -->|"nothing important"| F["Ship the prompt"]
+        D --> G["Re-run the same eval set and the regression set"]
+        E --> G
+        G --> H{"Significantly better, affordable, no regression?"}
+        H -->|"yes"| I["Ship the candidate; keep evaluating"]
+        H -->|"no"| C
+      ```
+
+      Notice two things. Every branch goes back through the **same** eval set, so candidates are compared on the
+      same cases. And fine-tuning is reached only by naming a behaviour gap that a measured prompt did not close -
+      never as the first step.
+
+  - id: lora-internals
+    kind: internals
+    concepts: [lora-adapters]
+    title: LoRA - training a low-rank update
+    body: |
+      Full fine-tuning of a d × k weight matrix trains d·k numbers and, with Adam, keeps two more numbers of
+      optimizer state for each. Hu et al. hypothesise that the **change** needed to adapt a pretrained model has a
+      low "intrinsic rank", and train only that change in factored form (section 4.1):
+
+      ```plaintext
+      h = W0 x + ΔW x = W0 x + B A x        B is d × r, A is r × k, r << min(d, k)
+      ```
+
+      - `W0` is **frozen**: "W0 is frozen and does not receive gradient updates, while A and B contain trainable
+        parameters".
+      - **Initialisation**: "a random Gaussian initialization for A and zero for B, so ΔW = BA is zero at the
+        beginning of training". The adapted model starts exactly at the base model. (PEFT's default, as
+        documented, is Kaiming-uniform for A and zeros for B; its `init_lora_weights="gaussian"` gives the paper's
+        Gaussian A.)
+      - **Scaling**: the update is multiplied by `alpha / r`, so changing r does not force retuning the learning
+        rate; the paper sets alpha to the first r tried. PEFT calls it `lora_alpha` and uses `lora_alpha/r`, or
+        `lora_alpha/math.sqrt(r)` with `use_rslora=True`.
+      - **Trainable parameters**: `r (d + k)` per adapted matrix instead of `d k`.
+      - **No added latency when merged**: "we can explicitly compute and store W = W0 + BA and perform inference
+        as usual" - and recover W0 by subtracting BA to switch tasks. Kept unmerged, one base model in memory can
+        serve many adapters; the paper notes that batching requests for **different** adapters in one forward pass
+        "is not straightforward" if you merge.
+
+      The layer you implement in the first coding exercise (excerpt of the reference solution):
+
+      ```python
+      class LoRALinear(nn.Module):
+          def __init__(self, base, r=4, alpha=None):
+              super().__init__()
+              if not 1 <= r <= min(base.in_features, base.out_features):
+                  raise ValueError(...)
+              self.base = base
+              for p in self.base.parameters():
+                  p.requires_grad_(False)                          # W0 (and its bias) frozen
+              self.scaling = (r if alpha is None else alpha) / r
+              self.lora_A = nn.Parameter(torch.empty(r, base.in_features))
+              self.lora_B = nn.Parameter(torch.zeros(base.out_features, r))   # B = 0, so BA = 0
+              nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+              self.enabled = True
+
+          def forward(self, x):
+              out = self.base(x)
+              if self.enabled:
+                  out = out + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+              return out
+      ```
+
+      `x @ A.T @ B.T` never builds the d × k matrix `BA`: it goes through the narrow r-dimensional bottleneck,
+      which is why training is cheap. The count, checked with that class:
+
+      ```python
+      layer = LoRALinear(nn.Linear(4096, 4096, bias=False), r=8)
+      t, n = count_parameters(layer)
+      print(f"one 4096x4096 projection, r=8: trainable {t:,} of {n:,} ({100 * t / n:.2f}%)")
+      # Hu et al. section 5 formula: |Theta| = 2 x L_LoRA x d_model x r
+      for r, mats in ((4, 2), (8, 1)):
+          print(f"GPT-3 shape, d_model 12288, 96 layers, {mats} matrix type(s), r={r}: {2 * 96 * mats * 12288 * r:,}")
+      x = torch.randn(3, 4096)
+      print("adapter starts at zero:", torch.equal(layer(x), layer.base(x)))
+      ```
+
+      ```plaintext
+      one 4096x4096 projection, r=8: trainable 65,536 of 16,842,752 (0.39%)
+      GPT-3 shape, d_model 12288, 96 layers, 2 matrix type(s), r=4: 18,874,368
+      GPT-3 shape, d_model 12288, 96 layers, 1 matrix type(s), r=8: 18,874,368
+      adapter starts at zero: True
+      ```
+
+      The last two lines reproduce the paper's Table 5 budget: "18M" trainable parameters on GPT-3 175B is r = 8
+      on one attention matrix type or r = 4 on two, in all 96 layers. With that budget, adapting both W_q and W_v
+      at r = 4 scored best or joint best (73.7 on WikiSQL, 91.3 on MultiNLI), and Table 6 found "a rank as small as
+      one suffices for adapting both Wq and Wv on these datasets". The paper's headline: compared with full
+      fine-tuning of GPT-3 175B, LoRA "can reduce the number of trainable parameters by 10,000 times and the GPU
+      memory requirement by 3 times" (training VRAM 1.2 TB to 350 GB; a 35 MB checkpoint instead of 350 GB).
+
+      **QLoRA** goes further on memory: it "backpropagates gradients through a frozen, 4-bit quantized pretrained
+      language model into Low Rank Adapters", with a 4-bit NormalFloat (NF4) data type, double quantization of
+      the quantization constants and paged optimizers, reducing the memory to fine-tune a 65B model "from >780GB
+      of GPU memory to <48GB" without degrading performance in their experiments. Its other lesson matters as much
+      for the choice: "data quality is far more important than dataset size" - a 9k-example dataset (OASST1)
+      outperformed a 450k-example one (FLAN v2) for chatbot performance.
+
+  - id: forgetting-demo
+    kind: code
+    concepts: [fine-tuning-forgetting, lora-adapters]
+    title: Watching a model forget
+    body: |
+      A tiny experiment makes forgetting visible. A 4,866-parameter MLP learns **task A** (classify 8-feature
+      points by one rule) from 2,000 examples. Then it is adapted to **task B** - a different rule on points from a
+      different region of input space - from only 200 examples, by full fine-tuning or by LoRA on all three linear
+      layers. Both tasks are measured on 2,000 fresh points after each run. Synthetic data, fixed seeds; the
+      script uses the `add_lora` and `count_parameters` you write in the first coding exercise.
+
+      ```python
+      import torch, torch.nn.functional as F
+      from torch import nn
+      from genai.lora_linear import add_lora, count_parameters
+
+      gen = torch.Generator().manual_seed(0)
+      w_a, w_b = torch.randn(8, generator=gen), torch.randn(8, generator=gen)
+      shift = torch.zeros(8); shift[0] = 4.0          # task B lives in a different region of input space
+
+      def task(n, w, offset):
+          x = torch.randn(n, 8, generator=gen) + offset
+          return x, ((x - offset) @ w > 0).long()
+
+      xa, ya = task(2000, w_a, 0.0); xa_test, ya_test = task(2000, w_a, 0.0)
+      xb, yb = task(200, w_b, shift); xb_test, yb_test = task(2000, w_b, shift)
+
+      def acc(m, x, y):
+          with torch.no_grad():
+              return (m(x).argmax(-1) == y).float().mean().item()
+
+      def fit(m, x, y, steps, lr):
+          opt = torch.optim.Adam([p for p in m.parameters() if p.requires_grad], lr=lr)
+          for _ in range(steps):
+              opt.zero_grad(); F.cross_entropy(m(x), y).backward(); opt.step()
+
+      def mlp():
+          return nn.Sequential(nn.Linear(8, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 2))
+
+      torch.manual_seed(0)
+      base = mlp(); fit(base, xa, ya, 300, 1e-2)
+      saved = base.state_dict()
+
+      def report(name, m):
+          print(f"{name:<24} trainable {count_parameters(m)[0]:5d}   task A {acc(m, xa_test, ya_test):.3f}   task B {acc(m, xb_test, yb_test):.3f}")
+
+      report("base, trained on A", base)
+      for steps in (100, 300):
+          torch.manual_seed(1); full = mlp(); full.load_state_dict(saved); fit(full, xb, yb, steps, 3e-3)
+          report(f"full fine-tune, {steps}", full)
+          for r in (1, 2):
+              torch.manual_seed(1); m = mlp(); m.load_state_dict(saved)
+              add_lora(m, ["0", "2", "4"], r=r); fit(m, xb, yb, steps, 3e-3)
+              report(f"LoRA r={r}, {steps}", m)
+      for i in (0, 2, 4):
+          m[i].enabled = False
+      report("same LoRA, adapters off", m)
+      torch.manual_seed(1); mix = mlp(); mix.load_state_dict(saved)
+      keep = torch.randperm(2000, generator=gen)[:200]
+      fit(mix, torch.cat([xb, xa[keep]]), torch.cat([yb, ya[keep]]), 300, 3e-3)
+      report("full + 200 task-A replay", mix)
+      ```
+
+      ```plaintext
+      base, trained on A       trainable  4866   task A 0.989   task B 0.491
+      full fine-tune, 100      trainable  4866   task A 0.655   task B 0.755
+      LoRA r=1, 100            trainable   266   task A 0.738   task B 0.658
+      LoRA r=2, 100            trainable   532   task A 0.762   task B 0.639
+      full fine-tune, 300      trainable  4866   task A 0.575   task B 0.916
+      LoRA r=1, 300            trainable   266   task A 0.684   task B 0.758
+      LoRA r=2, 300            trainable   532   task A 0.689   task B 0.730
+      same LoRA, adapters off  trainable   532   task A 0.989   task B 0.491
+      full + 200 task-A replay trainable  4866   task A 0.930   task B 0.914
+      ```
+
+      Read it row by row:
+
+      - **The base** is excellent on A (0.989) and at chance on B (0.491): B is new behaviour, so "no adaptation"
+        is not an option here.
+      - **Full fine-tuning forgets.** After 300 steps B reaches 0.916 and A falls from 0.989 to 0.575 - nearly
+        chance. Nothing in the B data told the model to keep A; the weights simply moved. This is catastrophic
+        forgetting (Kirkpatrick et al.: neural networks are "not, in general, capable" of learning tasks in
+        sequence without it).
+      - **LoRA learns less and forgets less - but still forgets.** At 300 steps LoRA r=1 trains 266 numbers
+        (5% of the model), keeps more of A (0.684 against 0.575) and learns less of B (0.758 against 0.916). That is
+        the pattern Biderman et al. report at LLM scale: "LoRA substantially underperforms full finetuning.
+        Nevertheless, LoRA better maintains the base model's performance on tasks outside the target domain." A
+        low-rank update is still a change to every input that passes through the layer.
+      - **Switching the adapter off restores A exactly** (0.989, bit-for-bit the base model, because W0 was never
+        touched). This is LoRA's real protection: route task-A traffic to the base and task-B traffic through the
+        adapter, or keep several adapters for one base.
+      - **Replay works.** Full fine-tuning with 200 task-A examples mixed into the B data keeps A at 0.930 and
+        reaches 0.914 on B. InstructGPT's PPO-ptx does the same thing at scale - "mixing PPO updates with updates
+        that increase the log likelihood of the pretraining distribution" - to reduce its alignment tax.
+
+      In a toy this small, numbers move a lot with the learning rate and the number of steps; the **mechanism**,
+      not the decimals, is the lesson. In a real project the same comparison is run on your eval set **and** a
+      regression set before anything ships.
+
+  - id: choice-helper
+    kind: code
+    concepts: [evidence-based-choice, adaptation-levers]
+    title: A transparent decision checklist
+    body: |
+      Before building anything, write down what you know about the scenario and let the sources' arguments vote.
+      The second coding exercise turns them into points (the docstring of `recommend` lists every rule):
+
+      | Signal | Points | Source of the argument |
+      | --- | --- | --- |
+      | facts change monthly / daily | RAG +2 / +3, fine-tuning -1 / -2 | RAG paper: index hot-swapping; parametric models need retraining |
+      | answers must cite sources | RAG +2 | RAG paper: provenance |
+      | gap with a good prompt: none / knowledge / format / style or skill | prompting +2 / RAG +2 / prompting +1 and fine-tuning +1 / fine-tuning +2 | OpenAI SFT and DPO "best for" lists; few-shot first |
+      | labelled examples < 10 / 10-49 / 500+ | fine-tuning excluded / -1 / +1 | OpenAI SFT docs: minimum 10, start with 50; you also need a held-out test set |
+      | latency budget < 500 ms | RAG -1, fine-tuning +1 | retrieval adds a step; shorter prompts "can be lower latency" |
+      | prompt tokens × requests per day >= 50 million | fine-tuning +1 | shorter prompts save "token costs at scale" |
+
+      Prompting starts one point ahead, and ties go to the simpler approach. The thresholds (500 ms, 50 million
+      tokens a day, 500 examples) are **this lesson's** choices for a checklist, not published constants - tune
+      them to your system. Four SandPay scenarios:
+
+      ```python
+      from genai.approach_choice import Scenario, recommend
+
+      scenarios = {
+          "support fee answers": Scenario("monthly", True, "knowledge", 40, 3000, 20_000, 900),
+          "dispute-letter tone": Scenario("never", False, "style", 1200, 2000, 5_000, 2500),
+          "fraud-note tagger": Scenario("never", False, "format", 3000, 300, 400_000, 1800),
+          "new team, no data": Scenario("never", False, "skill", 6, 2000, 500, 600),
+      }
+      for name, s in scenarios.items():
+          rec = recommend(s)
+          print(f"{name}: ranked {rec.ranked}  scores {rec.scores}  excluded {rec.excluded}")
+          for why in rec.reasons:
+              print("   -", why)
+      ```
+
+      ```plaintext
+      support fee answers: ranked ['rag', 'prompting', 'fine_tuning']  scores {'prompting': 1, 'rag': 6, 'fine_tuning': -2}  excluded {}
+         - facts change monthly: update an index, not the weights
+         - citations needed: retrieved chunks give provenance
+         - missing or private facts: put them in the context
+         - under 50 labelled examples: too few to train and evaluate well
+      dispute-letter tone: ranked ['fine_tuning', 'prompting', 'rag']  scores {'prompting': 1, 'rag': 0, 'fine_tuning': 3}  excluded {}
+         - style gap: demonstrations teach behaviour
+         - 500+ labelled examples: enough to train and hold out a test set
+      fraud-note tagger: ranked ['fine_tuning', 'prompting', 'rag']  scores {'prompting': 2, 'rag': -1, 'fine_tuning': 4}  excluded {}
+         - format gap: few-shot examples first, fine-tune if not consistent
+         - 500+ labelled examples: enough to train and hold out a test set
+         - tight latency: retrieval adds a step, a tuned model needs a shorter prompt
+         - heavy prompt volume: shorter prompts save tokens at scale
+      new team, no data: ranked ['prompting', 'rag']  scores {'prompting': 1, 'rag': 0, 'fine_tuning': 2}  excluded {'fine_tuning': 'fewer than 10 labelled examples'}
+         - skill gap: demonstrations teach behaviour
+      ```
+
+      The last scenario shows why a score alone is not enough: fine-tuning has the highest score (2) but is not
+      viable with 6 examples, so the team's first job is to collect data - and meanwhile ship the best prompt.
+      The output is a **hypothesis** with its reasons printed, so a reviewer can disagree with a specific line.
+      The decision comes from measurement.
+
+  - id: harness
+    kind: code
+    concepts: [evidence-based-choice]
+    title: Deciding with paired evidence
+    body: |
+      The third coding exercise is the harness that turns "RAG seems better" into a decision. SandPay's support
+      assistant answers fee questions; fees for card refunds, chargebacks and instant payouts changed on
+      1 October. The eval set has 24 questions, four per fee (12 about changed fees, 12 about unchanged ones). Three
+      candidates run against the **same** cases:
+
+      - **prompting** - instructions plus two few-shot examples; the model answers from its July "memory";
+      - **rag** - the same prompt plus the top-1 fee document retrieved with toy embeddings;
+      - **fine_tuning** - a model "tuned" (in July) to answer in the right format with no examples in the prompt.
+
+      The fake model is a `ScriptedLLM` callable we wrote: it answers from the context if the retrieved document
+      is about the asked fee, otherwise from its July memory, and uses the `Fee: <amount>` format when the prompt
+      shows it (or it is the tuned model). Retrieval is real (toy embeddings), so its misses are genuine. The core
+      of the run is below - an excerpt: the rest of the script defines the fee data, the 24 cases, the fake model
+      and `retrieve`, and prints the retrieval hit rate and misses (the last lines of the output):
+
+      ```python
+      requests = {
+          "prompting": lambda c: {"system": EXAMPLES, "messages": [{"role": "user", "content": c["q"]}]},
+          "rag": lambda c: {"system": EXAMPLES + "CONTEXT: " + DOCS[retrieve(c["q"])], "messages": [{"role": "user", "content": c["q"]}]},
+          "fine_tuning": lambda c: {"system": "<tuned>", "messages": [{"role": "user", "content": c["q"]}]},
+      }
+      grade = lambda c, text: text == f"Fee: {c['answer']}"
+      prices = {"prompting": (3.0, 15.0), "rag": (3.0, 15.0), "fine_tuning": (6.0, 24.0)}   # illustrative, not a provider's
+      results = [run_approach(n, ScriptedLLM(model), CASES, requests[n], grade) for n in requests]
+      for r in results:
+          print(f"{r.name:<12} accuracy {r.accuracy:.3f}  input tokens/request {r.input_tokens / len(CASES):5.1f}  cost per 1k requests {cost_per_1k_requests(r, *prices[r.name]):.3f}")
+      d = choose(results, "prompting", prices)
+      print("choice:", d.choice); print("\n".join(d.reasons))
+      ```
+
+      ```plaintext
+      prompting    accuracy 0.500  input tokens/request  42.5  cost per 1k requests 0.195
+      rag          accuracy 0.875  input tokens/request  57.1  cost per 1k requests 0.234
+      fine_tuning  accuracy 0.500  input tokens/request   9.5  cost per 1k requests 0.165
+      retrieval hit rate 20/24
+      choice: rag
+      rag: 9 wins / 0 losses, p=0.004 - accepted
+      fine_tuning: 0 wins / 0 losses, p=1.000 - not better than prompting
+      miss: 'What does a card refund cost?' -> fees-fx
+      miss: 'Is there a fee on a card refund?' -> fees-payouts
+      miss: 'How much is the card refund fee for merchants?' -> fees-disputes
+      miss: 'payout pricing?' -> fees-instant
+      ```
+
+      What the evidence says:
+
+      - **The comparison is paired.** RAG and prompting answered the same 24 questions. They disagree on 9; RAG
+        is right on all 9. If the two were equally good, each disagreement would be a coin flip, and 9 heads out
+        of 9 has a two-sided probability of `2 × 0.5^9 = 0.004` - the **sign test**. Comparing two accuracies
+        from different question sets could not support this conclusion.
+      - **The tuned model is cheapest and no better.** It needs 9.5 input tokens per request instead of 42.5 - the
+        "shorter prompts" benefit is real - but it answers changed fees with July's numbers, exactly like the
+        prompt, so it has 0 wins. Its cost advantage is a reason to prefer it **only among candidates that are
+        good enough**.
+      - **RAG's remaining errors are retrieval errors.** Three of the four card-refund questions retrieved the
+        wrong document (a hashed bag-of-words does not know that "refund" questions belong to the refund page),
+        so the model fell back to its stale memory. The next improvement is in retrieval (better embeddings,
+        hybrid keyword search, reranking - see the [RAG lesson](#/lesson/retrieval-augmented-generation)), not
+        in the weights. The fourth miss ("payout pricing?" found the instant-payout page) happened to be about an
+        unchanged fee, so the stale memory was still right - an eval only sees what it asks.
+      - **24 cases is small.** A real decision wants more cases per failure type and a regression set; the
+        `guard` argument of `choose` rejects a candidate whose regression-set accuracy drops more than an agreed
+        budget (2 points by default), which is how forgetting is caught before release.
+
+  - id: steps
+    kind: steps
+    concepts: [evidence-based-choice]
+    title: A procedure you can follow
+    body: |
+      1. **Write success criteria** you can measure: accuracy on the questions that matter, format validity,
+         citation correctness, p95 latency, cost per 1,000 requests, and what must not regress.
+      2. **Build the eval set before the system**: real or realistic inputs with expected outputs and a grader,
+         grouped by failure type (changed facts, format, tone, refusals). Keep a separate **regression set**.
+      3. **Measure a good prompt** - clear instructions, a few examples, the right model. Record per-case results,
+         tokens and latency. This is the baseline every candidate must beat.
+      4. **Read the failures.** Missing, private or changing facts, or a need for sources -> retrieval. The facts
+         are present but the behaviour is wrong across many cases, and you have (or can collect) at least dozens of
+         good demonstrations -> fine-tuning. Use the checklist to make the hypothesis explicit.
+      5. **Build the smallest candidate** that tests the hypothesis: one retrieval step; a LoRA adapter or a
+         provider SFT job with a held-out split.
+      6. **Compare on the same cases**: wins and losses against the baseline, a sign test (or another paired test),
+         cost and latency per request, and the regression set.
+      7. **Decide and record why**: ship only a candidate that is significantly better, within budget and without
+         regressions; keep the eval and regression sets running in CI, because providers retire base models and
+         documents change.
+
+  - id: example
+    kind: example
+    concepts: [adaptation-levers, evidence-based-choice, fine-tuning-forgetting]
+    title: SandPay's three requests
+    body: |
+      **"The assistant quotes old fees."** Product wants to fine-tune "so it knows our fees". The eval shows the
+      prompt-only assistant is right on unchanged fees and wrong on every changed one, and fees change most
+      quarters. That is a knowledge-freshness problem: retrieval over the fee pages, with the page cited in the
+      answer. A tester checks the changed-fee questions specifically, the retrieval hit rate per question type,
+      and that an answer never cites a page it did not retrieve.
+
+      **"Dispute letters sound wrong."** The letters contain the right facts but the tone and structure vary;
+      ten few-shot examples in the prompt improved format validity from 71% to 88% on the eval (numbers from the
+      team's own eval, fictional here) and the prompt is now 2,500 tokens on every request. SandPay has 1,200
+      approved letters. Fine-tuning (a LoRA adapter on an open-weight model, or a provider SFT job where offered)
+      is a reasonable candidate; the tester holds out 200 letters, checks format validity and tone with a rubric
+      grader, and runs the **regression set** (fee questions, refusals of out-of-scope requests) to catch
+      forgetting.
+
+      **"Make the fraud-note tagger faster."** Latency budget 300 ms, 400,000 requests a day. Before tuning
+      anything, Anthropic's guidance applies: "you can sometimes improve latency and cost more easily by choosing
+      a different model". Try a smaller model with the same prompt first, and prompt caching for the long fixed
+      prefix (provider-specific; Anthropic documents a 5-minute default cache lifetime as of 14 November 2026); a
+      tuned smaller model is the next candidate, judged on the same eval.
+
+  - id: tests
+    kind: tests
+    concepts: [evidence-based-choice, fine-tuning-forgetting, lora-adapters]
+    title: What to test before switching approach
+    body: |
+      | Test | Expected result | Evidence |
+      | --- | --- | --- |
+      | Candidate vs baseline on the same eval set | significantly more wins than losses (sign test p < 0.05, or your agreed test) | per-case results of both, the wins / losses counts and p |
+      | Changed-fact cases (RAG) | answers match the current documents | the retrieved chunk id per case and the answer |
+      | Retrieval hit rate | the right document in the top k for each question type | hit rate per type; the misses listed |
+      | Regression set (fine-tuning) | accuracy drop within the agreed budget | base vs tuned accuracy on the regression set |
+      | Adapter off (LoRA) | outputs identical to the base model | an equality check on fixed inputs |
+      | Merged adapter | merged model's outputs equal the unmerged adapter's (float tolerance) | max difference on a test batch |
+      | Held-out split (fine-tuning) | quality on held-out examples close to training examples | train vs held-out scores per checkpoint |
+      | Cost and latency | per-request tokens and p95 latency within budget | token counts and timings from the eval run |
+      | Negative: a "win" from a smaller eval set | not accepted until re-run on the full paired set | the size of each run |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [adaptation-levers, lora-adapters, fine-tuning-forgetting, evidence-based-choice]
+    title: Common mistakes
+    body: |
+      - **Fine-tuning for facts.** The tuned model learns the facts of its training date and states them
+        confidently forever. Facts that change belong in an index.
+      - **No baseline.** "The fine-tuned model scores 82%" means nothing without the measured prompt on the same
+        cases; it may have scored 84%.
+      - **Comparing on different cases**, or on a handful of hand-picked examples. Pair the results and test the
+        disagreements.
+      - **Ignoring the regression set.** A tuned model that gained on the target task and lost on everything else
+        (the toy above went from 0.989 to 0.575 on task A) is a regression, not an improvement.
+      - **Assuming LoRA cannot forget.** The adapted model can; the frozen base is what is safe. Keep it reachable,
+        or use replay.
+      - **LoRA implementation slips**: B initialised randomly (the model starts somewhere random instead of at the
+        base), the base not frozen (it is full fine-tuning with extra parameters), the alpha / r scaling missing,
+        or an adapter on the wrong layers. Test "starts at the base", "only adapter parameters have gradients" and
+        "adapter off equals base".
+      - **Treating data volume as quality.** QLoRA's 9k curated examples beat 450k; 50 well-crafted demonstrations
+        are OpenAI's suggested starting point, not a guarantee.
+      - **Forgetting the platform.** A hosted fine-tuning service can be withdrawn and base models are deprecated;
+        plan for re-tuning, or prefer approaches whose assets (prompts, indexes, eval sets) move between models.
+
+      **Debugging method:** when a candidate disappoints, classify each failed case: wrong fact (retrieval or
+      memory), right fact but wrong behaviour (prompt or tuning), or a grader error. The class tells you which
+      lever to pull next.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [adaptation-levers, lora-adapters, evidence-based-choice]
+    title: Trade-offs and alternatives
+    body: |
+      - **Long context instead of retrieval.** If the whole knowledge base fits comfortably in the context window
+        and changes rarely, pasting it in (with prompt caching) can beat a retrieval pipeline on simplicity. It
+        costs tokens on every request and gets harder to cite precisely as it grows.
+      - **A different model instead of any of the three.** Anthropic's prompt engineering overview notes that
+        latency and cost are sometimes fixed more easily by choosing another model.
+      - **Full fine-tuning versus LoRA.** Full fine-tuning learns more (Biderman et al. found it learns updates of
+        rank "10-100× greater than typical LoRA configurations") and forgets more, and needs far more memory;
+        LoRA's checkpoints are megabytes and swap per task. Neither removes the need for a regression set.
+      - **Distillation**: tune a smaller model on a larger model's outputs to cut cost and latency - a
+        fine-tuning variant whose success is again judged on the same eval.
+      - **The checklist's limits.** It encodes arguments, not measurements, and its thresholds are local choices.
+        Use it to make a hypothesis visible; let the paired comparison decide.
+      - **The sign test's limits.** It ignores cases where both approaches agree and needs a reasonable number of
+        disagreements; with very few, nothing is significant and you need more cases, not a looser threshold.
+
+  - id: summary
+    kind: summary
+    concepts: [adaptation-levers, lora-adapters, fine-tuning-forgetting, evidence-based-choice]
+    title: Quick reference
+    body: |
+      - **Prompting** changes what the model is told; **RAG** changes what it reads (an updatable index, with
+        provenance); **fine-tuning** changes its weights (behaviour, format, style, shorter prompts).
+      - Changing or private **knowledge** -> RAG. Consistent **behaviour** a measured prompt cannot reach, with
+        enough good examples -> fine-tuning. They combine.
+      - **LoRA**: `h = W0 x + (alpha / r) B A x`, W0 frozen, B = 0 at the start, `r (d + k)` trainable numbers per
+        matrix, mergeable for zero added latency. **QLoRA** stores the frozen base in 4-bit.
+      - **Forgetting**: full fine-tuning forgets most, LoRA less, the frozen base (adapter off) not at all; replay
+        protects old tasks. Always run a regression set.
+      - **Decide with evidence**: success criteria, eval set, measured prompt baseline, one candidate at a time,
+        paired wins / losses with a sign test, cost per request, regression guard.
+      - Provider fine-tuning offers and terms change - OpenAI's platform was being wound down as documented on
+        14 November 2026. Check current docs.
+
+exercises:
+  - id: lever-for-stale-fees
+    type: mcq
+    concept: adaptation-levers
+    skill: application
+    title: The assistant quotes July's fees
+    prompt: |
+      SandPay's support assistant (a hosted model with a good prompt) answers unchanged-fee questions correctly
+      and changed-fee questions with the old amounts. Fees change about once a quarter, and compliance wants each
+      answer to name the fee page it came from. Which change addresses the problem?
+    options:
+      - id: rag
+        text: Retrieve the current fee pages for each question, put them in the context and cite the page in the answer.
+        feedback: Correct - the failure is missing, changing knowledge plus a provenance requirement. An index can be updated the day fees change, and the retrieved page is the citation.
+      - id: finetune
+        text: Fine-tune the model on the current fee table.
+        feedback: The tuned model would know this quarter's fees and be wrong again next quarter, and its weights cannot say which page an answer came from.
+      - id: examples
+        text: Add more few-shot examples of fee answers to the prompt.
+        feedback: Examples teach the format, not facts the model has never seen - unless the examples contain every current fee, in which case they are a crude, manual retrieval.
+      - id: bigger
+        text: Switch to a larger model.
+        feedback: A larger model trained before October does not know October's fees either.
+    correct: [rag]
+    hints:
+      - Is the model writing badly, or does it lack information?
+      - Which approach can change its knowledge without training, and point at a source?
+    solution: |
+      The evidence (right on unchanged fees, wrong on changed ones) says the behaviour is fine and the knowledge is
+      stale. That is RAG's job: Lewis et al. show a retrieval index can be "hot-swapped" to update a model's
+      knowledge, and retrieved passages give provenance. Confirm with the eval: the changed-fee cases should flip
+      to correct, and the retrieval hit rate per question type tells you whether the remaining errors are
+      retrieval misses.
+    followUp: |
+      The same assistant also writes answers in an inconsistent structure that the help-centre widget cannot
+      parse. Which lever do you try first for that, and what would make you move to the next one?
+
+  - id: optimisation-loop-order
+    type: order
+    concept: evidence-based-choice
+    skill: application
+    title: Put the decision loop in order
+    prompt: Order the steps of choosing an approach for a new LLM feature.
+    items:
+      - id: criteria
+        text: Define success criteria, including what must not regress
+      - id: eval-set
+        text: Build the eval set and the regression set
+      - id: baseline
+        text: Measure a good prompt as the baseline
+      - id: classify
+        text: Classify the failures (missing knowledge versus wrong behaviour)
+      - id: candidate
+        text: Build one candidate (retrieval or a fine-tune) for the dominant failure
+      - id: compare
+        text: Compare the candidate with the baseline on the same cases, with cost and the regression set
+      - id: ship
+        text: Ship the candidate only if it is significantly better, then keep the evals running
+    hints:
+      - Nothing can be compared before there is something to measure with.
+      - A candidate is chosen from the baseline's failures.
+    solution: |
+      Criteria come first because the eval set is built from them; the baseline must be measured before failures
+      can be classified; the candidate targets the classified failure; and the comparison needs the same eval set
+      and the regression set. OpenAI's guide starts with evals "establishing a baseline"; Anthropic's assumes
+      success criteria and a way to test them before prompt engineering.
+
+  - id: lora-count
+    type: mcq
+    concept: lora-adapters
+    skill: application
+    title: How many parameters does the adapter train?
+    prompt: |
+      A model has 24 layers. In each, you add LoRA with r = 8 to the query and value projections, each a
+      1024 × 1024 matrix, and nothing else is trainable. How many parameters are trainable?
+    options:
+      - id: right
+        text: 786,432
+        feedback: Correct - r (d + k) = 8 × 2048 = 16,384 per matrix, × 2 matrices × 24 layers.
+      - id: square
+        text: 50,331,648
+        feedback: That is 2 × 24 × 1024 × 1024, full fine-tuning of those matrices. LoRA trains B (d × r) and A (r × k), never the d × k matrix.
+      - id: one-side
+        text: 393,216
+        feedback: That counts only one of A and B. Both factors are trainable - 8 × 1024 each.
+      - id: rank-squared
+        text: 3,072
+        feedback: r² per matrix would be a tiny r × r core; LoRA's factors connect the full input and output widths to the rank.
+    correct: [right]
+    hints:
+      - What are the shapes of B and A for a d × k matrix?
+      - Per matrix, r × d + r × k.
+    solution: |
+      For a 1024 × 1024 matrix, `B` is 1024 × 8 and `A` is 8 × 1024: 16,384 parameters. Two matrices per layer
+      and 24 layers: `16,384 × 48 = 786,432`. The paper's formula is the same: `2 × L_LoRA × d_model × r` =
+      `2 × 48 × 1024 × 8`. Full fine-tuning of those matrices would train 50,331,648.
+    followUp: |
+      With the same budget of 786,432 parameters, what rank could you use if you adapted all four attention
+      matrices instead? What did Hu et al.'s Table 5 find about spending a budget that way?
+
+  - id: lora-bugs
+    type: debug
+    concept: lora-adapters
+    skill: analysis
+    title: Find the LoRA bugs
+    prompt: |
+      A teammate's LoRA layer trains, but the adapted model's loss at step 0 is far worse than the base model's,
+      and the checkpoint is as large as the full model. Click **every** line with a bug.
+    language: python
+    code: |
+      class LoRALinear(nn.Module):
+          def __init__(self, base, r=4, alpha=4):
+              super().__init__()
+              self.base = base
+              self.scaling = alpha / r
+              self.lora_A = nn.Parameter(torch.empty(r, base.in_features))
+              self.lora_B = nn.Parameter(torch.empty(base.out_features, r))
+              nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+              nn.init.kaiming_uniform_(self.lora_B, a=math.sqrt(5))
+
+          def forward(self, x):
+              return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+    correctLines: [4, 9]
+    lineNotes:
+      - line: 5
+        note: alpha / r is the scaling the paper and PEFT use.
+      - line: 8
+        note: A random, B zero is the paper's scheme - A may be random. The problem is what happens to B.
+      - line: 12
+        note: x @ A.T @ B.T with the scaling is the correct low-rank path.
+    hints:
+      - What should the adapted model compute before any training step?
+      - Which parameters does the optimizer see, and which does the checkpoint store?
+    solution: |
+      **Line 9** gives B random values, so `BA` is a random matrix and the model starts away from the base - hence
+      the bad loss at step 0. B must start at zero (`torch.zeros`) so `ΔW = BA = 0`. **Line 4** wraps `base`
+      without freezing it: its weights still have `requires_grad=True`, so training updates them too (full
+      fine-tuning plus an adapter) and the checkpoint must store the whole model. Add
+      `for p in base.parameters(): p.requires_grad_(False)`. Confirm with two tests: outputs equal the base's
+      before training, and after a step only `lora_A` and `lora_B` have changed.
+    followUp: |
+      After fixing both bugs, how would you verify that `merged()` is correct without trusting its code?
+
+  - id: merge-latency
+    type: mcq
+    concept: lora-adapters
+    skill: analysis
+    title: One base model, many merchants
+    prompt: |
+      SandPay wants a tone adapter per large merchant - 40 adapters on one 7B open-weight base - served from the
+      same GPUs, with requests from different merchants arriving mixed. Which statement is right?
+    options:
+      - id: unmerged
+        text: Keep the adapters unmerged and select one per request; merging would bake one merchant's adapter into the shared weights.
+        feedback: Correct - Hu et al. note that merging removes added latency but makes batching inputs for different adapters "not straightforward"; unmerged adapters can be chosen per request at a small cost.
+      - id: merge-all
+        text: Merge all 40 adapters into the base once; LoRA updates add up without interfering.
+        feedback: Merging sums all the updates into one set of weights, so every merchant gets every other merchant's tone. Adapters are separate tasks.
+      - id: forty-models
+        text: Store 40 full copies of the model, because LoRA cannot be switched at run time.
+        feedback: Switching is one of LoRA's advertised benefits - 100 GPT-3 adapters were estimated at 35 MB each against 350 GB per full copy.
+      - id: latency
+        text: Every adapter permanently adds a forward pass's worth of latency.
+        feedback: The extra path is through an r-dimensional bottleneck; and merged, it adds nothing at all.
+    correct: [unmerged]
+    hints:
+      - What does merging do to W0?
+      - Do different requests in one batch need different weights?
+    solution: |
+      Merging computes `W = W0 + BA` for one adapter - ideal when a deployment serves one task, since inference is
+      then exactly as fast as the base. For many tasks on shared hardware, keep W0 once and apply the selected
+      adapter per request; the paper's footnote estimates 100 adapted GPT-3 models at about 354 GB in total instead
+      of 35 TB. Measure the per-request latency of the unmerged path on your own hardware before committing.
+
+  - id: forgetting-diagnosis
+    type: mcq
+    concept: fine-tuning-forgetting
+    skill: analysis
+    title: The tuned model got worse at refusing
+    prompt: |
+      A full fine-tune on 1,200 dispute letters raised letter quality from 0.78 to 0.91 on the held-out letters.
+      The regression set shows out-of-scope refusals fell from 0.97 to 0.81 and fee answers from 0.95 to 0.88.
+      Which response is best supported?
+    options:
+      - id: replay
+        text: Treat it as forgetting - retrain with a sample of the regression behaviours (refusals, fee answers) mixed in, or use a LoRA adapter routed only to letter requests, and re-run both sets.
+        feedback: Correct - the target improved while unrelated behaviours dropped, which is catastrophic forgetting. Replay (as InstructGPT's PPO-ptx did) or keeping the base reachable for other traffic are the standard remedies; both sets decide.
+      - id: more-epochs
+        text: Train for more epochs so the model generalises.
+        feedback: More training on letters only moves the weights further towards letters; in the toy, 300 steps forgot more than 100.
+      - id: ship
+        text: Ship it - the target metric improved significantly.
+        feedback: The regression set exists to catch exactly this. A 16-point drop in refusals is a release blocker in most budgets.
+      - id: lower-rank
+        text: Switch to LoRA with r = 1; LoRA cannot forget.
+        feedback: LoRA forgets less but the adapted model still forgets (task A fell to 0.684 in the toy). It is the adapter-off base that is safe.
+    correct: [replay]
+    hints:
+      - Which numbers went up and which went down?
+      - What did the toy's replay row and adapter-off row show?
+    solution: |
+      Gains on the target with losses elsewhere is the signature of forgetting. Mix old behaviours into training
+      (replay - 200 task-A examples kept the toy's task A at 0.930), or train an adapter and route only letter
+      requests through it so everything else uses the untouched base (task A back to 0.989 with the adapter off).
+      Re-run the held-out letters and the regression set; ship when both are within budget.
+    followUp: |
+      Your regression budget is "no behaviour drops more than 2 points". Which of the two remedies makes that
+      easier to guarantee, and why?
+
+  - id: read-forgetting-table
+    type: short
+    concept: fine-tuning-forgetting
+    skill: analysis
+    title: Read the forgetting table
+    prompt: |
+      Using the lesson's table (full fine-tune at 300 steps: A 0.575, B 0.916; LoRA r=1 at 300 steps: A 0.684,
+      B 0.758; adapters off: A 0.989; replay: A 0.930, B 0.914), write three or four sentences a product manager
+      could act on: which option you would pick for a model that must do both tasks, and why.
+    modelAnswer: |
+      Full fine-tuning learned the new task best (0.916) but destroyed the old one (0.575, near chance). LoRA kept
+      a bit more of the old task (0.684) but learned less of the new (0.758), so on its own it does not solve
+      forgetting. If one model must serve both tasks, train with replay - old examples mixed into the new data -
+      which kept both above 0.91. If the two tasks arrive as separate request types, an adapter used only for the
+      new task with the untouched base for the old one gives 0.989 on the old task for free.
+    rubric:
+      - Names the forgetting in the full fine-tune with the numbers
+      - States that LoRA reduced but did not prevent forgetting
+      - Recommends replay for one model doing both, or routing with the adapter off for separate traffic
+      - Notes these are toy numbers and the real decision needs the team's own regression set
+    hints:
+      - Compare each row's task A against the base's 0.989.
+    solution: See the model answer. The key distinction is between the adapted model (which forgets) and the frozen base (which does not).
+
+  - id: sign-test-read
+    type: mcq
+    concept: evidence-based-choice
+    skill: analysis
+    title: Is the RAG candidate better?
+    prompt: |
+      On a 30-case eval, the prompt baseline scores 21/30 and a RAG candidate 24/30. Per case, RAG is right where
+      the prompt was wrong on 3 cases, and wrong where the prompt was right on 0. What do you conclude?
+    options:
+      - id: not-yet
+        text: Not yet significant - 3 wins and 0 losses gives a two-sided sign-test p of 0.25; add cases (especially of the failing type) before deciding.
+        feedback: Correct - only the 3 disagreements carry information about which is better, and 3 out of 3 happens a quarter of the time by chance.
+      - id: ten-points
+        text: RAG is 10 points better, which is clearly significant.
+        feedback: The 10 points come from 3 cases. Paired testing looks at the disagreements, and 3 is too few to rule out chance.
+      - id: worse
+        text: The two are identical because they agree on 27 cases.
+        feedback: Agreement carries no information about which is better, but it does not prove equality either; the disagreements all favour RAG, just not yet significantly.
+      - id: unpaired
+        text: Compare 21/30 and 24/30 with an unpaired test of two proportions instead.
+        feedback: The cases are the same, so the results are paired; an unpaired test throws away that information and is less powerful here.
+    correct: [not-yet]
+    hints:
+      - Which cases tell you anything about the difference?
+      - With 3 disagreements, how likely is a 3-0 split if both were equally good?
+    solution: |
+      The paired view: 27 cases agree, 3 disagree, all in RAG's favour. Under "equally good", each disagreement is
+      a fair coin: `P(3-0 or 0-3) = 2 × 0.5³ = 0.25`. That is weak evidence. The lesson's `sign_test_p(3, 0)`
+      returns 0.25 and `choose` keeps the baseline. Add cases of the type RAG is meant to fix (changed facts) and
+      re-run; 9-0, as in the harness demo, gives p = 0.004.
+    followUp: |
+      If the candidate is also 40% more expensive per request, does that change what `choose` decides when it is
+      significantly better? Should it?
+
+  - id: design-comparison
+    type: testdesign
+    concept: evidence-based-choice
+    skill: application
+    title: Plan the comparison for dispute letters
+    prompt: |
+      SandPay's team proposes a LoRA fine-tune of an open-weight model to write dispute letters, replacing a
+      prompt with ten examples. Design the evaluation that decides. For each check, give the preconditions,
+      steps, expected result and the evidence you keep.
+    modelAnswer: |
+      1. **Paired quality comparison.** Pre: 200 approved letters held out from training (never seen by the
+         tuner), a rubric grader validated against two human reviewers on 30 letters. Steps: generate letters for
+         the 200 cases with the baseline prompt and with the adapter; grade both. Expected: the adapter wins
+         significantly more disagreements (sign test p < 0.05). Evidence: per-case grades, wins / losses, p.
+      2. **Format validity.** Steps: parse every output against the letter schema. Expected: at least the
+         baseline's validity. Evidence: failure list.
+      3. **Regression set.** Pre: fee questions, refusals of out-of-scope requests, a few general tasks with
+         expected outputs. Steps: run base and adapted model. Expected: no drop beyond the agreed budget (for
+         example 2 points). Evidence: per-set accuracy for both.
+      4. **Adapter isolation.** Steps: run fixed inputs with the adapter off. Expected: identical to the base.
+         Evidence: equality check.
+      5. **Cost and latency.** Steps: measure tokens and p95 latency on the 200 cases. Expected: within budget.
+         Evidence: the numbers per approach.
+      6. **Overfitting.** Steps: compare training-set and held-out scores per checkpoint. Expected: no large gap;
+         pick the checkpoint by held-out score. Evidence: the curve.
+    rubric:
+      - The held-out set is separate from the training data and the comparison is paired
+      - Uses a significance test on the disagreements, not only two averages
+      - Includes a regression set with an explicit budget
+      - Measures cost and latency, not only quality
+      - Every check has preconditions, steps, expected result and evidence
+    hints:
+      - What could make the tuned model look better than it is?
+      - What could it break that the letter eval never asks about?
+    solution: See the model answer. The two checks most often missed are the held-out split and the regression set.
+
+  - id: interview-ft-vs-rag
+    type: interview
+    concept: adaptation-levers
+    skill: analysis
+    title: "Interview: fine-tuning or RAG?"
+    prompt: |
+      *"Our support bot gives outdated answers and sometimes sounds robotic. The team wants to fine-tune it. What
+      would you do?"*
+    modelAnswer: |
+      I would split the two complaints, because they are different problems. Outdated answers are a knowledge
+      problem: the facts change, so they belong in an index the bot retrieves from per request, which can be
+      updated the day something changes and lets the answer cite its source - fine-tuning would freeze today's
+      facts into the weights. Sounding robotic is a behaviour problem: first improve the prompt with clear tone
+      instructions and a few good examples; if a measured prompt still falls short and we have a few hundred
+      approved replies, a fine-tune (for example a LoRA adapter, or a provider's supervised fine-tuning if
+      available) is a candidate.
+
+      Before any of it, I would build an eval set from real tickets - changed-fact questions, tone-graded replies -
+      plus a regression set, measure the current prompt as the baseline, and compare each candidate on the same
+      cases with a paired test, cost per request and the regression set. I would ship only what is measurably
+      better, and keep the evals running because documents and base models change.
+    rubric:
+      - Separates the knowledge problem from the behaviour problem
+      - Proposes retrieval for changing facts and explains why fine-tuning is a poor fit for them
+      - Tries prompting first for tone and names when fine-tuning becomes worth it
+      - Insists on a baseline, a paired comparison and a regression set
+      - Mentions cost, latency or platform availability as constraints
+    followUps:
+      - How would you know whether a remaining wrong answer is a retrieval miss or a generation error?
+      - What could a fine-tune break, and how would you catch it before release?
+      - How many examples would you want before trying a fine-tune, and how would you split them?
+    hints:
+      - Two complaints, two causes.
+    solution: |
+      See the model answer. Interviewers listen for the knowledge-versus-behaviour split and for an evaluation
+      plan before any training.
+
+  - id: coding-lora-linear
+    type: coding
+    concept: lora-adapters
+    skill: application
+    title: Implement a LoRA linear layer
+    prompt: |
+      In `lora_linear.py`, `LoRALinear` is a teammate's draft that runs and is wrong in several places; three
+      methods and two functions are not written. Fix and complete it so that the layer freezes the wrapped
+      `nn.Linear`, starts exactly at the base model, scales the update by alpha / r, can be switched off and
+      merged, and rejects a rank outside 1..min(in, out). Then write `count_parameters(model)` (trainable, total)
+      and `add_lora(model, targets, r, alpha)`, which freezes the whole model and wraps the named linear layers.
+    project: ai
+    files:
+      - exercises/genai/lora_linear.py
+    test: tests/genai/test_lora_linear.py
+    command: .venv/bin/python -m pytest tests/genai/test_lora_linear.py
+    hints:
+      - Compare the draft's initialisation of lora_B and its handling of base with section 4.1 of the paper.
+      - The forward pass in the draft forgets one factor - which?
+      - "delta_weight is scaling * (lora_B @ lora_A); merged() copies base.weight + delta_weight() into a fresh nn.Linear inside torch.no_grad()."
+      - "add_lora: dict(model.named_modules()) finds a module by name; split 'block.0' with rpartition('.') to get the parent and setattr the LoRALinear on it."
+    modelAnswer: |
+      ```python
+      def __init__(self, base, r=4, alpha=None):
+          super().__init__()
+          if not 1 <= r <= min(base.in_features, base.out_features):
+              raise ValueError(f"rank r must be between 1 and {min(base.in_features, base.out_features)}, got {r}")
+          self.base = base
+          for p in self.base.parameters():
+              p.requires_grad_(False)
+          self.r = r
+          self.scaling = (r if alpha is None else alpha) / r
+          self.lora_A = nn.Parameter(torch.empty(r, base.in_features, dtype=base.weight.dtype))
+          self.lora_B = nn.Parameter(torch.zeros(base.out_features, r, dtype=base.weight.dtype))
+          nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+          self.enabled = True
+
+      def delta_weight(self):
+          return self.scaling * (self.lora_B @ self.lora_A)
+
+      def forward(self, x):
+          out = self.base(x)
+          if self.enabled:
+              out = out + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+          return out
+
+      def merged(self):
+          layer = nn.Linear(self.base.in_features, self.base.out_features, bias=self.base.bias is not None)
+          layer = layer.to(self.base.weight.dtype)
+          with torch.no_grad():
+              layer.weight.copy_(self.base.weight + self.delta_weight())
+              if self.base.bias is not None:
+                  layer.bias.copy_(self.base.bias)
+          return layer
+
+
+      def count_parameters(model):
+          trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+          return trainable, sum(p.numel() for p in model.parameters())
+
+
+      def add_lora(model, targets, r=4, alpha=None):
+          modules = dict(model.named_modules())
+          for name in targets:
+              if name not in modules:
+                  raise KeyError(f"no module named {name!r}")
+              if not isinstance(modules[name], nn.Linear):
+                  raise TypeError(f"{name!r} is not nn.Linear")
+          for p in model.parameters():
+              p.requires_grad_(False)
+          for name in targets:
+              parent_name, _, child = name.rpartition(".")
+              parent = modules[parent_name] if parent_name else model
+              setattr(parent, child, LoRALinear(modules[name], r=r, alpha=alpha))
+          return model
+      ```
+
+      B at zero makes the adapted model start at the base; freezing the base keeps W0 intact (so "adapter off"
+      is exactly the base); the scaling multiplies the low-rank path only. Targets are validated before anything
+      is frozen, so a typo does not leave a half-changed model.
+    rubric:
+      - Every test in tests/genai/test_lora_linear.py passes
+      - The low-rank path is computed as x @ A.T @ B.T, without building the d × k matrix in forward
+      - merged() returns a new layer and leaves base unchanged
+      - You can explain why B, not A, starts at zero, and what alpha / r does
+    solution: |
+      See the model answer. The tests check the shapes and freezing, the exact start at the base output, rank
+      validation, the alpha / r scaling, the rank of the update, adapter off, that training changes only the
+      adapter, merging, parameter counts on the lesson's MLP (532 trainable at r = 2 on all three layers), nested
+      module names and bad targets.
+    followUp: |
+      Add `unmerge(merged_layer)` that recovers W0 by subtracting the update, and test that it round-trips within
+      float tolerance. Why might the round trip not be exact in float16?
+
+  - id: coding-approach-choice
+    type: coding
+    concept: evidence-based-choice
+    skill: application
+    title: Write the decision checklist
+    prompt: |
+      In `approach_choice.py`, implement `validate(scenario)` and `recommend(scenario)` exactly as their
+      docstrings describe: seven rules that score prompting, RAG and fine-tuning, exclude fine-tuning below 10
+      labelled examples, record one reason per rule that changed a score, and rank the viable approaches with ties
+      going to the simpler one.
+    project: ai
+    files:
+      - exercises/genai/approach_choice.py
+    test: tests/genai/test_approach_choice.py
+    command: .venv/bin/python -m pytest tests/genai/test_approach_choice.py
+    hints:
+      - Keep a scores dict starting at prompting 1, rag 0, fine_tuning 0, and a small helper that adds points and appends a reason.
+      - The gap rule always fires; a dict from gap to (points, reason) avoids a chain of ifs.
+      - Exclusion does not change the score - fine_tuning keeps its points and is left out of ranked.
+      - "Sort with key=lambda a: (-scores[a], APPROACHES.index(a)) so ties keep the simpler-first order."
+    modelAnswer: |
+      ```python
+      def recommend(s):
+          validate(s)
+          scores = {"prompting": 1, "rag": 0, "fine_tuning": 0}
+          excluded, reasons = {}, []
+
+          def add(points, why):
+              for name, delta in points.items():
+                  scores[name] += delta
+              reasons.append(why)
+
+          if s.knowledge_change == "monthly":
+              add({"rag": 2, "fine_tuning": -1}, "facts change monthly: update an index, not the weights")
+          elif s.knowledge_change == "daily":
+              add({"rag": 3, "fine_tuning": -2}, "facts change daily: retraining cannot keep up")
+          if s.needs_citations:
+              add({"rag": 2}, "citations needed: retrieved chunks give provenance")
+          add(*gap_rules[s.gap])      # dict: gap -> (points, reason), written out in the solution file
+          if s.labelled_examples < 10:
+              excluded["fine_tuning"] = "fewer than 10 labelled examples"
+          elif s.labelled_examples < 50:
+              add({"fine_tuning": -1}, "under 50 labelled examples: too few to train and evaluate well")
+          elif s.labelled_examples >= 500:
+              add({"fine_tuning": 1}, "500+ labelled examples: enough to train and hold out a test set")
+          if s.latency_budget_ms < 500:
+              add({"rag": -1, "fine_tuning": 1}, "tight latency: retrieval adds a step, a tuned model needs a shorter prompt")
+          if s.prompt_tokens * s.requests_per_day >= 50_000_000:
+              add({"fine_tuning": 1}, "heavy prompt volume: shorter prompts save tokens at scale")
+          ranked = sorted((a for a in APPROACHES if a not in excluded),
+                          key=lambda a: (-scores[a], APPROACHES.index(a)))
+          return Recommendation(ranked, scores, excluded, reasons)
+      ```
+
+      `gap_rules` maps each gap to its points and reason (see the solution file). `validate` checks the two
+      enumerations and that no number is negative.
+    rubric:
+      - Every test in tests/genai/test_approach_choice.py passes
+      - The rules live in one readable place, with a reason string per rule
+      - Invalid input raises ValueError before any scoring
+      - You can name the source argument behind each rule and one scenario where the checklist would mislead
+    solution: |
+      See the model answer. The tests check the four scenario families, the inclusive volume threshold, the
+      example-count bands (10, 49, 50, 499, 500), exclusion without losing the score, the simpler-first tie-break
+      and every invalid input.
+    followUp: |
+      Add a `needs_offline_deployment` field (no network to a hosted API). Which approaches does it affect, and
+      would you express it as points or as an exclusion?
+
+  - id: coding-approach-eval
+    type: coding
+    concept: evidence-based-choice
+    skill: application
+    title: Build the comparison harness
+    prompt: |
+      In `approach_eval.py`, implement `run_approach` (ask a client about every case, grade, sum tokens),
+      `discordant` (wins and losses against a baseline), `sign_test_p` (exact two-sided sign test),
+      `cost_per_1k_requests` and `choose`, which accepts a candidate only if it wins significantly more
+      disagreements than it loses and passes the optional regression guard, then picks the most accurate and,
+      on a tie, the cheapest. Clients are injected; the tests use `ScriptedLLM`.
+    project: ai
+    files:
+      - exercises/genai/approach_eval.py
+    test: tests/genai/test_approach_eval.py
+    command: .venv/bin/python -m pytest tests/genai/test_approach_eval.py
+    hints:
+      - "run_approach: reply = client.create(**build_request(case)); grade(case, reply.text); add reply.input_tokens and reply.output_tokens."
+      - "discordant: count pairs where the candidate is right and the baseline wrong (wins), and the reverse (losses)."
+      - "sign_test_p: with n = wins + losses and k = min(wins, losses), p = 2 × sum(comb(n, i) for i in 0..k) / 2**n, capped at 1."
+      - "choose: build reasons in results order; pick min(accepted, key=lambda r: (-r.accuracy, cost))."
+    modelAnswer: |
+      ```python
+      def run_approach(name, client, cases, build_request, grade):
+          result = ApproachResult(name)
+          for case in cases:
+              reply = client.create(**build_request(case))
+              result.correct.append(bool(grade(case, reply.text)))
+              result.input_tokens += reply.input_tokens
+              result.output_tokens += reply.output_tokens
+          return result
+
+
+      def sign_test_p(wins, losses):
+          n = wins + losses
+          if n == 0:
+              return 1.0
+          k = min(wins, losses)
+          return min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2**n)
+
+
+      def choose(results, baseline, prices, alpha=0.05, guard=None, max_regression=0.02):
+          by_name = {r.name: r for r in results}
+          base, accepted, reasons = by_name[baseline], [], []
+          for r in results:
+              if r.name == baseline:
+                  continue
+              wins, losses = discordant(base, r)
+              p = sign_test_p(wins, losses)
+              if wins <= losses or p >= alpha:
+                  reasons.append(f"{r.name}: {wins} wins / {losses} losses, p={p:.3f} - not better than {baseline}")
+              elif guard is not None and guard[baseline] - guard[r.name] > max_regression:
+                  reasons.append(f"{r.name}: better (p={p:.3f}) but regression set drops {guard[baseline] - guard[r.name]:.3f}")
+              else:
+                  accepted.append(r)
+                  reasons.append(f"{r.name}: {wins} wins / {losses} losses, p={p:.3f} - accepted")
+          if not accepted:
+              return Decision(baseline, reasons)
+          best = min(accepted, key=lambda r: (-r.accuracy, cost_per_1k_requests(r, *prices[r.name])))
+          return Decision(best.name, reasons)
+      ```
+
+      `discordant` raises `ValueError` when the two results cover different numbers of cases - unpaired results
+      cannot be compared this way. `cost_per_1k_requests` is the average tokens per request times the prices per
+      million, times 1,000.
+    rubric:
+      - Every test in tests/genai/test_approach_eval.py passes
+      - The client is a parameter; nothing calls a network
+      - The decision uses paired disagreements, not two averages
+      - You can explain why cost only breaks ties among accepted candidates
+    solution: |
+      See the model answer. The tests check request order and grading with a ScriptedLLM, token sums from the
+      fake's toy tokenizer, the request builder (system prompt used), discordant counts and their pairing check,
+      exact sign-test values (for example 15 wins / 3 losses gives p = 0.0075), cost, the significance and
+      wins-over-losses rules, the accuracy-then-cost choice and the regression guard.
+    followUp: |
+      Add a `max_cost_increase` budget so a significantly better candidate is still rejected if it costs more than,
+      say, 50% above the baseline per request. Where in `choose` does the check belong?
+
+placement:
+  - id: place-lever
+    type: mcq
+    concept: adaptation-levers
+    skill: application
+    title: Which lever?
+    prompt: |
+      A model answers SandPay policy questions with the right facts (retrieved from current pages) but in five
+      different layouts, and the support widget needs one fixed JSON shape. Few-shot examples got it to 90% valid;
+      you have 2,000 approved responses. What is the most reasonable next candidate?
+    options:
+      - id: ft
+        text: Fine-tune for the output format, keep retrieval for the facts, and compare on the same eval.
+        feedback: Correct - the facts are fine (retrieval works), the gap is consistent format, a measured prompt is not enough, and there is plenty of data. The approaches combine.
+      - id: more-rag
+        text: Retrieve more documents per question.
+        feedback: The facts are already right; more context does not fix the layout.
+      - id: drop-rag
+        text: Fine-tune on the policy pages and remove retrieval.
+        feedback: That would freeze the policies into the weights and lose provenance; only the format needs to change.
+      - id: nothing
+        text: Nothing can be done beyond prompting.
+        feedback: Consistent format is one of the documented uses of supervised fine-tuning.
+    correct: [ft]
+    solution: |
+      Separate the two jobs: retrieval supplies current facts, fine-tuning (or another format mechanism the
+      provider documents) supplies consistent behaviour. Then compare with the prompt baseline on the same eval
+      and run the regression set.
+
+  - id: place-lora
+    type: mcq
+    concept: lora-adapters
+    skill: application
+    title: LoRA at step zero
+    prompt: |
+      You wrap a trained `nn.Linear(512, 512)` with a correctly implemented LoRA layer, r = 4, and run a batch
+      before any training. Which is true?
+    options:
+      - id: equal
+        text: The output equals the base layer's, and 4,096 parameters are trainable.
+        feedback: Correct - B starts at zero so BA = 0, and r (d + k) = 4 × 1024 = 4,096.
+      - id: random
+        text: The output differs from the base because A is random; 4,096 parameters are trainable.
+        feedback: A is random, but it is multiplied by B = 0, so the update is zero.
+      - id: count
+        text: The output equals the base layer's, and 262,144 parameters are trainable.
+        feedback: 262,144 is 512 × 512, the full matrix. LoRA trains only A and B.
+      - id: both-zero
+        text: The output equals the base's because A and B are both zero; 2,048 parameters are trainable.
+        feedback: If both started at zero, the gradients of both would be zero and nothing would learn. Only B is zero, and both factors count.
+    correct: [equal]
+    solution: |
+      `ΔW = BA` with B = 0 is zero, so the layer reproduces the base exactly; trainable parameters are
+      `r × (in + out) = 4 × (512 + 512) = 4,096`.
+
+  - id: place-forgetting
+    type: mcq
+    concept: fine-tuning-forgetting
+    skill: application
+    title: Protecting the old behaviour
+    prompt: |
+      After a LoRA fine-tune for a new task, the adapted model is worse at an old task the base did well. The
+      old task's requests can be told apart from the new task's. What keeps the old task at the base model's
+      quality with no retraining?
+    options:
+      - id: route
+        text: Send old-task requests to the base model with the adapter switched off.
+        feedback: Correct - LoRA never changed W0, so the base with the adapter off is bit-for-bit the original model.
+      - id: lower-r
+        text: Retrain with a lower rank.
+        feedback: That may forget less, but it is retraining and still changes the old task's outputs.
+      - id: merge
+        text: Merge the adapter into the weights.
+        feedback: Merging produces exactly the adapted model - the one that forgot.
+      - id: more-data
+        text: Train longer on the new task.
+        feedback: More training on the new task moves further from the old one.
+    correct: [route]
+    solution: |
+      The frozen base is LoRA's guarantee: switch the adapter off (or route around it) and the old behaviour is
+      unchanged. If one model must do both, use replay and a regression set.
+
+  - id: place-evidence
+    type: mcq
+    concept: evidence-based-choice
+    skill: application
+    title: Enough evidence?
+    prompt: |
+      On the same 200 cases, a fine-tuned candidate and the prompt baseline disagree on 20: the candidate wins 15
+      and loses 5. Cost per request is 10% lower and the regression set is unchanged. With a 0.05 threshold, what
+      do you decide?
+    options:
+      - id: ship
+        text: Ship the candidate - the sign test gives p of about 0.04, it is cheaper and nothing regressed.
+        feedback: Correct - 15 versus 5 out of 20 disagreements is significant at 0.05 (p ≈ 0.041), and the cost and regression checks pass.
+      - id: keep
+        text: Keep the baseline - 15 wins out of 200 is only 7.5% of the cases.
+        feedback: Only disagreements tell you which is better; the 180 agreements are neutral.
+      - id: cost-only
+        text: Ship it because it is cheaper; quality does not matter if it is not worse.
+        feedback: Here it is also better, but cost alone does not show that; "not significantly worse" needs its own test and margin.
+      - id: averages
+        text: Compute both accuracies and ship if the difference is above 5 points.
+        feedback: A fixed point threshold ignores how many cases support the difference; the paired test does not.
+    correct: [ship]
+    solution: |
+      `sign_test_p(15, 5)` = `2 × P(X ≤ 5)` for X ~ Binomial(20, 0.5) ≈ 0.041 < 0.05. With lower cost and no
+      regression, the candidate meets every criterion.
+
+recall:
+  - id: recall-what-changes
+    concept: adaptation-levers
+    prompt: What does each of prompting, RAG and fine-tuning change?
+    answer: Prompting changes the instructions and examples per request; RAG changes the facts in the context, fetched from an index you can update without training; fine-tuning changes the weights, so it changes behaviour (format, style, a narrow skill) on every request.
+  - id: recall-ft-not-facts
+    concept: adaptation-levers
+    prompt: Why is fine-tuning a poor way to teach facts that change?
+    answer: The weights hold the facts of the training date and give no provenance; every change needs a new training run. An index can be updated (the RAG paper hot-swapped a 2016 and 2018 Wikipedia index) and the retrieved passage is the citation.
+  - id: recall-lora-formula
+    concept: lora-adapters
+    prompt: Write the LoRA forward pass and say how it is initialised.
+    answer: h = W0 x + (alpha / r) B A x, with W0 frozen, A (r × k) random and B (d × r) zero, so the adapted model starts exactly at the base. Trainable parameters r (d + k) per matrix.
+  - id: recall-lora-merge
+    concept: lora-adapters
+    prompt: What does merging a LoRA adapter buy, and what does it cost?
+    answer: W = W0 + BA gives zero added inference latency. You lose easy per-request switching between adapters on one base; keep them unmerged to serve many tasks.
+  - id: recall-qlora
+    concept: lora-adapters
+    prompt: What does QLoRA add to LoRA?
+    answer: A frozen base stored in 4-bit NormalFloat (NF4), double quantization of the quantization constants and paged optimizers - enough to fine-tune a 65B model on one 48 GB GPU in the paper. It also found data quality matters far more than size.
+  - id: recall-forgetting
+    concept: fine-tuning-forgetting
+    prompt: Which protects an old task best after adapting to a new one - full fine-tuning, LoRA, the adapter switched off, or replay?
+    answer: The adapter switched off (the untouched base) keeps the old task exactly; replay keeps it in one model; LoRA forgets less than full fine-tuning but still forgets. Always run a regression set.
+  - id: recall-paired
+    concept: evidence-based-choice
+    prompt: How do you decide whether a candidate beats the baseline?
+    answer: Run both on the same cases, count the disagreements each wins, and apply a paired test such as the sign test (p = 2 × P(X ≤ min) under Binomial(n, 0.5)). Then check cost per request and the regression set; ship only if better, affordable and no regression.
+  - id: recall-order
+    concept: evidence-based-choice
+    prompt: What comes before any prompt engineering or fine-tuning?
+    answer: Success criteria and an eval set (plus a regression set), then a measured prompt baseline - both Anthropic's and OpenAI's guides put measurement first.
+
+next:
+  - llm-evaluation-and-guardrails
+  - tool-use-and-function-calling
+  - agent-loops-and-workflow-patterns

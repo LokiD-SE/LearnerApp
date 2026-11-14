@@ -1,0 +1,1654 @@
+id: llm-apis-and-structured-output
+title: LLM APIs, streaming and structured output
+subject: ai-engineering
+module: genai-engineering
+level: intermediate
+status: published
+estimatedMinutes: 120
+summary: Call a hosted large language model like any other unreliable, metered remote API - build the messages request (system prompt, roles, max_tokens), read the stop reason and token usage, assemble a streamed reply from its events, retry 429 and overload errors with retry-after and exponential backoff with jitter (and never retry a 400), get JSON you can trust by parsing, validating and repairing it, and count tokens and cost. Runnable code uses an offline scripted fake model; every provider fact (Anthropic Messages API, OpenAI Responses API) is quoted from the official documentation as read on 14 November 2026 and labelled as provider-specific.
+tags:
+  [
+    LLM API,
+    Messages API,
+    Responses API,
+    chat completion,
+    system prompt,
+    message roles,
+    max_tokens,
+    stop reason,
+    stop_reason,
+    token usage,
+    streaming,
+    server-sent events,
+    SSE,
+    structured outputs,
+    JSON mode,
+    JSON schema,
+    output validation,
+    repair and retry,
+    rate limits,
+    HTTP 429,
+    HTTP 529,
+    HTTP 503,
+    retry-after,
+    exponential backoff,
+    jitter,
+    thundering herd,
+    token cost,
+    cost accounting,
+    Anthropic,
+    OpenAI,
+    Python,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`; tests run with pytest. No package beyond the standard
+    library is needed for this lesson's code (no pydantic, no jsonschema - the checks are plain `dict` code so
+    every rule is visible). Every output shown was printed by the code shown, run on Linux on 14 November 2026
+    with `OMP_NUM_THREADS=2`.
+  - **No real model is called, no API key, no network.** The "model" is `ScriptedLLM` from
+    `practice/ai/support/llm_fake.py`: an offline stand-in with the *shape* of a messages API (`system`,
+    `messages`, `max_tokens`, `temperature`; a reply with content blocks, a `stop_reason` and token counts). It
+    replays replies **you script** and can raise `RateLimitError(retry_after)` (status 429), `OverloadedError`
+    (status 503) and `BadRequestError` (status 400). Its token counts come from a toy tokenizer (`count_tokens`
+    counts words and punctuation marks) - real tokenizers count differently. Its streaming yields 4-character text
+    chunks; the stream **events** in this lesson come from `events_from_reply` in `llm_stream.py`, a simplified
+    format modelled on Anthropic's documented event flow, not any provider's wire format.
+  - **Prices are made up.** `TOY_PRICES` (`toy-small` 0.50 / 2.00 and `toy-large` 5.00 / 25.00 US dollars per
+    million input / output tokens) is a fictional table for arithmetic practice. It is not any provider's price
+    list. Real prices change: read them from [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+    or [OpenAI pricing](https://developers.openai.com/api/docs/pricing) on the day you estimate.
+  - **Provider facts** (request shapes, stop reasons, streaming events, error codes, rate-limit headers,
+    structured outputs) are quoted or summarised from these official pages, read on **14 November 2026**, and
+    marked "provider-specific" in the text. APIs change; check the current page before relying on a detail.
+    - Anthropic (Claude API): [Messages API reference](https://platform.claude.com/docs/en/api/messages) (body
+      parameters `max_tokens`, `messages` - "Consecutive `user` or `assistant` turns in your request will be
+      combined into a single turn", top-level `system`; the `usage` object - token counts "will not match one-to-one
+      with the exact visible content", "`output_tokens` will be non-zero, even for an empty string response");
+      [API overview](https://platform.claude.com/docs/en/api/overview) (required headers `anthropic-version` and
+      `content-type`, authentication); [Stop reasons and
+      fallback](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons) (`end_turn`,
+      `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal`, `model_context_window_exceeded`; stop
+      reasons versus errors); [Streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming)
+      (event flow, `ping`, error events, "The token counts shown in the `usage` field of the `message_delta` event are
+      *cumulative*", error recovery); [Claude API errors](https://platform.claude.com/docs/en/api/errors) (400 to
+      529, error shape, `request-id`, SDK retries "twice by default, honoring the `retry-after` header"); [Rate
+      limits](https://platform.claude.com/docs/en/api/rate-limits) (RPM, ITPM, OTPM, token bucket, `retry-after`,
+      `anthropic-ratelimit-*` headers, the spend-cap 429 without `retry-after`); [Structured
+      outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs) (`output_config.format`,
+      JSON Schema limitations, invalid outputs - refusals, `max_tokens`, enum casing).
+    - OpenAI: [Text generation](https://developers.openai.com/api/docs/guides/text) (`instructions`, the
+      `developer`, `user` and `assistant` roles); [Responses API - create](https://developers.openai.com/api/reference/resources/responses/methods/create)
+      (`max_output_tokens`, `temperature`, `status` and `incomplete_details.reason`, `usage`); [Streaming API
+      responses](https://developers.openai.com/api/docs/guides/streaming-responses) (`stream=true`, server-sent
+      events `response.created`, `response.output_text.delta`, `response.completed`, `error`); [Structured model
+      outputs](https://developers.openai.com/api/docs/guides/structured-outputs) (`text.format` with `json_schema`
+      and `strict`, JSON mode `json_object`, edge cases); [Error
+      codes](https://developers.openai.com/api/docs/guides/error-codes) and [Rate
+      limits](https://developers.openai.com/api/docs/guides/rate-limits) (429 and 503 codes, `Retry-After`,
+      `x-ratelimit-*` headers, "Retrying with exponential backoff").
+  - **SandPay** is a fictional payments company; every ticket, amount and merchant here is invented.
+  - **Builds on:** [How large language models work](#/lesson/how-llms-work) (tokens, context windows, sampling).
+
+prerequisites:
+  - how-llms-work
+
+concepts:
+  - id: llm-request-anatomy
+    name: Messages, parameters, stop reasons and streaming
+    summary: A chat-style LLM call sends a system prompt plus the whole conversation as a list of role-tagged messages and a max_tokens cap - the API keeps no memory between calls. The reply carries content blocks, a stop reason (finished, hit max_tokens, wants a tool, refused) and token usage; a cut-off reply is a successful response, so code must check the stop reason. Streaming sends the same reply as events - text deltas, cumulative usage, the stop reason near the end - and can fail after a 200 status.
+  - id: llm-errors-and-retries
+    name: API errors, rate limits and retries with backoff
+    summary: Hosted LLM APIs fail like other HTTP APIs - 400s mean the request is wrong and must not be retried, 429 means a rate limit (or a spend limit) and 5xx or 529 overload are transient. Retry only transient errors, wait at least the server's retry-after, otherwise use exponential backoff with random jitter so clients do not retry in lockstep, and cap both the attempts and the total waiting time.
+  - id: llm-structured-output
+    name: JSON output - parse, validate, repair
+    summary: Prompted JSON can arrive wrapped in prose or fences, malformed, cut off or with wrong fields; JSON mode guarantees parseable JSON only, and schema-constrained structured outputs still leave refusals, truncation, business rules and (provider-specific) unsupported constraints to your code. Parse defensively, validate every field with all errors reported, repair by sending the errors back once or twice, and never repair a reply truncated by max_tokens.
+  - id: llm-tokens-and-cost
+    name: Token usage and cost accounting
+    summary: Providers bill and rate-limit by tokens, input and output priced separately, as reported in each reply's usage (not by counting characters yourself). Cost per call is input times input price plus output times output price; every turn re-sends the whole conversation, retries of failed calls are not billed but repair rounds are, and a running meter per feature turns a per-call fraction of a cent into a monthly budget.
+
+objectives:
+  - Build a messages request (system prompt, alternating user and assistant turns, max_tokens) and explain why the client must re-send the conversation on every call.
+  - Read a reply's stop reason and usage, and handle a reply cut off at max_tokens differently from a finished one.
+  - Assemble a streamed reply from events, keeping the latest cumulative usage and treating an error event or a missing end event as a failure.
+  - Classify API errors into retryable and not retryable, and write a retry loop that honours retry-after, backs off exponentially with jitter, and caps attempts and total waiting time.
+  - Compare prompt-only JSON, JSON mode and schema-constrained structured outputs across two providers, and say what each still leaves to your code.
+  - Write a parser and validator for model JSON that reports every error, and a repair-and-retry loop that stops on truncation.
+  - Compute the cost of a call and a monthly budget from token usage and a price table, including the cost of repair rounds.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [llm-request-anatomy, llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: The idea in plain language
+    body: |
+      Calling a hosted language model is like phoning a brilliant contractor who has **no memory** and **bills by
+      the word**:
+
+      - Every call, you read out the whole job sheet again - who they are (the **system prompt**), everything said
+        so far (the **messages**) and how long their answer may be (**max_tokens**). They remember nothing from the
+        last call.
+      - They tell you **why they stopped**: finished, ran out of the time you gave them, or need you to do
+        something first. "Ran out of time" still comes back as a normal answer - just a cut-off one.
+      - You can listen **as they talk** (streaming) instead of waiting for the whole answer - but the line can drop
+        halfway through.
+      - Sometimes the line is **busy** (429, rate limited) or the office is **overloaded** (529 or 503). You call
+        back later - not instantly, and not all at the same second as everyone else. If they say "your request makes
+        no sense" (400), calling back with the same request is pointless.
+      - If you need a **form filled in** rather than an essay, ask for JSON - and still check every box, because a
+        form can come back half-filled, with a wrong code in a box, or not at all.
+      - And you pay **per word in and per word out**, every time you read the job sheet out again.
+
+      This lesson builds the small piece of code that sits between an application and the model and takes care of
+      all of this. SandPay - a fictional payments company - uses it to triage support tickets into JSON.
+
+  - id: what
+    kind: what
+    concepts: [llm-request-anatomy, llm-tokens-and-cost]
+    title: Terms, and two providers side by side
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Messages API / chat completion** | An HTTP endpoint that takes a conversation and returns the model's next turn. |
+      | **System prompt / instructions** | Standing instructions for the whole conversation (role, rules, output format). |
+      | **Message roles** | `user` (input from the person or your program) and `assistant` (the model's earlier turns); some APIs add a developer-level role. |
+      | **max_tokens** | The cap on how many tokens the model may *generate* - not a target length. |
+      | **Stop reason** | Why generation ended: finished naturally, hit the cap, wants to call a tool, refused... |
+      | **Usage** | Token counts for the call (input and output), the unit of billing and rate limits. |
+      | **Streaming** | The reply arrives as a series of events over one HTTP response (server-sent events). |
+      | **Structured output** | Asking for - or constraining the model to - JSON that fits a schema. |
+      | **Rate limit** | A cap on requests or tokens per minute; exceeding it returns HTTP 429. |
+
+      The same ideas carry different names per provider. **Provider-specific, as documented on 14 November 2026:**
+
+      | | Anthropic - Messages API (`POST /v1/messages`) | OpenAI - Responses API (`POST /v1/responses`) |
+      | --- | --- | --- |
+      | Standing instructions | top-level `system` parameter | `instructions` parameter, or a `developer`-role message |
+      | Conversation | `messages`: `user` and `assistant` turns; "Consecutive `user` or `assistant` turns in your request will be combined into a single turn" | `input`: a string or a list of messages with roles `developer`, `user`, `assistant` |
+      | Output cap | `max_tokens` (required) | `max_output_tokens` (optional; includes reasoning tokens; minimum 16) |
+      | Why it stopped | `stop_reason`: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal`, `model_context_window_exceeded` | `status` (`completed` or `incomplete`) and `incomplete_details.reason` (`max_output_tokens`, `content_filter`, ...) |
+      | Usage | `usage.input_tokens`, `usage.output_tokens` (+ cache fields) | `usage.input_tokens`, `usage.output_tokens` (+ cached and reasoning token details) |
+      | Sampling | the reference page read on 14 November 2026 lists no `temperature` body parameter | `temperature`, 0 to 2, default 1 |
+      | Required headers | an API key (`x-api-key` or `Authorization: Bearer`), `anthropic-version` (for example `2026-10-21`), `content-type: application/json` | `Authorization: Bearer` API key |
+
+      Two lessons from the table: **names differ but the shape is the same** (instructions + role-tagged turns + an
+      output cap in; content + stop information + usage out), and **parameters differ by provider and model** - read
+      the reference for the model you use rather than assuming a parameter exists. That is why the code in this
+      lesson talks to a client passed in as a parameter: swap the fake for a real SDK client behind the same small
+      interface.
+
+  - id: why
+    kind: why
+    concepts: [llm-request-anatomy, llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: Why a thin wrapper is not enough
+    body: |
+      The first version of SandPay's ticket triage was four lines: send the ticket, `json.loads` the reply, save
+      it. In its first week of (imagined) production it:
+
+      - **crashed on 3% of tickets** because the model wrapped the JSON in a code fence or added "Sure! Here it is";
+      - **saved half a JSON object** when a long ticket hit `max_tokens` - the API answered 200, so nothing looked
+        wrong until `json.loads` failed;
+      - **took the whole service down** during a traffic spike: every worker got 429, retried immediately, got 429
+        again - and the retries themselves kept the rate limit exceeded;
+      - **retried a 400 forever** after someone set `max_tokens` above the model's limit;
+      - **cost four times the estimate**, because nobody counted the repair rounds and the conversation re-sent on
+        every turn.
+
+      None of these is about the model being clever or not. They are ordinary distributed-systems problems -
+      unreliable network, rate limits, untrusted input, metering - and the fixes are ordinary engineering: check
+      the stop reason, classify errors, back off with jitter, validate, and count.
+
+  - id: first-call
+    kind: code
+    concepts: [llm-request-anatomy]
+    title: A first call, a cut-off call and a stateless conversation
+    body: |
+      The fake model takes the same arguments a messages API does. Run from `practice/ai` (the support folder is on
+      the path for the tests; a script adds it itself):
+
+      ```python
+      from llm_fake import ScriptedLLM, BadRequestError
+
+      llm = ScriptedLLM(["A chargeback is a card payment reversed by the issuing bank after a cardholder dispute."])
+      reply = llm.create(
+          system="You are SandPay's support assistant. Answer in one sentence.",
+          messages=[{"role": "user", "content": "What is a chargeback?"}],
+          max_tokens=200,
+      )
+      print(reply.content)
+      print(reply.stop_reason, reply.input_tokens, reply.output_tokens)
+      ```
+
+      ```plaintext
+      [{'type': 'text', 'text': 'A chargeback is a card payment reversed by the issuing bank after a cardholder dispute.'}]
+      end_turn 18 16
+      ```
+
+      The reply is a **list of content blocks**, not a string - a model can return text and a tool call in one turn.
+      `reply.text` joins the text blocks.
+
+      Now the same answer with a cap of 6 tokens:
+
+      ```python
+      cut = llm.create(messages=[{"role": "user", "content": "What is a chargeback?"}], max_tokens=6)
+      print(repr(cut.text), cut.stop_reason, cut.output_tokens)
+      ```
+
+      ```plaintext
+      'A chargeback is a card payment' max_tokens 6
+      ```
+
+      No exception. A truncated reply is a **successful** response with a different stop reason. Anthropic's docs
+      draw the same line: stop reasons are "part of the response body" of successful responses, errors are "HTTP
+      status codes 4xx or 5xx". Code that only checks for exceptions will happily store half an answer.
+
+      **The API keeps no conversation.** Each call sees only what you send:
+
+      ```python
+      llm = ScriptedLLM(lambda req: f"I can see {len(req.messages)} message(s); the last says: {req.messages[-1]['content']!r}")
+      history = [{"role": "user", "content": "My refund for order 1042 is missing."}]
+      r1 = llm.create(messages=history)
+      history.append({"role": "assistant", "content": r1.text})
+      history.append({"role": "user", "content": "It was 42.10 EUR."})
+      r2 = llm.create(messages=history)
+      r3 = llm.create(messages=[{"role": "user", "content": "How much was it?"}])
+      print(r1.text); print(r2.text); print(r3.text)
+      print([len(c.messages) for c in llm.calls])
+      ```
+
+      ```plaintext
+      I can see 1 message(s); the last says: 'My refund for order 1042 is missing.'
+      I can see 3 message(s); the last says: 'It was 42.10 EUR.'
+      I can see 1 message(s); the last says: 'How much was it?'
+      [1, 3, 1]
+      ```
+
+      The third call forgot everything because the code did not send the history. Your application owns the
+      conversation: append the assistant's reply and the next user turn, and send the whole list again - which also
+      means **every turn re-bills every earlier token** as input.
+
+      An invalid request fails at once with a 400-style error:
+
+      ```python
+      ScriptedLLM(["x"]).create(messages=[{"role": "user", "content": "hi"}], max_tokens=0)
+      ```
+
+      ```plaintext
+      BadRequestError 400 max_tokens must be at least 1
+      ```
+
+      (That limit is the fake's rule. Provider-specific - Anthropic's reference lists `max_tokens` with "minimum: 0"
+      and uses 0 to pre-warm the prompt cache; OpenAI's `max_output_tokens` has "minimum: 16". Read the reference.)
+
+  - id: stop-reasons
+    kind: internals
+    concepts: [llm-request-anatomy]
+    title: Stop reasons - what to do with each
+    body: |
+      **Provider-specific: Anthropic's stop reasons, as documented on 14 November 2026** (quick-reference table on
+      the "Stop reasons and fallback" page):
+
+      | `stop_reason` | When | What to do |
+      | --- | --- | --- |
+      | `end_turn` | "Claude completed its response naturally." | Use the response. |
+      | `max_tokens` | "The response reached your `max_tokens` limit." | "Raise `max_tokens` or continue the response." |
+      | `stop_sequence` | "Claude emitted one of your `stop_sequences`." | Read `stop_sequence` to see which. |
+      | `tool_use` | "Claude is calling a tool." | "Run the tool and return the result." |
+      | `pause_turn` | "A server-tool loop reached its iteration limit." | "Send the assistant content back to continue." |
+      | `refusal` | "Claude declined to respond." | Read `stop_details`; the page suggests retrying on a fallback model. |
+      | `model_context_window_exceeded` | "The response filled the model's context window." | "Treat the response as truncated." |
+
+      **OpenAI's Responses API** reports the same information differently: a response has a `status` of
+      `completed` or `incomplete`, and `incomplete_details.reason` is one of `max_output_tokens`, `max_messages`,
+      `content_filter` or `steered`. Different names, same rule:
+
+      > Branch on the stop information **before** you use the content. Only "finished naturally" (and, in a tool
+      > loop, "wants a tool") means the content is complete.
+
+      `max_tokens` is a ceiling, not a request for length: Anthropic's reference says "our models may stop *before*
+      reaching this maximum". Set it to the largest answer you are willing to pay for and wait for; a too-low cap
+      shows up as truncation, a too-high cap only as a bigger worst case.
+
+  - id: streaming
+    kind: internals
+    concepts: [llm-request-anatomy]
+    title: Streaming - the same reply, as events
+    body: |
+      Without streaming, the client waits for the whole reply. With streaming, the server sends the reply as a series
+      of **server-sent events** on one HTTP response, so a chat UI can show words as they are generated.
+
+      **Provider-specific: Anthropic's event flow** ("Streaming messages", read 14 November 2026):
+
+      1. `message_start` - a `Message` with empty `content`;
+      2. per content block, `content_block_start`, any number of `content_block_delta` events (for text,
+         `{"type": "text_delta", "text": "..."}`), and `content_block_stop`;
+      3. "One or more `message_delta` events" - top-level changes, including the `stop_reason`;
+      4. a final `message_stop`.
+
+      Plus: "Event streams might also include any number of `ping` events", and "The API might occasionally send
+      errors in the event stream" - for example `{"type": "error", "error": {"type": "overloaded_error", "message":
+      "Overloaded"}}`, "which would normally correspond to an HTTP 529 in a non-streaming context". And a warning in
+      the docs: "The token counts shown in the `usage` field of the `message_delta` event are *cumulative*."
+
+      **Provider-specific: OpenAI** streams with `stream=true` over server-sent events; the "Streaming API responses"
+      guide lists the common events `response.created`, `response.output_text.delta`, `response.completed` and
+      `error`.
+
+      Three consequences for your code, whatever the provider:
+
+      - **Ignore what you do not know.** Pings and new event types must not break the parser.
+      - **Usage is cumulative.** Keep the *latest* count; adding the counts up double-counts.
+      - **A 200 is not success yet.** The stream can carry an error event after text has arrived, or simply stop.
+        Success is the end event (`message_stop`, `response.completed`) - anything else is a partial reply.
+
+      The exercise file `llm_stream.py` gives `events_from_reply`, which turns a fake reply into events in a
+      simplified version of that flow (one text block, `text_delta` events), so the rules can be tested offline:
+
+      ```python
+      from llm_fake import ScriptedLLM
+      from genai.llm_stream import assemble, events_from_reply, stream_text, StreamError
+
+      ASK = [{"role": "user", "content": "What is a chargeback?"}]
+      reply = ScriptedLLM(["A chargeback reverses a card payment after a dispute."]).create(messages=ASK, max_tokens=100)
+      events = events_from_reply(reply, chunk=12)
+      for e in events:
+          print(e)
+      print(assemble(events))
+      ```
+
+      ```plaintext
+      {'type': 'message_start', 'usage': {'input_tokens': 5, 'output_tokens': 0}}
+      {'type': 'text_delta', 'text': 'A chargeback'}
+      {'type': 'ping'}
+      {'type': 'text_delta', 'text': ' reverses a '}
+      {'type': 'message_delta', 'stop_reason': None, 'usage': {'output_tokens': 4}}
+      {'type': 'text_delta', 'text': 'card payment'}
+      {'type': 'text_delta', 'text': ' after a dis'}
+      {'type': 'text_delta', 'text': 'pute.'}
+      {'type': 'message_delta', 'stop_reason': 'end_turn', 'usage': {'output_tokens': 10}}
+      {'type': 'message_stop'}
+      Assembled(text='A chargeback reverses a card payment after a dispute.', stop_reason='end_turn', input_tokens=5, output_tokens=10)
+      ```
+
+      Summing the two `message_delta` counts would report 14 output tokens instead of 10 - the bug the cumulative
+      warning is about. Cut the stream with an error event after two deltas:
+
+      ```python
+      try:
+          assemble(events_from_reply(reply, chunk=12, fail_after=2))
+      except StreamError as e:
+          print("StreamError:", e, "| partial:", repr(e.partial))
+      ```
+
+      ```plaintext
+      StreamError: overloaded_error: Overloaded | partial: 'A chargeback reverses a '
+      ```
+
+      Keep the partial text: Anthropic's "Error recovery" section describes capturing the partial response and
+      sending a continuation request (for Claude 4.6 and later models, as a user message asking the model to
+      continue) instead of starting again. For a JSON reply, starting again is usually simpler.
+
+      For a UI you often only need the text: `stream_text(llm, on_text, **request)` passes each chunk to a callback
+      and returns the whole text. With the fake's 4-character chunks:
+
+      ```plaintext
+      ['A ch', 'arge', 'back', ' rev', 'erse', 's a ', 'card', ' pay', 'ment', ' aft', 'er a', ' dis', 'pute', '.']
+      ```
+
+  - id: visual-stream
+    kind: visual
+    concepts: [llm-request-anatomy]
+    title: One streamed reply
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant App as SandPay app
+        participant API as LLM API
+        App->>API: POST messages (stream on)
+        API-->>App: 200 OK, event stream opens
+        API-->>App: message_start (input tokens)
+        API-->>App: text delta "A chargeback"
+        API-->>App: ping
+        API-->>App: text delta " reverses a "
+        API-->>App: message_delta (usage so far, cumulative)
+        API-->>App: text deltas ...
+        API-->>App: message_delta (stop_reason, final usage)
+        API-->>App: message_stop
+        Note over App: complete only now - an error event<br/>or a dropped connection before this<br/>leaves a partial reply
+      ```
+
+      Notice that the HTTP status is decided at the top, before any text exists - which is why errors during the
+      stream arrive as events, not status codes.
+
+  - id: errors
+    kind: internals
+    concepts: [llm-errors-and-retries]
+    title: Which errors to retry
+    body: |
+      **Provider-specific: Anthropic's HTTP errors** ("Claude API errors", read 14 November 2026), abridged:
+
+      | Status | `error.type` | Meaning | Retry? |
+      | --- | --- | --- | --- |
+      | 400 | `invalid_request_error` | "an issue with the format or content of your request" (also returned at a spend limit you set) | No - fix the request |
+      | 401 | `authentication_error` | API key problem | No |
+      | 403 | `permission_error` | key lacks permission | No |
+      | 404 | `not_found_error` | resource not found | No |
+      | 413 | `request_too_large` | over the request size limit | No |
+      | 429 | `rate_limit_error` | rate limit hit - or the tier's monthly spend cap | Yes, after `retry-after`; not the spend cap |
+      | 500 | `api_error` | unexpected internal error | Yes, "with exponential backoff" |
+      | 504 | `timeout_error` | timed out while processing | Maybe - the docs suggest streaming for long requests |
+      | 529 | `overloaded_error` | "The API is temporarily overloaded." | Yes |
+
+      Errors come back as JSON with a top-level `error` object (`type`, `message`) and a `request_id`; every response
+      also has a `request-id` header - log it, support asks for it.
+
+      **Provider-specific: OpenAI's codes** ("Error codes" and "Rate limits", read 14 November 2026): 429 covers
+      "Rate limit reached for requests", `slow_down` ("Your request rate increased too quickly"), and also
+      **non-transient** cases - `credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+      `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`. Overload is 503 with code
+      `server_is_overloaded`; 500 is a server error. The rate-limit guide says: "Don't retry quota, billing, or other
+      errors that require you to take action", and "Other errors can use the same HTTP statuses, so inspect the error
+      body before choosing a recovery action."
+
+      So the rule is not just "retry 429":
+
+      - **Retry** transient failures: rate limit with a wait, overload (529 / 503), 500-class server errors,
+        dropped connections.
+      - **Never retry** a 400-class error with the same request: it will fail the same way and burn quota.
+      - **Look inside a 429** before retrying. Anthropic documents that the spend-cap 429 "has no `retry-after` header
+        and keeps failing until access resumes", and on the Messages API carries `error.details.error_code`
+        `enforced_spend_limit_reached`; OpenAI uses distinct codes for quota and spend limits.
+
+      Both providers' official SDKs already retry. Anthropic: the SDK "automatically retries transient failures ...
+      with exponential backoff, twice by default, honoring the `retry-after` header when present" (`max_retries` to
+      change it). OpenAI: each SDK "automatically retries eligible `429` and `503` responses", and if you write your
+      own loop, "disable SDK retries or account for them in those limits so nested retry loops don't multiply
+      requests". Two retry layers at 3 attempts each make 9 requests - or 16 with 4 each.
+
+  - id: rate-limits
+    kind: internals
+    concepts: [llm-errors-and-retries, llm-tokens-and-cost]
+    title: Rate limits are counted in requests and tokens
+    body: |
+      **Provider-specific, as documented on 14 November 2026:**
+
+      - **Anthropic** measures Messages API limits in requests per minute (RPM), input tokens per minute (ITPM) and
+        output tokens per minute (OTPM), per model class; "If you exceed any of the rate limits, you get a 429 error".
+        The API "uses the token bucket algorithm", so "your capacity is continuously replenished up to your maximum
+        limit, rather than being reset at fixed intervals", and "a rate of 60 requests per minute (RPM) might be
+        enforced as 1 request per second". OTPM counts tokens actually generated: "The `max_tokens` parameter does not
+        factor into OTPM rate limit calculations". A "ramp limit" can return 429 "after a sharp increase in usage ...
+        even while you're under your ITPM and OTPM rate limits".
+      - **OpenAI** uses RPM, RPD, TPM, TPD and others; "Rate limits can be hit across any of the options depending on
+        what occurs first" - 20 tiny requests can exhaust an RPM of 20.
+
+      Both send headers you can read on **every** response, not only on a 429:
+
+      | | Anthropic | OpenAI |
+      | --- | --- | --- |
+      | Wait before retrying | `retry-after` (seconds; "Earlier retries might fail") | `Retry-After` ("The minimum number of seconds to wait") |
+      | Requests left | `anthropic-ratelimit-requests-remaining` | `x-ratelimit-remaining-requests` |
+      | Tokens left | `anthropic-ratelimit-tokens-remaining` (also `-input-tokens-`, `-output-tokens-`) | `x-ratelimit-remaining-tokens` |
+      | When it refills | `anthropic-ratelimit-*-reset` (an RFC 3339 time) | `x-ratelimit-reset-*` (a duration such as `6m0s`) |
+
+      Use the "remaining" headers to slow down **before** the 429 (a client-side token bucket or a concurrency
+      limit), and the retry-after header when you do get one. Note the different formats: an absolute time on one
+      side, a duration on the other - parse what the docs say, not what you expect.
+
+  - id: retries-code
+    kind: code
+    concepts: [llm-errors-and-retries, llm-tokens-and-cost]
+    title: A client wrapper with backoff, jitter and a meter
+    body: |
+      `practice/ai/exercises/genai/llm_client.py` (you write it in the exercise) wraps any client with a
+      `create(**request)` method. The core of the reference solution:
+
+      ```python
+      RETRYABLE_STATUSES = {429, 500, 502, 503, 504, 529}
+
+      def backoff_delay(attempt, base, cap, rand):
+          """Full jitter: a random delay between 0 and min(cap, base * 2**attempt)."""
+          return rand() * min(cap, base * 2**attempt)
+
+      def is_retryable(error):
+          return getattr(error, "status", None) in RETRYABLE_STATUSES
+
+      class LLMClient:  # a dataclass in the file: llm, model, prices, max_retries=4, base=0.5, cap=8.0,
+                        # max_total_wait=30.0, sleep=time.sleep, rand=random.random, and running totals
+          def next_delay(self, error, attempt):
+              retry_after = getattr(error, "retry_after", None)
+              if retry_after is not None:
+                  return retry_after + self.rand() * self.base   # a minimum, plus a little jitter
+              return backoff_delay(attempt, self.base, self.cap, self.rand)
+
+          def create(self, **request):
+              attempt = 0
+              while True:
+                  try:
+                      reply = self.llm.create(**request)
+                  except Exception as error:
+                      if not is_retryable(error) or attempt >= self.max_retries:
+                          raise
+                      delay = self.next_delay(error, attempt)
+                      if sum(self.waits) + delay > self.max_total_wait:
+                          raise                      # defer the work; never retry sooner than asked
+                      self.waits.append(delay)
+                      self.sleep(delay)
+                      attempt += 1
+                      continue
+                  self.calls += 1
+                  self.input_tokens += reply.input_tokens
+                  self.output_tokens += reply.output_tokens
+                  self.cost += cost_usd(reply.input_tokens, reply.output_tokens, self.model, self.prices)
+                  return reply
+      ```
+
+      `sleep` and `rand` are **injected**: tests pass `list.append` as `sleep` (so nothing waits and every delay is
+      recorded) and a fixed `rand`. A script of a 429 with `retry_after=2`, two overloads, then success - with a
+      seeded generator:
+
+      ```python
+      import random
+      from llm_fake import ScriptedLLM, RateLimitError, OverloadedError, BadRequestError
+      from genai.llm_client import LLMClient
+
+      rng, log = random.Random(7), []
+      llm = ScriptedLLM([RateLimitError(retry_after=2), OverloadedError(), OverloadedError(),
+                         "Your refund was sent on 3 November."])
+      client = LLMClient(llm, "toy-small", sleep=log.append, rand=rng.random)
+      reply = client.create(messages=[{"role": "user", "content": "Where is my refund?"}], max_tokens=100)
+      print(reply.text)
+      print("attempts:", len(llm.calls), "waits:", [round(w, 3) for w in log])
+      print("tokens:", client.input_tokens, client.output_tokens, "cost: $%.8f" % client.cost)
+      ```
+
+      ```plaintext
+      Your refund was sent on 3 November.
+      attempts: 4 waits: [2.162, 0.151, 1.302]
+      tokens: 5 8 cost: $0.00001850
+      ```
+
+      The first wait is 2 seconds plus jitter (never less than the server asked); the next two are random draws below
+      0.5 x 2^1 = 1 and 0.5 x 2^2 = 2 seconds. Only the successful call is metered - rejected requests produce no
+      reply and no usage. A `BadRequestError` is raised after **one** call:
+
+      ```plaintext
+      raised BadRequestError after 1 call(s)
+      [True, True, False]        # is_retryable for 429, overload, 400
+      ```
+
+      **Why jitter.** Exponential backoff alone spaces one client's retries out, but clients that failed together
+      retry together. 100 clients rate-limited at the same moment, first retry with base 1 second:
+
+      ```python
+      def first_retry_times(jitter, seed=0):
+          rng = random.Random(seed)
+          return [backoff_delay(0, 1.0, 8.0, rng.random) if jitter else 1.0 for _ in range(100)]
+      ```
+
+      ```plaintext
+      no jitter   -> first retry between 1.000 and 1.000 s; most retries in any 100 ms: 100
+      full jitter -> first retry between 0.001 and 0.996 s; most retries in any 100 ms: 18
+      ```
+
+      Without jitter, all 100 hit the API in the same instant again - a **thundering herd** that recreates the
+      overload. OpenAI's rate-limit guide puts it as "Adding random jitter to the delay helps retries from all hitting
+      at the same time", and for a `Retry-After` value: "wait at least that long and add a small random delay so
+      multiple clients don't retry at the same time". The same guide says to "Limit both the number of attempts and
+      the total time spent retrying" - which is what `max_retries` and `max_total_wait` do.
+
+  - id: structured-internals
+    kind: internals
+    concepts: [llm-structured-output]
+    title: Three ways to ask for JSON - and what each guarantees
+    body: |
+      | Approach | Guarantees | Still your job |
+      | --- | --- | --- |
+      | **Prompt only** ("Reply with only a JSON object with keys ...") | Nothing. | Extract, parse, validate, repair. |
+      | **JSON mode** | Parseable JSON (provider-specific). | Every field, type and value. |
+      | **Structured outputs** (schema-constrained decoding) | Output follows the supported part of your schema (provider-specific). | Refusals, truncation, unsupported constraints, business rules. |
+
+      **Provider-specific: OpenAI** ("Structured model outputs", read 14 November 2026). Structured Outputs is
+      enabled with `text: { format: { type: "json_schema", "strict": true, "schema": ... } }`; JSON mode with
+      `text: { format: { type: "json_object" } }`. "While both ensure valid JSON is produced, only Structured Outputs
+      ensure schema adherence." In JSON mode "you must always instruct the model to produce JSON" - otherwise "the
+      model may generate an unending stream of whitespace", and "the API will throw an error if the string "JSON"
+      does not appear somewhere in the context". Strict schemas require every field to be `required` and
+      `additionalProperties: false`. And the guide is explicit about the limits: Structured Outputs "constrains
+      completed, non-refusal model output", "Your application still needs to handle refusals, incomplete responses,
+      and API errors, and validate any business rules that the schema does not express", and "Structured Outputs can
+      still contain mistakes".
+
+      **Provider-specific: Anthropic** ("Structured outputs", read 14 November 2026). JSON outputs are requested with
+      `output_config.format` of `type: "json_schema"` and a `schema`; the JSON arrives "in the response's text content
+      block". The schema language is a subset: `additionalProperties` "must be set to `false` for objects", and
+      **not supported** are, among others, "Numerical constraints (such as `minimum`, `maximum`, `multipleOf`)" and
+      "String constraints (`minLength`, `maxLength`)" - an unsupported feature returns a 400; the SDK helpers move
+      such constraints into field descriptions and validate them on the response. The "Invalid outputs" section lists
+      what can still go wrong:
+
+      - a refusal - "`stop_reason: "refusal"`", a 200 status, billed tokens, and "The output might not match your
+        schema";
+      - truncation - "`stop_reason: "max_tokens"`", "The output might be incomplete and not match your schema";
+      - enum casing - "Structured outputs don't guarantee the capitalization of string `enum` and `const` values ...
+        Compare enum values case-insensitively".
+
+      The conclusion is the same for both: constrained decoding removes most **syntax** failures, so use it when your
+      provider and model support it - but **keep a validator in your code**. It catches what the schema cannot say
+      (an amount must be non-negative, a summary at most 200 characters, a currency SandPay supports), it guards
+      providers or models without the feature, and it is the thing your tests can exercise offline.
+
+  - id: json-run
+    kind: code
+    concepts: [llm-structured-output]
+    title: Parse, validate, repair - SandPay ticket triage
+    body: |
+      SandPay wants every support ticket as one object: `category` (refund, chargeback, fraud, other), `amount`
+      (number of at least 0, or null), `currency` (EUR, GBP, USD or null), `urgent` (boolean) and `summary` (at most
+      200 characters). `json_output.py` has three functions.
+
+      **1. Extract** - accept bare JSON, JSON in a code fence, or JSON with prose around it:
+
+      ```python
+      from genai.json_output import extract_json, validate_triage, triage, StructuredOutputError
+
+      print(extract_json('Sure! Here it is:\n```json\n{"category": "refund", "amount": 42.10}\n```'))
+      extract_json('{"category": "refund", "amount": 42.10')     # cut off
+      ```
+
+      ```plaintext
+      {'category': 'refund', 'amount': 42.1}
+      JSONDecodeError: Expecting ',' delimiter: line 1 column 39 (char 38)
+      ```
+
+      **2. Validate** - check every field and report **every** problem (the repair prompt needs them all), returning a
+      normalised copy:
+
+      ```python
+      print(validate_triage({"category": "Refund", "amount": 42.1, "currency": "eur", "urgent": False,
+                             "summary": "Double charge."}))
+      print(validate_triage({"category": "complaint", "amount": "42.10", "currency": "JPY", "urgent": "yes",
+                             "note": "x"}))
+      ```
+
+      ```plaintext
+      ({'category': 'refund', 'amount': 42.1, 'currency': 'EUR', 'urgent': False, 'summary': 'Double charge.'}, [])
+      (None, ['missing field: summary', 'unexpected field: note', "category must be one of refund, chargeback, fraud, other, got 'complaint'", "amount must be a number or null, got '42.10'", "currency must be one of EUR, GBP, USD or null, got 'JPY'", "urgent must be true or false, got 'yes'"])
+      ```
+
+      Two Python traps live here: `isinstance(True, int)` is `True`, so a numeric check must exclude `bool`; and a
+      string `"42.10"` is not a number - coercing it silently hides a model that ignores your format.
+
+      **3. Repair and retry** - if the reply does not parse or validate, send the model its own reply and the list of
+      errors, and ask again:
+
+      ```python
+      first = '{"category": "refund request", "amount": 42.10, "currency": "EUR", "urgent": "no", "summary": "Charged twice at Cafe Lumen."}'
+      second = '{"category": "refund", "amount": 42.10, "currency": "EUR", "urgent": false, "summary": "Charged twice at Cafe Lumen."}'
+      llm = ScriptedLLM([first, second])
+      print(triage(llm, "I was charged 42.10 EUR twice at Cafe Lumen yesterday, please refund one of them!"))
+      for m in llm.calls[1].messages:
+          print(m["role"], "->", m["content"])
+      ```
+
+      ```plaintext
+      {'category': 'refund', 'amount': 42.1, 'currency': 'EUR', 'urgent': False, 'summary': 'Charged twice at Cafe Lumen.'}
+      user -> I was charged 42.10 EUR twice at Cafe Lumen yesterday, please refund one of them!
+      assistant -> {"category": "refund request", "amount": 42.10, "currency": "EUR", "urgent": "no", "summary": "Charged twice at Cafe Lumen."}
+      user -> Your reply was not valid:
+      - category must be one of refund, chargeback, fraud, other, got 'refund request'
+      - urgent must be true or false, got 'no'
+      Reply with only the corrected JSON object.
+      ```
+
+      The second call carries the whole exchange - the ticket, the bad reply and the errors - so the model can
+      correct exactly what was wrong. Two cases end without repair:
+
+      ```plaintext
+      StructuredOutputError: reply truncated at max_tokens 1              # max_tokens=10, first attempt
+      StructuredOutputError: no valid triage after 3 attempts ['not valid JSON: no JSON object in the reply']
+      ```
+
+      A reply cut off at `max_tokens` is not the model's mistake: asking it to "fix" the JSON under the same cap gets
+      another cut-off reply. Raise (or retry with a larger cap) instead. And repair is bounded: after `max_attempts`
+      the caller gets an error with the last problems, to route the ticket to a human queue.
+
+  - id: visual-pipeline
+    kind: visual
+    concepts: [llm-structured-output, llm-errors-and-retries]
+    title: The triage call, end to end
+    body: |
+      ```mermaid
+      flowchart TD
+        A[Ticket] --> B[client.create with retries]
+        B -->|400| X[Raise - fix the request]
+        B -->|429 / 5xx / 529, retries left| W[Wait: retry-after + jitter,<br/>or exponential backoff with jitter] --> B
+        B -->|reply| S{stop reason}
+        S -->|max_tokens| T[Raise: truncated - do not repair]
+        S -->|finished| P[extract_json]
+        P -->|fails| R[Append reply + errors,<br/>ask for corrected JSON]
+        P --> V[validate_triage]
+        V -->|errors| R
+        R -->|attempts left| B
+        R -->|no attempts left| H[Raise - send ticket to a human]
+        V -->|valid| OK[Normalised triage object]
+      ```
+
+      Notice the two loops are different: the **retry** loop (inside the client) re-sends the same request after a
+      transport failure and costs nothing extra; the **repair** loop sends a longer, new request after a successful
+      but wrong reply - and is billed.
+
+  - id: cost
+    kind: code
+    concepts: [llm-tokens-and-cost]
+    title: Counting tokens and money
+    body: |
+      Providers bill by tokens. **Provider-specific - Anthropic's reference** describes `usage` as "Billing and
+      rate-limit usage", and warns that because requests are transformed and outputs parsed, "the token counts in
+      `usage` will not match one-to-one with the exact visible content of an API request or response" - for example
+      "`output_tokens` will be non-zero, even for an empty string response". **OpenAI's** `usage` has
+      `input_tokens`, `output_tokens` and details such as `cached_tokens` and `reasoning_tokens` (`max_output_tokens` counts
+      "visible output tokens and reasoning tokens", so output can exceed the text you see). So: **meter from the usage the API returns**, and use your own token counting
+      only for estimates before a call.
+
+      Cost per call is
+
+      ```plaintext
+      cost = input_tokens x input_price + output_tokens x output_price      (prices per token)
+      ```
+
+      Output tokens usually cost several times more than input tokens, which is why the made-up table below keeps that
+      shape. **The prices are fictional - for arithmetic only:**
+
+      ```python
+      from llm_fake import count_tokens
+      from genai.llm_client import TOY_PRICES, cost_usd
+      from genai.json_output import TRIAGE_INSTRUCTIONS
+
+      print(TOY_PRICES)                                   # dollars per MILLION tokens: (input, output)
+      inp = count_tokens(TRIAGE_INSTRUCTIONS + TICKET); out = count_tokens(second)
+      print("one triage call: input", inp, "output", out)
+      for model in TOY_PRICES:
+          c = cost_usd(inp, out, model, TOY_PRICES)
+          print(f"{model}: ${c:.6f} per ticket, ${c * 20000 * 30:.2f} per month at 20,000 tickets a day")
+      ```
+
+      ```plaintext
+      {'toy-small': (0.5, 2.0), 'toy-large': (5.0, 25.0)}
+      one triage call: input 100 output 44
+      toy-small: $0.000138 per ticket, $82.80 per month at 20,000 tickets a day
+      toy-large: $0.001600 per ticket, $960.00 per month at 20,000 tickets a day
+      ```
+
+      Fractions of a cent per call become real money at volume - and the choice of model is a 10x lever. Now meter
+      the triage with one repair round against a first-time-right reply, through `LLMClient`:
+
+      ```plaintext
+      with one repair: 2 calls, 292 in, 91 out, $0.000328
+      first time right: 1 call,  100 in, 44 out, $0.000138 -> repair costs 2.4x
+      ```
+
+      The repair call re-sends the system prompt, the ticket, the bad reply and the error list, so one repair more
+      than doubles the cost of that ticket. A repair rate is therefore a **cost** metric as well as a quality one; it
+      is worth tracking per prompt version. Retries of rejected calls (429, 529) cost nothing in tokens - but they
+      cost latency and they count toward request-per-minute limits.
+
+      Practical rules: set `max_tokens` from the largest valid answer (it bounds the worst-case output cost); keep a
+      meter per feature, model and prompt version; alert on cost per successful result, not per call; and remember
+      that a long conversation re-bills its whole history on every turn.
+
+  - id: steps
+    kind: steps
+    concepts: [llm-request-anatomy, llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: Building an LLM call you can run in production
+    body: |
+      1. **Write the request as data**: system prompt, the full message list, an explicit `max_tokens` sized to the
+         largest valid answer. Keep the conversation in your code - the API stores nothing.
+      2. **Inject the client.** Your function takes the model client as a parameter, so tests pass a scripted fake.
+      3. **Branch on the stop reason** before using the content: finished, truncated, refused, tool call.
+      4. **Classify errors**: never retry 400-class; retry 429, 5xx and overload; inspect a 429's body for spend or
+         quota limits.
+      5. **Back off**: wait at least `retry-after`, else exponential backoff with jitter; cap attempts and total wait;
+         make sure the SDK's own retries and yours do not multiply.
+      6. **Ask for JSON** with the strongest tool the provider offers (structured outputs > JSON mode > prompt),
+         **and** extract, validate and report every error in your code.
+      7. **Repair at most once or twice**, sending the bad reply and the errors; do not repair a truncated reply;
+         after the last attempt, hand the item to a human queue.
+      8. **Stream** where a person is waiting; assemble events, keep the latest cumulative usage, and treat a missing
+         end event as failure.
+      9. **Meter** input and output tokens from the API's usage on every successful call; turn them into cost with the
+         current price table; track cost per successful result.
+      10. **Log** the request id, model, stop reason, usage, retries and repair count for every call.
+
+  - id: example
+    kind: example
+    concepts: [llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: "Example: reviewing SandPay's triage service before launch"
+    body: |
+      SandPay's support team will route 20,000 tickets a day through the LLM triage. A tester reviewing it before
+      launch checks behaviour, not prose:
+
+      - **Contract:** feed scripted replies that are bare JSON, fenced JSON, JSON with prose, malformed JSON, wrong
+        enum (`"Refund request"`), wrong type (`"urgent": "no"`), a string amount, a negative amount, a 201-character
+        summary, an extra field. Expected: the first three are accepted and normalised; each of the others produces a
+        precise error and a repair prompt containing it.
+      - **Truncation:** a reply with stop reason `max_tokens`. Expected: no repair call (`len(llm.calls) == 1`), an
+        error that says "truncated", and the ticket routed to the human queue.
+      - **Retries:** a scripted 429 with `retry_after=3`, then success. Expected: one recorded sleep of at least 3
+        seconds, two calls. A 400 then anything: exactly one call. Ten overloads: `max_retries + 1` calls, then the
+        error.
+      - **Budget:** with `LLMClient` metering, 100 scripted tickets where 10% need a repair. Expected: cost equals the
+        sum of `cost_usd` over the successful calls; repair rate 10%. Projected monthly cost under the current
+        (real, dated) price list goes into the launch note.
+      - **Evidence:** the pytest report, the recorded `llm.calls` (what was sent), the recorded sleeps, and the meter's
+        totals - all from offline runs, so they are repeatable in CI.
+
+      What the tester cannot prove offline: that the real model returns valid triage for real tickets. That needs an
+      evaluation set run against the real API (the [evaluation lesson](#/lesson/llm-evaluation-and-guardrails)).
+
+  - id: tests
+    kind: tests
+    concepts: [llm-errors-and-retries, llm-structured-output, llm-request-anatomy]
+    title: Test cases for an LLM client
+    body: |
+      | # | Case | Input (scripted) | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Happy path | valid JSON | object returned, 1 call | `len(llm.calls) == 1` |
+      | 2 | Fenced JSON | ` ```json ... ``` ` | same object | return value |
+      | 3 | Repair | invalid then valid | 2 calls; 2nd has assistant reply + errors | `llm.calls[1].messages` |
+      | 4 | Give up | invalid x 3 | `StructuredOutputError` with last errors | exception fields |
+      | 5 | Truncated | `max_tokens` stop | error, no repair | 1 call |
+      | 6 | Rate limited | 429 (`retry_after=5`) then ok | one wait of at least 5 s | recorded sleeps |
+      | 7 | Bad request | 400 | raised, 1 call, no sleep | call count, sleeps |
+      | 8 | Overload storm | 503 x 10 | `max_retries + 1` calls then raise | call count |
+      | 9 | Wait budget | two 429s of 20 s, budget 30 s | raise before the 2nd wait | sleeps `[20.25]` |
+      | 10 | Stream error | error event mid-stream | `StreamError` with partial text | exception |
+      | 11 | Stream cut | no end event | `StreamError` | exception |
+      | 12 | Usage | two cumulative deltas | latest count, not the sum | assembled usage |
+
+      Negative tests matter most: the model's success path is the one you see in a demo; the failure paths are the
+      ones that happen at 3 a.m. under load. All twelve run in milliseconds because `sleep` is injected.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [llm-request-anatomy, llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Using `reply.text` without checking the stop reason.** Symptom: occasional `JSONDecodeError` on long
+        inputs, or answers that end mid-sentence. Check: log `stop_reason` with every call; truncations cluster on
+        long inputs.
+      - **Retrying everything.** Symptom: a config error (400) turns into thousands of requests and a quota alert.
+        Check: retry counts per status code in the logs.
+      - **Retrying immediately, or at fixed intervals.** Symptom: 429 rates that stay high after a spike, retries
+        arriving in waves. Fix: honour `retry-after`, add jitter.
+      - **Two retry layers.** Your loop plus the SDK's default retries multiply attempts. Fix: set the SDK's
+        `max_retries` to 0 when you own the loop, or rely on the SDK and do not add one.
+      - **Treating every 429 as temporary.** A spend-cap or quota 429 never clears by waiting. Check the error body
+        (`enforced_spend_limit_reached`, `credit_balance_exhausted` and similar - provider-specific).
+      - **Trusting JSON mode or a schema as validation.** Symptom: negative amounts or unsupported currencies in the
+        database. Fix: validate business rules in code.
+      - **Repairing a truncated reply.** It comes back truncated again - and billed twice.
+      - **Summing streamed usage.** Usage in Anthropic's `message_delta` is cumulative; summing over-reports cost.
+      - **Treating a 200 stream as success.** An error event or a dropped connection leaves a partial reply.
+      - **Losing the conversation.** The API stores nothing; the model "forgets" whatever your code did not send.
+      - **Estimating cost from characters, or forgetting repair rounds.** Meter from `usage`, per successful result.
+
+      Debugging method: reproduce with a `ScriptedLLM` script that replays the failing sequence (the error, the
+      reply text, the stop reason from the logs), then look at `llm.calls` to see exactly what your code sent.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: Trade-offs and alternatives
+    body: |
+      - **SDK retries or your own loop?** The SDKs' retries are tested and honour retry-after - use them unless you
+        need a total wait budget, custom classification or metrics per attempt. Never both unaccounted.
+      - **Structured outputs or prompt plus validator?** Constrained decoding removes syntax failures and most repair
+        rounds (and their cost), but it is provider- and model-specific, supports a subset of JSON Schema, and the
+        schema is extra input. The validator is needed either way.
+      - **Repair or fail fast?** Each repair round more than doubles that item's cost and adds a full round trip of
+        latency. One repair is often worth it; three rarely are - measure the success rate of each extra attempt.
+      - **Streaming or not?** Streaming improves perceived latency for people; for a back-end job that needs the
+        whole JSON before it can act, it only adds failure modes. (Anthropic suggests streaming for long requests to
+        avoid timeouts - a reason to stream even in a back end.)
+      - **Bigger model or smaller?** In the made-up table the large model costs about 11.6x more per ticket. A smaller
+        model plus validation and an occasional repair can be cheaper and as accurate - only an evaluation on your
+        own tickets can say.
+      - **Batch APIs** (both providers document one, with their own rate or queue limits) suit overnight back-fills,
+        not a waiting customer. Check the provider's batch documentation for current pricing and terms.
+
+  - id: summary
+    kind: summary
+    concepts: [llm-request-anatomy, llm-errors-and-retries, llm-structured-output, llm-tokens-and-cost]
+    title: Quick reference
+    body: |
+      - Request = system prompt + the **whole** conversation (roles `user` / `assistant`) + `max_tokens`. The API keeps
+        no state.
+      - Reply = content blocks + **stop reason** + **usage**. Truncation (`max_tokens`) is a 200 - check it.
+      - Streaming: text deltas, pings, cumulative usage, stop reason near the end; success only at the end event.
+      - Retry 429 / 5xx / 529; never 400s; wait at least retry-after, else exponential backoff with **jitter**; cap
+        attempts and total wait; do not stack SDK and app retries.
+      - Some 429s are spend or quota limits - read the body.
+      - JSON: structured outputs > JSON mode > prompt; **always** extract, validate every field, report all errors.
+      - Repair once or twice with the bad reply and the errors; never repair a truncated reply.
+      - Cost = input x input price + output x output price, metered from `usage`; repair rounds are billed; every turn
+        re-sends history.
+      - Provider details (names, headers, codes) differ - quote the docs with a date.
+
+exercises:
+  - id: truncated-reply
+    type: mcq
+    concept: llm-request-anatomy
+    skill: analysis
+    title: Why does json.loads fail on 2% of tickets?
+    prompt: |
+      SandPay's triage calls the model with `max_tokens=60` and runs `json.loads(reply.text)`. About 2% of calls raise
+      `JSONDecodeError: Unterminated string`. Every failing call returned HTTP 200. The logs show the failing tickets
+      are the longest ones, and each failing reply has `output_tokens` equal to 60. What is going on, and what is the
+      best fix?
+    options:
+      - id: truncated
+        text: The replies were cut off at max_tokens (stop reason max_tokens). Check the stop reason before parsing, and raise max_tokens to fit the largest valid answer.
+        feedback: Correct - output_tokens equal to the cap and an unterminated string are the signature of truncation. A 200 with a max_tokens stop reason is a successful but incomplete reply.
+      - id: server-error
+        text: The API had transient errors; retry the failed calls with backoff.
+        feedback: Transient errors come back as 429 or 5xx status codes, not as a 200 with a body. Retrying the same request with the same cap truncates again.
+      - id: repair
+        text: The model makes JSON mistakes on long tickets; send the errors back and ask it to repair the JSON.
+        feedback: The model was stopped, not wrong. A repair under the same 60-token cap is truncated again - and billed again.
+      - id: temperature
+        text: Lower the temperature so the model writes more compact JSON.
+        feedback: Sampling settings do not change the cap. The evidence (output_tokens exactly 60) points at max_tokens.
+    correct: [truncated]
+    hints:
+      - Compare output_tokens on the failing calls with max_tokens.
+      - Is a reply that hit the token cap an HTTP error?
+    solution: |
+      `output_tokens == max_tokens` on every failure plus an unterminated string means the model was stopped by the
+      cap. The API reports this as a successful response with stop reason `max_tokens` (Anthropic) or status
+      `incomplete` with reason `max_output_tokens` (OpenAI). Confirm by logging the stop reason; fix by checking it
+      before parsing and sizing `max_tokens` for the largest valid answer (and keeping summaries short in the schema).
+    followUp: |
+      After raising the cap to 300, 0.1% of tickets still end with `max_tokens` - all of them pasted e-mail threads
+      that the model tries to quote. What would you change in the request or the schema?
+
+  - id: stream-order
+    type: order
+    concept: llm-request-anatomy
+    skill: recall
+    title: Anthropic's streaming event flow, in order
+    prompt: |
+      Put the events of one streamed Anthropic Messages reply with a single text block in order (as documented on
+      14 November 2026; `ping` events may appear anywhere and are left out).
+    items:
+      - id: message-start
+        text: message_start - a Message with empty content
+      - id: block-start
+        text: content_block_start for index 0
+      - id: block-delta
+        text: content_block_delta events carrying text_delta pieces
+      - id: block-stop
+        text: content_block_stop for index 0
+      - id: message-delta
+        text: message_delta with the stop_reason and cumulative usage
+      - id: message-stop
+        text: message_stop
+    hints:
+      - Content blocks open and close inside the message.
+      - The stop reason is only known once the content is finished.
+    solution: |
+      `message_start`, then each content block (`content_block_start`, deltas, `content_block_stop`), then one or more
+      `message_delta` events carrying top-level changes such as `stop_reason` (the usage in them is cumulative), then
+      `message_stop`. Only after `message_stop` is the reply complete.
+
+  - id: stream-code
+    type: coding
+    concept: llm-request-anatomy
+    skill: application
+    title: Assemble a streamed reply
+    prompt: |
+      In `llm_stream.py`, `events_from_reply` is given. Implement `assemble(events)` - concatenate text deltas, take
+      input tokens from `message_start`, keep the **latest** cumulative output count and the last stop reason that is
+      set, ignore pings and unknown events, raise `StreamError` (with the partial text) on an error event or when the
+      stream ends without `message_stop` - and `stream_text(llm, on_text, **request)`, which forwards every chunk of
+      `llm.stream(...)` to the callback and returns the whole text. The starting draft of `assemble` sums the usage
+      and trusts every stream to finish.
+    project: ai
+    files:
+      - exercises/genai/llm_stream.py
+    test: tests/genai/test_llm_stream.py
+    command: .venv/bin/python -m pytest tests/genai/test_llm_stream.py
+    hints:
+      - Loop once over the events with an if/elif on event["type"]; anything unmatched simply falls through.
+      - "Use event.get(\"stop_reason\") and only overwrite stop_reason when it is not None - an early message_delta may carry None."
+      - Track a finished flag set by message_stop, and check it after the loop.
+      - stream_text is four lines - a list, a for loop over llm.stream(**request), the callback, and a join.
+    modelAnswer: |
+      ```python
+      def assemble(events):
+          parts, stop_reason = [], None
+          input_tokens = output_tokens = 0
+          finished = False
+          for event in events:
+              kind = event.get("type")
+              if kind == "message_start":
+                  input_tokens = event["usage"]["input_tokens"]
+                  output_tokens = event["usage"].get("output_tokens", 0)
+              elif kind == "text_delta":
+                  parts.append(event["text"])
+              elif kind == "message_delta":
+                  output_tokens = event["usage"]["output_tokens"]      # cumulative: replace, never add
+                  if event.get("stop_reason") is not None:
+                      stop_reason = event["stop_reason"]
+              elif kind == "message_stop":
+                  finished = True
+              elif kind == "error":
+                  error = event["error"]
+                  raise StreamError(f"{error['type']}: {error['message']}", "".join(parts))
+          if not finished:
+              raise StreamError("stream ended without message_stop", "".join(parts))
+          return Assembled("".join(parts), stop_reason, input_tokens, output_tokens)
+
+
+      def stream_text(llm, on_text, **request):
+          parts = []
+          for piece in llm.stream(**request):
+              on_text(piece)
+              parts.append(piece)
+          return "".join(parts)
+      ```
+
+      The cumulative rule is the one most drafts miss; the missing-end check is the one that turns a silently partial
+      answer into an error the caller can handle (retry, or continue from the partial text).
+    solution: |
+      Replace (never add) the cumulative usage, ignore events you do not know, and raise StreamError with the partial
+      text on an error event or when message_stop never arrives. The reference is
+      `practice/ai/solutions/genai/llm_stream.py`.
+    rubric:
+      - Every test in tests/genai/test_llm_stream.py passes.
+      - Usage from message_delta replaces the previous count instead of adding to it.
+      - Unknown event types and pings are ignored rather than raising.
+      - A stream without message_stop is an error, and the partial text is kept on the exception.
+
+  - id: retry-debug
+    type: debug
+    concept: llm-errors-and-retries
+    skill: analysis
+    title: Why did one bad deploy send 40,000 requests?
+    prompt: |
+      After a deploy set `max_tokens` above the model's limit, this helper sent about 40,000 requests in ten minutes
+      and the provider started returning 429 to every SandPay service. Click **every** line that causes or worsens
+      the problem.
+    language: python
+    code: |
+      def call(client, request, attempts=50):
+          for attempt in range(attempts):
+              try:
+                  return client.messages.create(**request)
+              except Exception as error:
+                  delay = 0.5 * 2 ** attempt
+                  log.warning("attempt %d failed: %s", attempt, error)
+                  time.sleep(min(delay, 2.0))
+          raise RuntimeError("model unavailable")
+    correctLines: [1, 5, 6, 8]
+    lineNotes:
+      - line: 4
+        note: The call itself is fine; the SDK may also retry internally, which multiplies attempts - worth checking, but the bug is in how failures are handled.
+      - line: 7
+        note: Logging every attempt is noisy but harmless; it is how the problem was found.
+      - line: 9
+        note: Raising after the last attempt is right; the message hides the real error, which is poor but not the cause.
+    hints:
+      - Which kind of error was every request getting after the deploy - and should it ever be retried?
+      - What happens when every worker sleeps exactly the same time?
+      - How long, at most, does this function wait in total, and how many times does it try?
+    solution: |
+      - **Line 5** catches every exception, including the 400 `invalid_request_error` the bad `max_tokens` caused - a
+        request that can never succeed. Catch only retryable errors (429, 5xx, overload) and re-raise the rest at once.
+      - **Line 1** allows 50 attempts per call - with an SDK that also retries by default, more. Cap attempts at a few,
+        and account for the SDK's own retries.
+      - **Lines 6 and 8** give every worker the same deterministic schedule, capped at 2 seconds - no jitter, no
+        retry-after. Workers that fail together retry together, which keeps the rate limit exceeded. Wait at least the
+        server's retry-after, otherwise use exponential backoff with random jitter, and cap the total waiting time.
+
+  - id: which-retry
+    type: mcq
+    concept: llm-errors-and-retries
+    skill: application
+    title: Which of these should the client retry?
+    prompt: |
+      SandPay's client receives the following. Which **should** be retried automatically? (Provider behaviour as
+      documented by Anthropic and OpenAI on 14 November 2026.)
+    options:
+      - id: overload-and-ratelimit
+        text: An Anthropic 529 overloaded_error, an OpenAI 503 server_is_overloaded, and a 429 rate_limit_error with a retry-after header of 4 seconds (after waiting at least 4 seconds).
+        feedback: Correct - overload and rate limits with a retry-after are transient; both providers say to follow the retry-after header when it is present.
+      - id: all-429
+        text: Every 429, including OpenAI's credit_balance_exhausted and Anthropic's spend-cap 429 without retry-after.
+        feedback: Those 429s need someone to add credit or raise a limit. Anthropic says the spend-cap 429 "keeps failing until access resumes"; OpenAI says not to retry quota or billing errors.
+      - id: 400-too
+        text: All of the above plus a 400 invalid_request_error, because it might be a temporary validation glitch.
+        feedback: A 400 means the request itself is wrong; sending the same request again fails the same way and wastes quota.
+      - id: none
+        text: None - retries make overload worse, so fail fast always.
+        feedback: Retries without backoff make overload worse; bounded retries with backoff and jitter are what both providers recommend for transient errors.
+    correct: [overload-and-ratelimit]
+    hints:
+      - Will waiting change the outcome for this error?
+      - Read the 429's body - is it about request rate, or about money?
+    solution: |
+      Retry when waiting can change the outcome: overload (529, 503), server errors, and rate-limit 429s - waiting at
+      least the retry-after. Do not retry 400-class errors or 429s caused by spend caps, credit or quota; they need a
+      person, so alert instead.
+    followUp: |
+      A 504 `timeout_error` arrives for a long non-streaming request. Would you retry it as is? What does Anthropic's
+      error page suggest instead?
+
+  - id: client-code
+    type: coding
+    concept: llm-errors-and-retries
+    skill: application
+    title: A retrying, metering client wrapper
+    prompt: |
+      In `llm_client.py`, implement `backoff_delay` (full jitter, capped), `is_retryable` (by the error's `status`:
+      429, 500, 502, 503, 504 and 529), `cost_usd` (from a per-million-token price table), `LLMClient.next_delay`
+      (retry-after plus up to `base` of jitter, else backoff) and `LLMClient.create`: no retry for non-retryable
+      errors, at most `max_retries` retries, stop before the total wait would exceed `max_total_wait`, and add tokens
+      and cost to the running totals after each successful call. `sleep` and `rand` are injected - never call
+      `time.sleep` directly. The starting draft retries everything three times after one second.
+    project: ai
+    files:
+      - exercises/genai/llm_client.py
+    test: tests/genai/test_llm_client.py
+    command: .venv/bin/python -m pytest tests/genai/test_llm_client.py
+    hints:
+      - backoff_delay is one line - rand() times the smaller of cap and base * 2**attempt. Reject a negative attempt.
+      - "getattr(error, \"status\", None) works for any exception, including ones without a status."
+      - In create, use while True with try/except; in the except branch decide raise-or-wait, in the else path update the meter and return.
+      - Compare sum(self.waits) + delay with max_total_wait before sleeping, and append the delay to self.waits only when you actually wait.
+    modelAnswer: |
+      ```python
+      def backoff_delay(attempt, base, cap, rand):
+          if attempt < 0:
+              raise ValueError("attempt must be >= 0")
+          return rand() * min(cap, base * 2**attempt)
+
+      def is_retryable(error):
+          return getattr(error, "status", None) in {429, 500, 502, 503, 504, 529}
+
+      def cost_usd(input_tokens, output_tokens, model, prices):
+          price_in, price_out = prices[model]
+          return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+      # in LLMClient
+      def next_delay(self, error, attempt):
+          retry_after = getattr(error, "retry_after", None)
+          if retry_after is not None:
+              return retry_after + self.rand() * self.base
+          return backoff_delay(attempt, self.base, self.cap, self.rand)
+      ```
+
+      `create` is the loop shown in the lesson: re-raise when the error is not retryable, the retries are used up, or
+      the next wait would break the budget; otherwise record, sleep and try again; on success add the reply's usage
+      and cost. Two design points: the retry-after is a **minimum** (jitter is added on top, never subtracted), and
+      only successful calls are metered because rejected requests return no usage.
+    solution: |
+      Classify by status, wait at least retry-after (plus jitter) or a full-jitter backoff, cap attempts and total
+      wait, and meter only successful calls. The reference is `practice/ai/solutions/genai/llm_client.py`.
+    rubric:
+      - Every test in tests/genai/test_llm_client.py passes.
+      - A 400-class error is raised after exactly one call, with no sleep.
+      - The wait after a rate limit is never shorter than retry_after, and backoff waits are randomised.
+      - Attempts and total waiting time are both capped; time.sleep and random are injected, not called directly.
+
+  - id: spend-cap-429
+    type: mcq
+    concept: llm-errors-and-retries
+    skill: analysis
+    title: The 429 that never clears
+    prompt: |
+      At 14:00 on the last day of the month every SandPay call to the Anthropic API starts returning 429
+      `rate_limit_error`. The responses have **no** `retry-after` header; the request rate is a tenth of the usual,
+      and the body contains `"details": { "error_code": "enforced_spend_limit_reached" }`. The SDK retries twice and
+      fails. What do you do?
+    options:
+      - id: spend-cap
+        text: Stop retrying and alert - this is the spend cap (or a spend limit), not a rate limit; access resumes only when the limit is raised or the tier changes.
+        feedback: Correct - Anthropic documents that the spend-cap 429 has no retry-after header, carries enforced_spend_limit_reached on the Messages API, and keeps failing until access resumes.
+      - id: more-retries
+        text: Raise max_retries to 10 and the backoff cap to 60 seconds.
+        feedback: Retrying cannot clear a spend cap; more retries only add load and delay the alert.
+      - id: lower-rate
+        text: Lower the request rate with a client-side limiter until the 429s stop.
+        feedback: The rate is already a tenth of normal - the evidence says this is not about rate.
+      - id: switch-key
+        text: Rotate the API key, because 429 means the key is blocked.
+        feedback: Key problems are 401 or 403. The error code names a spend limit.
+    correct: [spend-cap]
+    hints:
+      - Which header is missing, and what does the error_code say?
+      - What date is it?
+    solution: |
+      Read the body, not just the status. No retry-after, a low request rate, the month's end and
+      `enforced_spend_limit_reached` all point at the spend limit. Retries cannot help; the client should classify this
+      as non-retryable, fail fast with a clear message, and page whoever owns the budget. OpenAI has the same pattern
+      with its own codes (`organization_spend_limit_exceeded`, `credit_balance_exhausted`).
+
+  - id: json-code
+    type: coding
+    concept: llm-structured-output
+    skill: application
+    title: Parse, validate and repair triage JSON
+    prompt: |
+      In `json_output.py`, implement `extract_json` (bare, fenced, or wrapped in prose; `ValueError` when nothing
+      parses - the draft only handles bare JSON), `validate_triage` (every field of the triage contract, all errors
+      reported, enum values compared case-insensitively, `bool` not accepted as a number, normalised copy returned)
+      and `triage` (call the model with `TRIAGE_INSTRUCTIONS`; on a parse or validation failure append the reply and a
+      user message listing the errors and try again, up to `max_attempts`; on a `max_tokens` stop raise at once).
+    project: ai
+    files:
+      - exercises/genai/json_output.py
+    test: tests/genai/test_json_output.py
+    command: .venv/bin/python -m pytest tests/genai/test_json_output.py
+    hints:
+      - The module gives you _FENCE (a regex for code fences) and _is_number; json.JSONDecodeError is a subclass of ValueError.
+      - In validate_triage, collect missing and unexpected fields first with two list comprehensions, then check each present field on its own so one bad field does not hide another.
+      - For enums, compare value.lower() with CATEGORIES and value.upper() with CURRENCIES, but check isinstance(value, str) first.
+      - In triage, check reply.stop_reason before parsing; the repair message must contain the word JSON and each error.
+    modelAnswer: |
+      ```python
+      def extract_json(text):
+          text = text.strip()
+          fenced = _FENCE.search(text)
+          if fenced:
+              text = fenced.group(1).strip()
+          elif not text.startswith("{"):
+              start, end = text.find("{"), text.rfind("}")
+              if start == -1 or end < start:
+                  raise ValueError("no JSON object in the reply")
+              text = text[start : end + 1]
+          return json.loads(text)
+
+
+      def triage(llm, ticket, max_attempts=3, max_tokens=300):
+          messages = [{"role": "user", "content": ticket}]
+          errors = []
+          for attempt in range(1, max_attempts + 1):
+              reply = llm.create(system=TRIAGE_INSTRUCTIONS, messages=messages, max_tokens=max_tokens)
+              if reply.stop_reason == "max_tokens":
+                  raise StructuredOutputError("reply truncated at max_tokens", ["reply truncated"], attempt)
+              try:
+                  obj = extract_json(reply.text)
+              except ValueError as error:
+                  errors = [f"not valid JSON: {error}"]
+              else:
+                  clean, errors = validate_triage(obj)
+                  if clean is not None:
+                      return clean
+              messages.append({"role": "assistant", "content": reply.text})
+              messages.append({"role": "user", "content": "Your reply was not valid:\n- " + "\n- ".join(errors)
+                               + "\nReply with only the corrected JSON object."})
+          raise StructuredOutputError(f"no valid triage after {max_attempts} attempts", errors, max_attempts)
+      ```
+
+      `validate_triage` checks each field separately and appends a message per problem (see the solution file). The
+      repair prompt works because it is specific: the model sees its own reply and the exact rule each field broke.
+    solution: |
+      Extract tolerantly, validate every field and report all errors, repair with the bad reply plus the errors, and
+      raise at once on a max_tokens stop. The reference is `practice/ai/solutions/genai/json_output.py`.
+    rubric:
+      - Every test in tests/genai/test_json_output.py passes.
+      - All validation errors are reported in one pass, not only the first.
+      - True/False is rejected as an amount and "42.10" is not coerced into a number.
+      - A truncated reply is never sent for repair, and the number of attempts is bounded.
+
+  - id: schema-not-enough
+    type: mcq
+    concept: llm-structured-output
+    skill: analysis
+    title: Structured outputs are on - why keep a validator?
+    prompt: |
+      SandPay moves triage to Anthropic structured outputs with a JSON schema whose `amount` has `"minimum": 0` and
+      whose `category` is an enum. A teammate proposes deleting `validate_triage` "because the API guarantees the
+      schema now". Based on Anthropic's structured-outputs page (14 November 2026), which statement is right?
+    options:
+      - id: keep
+        text: Keep it - minimum is not a supported constraint (it is moved to the description by the SDK helpers, or rejected with a 400 in a raw schema), refusals and max_tokens stops may not match the schema, and enum capitalisation is not guaranteed.
+        feedback: Correct - all four are documented limits, and business rules beyond the schema (supported currencies, summary length) still need code.
+      - id: delete
+        text: Delete it - constrained decoding guarantees every field, type and constraint.
+        feedback: It constrains the supported subset of JSON Schema for completed, non-refusal output. Numerical and string-length constraints are not in that subset.
+      - id: syntax-only
+        text: Keep only the json.loads step, because the remaining risk is invalid JSON syntax.
+        feedback: Syntax is the risk structured outputs does remove for completed replies; the remaining risks are semantic (constraints, casing, refusals, truncation).
+      - id: json-mode
+        text: Switch to JSON mode instead, which validates the schema more strictly.
+        feedback: JSON mode (an OpenAI feature name) guarantees only valid JSON, not schema adherence - it is weaker, not stronger.
+    correct: [keep]
+    hints:
+      - Look at the "Not supported" list for numbers and strings.
+      - What does the response look like when stop_reason is refusal?
+    solution: |
+      Structured outputs narrow the failure modes; they do not remove the validator. Anthropic lists numerical
+      constraints as unsupported, says a refusal or a `max_tokens` stop "might not match your schema", and says to
+      compare enum values case-insensitively. OpenAI's guide likewise tells you to handle refusals and incomplete
+      responses and "validate any business rules that the schema does not express".
+
+  - id: json-mode-vs-structured
+    type: short
+    concept: llm-structured-output
+    skill: recall
+    title: JSON mode versus structured outputs
+    prompt: |
+      In two or three sentences: what does OpenAI's JSON mode guarantee, what does Structured Outputs add, and which
+      precaution does the documentation require when you use JSON mode?
+    modelAnswer: |
+      JSON mode (`text.format` of type `json_object`) only ensures the output is valid, parseable JSON; it does not
+      check any schema. Structured Outputs (`json_schema` with `strict: true`) also makes completed, non-refusal output
+      follow the supplied schema. With JSON mode you must instruct the model to produce JSON somewhere in the
+      conversation - otherwise it may emit whitespace until the token limit, and the API errors if the string "JSON"
+      does not appear in the context.
+    rubric:
+      - JSON mode = valid JSON only, no schema adherence.
+      - Structured Outputs = schema adherence for completed, non-refusal output.
+      - Mentions the instruction to produce JSON (and the whitespace or error consequence).
+    hints:
+      - One guarantees syntax, the other structure.
+    solution: |
+      Valid JSON versus schema adherence; and JSON mode needs an explicit "JSON" instruction in the context.
+
+  - id: cost-calc
+    type: mcq
+    concept: llm-tokens-and-cost
+    skill: application
+    title: What will the dispute summariser cost per day?
+    prompt: |
+      Using the lesson's **made-up** price table (`toy-large`: 5.00 dollars per million input tokens, 25.00 per million
+      output tokens), a dispute summariser averages 1,200 input and 300 output tokens per successful call, and runs
+      50,000 times a day. What is the daily cost?
+    options:
+      - id: right
+        text: About 675 dollars a day (0.0135 dollars per call).
+        feedback: "Correct - 1,200 x 5 + 300 x 25 = 13,500 dollars per million calls' worth of tokens, i.e. 0.0135 dollars per call; times 50,000 = 675."
+      - id: one-price
+        text: About 375 dollars a day, pricing all 1,500 tokens at the input price.
+        feedback: Output tokens cost five times more here; pricing them as input under-estimates the bill.
+      - id: thousand
+        text: About 675,000 dollars a day.
+        feedback: The prices are per million tokens, not per thousand - check the unit before multiplying.
+      - id: output-only
+        text: About 375 dollars a day, because only generated tokens are billed.
+        feedback: Input tokens are billed too - and every turn of a conversation re-sends them.
+    correct: [right]
+    hints:
+      - Price input and output tokens separately.
+      - Divide by one million once.
+    solution: |
+      Per call: (1,200 x 5.00 + 300 x 25.00) / 1,000,000 = 13,500 / 1,000,000 = 0.0135 dollars. Per day: 0.0135 x 50,000
+      = 675 dollars. Add the repair rate: if 10% of calls need a repair round costing about 1.4 times a first call
+      (as in the lesson's run), the bill grows by about 14%.
+
+  - id: stream-usage-sum
+    type: mcq
+    concept: llm-tokens-and-cost
+    skill: analysis
+    title: The cost dashboard says streaming doubled the bill
+    prompt: |
+      After the support chat switched to streaming, SandPay's cost dashboard shows output tokens up 60% while the
+      provider's invoice is flat. The metering code adds `event["usage"]["output_tokens"]` for every `message_delta`
+      event of each stream. What is wrong?
+    options:
+      - id: cumulative
+        text: The usage in message_delta events is cumulative, so adding several of them double-counts; keep only the latest value per stream.
+        feedback: Correct - Anthropic's streaming page warns that these counts are cumulative. The invoice, computed by the provider, is right.
+      - id: streaming-costs
+        text: Streaming really costs more; the invoice will catch up next month.
+        feedback: The same reply costs the same tokens streamed or not; the gap is in your arithmetic.
+      - id: pings
+        text: Ping events are billed as output tokens.
+        feedback: Pings carry no usage; the doubled count comes from adding cumulative values.
+      - id: input
+        text: The dashboard is counting input tokens as output.
+        feedback: Possible in general, but this code reads output_tokens from message_delta - the bug is summing cumulative counts.
+    correct: [cumulative]
+    hints:
+      - How many message_delta events can one stream have?
+    solution: |
+      One stream may have several `message_delta` events, each with the running total. Summing them over-reports (in
+      the lesson's run, 14 instead of 10). Take the last value per stream - or, better, meter from the provider's final
+      message object that the SDK assembles.
+
+  - id: triage-testdesign
+    type: testdesign
+    concept: llm-structured-output
+    skill: analysis
+    title: Test plan for the triage client
+    prompt: |
+      Design offline tests for SandPay's `triage` function and its retrying client before launch. For each test give
+      the preconditions (the scripted replies or errors), the steps, the expected result and the evidence you would
+      keep. Cover at least the parsing, validation, repair, truncation, retry and cost behaviour.
+    modelAnswer: |
+      Preconditions for all: `ScriptedLLM` with a fixed script, `LLMClient` with `sleep=list.append` and a fixed `rand`.
+
+      1. **Fenced JSON** - script a fenced valid object. Expected: normalised dict, 1 call. Evidence: return value, `llm.calls`.
+      2. **Prose around JSON** - "Sure! {...} Hope it helps". Expected: same dict.
+      3. **All errors at once** - an object with a wrong enum, string amount, unknown currency, string urgent, extra
+         field, missing summary. Expected: 6 errors listed. Evidence: the list.
+      4. **Repair** - invalid then valid. Expected: 2 calls; call 2's messages are user, assistant (the bad reply),
+         user (errors + "JSON"). Evidence: `llm.calls[1].messages`.
+      5. **Give up** - invalid three times, `max_attempts=3`. Expected: `StructuredOutputError`, attempts 3, last
+         errors kept; ticket routed to humans. Evidence: exception fields.
+      6. **Truncation** - small `max_tokens`. Expected: error after 1 call, no repair.
+      7. **Rate limit** - 429 with `retry_after=5`, then valid. Expected: one sleep of at least 5 s, 2 calls.
+      8. **Bad request** - 400. Expected: raised after 1 call, no sleep.
+      9. **Wait budget** - two 429s of 20 s with a 30 s budget. Expected: raised before the second wait.
+      10. **Cost** - one repair round. Expected: meter equals the sum of `cost_usd` of both calls; only successful
+          calls metered. Evidence: meter totals.
+
+      All run in CI in milliseconds; a separate evaluation on real tickets with the real API measures accuracy.
+    rubric:
+      - Each case states scripted inputs, steps, expected result and evidence.
+      - Covers parsing variants, all-errors validation, repair content, bounded attempts and truncation.
+      - Covers retryable versus non-retryable errors and a retry-after minimum, with no real sleeping.
+      - Includes a cost or usage check and says what offline tests cannot show.
+    hints:
+      - What can a scripted fake make happen that a real model rarely does on demand?
+      - Which evidence shows what was actually sent to the model?
+    solution: |
+      Script every failure path (bad JSON, bad fields, truncation, 429 with retry-after, 400, overload storm) and
+      check calls, sleeps, exceptions and meter totals; leave accuracy to an evaluation against the real API.
+
+  - id: interview-client
+    type: interview
+    concept: llm-errors-and-retries
+    skill: analysis
+    title: "\"Design the LLM client for our payments support tool\""
+    prompt: |
+      An interviewer for an AI engineering role asks: "Our support tool will call a hosted LLM 20,000 times a day to
+      turn tickets into JSON for our case system. Walk me through the client you would build around the API."
+    modelAnswer: |
+      **Request.** System prompt with the output contract, the ticket as the user message, `max_tokens` sized to the
+      largest valid object. The client is injected so the logic is testable with a scripted fake.
+
+      **Output.** Use the provider's structured outputs if the model supports it, and still parse defensively and
+      validate every field and business rule in code, reporting all errors. Check the stop reason first: a
+      `max_tokens` or refusal stop is not repaired. One or two repair rounds with the bad reply and the errors, then
+      send the ticket to a human queue.
+
+      **Errors.** Never retry 400-class errors. Retry 429, 5xx and overload (529 / 503) with the server's retry-after
+      as a minimum, otherwise exponential backoff with full jitter; cap attempts and total wait; read 429 bodies for
+      spend or quota limits and alert on those. Make sure SDK retries and mine don't multiply. Read the rate-limit
+      headers to throttle before hitting 429.
+
+      **Cost and observability.** Meter usage from every response; cost per successful ticket, repair rate, retry
+      counts per status, latency, request ids; dashboards and alerts on cost per result.
+
+      **Testing.** Offline tests for every failure path with injected sleep and random; an evaluation set against the
+      real model for accuracy before each prompt or model change.
+    rubric:
+      - Separates transport retries from output repair and bounds both.
+      - Classifies errors (400 vs 429 vs 5xx/overload, spend-limit 429) and uses retry-after plus jittered backoff.
+      - Validates output in code even with structured outputs and handles truncation and refusals.
+      - Meters tokens and cost per successful result and logs request ids.
+      - Makes the client testable (dependency injection, fake clock or sleep).
+    followUps:
+      - The provider has an outage for 20 minutes. What happens to the 20,000 tickets, and what should?
+      - How would you roll out a new prompt version without risking the case system?
+      - Your repair rate jumps from 2% to 15% after a model upgrade. What do you check first?
+    hints:
+      - Think in layers - request, output, errors, cost, tests.
+    solution: |
+      A testable client with structured output plus validation, bounded repair, classified retries with retry-after and
+      jitter, usage metering, logging and both offline tests and an evaluation set.
+
+placement:
+  - id: place-stateless
+    type: mcq
+    concept: llm-request-anatomy
+    skill: application
+    title: The assistant forgot the order number
+    prompt: |
+      A chatbot sends `messages=[{"role": "user", "content": new_question}]` on every turn. Users complain that it
+      forgets what they said one message earlier. What is the fix?
+    options:
+      - id: send-history
+        text: Keep the conversation in the application and send all earlier user and assistant turns, plus the new question, on every call.
+        feedback: Correct - the API keeps no state; the model sees only what each request contains.
+      - id: session-id
+        text: Pass a session id so the API can look up the earlier turns.
+        feedback: A messages API call is stateless; there is no session for it to look up in this pattern.
+      - id: max-tokens
+        text: Increase max_tokens so the model can remember more.
+        feedback: max_tokens caps the output length; it has nothing to do with what the model was sent.
+      - id: system
+        text: Put "remember the conversation" in the system prompt.
+        feedback: The model cannot remember text it was never sent.
+    correct: [send-history]
+    hints:
+      - What does the model receive on each call?
+    solution: |
+      Each call is independent. Append each assistant reply and the next user turn to a list and send the whole list -
+      knowing that every turn re-bills the earlier tokens, so long conversations need trimming or summarising.
+
+  - id: place-backoff
+    type: mcq
+    concept: llm-errors-and-retries
+    skill: application
+    title: Pick the retry policy
+    prompt: |
+      Your service gets bursts of 429 responses (with a retry-after header) and occasional 529 overloads. Which policy
+      is best?
+    options:
+      - id: jitter
+        text: Retry 429 and 529 only; wait at least retry-after (plus a little jitter) when present, else exponential backoff with random jitter; cap attempts and total wait.
+        feedback: Correct - this follows both providers' guidance and avoids synchronised retries.
+      - id: immediate
+        text: Retry immediately up to 10 times so the user is not kept waiting.
+        feedback: Immediate retries add load to an API that is already limiting you, and ignore retry-after.
+      - id: fixed
+        text: Retry every error, including 400s, every 2 seconds.
+        feedback: 400s never succeed on retry, and fixed intervals synchronise clients into waves.
+      - id: exp-no-jitter
+        text: Exponential backoff 1, 2, 4, 8 seconds, ignoring retry-after.
+        feedback: Better than fixed, but clients that failed together still retry together, and retrying before retry-after is likely to fail again.
+    correct: [jitter]
+    hints:
+      - What happens when 100 clients use the same deterministic schedule?
+    solution: |
+      Transient errors only; the server's retry-after as a minimum; otherwise exponential backoff with jitter; bounded
+      attempts and total time.
+
+  - id: place-json
+    type: mcq
+    concept: llm-structured-output
+    skill: analysis
+    title: Handle this reply
+    prompt: |
+      A triage call returns HTTP 200, stop reason `max_tokens`, and text `{"category": "refund", "amount": 42.1,
+      "currency": "EUR", "urgent": fal`. What should the code do?
+    options:
+      - id: no-repair
+        text: Treat it as truncated - do not parse or repair it; raise (or retry once with a larger max_tokens) and log it.
+        feedback: Correct - the model was stopped by the cap; a repair under the same cap is truncated again.
+      - id: repair
+        text: Send it back with the parse error and ask for the corrected JSON.
+        feedback: The model did not make a mistake; the cap did. The repair costs a call and fails the same way.
+      - id: complete
+        text: Complete the JSON in code by adding "se}" and accept it.
+        feedback: Guessing the rest of a cut-off object invents data - here urgent and summary.
+      - id: retry-backoff
+        text: Retry the same request with exponential backoff.
+        feedback: Nothing transient happened; the same request with the same cap gives the same truncation.
+    correct: [no-repair]
+    hints:
+      - Read the stop reason before the text.
+    solution: |
+      Stop reasons come first. `max_tokens` means incomplete output; fix the cap (or the schema's length), don't
+      repair or guess.
+
+  - id: place-cost
+    type: mcq
+    concept: llm-tokens-and-cost
+    skill: application
+    title: Where does the money go?
+    prompt: |
+      A chat feature's cost per conversation grows much faster than its number of turns. Each turn sends a 400-token
+      system prompt, all earlier turns, and the new message, and gets about 150 output tokens back. Why?
+    options:
+      - id: resend
+        text: Every turn re-sends the whole history as input, so input tokens grow with each turn and the total grows roughly with the square of the number of turns.
+        feedback: Correct - turn n re-bills the system prompt and all n-1 earlier exchanges.
+      - id: output
+        text: Output tokens are more expensive, so the output dominates.
+        feedback: Output per turn is constant here (about 150); constant parts cannot make cost grow faster than the turns.
+      - id: retries
+        text: Retries after 429s are billed.
+        feedback: Rejected requests return no usage; they cost time and request quota, not tokens.
+      - id: streaming
+        text: The feature streams, and streaming bills each chunk separately.
+        feedback: Streaming does not change the token count of a reply.
+    correct: [resend]
+    hints:
+      - Write down the input tokens of turn 1, 2 and 3.
+    solution: |
+      Turn n's input is about 400 + (n - 1) x (user + assistant tokens) + the new message, so the sum over n turns grows
+      quadratically. Trim or summarise old turns, and use prompt caching where the provider offers it.
+
+recall:
+  - id: recall-request
+    concept: llm-request-anatomy
+    prompt: What goes into a messages API request, and what does the API remember between calls?
+    answer: A system prompt (or instructions), the whole conversation as role-tagged user and assistant turns, and an output cap (max_tokens). The API remembers nothing - the application re-sends the history every time.
+  - id: recall-stop
+    concept: llm-request-anatomy
+    prompt: Name four stop reasons and what to do with a max_tokens stop.
+    answer: end_turn (finished), max_tokens (cut off), tool_use (run the tool), refusal (declined) - Anthropic also has stop_sequence, pause_turn and model_context_window_exceeded. A max_tokens stop is a 200 with incomplete content - raise the cap or continue; do not parse it as complete.
+  - id: recall-stream
+    concept: llm-request-anatomy
+    prompt: Three rules for assembling a streamed reply?
+    answer: Ignore pings and unknown events; keep the latest cumulative usage instead of summing; treat an error event or a missing end event (message_stop / response.completed) as failure and keep the partial text.
+  - id: recall-retry
+    concept: llm-errors-and-retries
+    prompt: Which errors do you retry, and how long do you wait?
+    answer: Retry 429 rate limits, 5xx and overload (529 or 503); never 400-class errors or spend/quota 429s. Wait at least retry-after (plus a little jitter); otherwise exponential backoff with random jitter; cap attempts and total wait; don't stack SDK and app retries.
+  - id: recall-jitter
+    concept: llm-errors-and-retries
+    prompt: Why add jitter to exponential backoff?
+    answer: Clients that failed together retry together on a deterministic schedule - a thundering herd that recreates the overload. Random jitter spreads them out (in the lesson, 100 retries in one instant became at most 18 in any 100 ms).
+  - id: recall-structured
+    concept: llm-structured-output
+    prompt: What do JSON mode and structured outputs guarantee, and what is still your job?
+    answer: JSON mode - valid JSON only. Structured outputs - completed, non-refusal output follows the supported part of the schema. Still yours - refusals, truncation, unsupported constraints (e.g. minimum on Anthropic), enum casing, business rules; so keep a validator.
+  - id: recall-repair
+    concept: llm-structured-output
+    prompt: How does repair-and-retry work, and when must you not repair?
+    answer: Append the model's bad reply as an assistant turn and a user turn listing every error, ask for only the corrected JSON, and bound the attempts. Never repair a reply cut off at max_tokens - it will be cut off again.
+  - id: recall-cost
+    concept: llm-tokens-and-cost
+    prompt: How do you compute and track the cost of LLM calls?
+    answer: Cost = input tokens x input price + output tokens x output price, from the usage each response reports (not character counts), using the current dated price list. Track per feature and per successful result; count repair rounds and the history re-sent every turn.
+
+next:
+  - prompt-engineering
+  - tool-use-and-function-calling
+  - llm-evaluation-and-guardrails
