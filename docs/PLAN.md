@@ -201,11 +201,13 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
 
 - [x] Outline: 32 full stack lessons (stages 8-10) and 36 AI lessons (stages 11-15) as planned lessons, with a
       **Full stack developer (TypeScript)** path and an **AI engineer - LLM apps, RAG and agents** path.
-- [ ] Track I lessons, in batches of 4-6. Batch 1 done: the web platform module (semantic HTML and forms, CSS layout, responsive design, WCAG 2.2 accessibility, DOM events and the event loop). Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
+- [ ] Track I lessons, in batches of 4-6. Batch 1 done: the web platform module (semantic HTML and forms, CSS layout, responsive design, WCAG 2.2 accessibility, DOM events and the event loop). Batch 2 done: modern JavaScript, TypeScript for applications, the Node.js
+      runtime and npm, React components and JSX, React state and effects. Stack: HTML/CSS (WHATWG, W3C, WCAG 2.2), TypeScript, React, Node.js +
       Express, PostgreSQL, Docker, GitHub Actions, OWASP. Sources: WHATWG HTML, MDN, ECMA-262, the TypeScript
       handbook, react.dev, nodejs.org, expressjs.com, the PostgreSQL manual, RFCs, OWASP, OpenAPI 3.1, docs.docker.com.
-- [ ] `practice/fullstack`: a TypeScript project (React + Express + PostgreSQL-compatible tests) with exercises,
-      solutions and `npm run verify`, run by `practice/verify.sh fullstack`.
+- [x] `practice/fullstack`: TypeScript, React 19 (Testing Library, jsdom), Express 5 (supertest) and PostgreSQL
+      (PGlite, no server); exercise tests tagged `@exercise`; `npm run verify` in CI via `practice/verify.sh fullstack`.
+      10 exercises so far.
 - [ ] Track J lessons, in batches of 4-6. Sources: the Model Context Protocol specification
       (modelcontextprotocol.io), Anthropic and OpenAI API docs, LangGraph and CrewAI docs, scikit-learn, NumPy,
       pandas and PyTorch docs, _Deep Learning_ (Goodfellow, Bengio, Courville), _Attention Is All You Need_,

@@ -1,0 +1,1253 @@
+id: node-runtime-and-npm
+title: The Node.js runtime, npm and package.json
+subject: fullstack
+module: js-ts-node
+level: beginner
+status: published
+estimatedMinutes: 60
+summary: How one JavaScript thread serves thousands of requests, the order in which Node runs your callbacks, ES modules versus CommonJS, package.json, semver ranges and lockfiles, and reading configuration from the environment - every output here was produced by a real run.
+tags:
+  [
+    node.js,
+    nodejs,
+    libuv,
+    event loop,
+    process.nextTick,
+    setImmediate,
+    microtasks,
+    esm,
+    commonjs,
+    package.json,
+    npm,
+    npm ci,
+    package-lock.json,
+    semver,
+    npx,
+    env-file,
+    process.env,
+    exit code,
+    fs/promises,
+    lts,
+  ]
+
+environment: |
+  - **Runtime:** **Node.js 24** (the version in this repository's `.nvmrc`; outputs were captured with
+    v24.21.0 and npm 11.19.0 on Linux, November 2026). API references are the [Node.js v24
+    documentation](https://nodejs.org/docs/latest-v24.x/api/): [Process](https://nodejs.org/docs/latest-v24.x/api/process.html)
+    (`process.nextTick`, `queueMicrotask` versus `nextTick`, `process.env`, `process.exit`, `process.exitCode`,
+    exit codes), [Modules: Packages](https://nodejs.org/docs/latest-v24.x/api/packages.html) (`"type"`,
+    `.mjs`/`.cjs`, syntax detection), [ECMAScript modules](https://nodejs.org/docs/latest-v24.x/api/esm.html)
+    (mandatory file extensions, `import.meta.dirname`), [CommonJS modules](https://nodejs.org/docs/latest-v24.x/api/modules.html)
+    (`require(esm)`), [Command-line options](https://nodejs.org/docs/latest-v24.x/api/cli.html) (`--env-file`,
+    `UV_THREADPOOL_SIZE`), [File system](https://nodejs.org/docs/latest-v24.x/api/fs.html) (promises API) and
+    [Readline](https://nodejs.org/docs/latest-v24.x/api/readline.html).
+  - **Event loop:** the Node.js guide [The Node.js Event Loop](https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick)
+    (phases, `setImmediate` versus `setTimeout`, `process.nextTick`) and the libuv documentation
+    ([design overview](https://docs.libuv.org/en/v1.x/design.html), [thread pool](https://docs.libuv.org/en/v1.x/threadpool.html) -
+    default size 4).
+  - **npm:** npm CLI v11 documentation - [package.json](https://docs.npmjs.com/cli/v11/configuring-npm/package-json)
+    (`dependencies`, `devDependencies`, `engines`), [package-lock.json](https://docs.npmjs.com/cli/v11/configuring-npm/package-lock-json),
+    [npm ci](https://docs.npmjs.com/cli/v11/commands/npm-ci), [npx](https://docs.npmjs.com/cli/v11/commands/npx),
+    [scripts](https://docs.npmjs.com/cli/v11/using-npm/scripts) and [About semantic
+    versioning](https://docs.npmjs.com/about-semantic-versioning). Version rules: [Semantic Versioning
+    2.0.0](https://semver.org/). Range results were computed with the `semver` package bundled inside npm 11.
+  - **Release lines:** [Node.js releases](https://nodejs.org/en/about/previous-releases) and the
+    [Release schedule](https://github.com/nodejs/Release) (checked 14 November 2026: v26 entered LTS on
+    28 October 2026, v24 moved to maintenance LTS on 20 October 2026 and is supported until 30 April 2028,
+    v22 ends on 30 April 2027). Re-check these dates - they move every six months.
+  - **Practice:** the coding exercises run in `practice/fullstack` (Vitest). SandPay, its API URL
+    (`https://api.sandpay.example`) and every payment in the examples are fictional.
+  - **Not covered here:** TypeScript (next lesson), HTTP servers ([An HTTP API with Node.js and
+    Express](#/lesson/express-http-server)), worker threads beyond a mention, and package publishing.
+
+prerequisites:
+  - modern-javascript-core
+  - dom-events-event-loop
+
+concepts:
+  - id: node-event-loop-model
+    name: The Node.js event loop and non-blocking I/O
+    summary: Node runs your JavaScript on one thread; libuv hands I/O to the operating system or a small thread pool and queues the callbacks. The loop runs them phase by phase (timers, poll, check, close), draining process.nextTick and promise jobs in between - so synchronous work blocks every request.
+  - id: node-module-systems
+    name: ES modules and CommonJS in Node
+    summary: The package.json "type" field and the .mjs/.cjs extensions decide whether a file is an ES module (import/export, mandatory file extensions, import.meta) or CommonJS (require, module.exports, __dirname).
+  - id: npm-dependencies-and-lockfiles
+    name: package.json, semver ranges and lockfiles
+    summary: dependencies are needed at run time and devDependencies only to build and test; semver ranges (^, ~, exact) say which versions are acceptable; package-lock.json records the exact tree, and npm ci installs exactly that or fails.
+  - id: node-process-and-config
+    name: Configuration, the process and core modules
+    summary: Configuration comes from environment variables (strings or undefined), validated once at start-up; --env-file loads a .env file without overriding the real environment; exit codes tell the caller what happened; node:fs/promises, node:path and streams do file work without blocking.
+
+objectives:
+  - Explain how a single JavaScript thread in Node serves many concurrent requests, and identify code that blocks the event loop.
+  - Predict the order of synchronous code, `process.nextTick`, promise callbacks, `setTimeout` and `setImmediate`, including the difference between a CommonJS and an ES module entry point.
+  - Decide whether a file is loaded as an ES module or CommonJS, and fix the errors each system raises when mixed up.
+  - Read a `package.json` - scripts, `dependencies` versus `devDependencies`, `engines` - and state which versions a `^`, `~` or exact range accepts.
+  - Explain what `package-lock.json` guarantees and why CI uses `npm ci` instead of `npm install`.
+  - Write start-up code that reads, converts and validates environment variables, and set exit codes correctly.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [node-event-loop-model]
+    title: The idea in plain language
+    body: |
+      Picture a busy café with **one barista at the till** and a row of machines behind them. The barista
+      never stands watching the milk steam. They take an order, start the machine, take the next order -
+      and when a machine beeps, they hand that drink over. One person serves a queue of fifty because
+      **waiting is done by the machines, not by the person**.
+
+      Node.js works the same way. Your JavaScript runs on **one thread** - the barista. Reading a file,
+      querying a database or calling the SandPay API is handed to the operating system or to a small pool
+      of helper threads - the machines. When the work is done, a **callback** joins a queue, and the
+      **event loop** gives it to the thread when the thread is free.
+
+      The analogy also shows the one way to ruin it: if the barista decides to **grind beans by hand for
+      two minutes**, nobody else is served. In Node, any long synchronous work - a tight loop, a huge
+      `JSON.parse`, a `...Sync` file call, a slow regular expression - stops **every** request in the
+      process, not just the one that caused it.
+
+  - id: what
+    kind: what
+    concepts: [node-event-loop-model]
+    title: What Node.js is made of
+    body: |
+      | Part | What it does |
+      |---|---|
+      | **V8** | Google's JavaScript engine (also in Chrome). Compiles and runs your code on **one main thread**. |
+      | **libuv** | A C library that implements the **event loop** and asynchronous I/O. Network I/O uses the operating system's non-blocking mechanism (epoll on Linux, kqueue on macOS, IOCP on Windows); work with no non-blocking OS API goes to a **thread pool**. |
+      | **Core modules** | `node:fs`, `node:path`, `node:http`, `node:crypto`, `node:stream`... - JavaScript APIs over libuv and the OS. |
+      | **npm** | The package manager shipped with Node: installs packages into `node_modules`, runs scripts. |
+
+      The Node.js guide puts it in one sentence: the event loop "allows Node.js to perform non-blocking I/O
+      operations - despite the fact that a single JavaScript thread is used by default - by offloading
+      operations to the system kernel whenever possible."
+
+      **The thread pool** is small. libuv's documentation says "Its default size is 4", changeable only at
+      start-up with the `UV_THREADPOOL_SIZE` environment variable. The Node.js CLI documentation lists what
+      uses it: **all `fs` APIs** except watchers and the explicitly synchronous ones, asynchronous crypto
+      such as `crypto.pbkdf2()` and `crypto.scrypt()`, `dns.lookup()` and most `zlib` APIs. Sockets (HTTP,
+      database connections) do **not** use it.
+
+      **Same language, different host.** The browser and Node both run JavaScript on an event loop, but the
+      APIs differ: Node has no `document` or `window`; the browser has no `fs` or `process`. Both have
+      `setTimeout`, promises, `queueMicrotask`, `fetch` and `URL`.
+
+  - id: why
+    kind: why
+    concepts: [node-event-loop-model, npm-dependencies-and-lockfiles]
+    title: Why full stack developers use it
+    body: |
+      - **One language on both sides.** The React frontend and the API are both TypeScript, so types,
+        validation schemas and money helpers can be shared, and one person can follow a bug from the button
+        to the database.
+      - **Good at I/O-heavy servers.** A typical API spends most of its time **waiting** - for the
+        database, for SandPay, for the network. Non-blocking I/O lets one process hold thousands of open
+        connections without a thread per connection.
+      - **The tooling runs on it.** Vite, TypeScript's compiler, ESLint, Prettier, Vitest and Playwright
+        are all npm packages run by Node - even for a project whose server is written in Java.
+      - **Reproducible installs matter.** A project depends on hundreds of packages. Without a lockfile and
+        `npm ci`, your laptop, CI and production can each install **different** versions, and "works on my
+        machine" becomes a dependency problem.
+
+  - id: internals
+    kind: internals
+    concepts: [node-event-loop-model]
+    title: Inside the event loop - phases, nextTick and promise jobs
+    body: |
+      When Node starts, it runs your entry script **to the end** (synchronously), then enters the loop.
+      According to the Node.js guide, each turn of the loop goes through phases, and "each phase has a FIFO
+      queue of callbacks to execute":
+
+      | Phase | Runs |
+      |---|---|
+      | **timers** | callbacks of `setTimeout()` and `setInterval()` whose time has passed |
+      | **pending callbacks** | some system callbacks deferred to the next turn (for example certain TCP errors) |
+      | idle, prepare | internal only |
+      | **poll** | retrieves new I/O events and runs their callbacks (file read done, data on a socket); may wait here for I/O |
+      | **check** | `setImmediate()` callbacks |
+      | **close callbacks** | `'close'` events, for example `socket.on('close', ...)` |
+
+      (The guide notes that since libuv 1.45.0 - Node.js 20 - timers run after the poll phase in each
+      iteration, and also once before the loop starts. The order of phases matters less than the two rules
+      below.)
+
+      **Between callbacks, two extra queues are drained:**
+
+      1. The **`process.nextTick` queue**. The guide: it "is not technically part of the event loop";
+         "all callbacks passed to `process.nextTick()` will be resolved before the event loop continues."
+      2. The **microtask queue** - promise reactions (`.then`, code after `await`) and `queueMicrotask`.
+
+      In a **CommonJS** module, `nextTick` callbacks run **before** promise callbacks. In an **ES module**,
+      the opposite: the Process documentation explains that "ESM modules are processed already as part of
+      the microtask queue", so Node is already draining microtasks and they run before `nextTick`.
+
+      **Two consequences:**
+
+      - A recursive `process.nextTick` or an endless promise chain **starves** the loop - I/O callbacks
+        never get a turn. The guide recommends `setImmediate()` "in all cases because it's easier to reason
+        about", and the Process docs recommend `queueMicrotask()` over `process.nextTick()` for most code.
+      - **`setTimeout(fn, 0)` versus `setImmediate(fn)`** from the main module is **not deterministic** -
+        it depends on how fast the process starts. Inside an I/O callback, `setImmediate` always runs first,
+        because the check phase comes right after poll.
+
+  - id: visual
+    kind: visual
+    concepts: [node-event-loop-model]
+    title: "Flowchart: one turn of the Node.js event loop"
+    body: |
+      ```mermaid
+      flowchart TD
+        start(["Run the entry script to the end"]) --> drain0["Drain nextTick queue and microtasks"]
+        drain0 --> timers["timers: due setTimeout / setInterval"]
+        timers --> pending["pending callbacks"]
+        pending --> poll["poll: I/O callbacks, wait for I/O"]
+        poll --> check["check: setImmediate callbacks"]
+        check --> close["close callbacks"]
+        close --> alive{"Anything left? timers, open sockets, pending I/O"}
+        alive -- yes --> timers
+        alive -- no --> exit(["Process exits"])
+      ```
+
+      What to notice: **after every single callback** in any phase, Node drains the `nextTick` queue and the
+      microtask queue before taking the next callback. And the loop **ends by itself** when nothing is left
+      to wait for - you don't need `process.exit()` to finish a script.
+
+  - id: order-code
+    kind: code
+    concepts: [node-event-loop-model]
+    title: "Run it: callback order in CommonJS and in an ES module"
+    body: |
+      The same six lines, saved once as `order.cjs` and once as `order.mjs`:
+
+      ```javascript
+      console.log('1 sync start');
+      setTimeout(() => console.log('5 setTimeout 0'), 0);
+      setImmediate(() => console.log('6 setImmediate'));
+      Promise.resolve().then(() => console.log('4 promise then'));
+      process.nextTick(() => console.log('3 nextTick'));
+      console.log('2 sync end');
+      ```
+
+      Real output, Node v24.21.0:
+
+      ```plaintext
+      $ node order.cjs                $ node order.mjs
+      1 sync start                    1 sync start
+      2 sync end                      2 sync end
+      3 nextTick                      4 promise then
+      4 promise then                  3 nextTick
+      6 setImmediate                  6 setImmediate
+      5 setTimeout 0                  5 setTimeout 0
+      ```
+
+      - Synchronous lines always come first: callbacks wait until the current code finishes.
+      - CommonJS: `nextTick` before the promise. ES module: the promise before `nextTick` - exactly as the
+        Process documentation describes.
+      - The last two lines are **not stable**. Running each file 20 times gave `setTimeout` first 13 times
+        and `setImmediate` first 7 times (CommonJS), 8 and 12 (ESM). Never write code - or a test - that
+        depends on that order.
+
+      Inside an I/O callback the order is fixed:
+
+      ```javascript
+      // io.mjs
+      import { readFile } from 'node:fs';
+      readFile(import.meta.filename, () => {
+        setTimeout(() => console.log('timeout'), 0);
+        setImmediate(() => console.log('immediate'));
+      });
+      ```
+
+      ```plaintext
+      $ node io.mjs
+      immediate
+      timeout
+      ```
+
+      (Three runs, the same order each time - the check phase follows the poll phase.)
+
+  - id: blocking
+    kind: mistakes
+    concepts: [node-event-loop-model]
+    title: Blocking the event loop - the classic Node bug
+    body: |
+      A timer due in **10 ms**, then 200 ms of synchronous work:
+
+      ```javascript
+      // block.mjs
+      const start = Date.now();
+      setTimeout(() => console.log(`timer ran after ${Date.now() - start} ms`), 10);
+      while (Date.now() - start < 200) {} // 200 ms of synchronous work
+      console.log('loop done');
+      ```
+
+      ```plaintext
+      $ node block.mjs
+      loop done
+      timer ran after 204 ms
+      ```
+
+      The timer could not run until the thread was free. In a server, that "timer" is **every other
+      request**: while one request computes, all the others wait - health checks time out, and the load
+      balancer may restart a perfectly healthy process.
+
+      **Common causes and fixes:**
+
+      | Blocking code | Non-blocking alternative |
+      |---|---|
+      | `fs.readFileSync` / `writeFileSync` in a request handler | `await readFile(...)` from `node:fs/promises` (synchronous calls are fine in start-up code and CLI scripts) |
+      | `crypto.pbkdf2Sync`, `scryptSync` for password hashing | `crypto.pbkdf2` / `crypto.scrypt` with a callback (runs on the thread pool) |
+      | Big loops, sorting or `JSON.parse` of a huge body | limit request size, paginate, process in chunks, or move CPU work to `node:worker_threads` |
+      | A regular expression with catastrophic backtracking | a simpler pattern, input length limits |
+
+      **Debugging method:** if every endpoint slows down at once while CPU is at 100% on one core, suspect
+      a blocked loop. Reproduce with one slow request plus a fast health check in parallel; if the health
+      check waits for the slow request, the loop is blocked. Then profile (`node --cpu-prof`, or Chrome
+      DevTools via `node --inspect`) to find the function.
+
+      A second trap: the thread pool has **4 threads by default**. Twenty concurrent `fs` or `scrypt` calls
+      queue behind each other even though the loop is free.
+
+  - id: modules
+    kind: what
+    concepts: [node-module-systems]
+    title: ES modules and CommonJS - which one is this file?
+    body: |
+      Node has two module systems. **ES modules (ESM)** are the JavaScript standard - `import`/`export`,
+      also used by browsers. **CommonJS (CJS)** is Node's original system - `require()` and
+      `module.exports`. Node decides per file:
+
+      | File | Loaded as |
+      |---|---|
+      | `.mjs` | always ESM |
+      | `.cjs` | always CommonJS |
+      | `.js` with `"type": "module"` in the nearest `package.json` | ESM |
+      | `.js` with `"type": "commonjs"` or no `"type"` | CommonJS - but see syntax detection below |
+
+      The Packages documentation: "If a package.json file does not have a "type" field, .js files are
+      treated as CommonJS." Since v22.7.0 Node also has **syntax detection**: ambiguous files (a `.js` with
+      no `"type"`) that contain ES module syntax - `import`/`export` statements, `import.meta`, top-level
+      `await` - are run as ESM. Don't rely on it: set `"type"` explicitly.
+
+      **What changes in an ES module:**
+
+      | CommonJS | ES module |
+      |---|---|
+      | `const { fee } = require('./fees')` | `import { fee } from './fees.js'` - **the extension is mandatory** |
+      | `module.exports = { fee }` | `export function fee() {}` |
+      | `__dirname`, `__filename` | `import.meta.dirname`, `import.meta.filename` |
+      | `require.main === module` | `import.meta.main` |
+      | top-level `await` not allowed | top-level `await` allowed |
+
+      Real errors in a `"type": "module"` package (Node 24):
+
+      ```plaintext
+      $ node main.js        # import { fee } from './fees';
+      Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../esmdemo/fees' imported from .../esmdemo/main.js
+      Did you mean to import "./fees.js"?
+
+      $ node old.js         # const { fee } = require('./fees.js');
+      ReferenceError: require is not defined in ES module scope, you can use import instead
+      ```
+
+      **Mixing them.** ESM can `import` a CommonJS file. CommonJS can `require()` an ES module since
+      v22.12.0 and v20.19.0 (no flag), **only if that module has no top-level `await`**; otherwise use a
+      dynamic `import()`, which returns a promise.
+
+      **For a new project:** `"type": "module"` everywhere - it is what TypeScript, Vite and the browser
+      expect. (In TypeScript with `"module": "NodeNext"`, you also write `./fees.js` in imports even though
+      the source file is `fees.ts`: the import names the file Node will load.)
+
+  - id: package-json
+    kind: code
+    concepts: [npm-dependencies-and-lockfiles]
+    title: Reading a package.json
+    body: |
+      An illustrative `package.json` for the SandPay merchant API:
+
+      ```json
+      {
+        "name": "sandpay-merchant-api",
+        "version": "1.4.0",
+        "private": true,
+        "type": "module",
+        "engines": { "node": ">=24" },
+        "scripts": {
+          "dev": "node --watch --env-file=.env src/server.js",
+          "start": "node src/server.js",
+          "test": "vitest run",
+          "lint": "eslint ."
+        },
+        "dependencies": {
+          "express": "^5.3.0",
+          "pg": "^8.13.0",
+          "zod": "~4.6.7"
+        },
+        "devDependencies": {
+          "eslint": "^9.0.0",
+          "typescript": "6.0.3",
+          "vitest": "^5.0.3"
+        }
+      }
+      ```
+
+      - **`private: true`** - npm refuses to publish it. Use it for applications.
+      - **`scripts`** - `npm run dev`, `npm test`, `npm start`. While a script runs, npm puts
+        `node_modules/.bin` on the `PATH`, so `vitest` and `eslint` resolve to the project's own versions.
+      - **`dependencies`** - needed **at run time** (the server imports Express). npm's documentation:
+        "Please do not put test harnesses or transpilers or other "development" time tools in your
+        dependencies object."
+      - **`devDependencies`** - needed only to build, test and lint. A production install can skip them
+        with `npm ci --omit=dev`, which makes images smaller and gives attackers less code.
+      - **`engines`** - which Node (and npm) versions the project supports. The docs: "Unless the user has
+        set the engine-strict config flag, this field is advisory only and will only produce warnings" when
+        installed as a dependency. Pair it with `.nvmrc` and the CI Node version.
+      - **`npx <command>`** runs a package's binary - the local one if installed, otherwise fetched -
+        "in a similar context as running it via npm run".
+
+  - id: semver
+    kind: internals
+    concepts: [npm-dependencies-and-lockfiles]
+    title: Semver ranges and the lockfile
+    body: |
+      **Semantic Versioning 2.0.0:** given `MAJOR.MINOR.PATCH`, increment MAJOR for "incompatible API
+      changes", MINOR to "add functionality in a backward compatible manner" and PATCH for "backward
+      compatible bug fixes". And: "Major version zero (0.y.z) is for initial development. Anything MAY
+      change at any time."
+
+      A range in `package.json` says which versions you accept. Results computed with npm 11's own
+      `semver` package against a list of versions:
+
+      ```plaintext
+      versions:  4.18.2  4.18.9  4.21.0  5.0.0  5.0.0-beta.1
+      ^4.18.2    4.18.2 4.21.0 4.18.9          # minor and patch updates, same major
+      ~4.18.2    4.18.2 4.18.9                 # patch updates only
+      4.18.2     4.18.2                        # exactly this version
+
+      versions:  0.5.14  0.5.16  0.6.0  1.0.0
+      ^0.5.14    0.5.14 0.5.16                 # below 1.0.0, ^ does not cross the minor
+      ~0.5.14    0.5.14 0.5.16
+      ```
+
+      Prereleases (`5.0.0-beta.1`) never match a plain range like `^4.18.2`.
+
+      **The lockfile.** A range alone means two installs a week apart can get different versions.
+      `package-lock.json` "describes the exact tree that was generated, such that subsequent installs are
+      able to generate identical trees, regardless of intermediate dependency updates". It is "intended to
+      be committed into source repositories" - commit it, review its diff, never delete it to "fix" an
+      install.
+
+      **`npm install` versus `npm ci`.** `npm install` resolves ranges and **may update** the lockfile.
+      `npm ci` installs **exactly** the lockfile; per the npm docs, if the lock and `package.json` don't
+      match, it "will exit with an error, instead of updating the package lock", it deletes an existing
+      `node_modules` first, and "it will never write to package.json or any of the package-locks". Real
+      run after adding a dependency to `package.json` without updating the lock:
+
+      ```plaintext
+      $ npm ci
+      npm error code EUSAGE
+      npm error
+      npm error `npm ci` can only install packages when your package.json and package-lock.json or
+      npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.
+      npm error
+      npm error Missing: fees@1.0.0 from lock file
+      ```
+
+      Rule of thumb: **developers** run `npm install <pkg>` to add or update (and commit the lockfile);
+      **CI, Docker builds and deploys** run `npm ci`.
+
+  - id: config
+    kind: steps
+    concepts: [node-process-and-config]
+    title: Configuration from the environment, done properly
+    body: |
+      The twelve-factor rule (covered in [Deployment, configuration and
+      environments](#/lesson/deployment-and-configuration)) is to keep configuration - ports, URLs,
+      secrets - in **environment variables**, not in code. In Node they are in `process.env`.
+
+      1. **Remember every value is a string or `undefined`.** `process.env.PORT` is `'3000'`, not `3000`.
+         Assigning a non-string converts it to a string (`env.test = null` gives `'null'`), and the docs
+         call that behaviour deprecated.
+      2. **Read and validate once, at start-up**, into a typed config object. Convert numbers explicitly,
+         check allowed values, apply defaults, and report **every** problem in one error. Then pass the
+         object around; don't sprinkle `process.env.X` through the code.
+      3. **Fail fast.** An API that starts with a missing `SANDPAY_API_URL` will fail later, on a customer's
+         payment. Better to refuse to start, with a message that names the variable.
+      4. **Load a `.env` file in development with `--env-file`** (no package needed since Node 20.6):
+
+         ```plaintext
+         $ cat .env
+         PORT=3000
+         SANDPAY_API_URL=https://api.sandpay.example # sandbox
+         LOG_LEVEL="debug"
+
+         $ node --env-file=.env show.mjs
+         3000 https://api.sandpay.example debug string
+         $ PORT=8080 node --env-file=.env show.mjs
+         8080 https://api.sandpay.example debug string
+         ```
+
+         The comment after `#` and the quotes were removed, the type is `string`, and a variable already
+         set in the real environment **wins** - the CLI docs: "the value from the environment takes
+         precedence." A missing file is an error (`node: missing.env: not found`, exit code 9);
+         `--env-file-if-exists` continues without it.
+      5. **Keep `.env` out of Git** (`.gitignore`) and commit a `.env.example` with names but no secrets.
+         In production, the platform sets real environment variables.
+
+  - id: process-and-fs
+    kind: code
+    concepts: [node-process-and-config]
+    title: Exit codes, files and paths
+    body: |
+      **Exit codes** tell the shell, CI or the container platform what happened. Node "will normally exit
+      with a 0 status code when no more async operations are pending"; `1` means an uncaught exception.
+      From the Process docs:
+
+      ```plaintext
+      $ node -e 'process.exitCode = 9' ; echo $?
+      9
+      $ node -e 'process.exit(42)' ; echo $?
+      42
+      ```
+
+      Prefer **`process.exitCode = 1`** and let the process end by itself. `process.exit()` "will force
+      the process to exit as quickly as possible even if there are still asynchronous operations pending",
+      including writes to `stdout` - so a CLI that prints its usage and calls `process.exit(1)` can lose the
+      end of its own message when output is piped.
+
+      **Files and paths** (an ES module; illustrative):
+
+      ```javascript
+      import { readFile, writeFile, mkdir } from 'node:fs/promises';
+      import { join } from 'node:path';
+
+      // Paths relative to this file, not to the directory the command was started from:
+      const reportsDir = join(import.meta.dirname, '..', 'reports');
+      await mkdir(reportsDir, { recursive: true });
+
+      const text = await readFile(join(reportsDir, 'settlement-2026-11-13.csv'), 'utf8');
+      await writeFile(join(reportsDir, 'summary.json'), JSON.stringify({ lines: text.split('\n').length }));
+      ```
+
+      - The `node:` prefix makes it clear the module is built in.
+      - `path.join` uses the right separator on every OS; never build paths with string `+ '/'`.
+      - A relative path such as `'reports/x.csv'` is resolved against `process.cwd()` - wherever the
+        command was run - which differs between your terminal, `npm test` and a Docker container.
+      - The promises API "use[s] the underlying Node.js threadpool to perform file system operations off the
+        event loop thread". It is not synchronised: two concurrent writes to the same file can corrupt it.
+
+      **Streams for big files.** `readFile` loads the whole file into memory. For a large settlement file,
+      read it line by line - the pattern from the Readline docs:
+
+      ```javascript
+      import { createReadStream } from 'node:fs';
+      import { createInterface } from 'node:readline';
+
+      const lines = createInterface({ input: createReadStream('settlement.csv'), crlfDelay: Infinity });
+      for await (const line of lines) {
+        // one line at a time; memory use stays flat however big the file is
+      }
+      ```
+
+  - id: example
+    kind: example
+    concepts: [node-process-and-config, npm-dependencies-and-lockfiles, node-event-loop-model]
+    title: "A real project: the SandPay merchant API starts on a new laptop"
+    body: |
+      Riya clones the SandPay merchant API (fictional) and runs `npm install && npm run dev`. Three things
+      go wrong, each pointing at a concept in this lesson:
+
+      1. **"It works in CI but not for me."** CI runs `npm ci`; Riya's `npm install` resolved `zod@~4.6.7`
+         to a newer patch than the lockfile, because she deleted `package-lock.json` after a merge conflict.
+         Fix: restore the lockfile from `main`, run `npm ci`, and resolve lockfile conflicts by re-running
+         `npm install` on top of the merged `package.json` - never by deleting it.
+      2. **The API starts, then every payment fails with `Invalid URL`.** `SANDPAY_API_URL` was missing
+         from her `.env`, and the code read `process.env.SANDPAY_API_URL` only when the first payment was
+         made. Fix: a `loadConfig` that runs at start-up and refuses to start - which is exactly the first
+         coding exercise below.
+      3. **The settlement report endpoint makes the whole API hang for 3 seconds.** It used
+         `readFileSync` on a 200 MB file and parsed it in one loop. Fix: stream the file line by line, and
+         move the report to a background job.
+
+      A tester's checks for this service: start it with each required variable missing (it must refuse
+      to start, name the variable and exit non-zero); call a fast endpoint while a slow one runs (it must
+      stay fast); and confirm CI installs with `npm ci`.
+
+  - id: tests
+    kind: tests
+    concepts: [node-process-and-config, node-event-loop-model]
+    title: Tests for a Node service's start-up and responsiveness
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      |---|---|---|---|---|
+      | 1 | Required variable missing | Unset `SANDPAY_API_URL`, start the service | Does not start; message names `SANDPAY_API_URL`; non-zero exit code | stderr, `echo $?` |
+      | 2 | Several bad values | `PORT=eighty LOG_LEVEL=loud`, no URL | **One** error listing all three problems | stderr |
+      | 3 | Numeric conversion | `PORT=8080` | Listens on 8080 (a number, not the string) | `ss -ltnp` / startup log |
+      | 4 | Empty value | `PORT=` | Treated as missing: default 3000, or an error if required | startup log |
+      | 5 | Environment beats `.env` | `.env` has `PORT=3000`; run with `PORT=8080 node --env-file=.env ...` | Listens on 8080 | startup log |
+      | 6 | Loop not blocked | Start a slow report request, then call `/health` 10 times | `/health` stays within its usual latency | response times |
+      | 7 | Clean install | Fresh clone, `npm ci` | Succeeds without changing `package-lock.json` | `git status` clean |
+      | 8 | Lockfile drift | Add a dependency to `package.json` only, run `npm ci` | Fails with `EUSAGE` and "Missing: ... from lock file" | CI log |
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [node-event-loop-model, npm-dependencies-and-lockfiles]
+    title: Limits, trade-offs and release lines
+    body: |
+      - **CPU-heavy work** (image processing, big reports, ML inference) fights the single thread. Use
+        `node:worker_threads`, a job queue with separate worker processes, or another language for that
+        service.
+      - **One process uses one core for JavaScript.** Production runs several processes (containers,
+        replicas) behind a load balancer.
+      - **Dependency risk.** Every package is code you run. Prefer few, well-maintained dependencies, keep
+        the lockfile reviewed, and use `npm audit` and exact versions where a surprise would hurt.
+      - **Release lines.** Major versions are "Current" for six months; up to Node.js 26, even-numbered
+        majors then became **LTS** with about 30 months of fixes ("Production applications should only use
+        Active LTS or Maintenance LTS releases"). From Node.js 27 the cycle becomes annual and every major
+        goes to LTS. As of 14 November 2026: **v26** is Active LTS, **v24** Maintenance LTS (until 30 April
+        2028), **v22** Maintenance LTS (until 30 April 2027). Pin the version with `.nvmrc`, `engines` and
+        the CI setup, and upgrade on purpose.
+      - **CommonJS still exists** in many packages and older services. You will read both styles for years.
+
+  - id: summary
+    kind: summary
+    concepts:
+      [node-event-loop-model, node-module-systems, npm-dependencies-and-lockfiles, node-process-and-config]
+    title: Quick reference
+    body: |
+      - Node = **V8** (one JavaScript thread) + **libuv** (event loop, non-blocking I/O, thread pool of 4).
+      - Loop phases: timers -> pending -> poll -> **check** (`setImmediate`) -> close. `nextTick` and promise
+        jobs drain after every callback; CJS runs `nextTick` first, ESM runs promises first.
+      - `setTimeout(0)` vs `setImmediate` from the main module: **not deterministic**.
+      - Never block the loop: no `...Sync` calls or heavy loops in request handlers.
+      - `.mjs` = ESM, `.cjs` = CJS, `.js` follows `"type"`. ESM imports need **file extensions**; use
+        `import.meta.dirname` instead of `__dirname`.
+      - `^1.2.3` = `>=1.2.3 <2.0.0`; `~1.2.3` = `>=1.2.3 <1.3.0`; below 1.0.0, `^` stays within the minor.
+      - Commit `package-lock.json`; CI and Docker use **`npm ci`**.
+      - Environment values are **strings**; validate once at start-up, report all problems, fail fast.
+      - `--env-file` never overrides the real environment. Set `process.exitCode` rather than calling
+        `process.exit()`.
+
+exercises:
+  - id: predict-cjs-order
+    type: order
+    concept: node-event-loop-model
+    skill: analysis
+    title: Put the output in order (CommonJS)
+    prompt: |
+      `refund.cjs` is run with `node refund.cjs`. Put the lines it prints in order. (The script does no I/O,
+      so ignore the timer - it prints last in this run.)
+
+      ```javascript
+      console.log('A: refund requested');
+      setTimeout(() => console.log('E: timer'), 0);
+      Promise.resolve().then(() => console.log('D: promise'));
+      process.nextTick(() => console.log('C: nextTick'));
+      console.log('B: handler returned');
+      ```
+    items:
+      - id: a
+        text: "A: refund requested"
+      - id: b
+        text: "B: handler returned"
+      - id: c
+        text: "C: nextTick"
+      - id: d
+        text: "D: promise"
+      - id: e
+        text: "E: timer"
+    hints:
+      - Callbacks never interrupt code that is running. What runs before any callback?
+      - Which queue does Node drain first after the script, in a CommonJS file?
+      - In CommonJS the nextTick queue is processed before the microtask (promise) queue; timers wait for the loop.
+    solution: |
+      **A, B, C, D, E.** The script runs to the end first (A, B). Then Node drains the `process.nextTick`
+      queue (C) and the microtask queue with the promise reaction (D) - in that order because this is a
+      CommonJS file. Only then does the loop start and run the due timer (E). Confirmed with Node 24:
+      the same pattern prints `nextTick` before `promise then` in `order.cjs`.
+    followUp: |
+      Rename the file to `refund.mjs` and run it again. Which two lines swap, and what does the Process
+      documentation say is the reason?
+
+  - id: esm-surprise
+    type: mcq
+    concept: node-event-loop-model
+    skill: analysis
+    title: "Why did the promise win?"
+    prompt: |
+      A teammate's library flushes a log buffer with `process.nextTick(flush)` and expects it to run before
+      any promise callback. It worked in the old CommonJS service. In the new service (`"type": "module"`),
+      a promise callback in the entry file runs **before** `flush`. What is going on?
+    options:
+      - id: esm-microtasks
+        text: The entry file is an ES module; ES modules are evaluated as part of the microtask queue, so Node drains microtasks before the nextTick queue.
+        feedback: Correct - this is documented in the Node.js Process docs, which show resolve and microtask printed before nextTick in an ESM file.
+      - id: node-bug
+        text: It is a regression in Node 24; nextTick must always run before promises.
+        feedback: It is documented behaviour, not a bug. The order "nextTick first" only holds for CommonJS.
+      - id: timer
+        text: process.nextTick schedules a timer with a minimum delay of 1 ms, so it can lose to promises.
+        feedback: nextTick is not a timer and has no delay - it isn't part of the event loop's timers phase at all.
+      - id: threadpool
+        text: nextTick callbacks run on the thread pool, so their timing is random.
+        feedback: All JavaScript callbacks, including nextTick, run on the main thread. The thread pool runs native work such as fs and crypto.
+    correct: [esm-microtasks]
+    hints:
+      - What changed between the two services besides the Node version?
+      - Look at the Process documentation section "When to use queueMicrotask() vs. process.nextTick()".
+    solution: |
+      In CommonJS, `nextTick` callbacks run before microtasks. An ES module is evaluated **inside** the
+      microtask queue, so Node is already draining microtasks, and the promise callback runs first. The
+      fix is not to depend on this ordering at all: flush explicitly (`await flush()`) where the order
+      matters. Confirm by running the same snippet as `.cjs` and `.mjs` - the order flips.
+
+  - id: blocked-api
+    type: mcq
+    concept: node-event-loop-model
+    skill: application
+    title: Every endpoint slows down at once
+    prompt: |
+      SandPay's merchant API (fictional) hashes a merchant's API secret on every sign-in:
+
+      ```javascript
+      app.post('/sign-in', (req, res) => {
+        const hash = crypto.pbkdf2Sync(req.body.secret, salt, 600000, 32, 'sha256');
+        // ...compare and respond
+      });
+      ```
+
+      During a sign-in burst, `/health` and `/payments` latency jump from 5 ms to several seconds, and one
+      CPU core sits at 100%. What is the best fix?
+    options:
+      - id: async-pbkdf2
+        text: Use the asynchronous crypto.pbkdf2 (callback or promisified), so hashing runs on libuv's thread pool and the event loop stays free.
+        feedback: Correct - the sync version runs on the main thread and blocks every request. The async version runs on the thread pool (4 threads by default), so other requests keep being served.
+      - id: settimeout
+        text: Wrap the pbkdf2Sync call in setTimeout(..., 0) so it runs later.
+        feedback: It still runs on the main thread - just slightly later. While it runs, everything else still waits.
+      - id: promise
+        text: Wrap pbkdf2Sync in a Promise so it becomes asynchronous.
+        feedback: The Promise executor runs synchronously. Wrapping blocking code in a promise doesn't move it off the thread.
+      - id: more-memory
+        text: Increase the memory limit with --max-old-space-size.
+        feedback: Memory isn't the bottleneck; one core is at 100% because the JavaScript thread is busy.
+    correct: [async-pbkdf2]
+    hints:
+      - Which thread runs `pbkdf2Sync`?
+      - The CLI docs list asynchronous crypto among the APIs that use the thread pool.
+    solution: |
+      `pbkdf2Sync` keeps the single JavaScript thread busy for the whole hash, so no other callback - not
+      even `/health` - can run. `crypto.pbkdf2` does the same work on libuv's thread pool and calls back
+      when done. Confirm with a load test: fire sign-ins and `/health` together before and after the
+      change; `/health` latency should stay flat after it. If sign-ins still queue, the thread pool (4
+      threads) is the next limit.
+    followUp: |
+      After the fix, 50 concurrent sign-ins still take a long time each, but `/health` is fast. Which limit
+      are they waiting on, and how could you confirm it?
+
+  - id: esm-debug
+    type: debug
+    concept: node-module-systems
+    skill: analysis
+    title: Which lines break in an ES module?
+    prompt: |
+      The project's `package.json` has `"type": "module"`. `node src/report.js` fails. Click **every**
+      line that is wrong for an ES module.
+    language: javascript
+    code: |
+      import { readFile } from 'node:fs/promises';
+      import { join } from 'node:path';
+      import { formatMinor } from './money';
+
+      const file = join(__dirname, 'settlement.csv');
+      const text = await readFile(file, 'utf8');
+      console.log(formatMinor(text.length));
+    correctLines: [3, 5]
+    lineNotes:
+      - line: 6
+        note: Top-level await is allowed in ES modules - this line is fine.
+      - line: 1
+        note: Built-in modules with the node prefix are imported like this in ESM - correct.
+      - line: 2
+        note: A bare built-in specifier needs no extension; only relative and absolute paths do.
+    hints:
+      - ESM resolves relative specifiers exactly as written.
+      - Which CommonJS-only variable is used?
+      - The fixes are `./money.js` and `import.meta.dirname`.
+    solution: |
+      **Line 3:** relative imports need the file extension in ESM - `'./money.js'` (Node 24 prints
+      `ERR_MODULE_NOT_FOUND` with "Did you mean to import "./money.js"?"). **Line 5:** `__dirname` doesn't
+      exist in ES modules; use `import.meta.dirname` (or `import.meta.filename`). Top-level `await` on
+      line 6 is valid in ESM.
+    followUp: |
+      The same file must also be loadable with `require()` from an old CommonJS script. Will that work in
+      Node 24 with this file's top-level `await`? What would you change?
+
+  - id: require-not-defined
+    type: mcq
+    concept: node-module-systems
+    skill: application
+    title: "require is not defined"
+    prompt: |
+      After adding `"type": "module"` to `package.json`, an old helper `scripts/seed.js` fails with
+      `ReferenceError: require is not defined in ES module scope, you can use import instead`. The team
+      wants to convert it later, not today. What is the smallest correct change?
+    options:
+      - id: rename-cjs
+        text: Rename it to scripts/seed.cjs - .cjs files are always loaded as CommonJS, whatever "type" says.
+        feedback: Correct - the Packages docs say .cjs is always CommonJS "regardless of the nearest parent package.json".
+      - id: remove-type
+        text: Remove "type" from package.json again.
+        feedback: That fixes one file by changing how every .js file in the package loads - and breaks the files already written as ESM.
+      - id: import-require
+        text: Add import { require } from 'node:module' at the top.
+        feedback: node:module has no require export. (It has createRequire, which is a different, more involved fix.)
+      - id: flag
+        text: Run it with node --experimental-require-module.
+        feedback: That old flag was about require() loading ES modules, not about using require inside one.
+    correct: [rename-cjs]
+    hints:
+      - Which file extensions override the "type" field?
+    solution: |
+      Rename to **`seed.cjs`**. The extension wins over `"type"`, so only that file is CommonJS. Update
+      the script that runs it (`"seed": "node scripts/seed.cjs"`). Converting it to `import` syntax is the
+      long-term fix.
+
+  - id: caret-zero
+    type: mcq
+    concept: npm-dependencies-and-lockfiles
+    skill: analysis
+    title: What can a fresh install pick?
+    prompt: |
+      `package.json` has `"@electric-sql/pglite": "^0.5.14"` and `"express": "^5.3.0"`. There is **no
+      lockfile**. The registry has pglite 0.5.16 and 0.6.0, and express 5.4.1 and 6.0.0. Which versions can
+      `npm install` choose?
+    options:
+      - id: right
+        text: pglite 0.5.16 and express 5.4.1.
+        feedback: Correct - ^ allows changes that don't touch the left-most non-zero part. For 0.5.14 that is the minor (0.5), for 5.3.0 the major (5).
+      - id: zero-minor
+        text: pglite 0.6.0 and express 5.4.1.
+        feedback: Below 1.0.0, a caret range does not cross the minor version - ^0.5.14 means >=0.5.14 <0.6.0.
+      - id: majors
+        text: pglite 0.6.0 and express 6.0.0 - caret means "latest".
+        feedback: Caret never crosses a major version (or, below 1.0.0, a minor one). "latest" is a dist-tag, not a range.
+      - id: exact
+        text: Exactly 0.5.14 and 5.3.0 - the caret only marks the version that was installed first.
+        feedback: That is what an exact version ("0.5.14") does. A caret is a range.
+    correct: [right]
+    hints:
+      - Write each range as `>=x <y`.
+      - "SemVer: major version zero is for initial development - anything may change."
+    solution: |
+      `^0.5.14` = `>=0.5.14 <0.6.0` -> **0.5.16**. `^5.3.0` = `>=5.3.0 <6.0.0` -> **5.4.1**. This is
+      why a lockfile matters: without one, two installs a week apart can pick different versions. Check
+      with npm's semver calculator or with `npm view <pkg> versions`.
+
+  - id: deps-sort
+    type: short
+    concept: npm-dependencies-and-lockfiles
+    skill: application
+    title: dependencies or devDependencies?
+    prompt: |
+      The SandPay merchant API runs `node src/server.js` in production (plain JavaScript, no build step).
+      Sort these into `dependencies` or `devDependencies` and give a one-line reason for each: `express`,
+      `pg`, `zod`, `vitest`, `eslint`, `supertest`, `@types/node`, `typescript` (used only for type-checking
+      with `tsc --noEmit`). Then say which install command the production Docker image should use.
+    modelAnswer: |
+      - **dependencies** (imported by the running server): `express`, `pg`, `zod`.
+      - **devDependencies** (only for testing, linting or type-checking): `vitest`, `supertest`, `eslint`,
+        `@types/node`, `typescript`.
+      - Production image: **`npm ci --omit=dev`** - exactly the lockfile, without dev packages.
+
+      If the project compiled TypeScript to JavaScript in the Docker build, `typescript` would still be a
+      devDependency, used in a build stage, with only the output and production dependencies copied into
+      the final image.
+    rubric:
+      - Runtime imports in dependencies; test, lint and type tools in devDependencies.
+      - Gives the reason - what the running process imports.
+      - Production install uses npm ci (lockfile) and omits dev dependencies.
+    hints:
+      - Ask of each package - does `node src/server.js` import it?
+    solution: |
+      Anything the running process imports is a dependency; everything used only to build, test or check
+      the code is a devDependency. Production installs with `npm ci --omit=dev`.
+
+  - id: ci-lockfile
+    type: mcq
+    concept: npm-dependencies-and-lockfiles
+    skill: analysis
+    title: CI fails after a merge
+    prompt: |
+      After merging a branch, CI fails at the install step:
+
+      ```plaintext
+      npm error `npm ci` can only install packages when your package.json and package-lock.json or
+      npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.
+      npm error Missing: zod@4.6.7 from lock file
+      ```
+
+      What happened, and what is the right fix?
+    options:
+      - id: lock-not-updated
+        text: Someone added zod to package.json without committing the matching lockfile change. Run npm install locally, check the lockfile diff and commit it.
+        feedback: Correct - npm ci refuses to change the lockfile; it fails when the two disagree. Updating the lock and committing it fixes it at the source.
+      - id: switch-install
+        text: Change CI to npm install, which fixes the lockfile automatically.
+        feedback: That hides the problem - CI would install a tree nobody reviewed, possibly different from production.
+      - id: delete-lock
+        text: Delete package-lock.json and let CI generate a fresh one.
+        feedback: npm ci requires an existing lockfile, and deleting it throws away the record of exactly what was tested.
+      - id: registry
+        text: The npm registry is down; re-run the job.
+        feedback: A registry outage gives network errors (ETIMEDOUT, E503), not an EUSAGE about package.json and the lock being out of sync.
+    correct: [lock-not-updated]
+    hints:
+      - Read the error code - EUSAGE - and the "Missing ... from lock file" line.
+    solution: |
+      The lock doesn't contain `zod@4.6.7`, so `package.json` and `package-lock.json` disagree - typically
+      a merge that kept one side's `package.json` and the other side's lock. Run `npm install`, review the
+      lockfile diff (only the expected packages should change) and commit. Verify by running `npm ci`
+      locally - it must succeed and leave `git status` clean.
+
+  - id: load-config
+    type: coding
+    concept: node-process-and-config
+    skill: application
+    title: Validate configuration at start-up
+    prompt: |
+      Implement `loadConfig(env)` in TypeScript. It turns an environment object (strings or `undefined`)
+      into a typed `AppConfig`: `PORT` (integer 1-65535, default 3000), `SANDPAY_API_URL` (required,
+      absolute **https** URL, stored without a trailing slash), `LOG_LEVEL` (debug, info, warn or error;
+      default info) and `NODE_ENV` (production, development or test; default development). Treat an empty
+      string as missing. Collect **every** problem and throw one `ConfigError`; each message starts with the
+      variable's name. Read only the object you are given, never `process.env` directly.
+    project: fullstack
+    files:
+      - exercises/node/load-config.ts
+    test: tests/node/load-config.test.ts
+    command: npx vitest run tests/node/load-config.test.ts
+    hints:
+      - Write a small `read(name)` helper that trims the value and returns `undefined` for an empty string.
+      - "`Number('3e3')` is 3000 and `Number('')` is 0 - check the text with a regular expression such as `/^\\d+$/` before converting."
+      - "`URL.canParse(text)` checks that a string is an absolute URL; then compare `new URL(text).protocol` with `'https:'`."
+      - Push messages into a `problems` array and throw once at the end if it isn't empty.
+    modelAnswer: |
+      ```typescript
+      export function loadConfig(env: Record<string, string | undefined>): AppConfig {
+        const problems: string[] = [];
+        const read = (name: string) => env[name]?.trim() || undefined;
+
+        let port = 3000;
+        const rawPort = read('PORT');
+        if (rawPort !== undefined) {
+          const parsed = Number(rawPort);
+          if (/^\d+$/.test(rawPort) && parsed >= 1 && parsed <= 65535) port = parsed;
+          else problems.push(`PORT must be an integer from 1 to 65535, got "${rawPort}"`);
+        }
+
+        let sandpayApiUrl = '';
+        const rawUrl = read('SANDPAY_API_URL');
+        if (rawUrl === undefined) problems.push('SANDPAY_API_URL is required');
+        else if (!URL.canParse(rawUrl) || new URL(rawUrl).protocol !== 'https:')
+          problems.push(`SANDPAY_API_URL must be an absolute https URL, got "${rawUrl}"`);
+        else sandpayApiUrl = rawUrl.replace(/\/+$/, '');
+
+        // LOG_LEVEL and NODE_ENV: default, or one of the allowed values (see solutions/node/load-config.ts)
+
+        if (problems.length > 0) throw new ConfigError(problems);
+        return { port, sandpayApiUrl, logLevel, nodeEnv };
+      }
+      ```
+
+      Why: environment values are text, so conversion must be explicit and strict (`Number` alone accepts
+      `''`, `'3e3'` and `' 80 '`). Collecting problems means one restart fixes everything. Taking `env` as a
+      parameter keeps the function pure and testable - production calls `loadConfig(process.env)`.
+    rubric:
+      - Every test in tests/node/load-config.test.ts passes.
+      - Never trusts `Number()` alone - rejects '', '3e3', '30.5' and out-of-range ports.
+      - Reports all problems in one ConfigError, each starting with the variable name.
+      - Reads only the env parameter, so the function is testable without touching process.env.
+    solution: |
+      The reference solution is `solutions/node/load-config.ts`. It reads each variable once through a
+      trimming helper, converts strictly, collects problem messages and throws a single `ConfigError`.
+      Run `npm run test:solutions -- tests/node` to see it pass.
+    followUp: |
+      Add `SANDPAY_API_KEY` (required, must start with `sk_test_` unless `NODE_ENV` is production). How
+      would you make sure the key never appears in the error message or the logs?
+
+  - id: settlement-total
+    type: coding
+    concept: node-process-and-config
+    skill: application
+    title: Total a settlement file with fs/promises
+    prompt: |
+      Implement `settlementTotal(path)`: read a SandPay settlement CSV with `readFile` from
+      `node:fs/promises` and total the `SETTLED` rows in integer minor units. Handle `\n` and `\r\n` line
+      endings and a trailing empty line. Let file errors through (a missing file rejects with
+      `code: 'ENOENT'`), reject with "line N" for a malformed row or a non-integer amount, and reject when
+      currencies are mixed.
+    project: fullstack
+    files:
+      - exercises/node/settlement-total.ts
+    test: tests/node/settlement-total.test.ts
+    command: npx vitest run tests/node/settlement-total.test.ts
+    hints:
+      - "`await readFile(path, 'utf8')` gives a string; split it with `/\\r?\\n/`."
+      - Start the loop at index 1 to skip the header; the line number to report is `index + 1`.
+      - Don't wrap `readFile` in try/catch - an async function rejects with the original error, code included.
+      - "`/^\\d+$/` accepts non-negative integers only, so `12.50`, `-5` and `ten` are rejected."
+    modelAnswer: |
+      ```typescript
+      import { readFile } from 'node:fs/promises';
+
+      export async function settlementTotal(path: string): Promise<SettlementTotal> {
+        const lines = (await readFile(path, 'utf8')).split(/\r?\n/);
+        let currency = '';
+        let settledCount = 0;
+        let totalMinor = 0;
+        for (let index = 1; index < lines.length; index += 1) {
+          const line = lines[index] ?? '';
+          if (line.trim() === '') continue;
+          const fields = line.split(',');
+          if (fields.length !== 4) throw new Error(`line ${index + 1}: expected 4 fields`);
+          const [, amount = '', rowCurrency = '', status = ''] = fields;
+          if (!/^\d+$/.test(amount)) throw new Error(`line ${index + 1}: bad amount_minor "${amount}"`);
+          if (currency === '') currency = rowCurrency;
+          else if (rowCurrency !== currency) throw new Error(`line ${index + 1}: currency ${rowCurrency} differs`);
+          if (status === 'SETTLED') {
+            settledCount += 1;
+            totalMinor += Number(amount);
+          }
+        }
+        return { currency, settledCount, totalMinor };
+      }
+      ```
+
+      Integers in minor units keep the total exact. Letting the `ENOENT` error propagate keeps its `code`, so
+      the caller can tell "no file yet" from "bad file".
+    rubric:
+      - Every test in tests/node/settlement-total.test.ts passes.
+      - Uses the promise-based readFile (no readFileSync) and doesn't swallow file errors.
+      - Sums integer minor units - no floating-point amounts.
+      - Error messages name the 1-based line so someone can open the file and find it.
+    solution: |
+      The reference solution is `solutions/node/settlement-total.ts`. For files too large to hold in memory,
+      the same logic works line by line with `createInterface({ input: createReadStream(path) })` and
+      `for await`.
+    followUp: |
+      Rewrite it with `node:readline` and a read stream. What changes in how you count line numbers, and how
+      would you test that memory use stays flat for a 1 GB file?
+
+  - id: exit-truncation
+    type: debug
+    concept: node-process-and-config
+    skill: analysis
+    title: The usage message is cut off
+    prompt: |
+      A reconciliation CLI prints a long usage message when arguments are missing. In CI, where output is
+      piped to a log, the message is sometimes cut off halfway. Click the line that causes it.
+    language: javascript
+    code: |
+      import { argv } from 'node:process';
+
+      const [, , merchantId, date] = argv;
+      if (!merchantId || !date) {
+        console.log(USAGE_TEXT); // about 40 lines
+        process.exit(1);
+      }
+      await reconcile(merchantId, date);
+    correctLines: [6]
+    lineNotes:
+      - line: 5
+        note: Printing usage is right. The problem is what happens immediately after the write is queued.
+      - line: 3
+        note: argv[0] is the node binary and argv[1] the script, so skipping two entries is correct.
+    hints:
+      - Writes to stdout are sometimes asynchronous when piped.
+      - What does process.exit() do with pending asynchronous work?
+    solution: |
+      **Line 6.** `process.exit()` forces the process to exit "as quickly as possible even if there are
+      still asynchronous operations pending", including writes to `process.stdout` - the Process docs use
+      this exact example. Set **`process.exitCode = 1`** and return (here, put the rest in an `else`), so
+      Node exits with code 1 after the output is flushed.
+
+  - id: interview-single-thread
+    type: interview
+    concept: node-event-loop-model
+    skill: analysis
+    title: "\"Node is single-threaded - so how does it handle 10,000 connections?\""
+    prompt: |
+      An interviewer asks: "Node.js is single-threaded. How can one Node process handle 10,000 concurrent
+      connections, and when does that stop working?" Answer as you would in a full stack interview.
+    modelAnswer: |
+      Your **JavaScript** runs on one thread, but **I/O doesn't**. libuv registers sockets with the
+      operating system's non-blocking mechanism - epoll, kqueue or IOCP - and the event loop runs a
+      callback only when data is ready. Waiting costs no thread, so 10,000 idle or slow connections are
+      cheap. File system calls, DNS lookups and async crypto go to libuv's thread pool (4 threads by
+      default).
+
+      It stops working when the **thread is busy**: synchronous CPU work - a big loop, `JSON.parse` of a
+      huge body, `pbkdf2Sync`, a catastrophic regex - blocks every connection at once. Symptoms: all
+      endpoints slow down together and one core is at 100%. Fixes: async APIs, chunking, worker threads or
+      a separate job service, and running several processes behind a load balancer to use all cores.
+      Thread-pool saturation is a second limit: many concurrent `fs` or `scrypt` calls queue behind 4
+      threads.
+    rubric:
+      - Separates the single JavaScript thread from I/O done by the OS and libuv.
+      - Names the event loop and non-blocking sockets (epoll/kqueue/IOCP or "the kernel").
+      - Identifies CPU-bound synchronous work as the failure mode, with an example.
+      - Mentions the thread pool and its small default size.
+      - Gives fixes - async APIs, worker threads or separate services, multiple processes.
+    followUps:
+      - What is the difference between process.nextTick, a promise callback and setImmediate?
+      - How would you prove in production that the event loop is blocked?
+      - Why does UV_THREADPOOL_SIZE have to be set before the process starts?
+    hints:
+      - Who does the waiting - the JavaScript thread or the operating system?
+      - What happens to all connections when one callback runs for two seconds?
+    solution: |
+      One thread runs JavaScript; libuv and the OS do the waiting. It scales for I/O and fails for
+      CPU-bound synchronous work, which blocks everything - use async APIs, workers and multiple processes.
+
+placement:
+  - id: place-order
+    type: order
+    concept: node-event-loop-model
+    skill: analysis
+    title: Order the output (CommonJS)
+    prompt: |
+      `job.cjs` runs with `node job.cjs`. Order its output.
+
+      ```javascript
+      queueMicrotask(() => console.log('microtask'));
+      process.nextTick(() => console.log('nextTick'));
+      console.log('sync');
+      ```
+    items:
+      - id: sync
+        text: sync
+      - id: tick
+        text: nextTick
+      - id: micro
+        text: microtask
+    solution: |
+      Synchronous code first. In CommonJS, `process.nextTick` callbacks run before `queueMicrotask` ones
+      (the Process docs: "In CJS modules process.nextTick() callbacks are always run before
+      queueMicrotask() ones"). In an `.mjs` file the last two would swap.
+
+  - id: place-module
+    type: mcq
+    concept: node-module-systems
+    skill: application
+    title: How is this file loaded?
+    prompt: |
+      `package.json` contains `"type": "module"`. Which file is loaded as **CommonJS**?
+    options:
+      - id: cjs
+        text: tools/migrate.cjs
+        feedback: Correct - .cjs is always CommonJS, regardless of the type field.
+      - id: js
+        text: src/server.js
+        feedback: With "type" set to module, .js files are ES modules.
+      - id: mjs
+        text: src/worker.mjs
+        feedback: .mjs is always an ES module.
+      - id: require-inside
+        text: src/legacy.js, because it uses require()
+        feedback: Using require doesn't change how a file is loaded - in a "type" module package this file is ESM and require is undefined.
+    correct: [cjs]
+    solution: |
+      The extension decides first (`.mjs` ESM, `.cjs` CommonJS); a `.js` file follows the nearest
+      `package.json` `"type"`.
+
+  - id: place-tilde
+    type: mcq
+    concept: npm-dependencies-and-lockfiles
+    skill: analysis
+    title: What does a tilde allow?
+    prompt: |
+      A dependency is declared as `"zod": "~4.6.7"`. Which version may `npm install` choose when there is
+      no lockfile?
+    options:
+      - id: patch
+        text: 4.6.9
+        feedback: Correct - ~4.6.7 means >=4.6.7 <4.7.0, patch updates only.
+      - id: minor
+        text: 4.7.0
+        feedback: That would be allowed by ^4.6.7. A tilde stays within the minor version.
+      - id: major
+        text: 5.0.0
+        feedback: Neither ~ nor ^ allows a new major version.
+      - id: older
+        text: 4.6.5
+        feedback: Ranges have a lower bound - ~4.6.7 never goes below 4.6.7.
+    correct: [patch]
+    solution: |
+      `~4.6.7` = `>=4.6.7 <4.7.0`. With a committed lockfile and `npm ci`, the exact locked version is
+      installed regardless.
+
+  - id: place-env
+    type: mcq
+    concept: node-process-and-config
+    skill: application
+    title: Which port does it use?
+    prompt: |
+      `.env` contains `PORT=3000`. The service runs with `PORT=8080 node --env-file=.env server.js`, and
+      `server.js` does `const port = process.env.PORT ?? 4000;`. What is `port`?
+    options:
+      - id: s8080
+        text: The string '8080'
+        feedback: Correct - the real environment takes precedence over --env-file, and environment values are strings.
+      - id: n3000
+        text: The number 3000
+        feedback: Two mistakes - the .env file doesn't override a variable that is already set, and values are strings, not numbers.
+      - id: n8080
+        text: The number 8080
+        feedback: The right source, but process.env values are always strings - convert with Number() and validate.
+      - id: n4000
+        text: The number 4000
+        feedback: The default applies only when PORT is undefined; here it is set.
+    correct: [s8080]
+    solution: |
+      Environment beats the file ("the value from the environment takes precedence"), and every value is a
+      string. Convert and validate it once at start-up.
+
+recall:
+  - id: recall-node-parts
+    concept: node-event-loop-model
+    prompt: What are V8 and libuv responsible for in Node.js?
+    answer: V8 compiles and runs JavaScript on one main thread; libuv implements the event loop, non-blocking I/O and a thread pool (default 4 threads) for work such as fs, dns.lookup and async crypto.
+  - id: recall-phases
+    concept: node-event-loop-model
+    prompt: Name the main event loop phases in order, and where setImmediate runs.
+    answer: timers, pending callbacks, (idle/prepare), poll, check, close callbacks. setImmediate callbacks run in the check phase, right after poll.
+  - id: recall-ticks
+    concept: node-event-loop-model
+    prompt: When do process.nextTick and promise callbacks run, and which comes first?
+    answer: After the current operation, before the loop continues. In CommonJS nextTick runs first; in an ES module promise callbacks (microtasks) run first.
+  - id: recall-block
+    concept: node-event-loop-model
+    prompt: What is the symptom of a blocked event loop, and one common cause?
+    answer: Every request slows down at once while one core is at 100%; a synchronous call such as pbkdf2Sync or readFileSync in a request handler, or a heavy loop.
+  - id: recall-esm
+    concept: node-module-systems
+    prompt: How does Node decide whether a .js file is an ES module, and what replaces __dirname there?
+    answer: The nearest package.json "type" field ("module" = ESM; missing or "commonjs" = CommonJS); .mjs and .cjs override it. In ESM use import.meta.dirname.
+  - id: recall-ranges
+    concept: npm-dependencies-and-lockfiles
+    prompt: What do ^1.2.3, ~1.2.3 and ^0.5.14 accept?
+    answer: ^1.2.3 is >=1.2.3 <2.0.0; ~1.2.3 is >=1.2.3 <1.3.0; ^0.5.14 is >=0.5.14 <0.6.0 (below 1.0.0 the caret stays within the minor).
+  - id: recall-ci
+    concept: npm-dependencies-and-lockfiles
+    prompt: How is npm ci different from npm install?
+    answer: npm ci needs a lockfile, installs exactly it, fails if it disagrees with package.json, removes node_modules first and never writes package.json or the lock. npm install resolves ranges and may update the lock.
+  - id: recall-exit
+    concept: node-process-and-config
+    prompt: Why set process.exitCode instead of calling process.exit()?
+    answer: process.exit() forces an immediate exit even with pending async work, including stdout writes, so output can be lost. exitCode lets Node finish and then exit with that code.
+
+next:
+  - typescript-for-applications
+  - express-http-server

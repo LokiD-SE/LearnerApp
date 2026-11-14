@@ -1,0 +1,1044 @@
+id: react-state-and-effects
+title: State, effects and rendering in React
+subject: fullstack
+module: react-frontend
+level: intermediate
+status: published
+estimatedMinutes: 65
+summary: How React state really behaves - a snapshot per render, batched updates and updater functions, immutable objects and arrays, lifting and deriving state - and how Effects synchronise a component with the outside world, with dependencies, cleanup, Strict Mode and fetch races.
+tags: [react, useState, useEffect, state, snapshot, batching, updater function, immutability, derived state, lifting state up, cleanup, strict mode, race condition, AbortController, useRef, useMemo]
+
+environment: |
+  - **Versions:** React **19.2.9** and React DOM 19.2.9 (the versions pinned in `practice/fullstack`),
+    TypeScript 6.0, Vitest 5.0 with jsdom 30.1, Testing Library (`@testing-library/react` 16.3.3,
+    `@testing-library/user-event` 14.6.8), Node.js 24. react.dev documented React 19.3 when it was read; the
+    behaviour taught here is the same in 19.2.
+  - **Sources (react.dev, read 2026-11-14):** Learn -
+    [State: A Component's Memory](https://react.dev/learn/state-a-components-memory),
+    [Render and Commit](https://react.dev/learn/render-and-commit),
+    [State as a Snapshot](https://react.dev/learn/state-as-a-snapshot),
+    [Queueing a Series of State Updates](https://react.dev/learn/queueing-a-series-of-state-updates),
+    [Updating Objects in State](https://react.dev/learn/updating-objects-in-state),
+    [Updating Arrays in State](https://react.dev/learn/updating-arrays-in-state),
+    [Choosing the State Structure](https://react.dev/learn/choosing-the-state-structure),
+    [Sharing State Between Components](https://react.dev/learn/sharing-state-between-components),
+    [Referencing Values with Refs](https://react.dev/learn/referencing-values-with-refs),
+    [Synchronizing with Effects](https://react.dev/learn/synchronizing-with-effects),
+    [You Might Not Need an Effect](https://react.dev/learn/you-might-not-need-an-effect),
+    [Lifecycle of Reactive Effects](https://react.dev/learn/lifecycle-of-reactive-effects). Reference -
+    [useState](https://react.dev/reference/react/useState),
+    [useEffect](https://react.dev/reference/react/useEffect),
+    [StrictMode](https://react.dev/reference/react/StrictMode),
+    [useMemo](https://react.dev/reference/react/useMemo),
+    [useEffectEvent](https://react.dev/reference/react/useEffectEvent). Quotations are from these pages.
+  - **Run, not assumed:** the Strict Mode sequence "setup, cleanup, setup" was observed with React 19.2.9 under
+    Vitest (which sets `NODE_ENV=test`, so React's development build is used). The exercise tests in
+    `practice/fullstack/tests/react-state` were run against the unsolved files (they fail) and the reference
+    solutions (they pass). Strict Mode's extra calls happen **only in development**; production builds run
+    each Effect once per commit.
+  - **Fictional:** the SandPay merchant dashboard, its orders (`ord_1001`) and the Demo Shop products are
+    invented. Amounts are integers in minor units (cents).
+
+prerequisites: [react-components-and-jsx, dom-events-event-loop]
+
+concepts:
+  - id: react-state-snapshot
+    name: State as a snapshot, batching and updater functions
+    summary: Each render sees a fixed snapshot of state; setting state queues a new render instead of changing the variable, React batches the updates of one event, and an updater function (n => n + 1) is how one event applies several updates to the same state.
+  - id: react-state-structure
+    name: Immutable updates, lifting and derived state
+    summary: State objects and arrays are replaced, never mutated, so React can see the change; state two components share is lifted to their closest common parent, and anything that can be computed from props or state is computed during rendering instead of being stored.
+  - id: react-effect-synchronisation
+    name: Effects, dependencies and cleanup
+    summary: An Effect synchronises a component with a system outside React after the commit; its dependencies say when to re-synchronise, its cleanup undoes the previous synchronisation (which also prevents fetch races), Strict Mode runs an extra setup and cleanup in development to prove the cleanup works, and logic that is not synchronisation does not belong in an Effect.
+
+objectives:
+  - Predict what a component shows after a click handler calls a state setter several times, with and without updater functions.
+  - Explain the trigger, render and commit steps, and why reading a state variable after setting it still gives the old value.
+  - Write immutable updates for objects and arrays in state, and replace stored-but-derivable state with a calculation during rendering.
+  - Decide where a piece of state should live, and choose between state, a ref and a plain calculation.
+  - Write an Effect with correct dependencies and a cleanup that cancels or ignores a stale fetch, and explain the Strict Mode double call in development.
+  - Identify code that does not need an Effect and move it to rendering or to an event handler.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [react-state-snapshot, react-effect-synchronisation]
+    title: The idea in plain language
+    body: |
+      A React component is like a **photographer taking a picture of the UI**. Each render is one photo, and it
+      is taken with the state values of that moment - a **snapshot**. When a click handler "sets" state, it
+      doesn't repaint the old photo; it hands React a **note for the next photo**: "next time, the counter is
+      1". Everything the handler reads afterwards still comes from the old photo. React collects all notes of one
+      event, then takes **one** new photo.
+
+      Some things are not in the photo at all: a WebSocket to SandPay's status service, a timer, a chart
+      library, a request in flight. An **Effect** is the assistant who, **after** each photo is developed,
+      makes the outside world match it - "we now show order `ord_1002`, so subscribe to `ord_1002`" - and who
+      first **undoes** the previous arrangement: "stop listening to `ord_1001`". Forgetting that undo step is
+      the source of most Effect bugs.
+
+  - id: what
+    kind: what
+    concepts: [react-state-snapshot, react-state-structure, react-effect-synchronisation]
+    title: The vocabulary
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **State** | Data a component remembers between renders, declared with `useState`. Setting it **triggers a render**. |
+      | **Render** | React calling your component function to compute JSX. It must be a pure calculation - no DOM changes, no requests. |
+      | **Commit** | React applying the minimal DOM changes so the screen matches the latest render. |
+      | **Snapshot** | The fixed state values one render (and its event handlers) sees. react.dev: _"Setting state only changes it for the next render."_ |
+      | **Batching** | React waits until all code in an event handler has run before processing state updates, then renders once. |
+      | **Updater function** | A function passed to a setter, `setCount(c => c + 1)`. React queues it and passes it the result of the previous queued update. |
+      | **Derived value** | Anything computable from props or state - calculated during rendering, not stored. |
+      | **Lifting state up** | Moving state that two components share to their closest common parent and passing it down as props. |
+      | **Ref** | `useRef(initial)` returns `{ current }`; changing `current` does **not** trigger a render. |
+      | **Effect** | Code that runs **after the commit** to synchronise with a system outside React (`useEffect(setup, deps)`). |
+      | **Dependencies** | The reactive values (props, state, values computed from them) the Effect reads; React re-runs the Effect when one changed, compared with `Object.is`. |
+      | **Cleanup** | The function the setup returns; React calls it before re-running the Effect and on unmount. |
+
+  - id: internals-render
+    kind: internals
+    concepts: [react-state-snapshot]
+    title: Trigger, render, commit - and where the snapshot comes from
+    body: |
+      react.dev describes three steps for every screen update:
+
+      1. **Trigger.** The initial render, or a state update in this component (or an ancestor).
+      2. **Render.** React calls your component. On a re-render, `useState` returns the value **for this
+         render** - the state after applying the queued updates.
+      3. **Commit.** React changes only the DOM nodes that differ from the previous render ("React only changes
+         the DOM nodes if there's a difference between renders"). The browser then paints.
+
+      An event handler is a function created **during** one render, so it closes over that render's state
+      values. That is why this handler adds only one per click:
+
+      ```typescript
+      const [number, setNumber] = useState(0);
+
+      <button
+        onClick={() => {
+          setNumber(number + 1); // number is 0 -> "next render: 1"
+          setNumber(number + 1); // number is still 0 -> "next render: 1"
+          setNumber(number + 1); // number is still 0 -> "next render: 1"
+        }}
+      >
+        +3
+      </button>;
+      ```
+
+      Even an `await` or a `setTimeout` inside the handler doesn't help: the closure still holds the snapshot
+      from the render that created it. Fresh values only arrive in the **next** render's handler.
+
+      **Batching.** React queues the three updates and renders once, after the handler finishes. It does not
+      batch across separate intentional events: two clicks are two renders. If a setter receives a value equal
+      to the current one by `Object.is`, React may skip re-rendering.
+
+  - id: visual-cycle
+    kind: visual
+    concepts: [react-state-snapshot, react-effect-synchronisation]
+    title: One click, from handler to Effect
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant U as User
+        participant H as Click handler (render 1 snapshot)
+        participant R as React
+        participant D as DOM
+        participant E as Effects
+        U->>H: click
+        H->>R: setQty(q => q + 1) (queued)
+        H->>R: setQty(q => q + 1) (queued)
+        Note over H: handler finishes - still sees render 1 values
+        R->>R: render 2 - process queue, call component
+        R->>D: commit - change only what differs
+        D-->>U: browser paints
+        R->>E: cleanup from render 1 (if deps changed)
+        R->>E: setup for render 2 (if deps changed)
+      ```
+
+      Notice two things: the handler never sees the new value, and Effects run **after** the commit - "after
+      every commit" by default, or only when a dependency changed.
+
+  - id: code-updaters
+    kind: code
+    concepts: [react-state-snapshot]
+    title: Updater functions - several updates in one event
+    body: |
+      Pass a **function** when the next state depends on the previous one and you update it more than once,
+      or from code that may run with an old snapshot:
+
+      ```typescript
+      setNumber((n) => n + 1);
+      setNumber((n) => n + 1);
+      setNumber((n) => n + 1); // the next render shows number + 3
+      ```
+
+      React queues each updater and, during the next render, calls them in order: the first receives the
+      current state (0), the second receives 1, the third 2, and React stores 3.
+
+      Rules from the `useState` reference:
+
+      - Updaters must be **pure** - only compute and return. In Strict Mode, React runs each updater **twice**
+        in development (keeping one result) to expose impure ones.
+      - A plain value and an updater can be mixed: `setNumber(number + 5); setNumber(n => n + 1)` gives
+        `number + 6` - the value replaces, the updater adds.
+      - Convention: name the parameter after the state, `setEnabled(e => !e)`, `setLines(current => ...)`.
+
+  - id: why-immutable
+    kind: why
+    concepts: [react-state-structure]
+    title: Why state objects and arrays are never mutated
+    body: |
+      React decides whether anything changed by comparing the old and new state **by reference**
+      (`Object.is`). If you change an object in place and pass the same object back, React sees "same object"
+      and can skip the render - the screen stays stale even though your data changed:
+
+      ```typescript
+      // Wrong: mutates the object React already holds, then passes the same array back
+      line.quantity += 1;
+      setLines(lines);
+      ```
+
+      Mutation also breaks the snapshot idea - an earlier render's handlers would now see changed data - and
+      it can change **props** that a parent owns. react.dev's rule: treat any object or array in state as
+      **read-only**; create a new one and set state to it.
+
+  - id: code-immutable
+    kind: code
+    concepts: [react-state-structure]
+    title: Immutable updates for objects and arrays
+    body: |
+      ```typescript
+      // Object: copy with spread, override what changes
+      setOrder((o) => ({ ...o, status: 'REFUNDED' }));
+
+      // Nested object: copy every level you change
+      setOrder((o) => ({ ...o, customer: { ...o.customer, email: newEmail } }));
+
+      // Array: one line changes -> map returns a new array with a new object for that line
+      setLines((ls) => ls.map((l) => (l.id === id ? { ...l, quantity: l.quantity + 1 } : l)));
+
+      // Add / remove
+      setLines((ls) => [...ls, newLine]);
+      setLines((ls) => ls.filter((l) => l.id !== id));
+
+      // Sort: copy first - sort() and reverse() mutate
+      setLines((ls) => [...ls].sort(byAmount));
+      ```
+
+      react.dev's table of array operations:
+
+      | Goal | Avoid (mutates) | Prefer (new array) |
+      | --- | --- | --- |
+      | add | `push`, `unshift` | `concat`, `[...arr]` |
+      | remove | `pop`, `shift`, `splice` | `filter`, `slice` |
+      | replace | `splice`, `arr[i] = ...` | `map` |
+      | sort | `reverse`, `sort` | copy the array first |
+
+      Copying an array with `[...arr]` is **shallow**: the objects inside are the same objects, so changing
+      `copy[0].quantity` still mutates state. Replace the object instead, as the `map` line does.
+
+  - id: when-structure
+    kind: when
+    concepts: [react-state-structure]
+    title: Where should this value live?
+    body: |
+      Ask these questions in order:
+
+      1. **Can it be computed from props or other state?** Then it is not state. Calculate it during
+         rendering: `const total = lines.reduce(...)`. react.dev: _"When something can be calculated from the
+         existing props or state, don't put it in state."_ A stored copy (`const [total, setTotal]`) must be
+         updated everywhere `lines` changes - miss one place and the screen shows a wrong refund total.
+      2. **Do two components need it and must they agree?** Lift it to their **closest common parent** and pass
+         it down, with a callback to change it. One source of truth; the children become controlled.
+      3. **Does changing it need to update the screen?** Use state. If not - a timer id, the previous value,
+         a DOM node - use a **ref**: `useRef` returns the same `{ current }` object every render, and changing
+         `current` does not trigger a render. Don't read or write `ref.current` during rendering (except to
+         initialise it), because React doesn't know it changed.
+      4. **Is it a prop you only use as a starting value?** Name it so (`initialLines`) and copy it into state
+         once; later prop changes are then ignored on purpose. To start over for a different entity, give the
+         component a `key` (`<RefundList key={orderId} ... />`) - React then creates fresh state.
+
+  - id: what-effects
+    kind: what
+    concepts: [react-effect-synchronisation]
+    title: Effects synchronise with something outside React
+    body: |
+      react.dev: _"Effects let you run some code after rendering so that you can synchronize your component
+      with some system outside of React."_ Examples: a WebSocket subscription, a third-party widget, the
+      document title, a browser API, a network request whose result the component shows.
+
+      ```typescript
+      useEffect(() => {
+        const connection = statusFeed.subscribe(orderId, setLiveStatus); // start synchronising
+        return () => connection.unsubscribe(); // stop synchronising
+      }, [orderId]);
+      ```
+
+      - **No dependency array:** runs after **every** commit.
+      - **`[]`:** runs after the first commit (mount) only - plus Strict Mode's extra cycle in development.
+      - **`[orderId]`:** runs on mount and whenever `orderId` changed since the last render (`Object.is`).
+
+      You don't **choose** dependencies: every reactive value the Effect reads must be listed, and the React
+      Hooks lint rule reports a missing one. To run less often, change the code so it doesn't need the value.
+      State setters and refs from `useRef` have a stable identity, so leaving them out is safe.
+
+      Think of an Effect's lifecycle not as "mount/update/unmount" but, as react.dev puts it, an Effect can only
+      **start synchronising** and later **stop synchronising** - possibly many times while the component is on
+      screen, once per change of `orderId`.
+
+      **Strict Mode** (development only) mounts every component, unmounts it and mounts it again, so you see
+      `setup -> cleanup -> setup`. It also re-renders an extra time and re-runs ref callbacks. If that visibly
+      breaks your app - two chat connections, a duplicate analytics hit - the cleanup is missing or incomplete.
+      Don't "fix" it with a ref flag that skips the second run; fix the cleanup.
+
+  - id: visual-need-effect
+    kind: visual
+    concepts: [react-effect-synchronisation, react-state-structure]
+    title: Do I need an Effect?
+    body: |
+      ```mermaid
+      flowchart TD
+        A["I want code to run when something changes"] --> B{"Can it be computed from props or state?"}
+        B -- yes --> C["Calculate during rendering (useMemo only if measured slow)"]
+        B -- no --> D{"Is it caused by a specific user action?"}
+        D -- yes --> E["Put it in the event handler"]
+        D -- no --> F{"Should state reset when an id prop changes?"}
+        F -- yes --> G["Give the component a key"]
+        F -- no --> H{"Does it keep an outside system in sync with what is on screen?"}
+        H -- yes --> I["useEffect with dependencies and cleanup"]
+        H -- no --> J["Probably no Effect - rethink the data flow"]
+      ```
+
+      Read it from the top: most "when X changes, update Y" code ends in one of the first three boxes. Effects
+      are for the last one - synchronisation with something React doesn't control.
+
+  - id: code-fetch
+    kind: code
+    concepts: [react-effect-synchronisation]
+    title: Fetching in an Effect without races
+    body: |
+      Responses can arrive in a different order than the requests were sent. Without cleanup, a slow response
+      for the **previous** order can land after the current one and overwrite it. react.dev's pattern is an
+      `ignore` flag set by the cleanup; an `AbortController` also stops the request itself:
+
+      ```typescript
+      useEffect(() => {
+        const controller = new AbortController();
+        let ignore = false;
+
+        fetchStatus(orderId, controller.signal).then(
+          (value) => {
+            if (!ignore) setResult({ forId: orderId, outcome: { status: 'loaded', value } });
+          },
+          (error: unknown) => {
+            if (ignore) return; // aborted or superseded - not the user's error
+            setResult({ forId: orderId, outcome: { status: 'error', message: String(error) } });
+          },
+        );
+
+        return () => {
+          ignore = true; // results of this run are now stale
+          controller.abort(); // and the request itself can stop
+        };
+      }, [orderId, fetchStatus]);
+      ```
+
+      Remembering **which order a result is for** (`forId`) lets the component derive "loading" during
+      rendering - `result?.forId !== orderId` - so a previous order's status is never shown, without an extra
+      Effect that resets state.
+
+      react.dev also lists the limits of fetching in Effects: no server rendering of the data, request
+      waterfalls between parent and child, no caching between mounts. In an application, prefer your
+      framework's data loading or a client cache library; write the raw Effect when you need to understand or
+      test the mechanics, as here.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [react-effect-synchronisation]
+    title: Why the fetch Effect is written this way
+    body: |
+      - **`const controller = new AbortController()` inside the Effect** - one controller per run, so each
+        cleanup cancels exactly its own request.
+      - **`let ignore = false`** - a variable captured by this run's callbacks. The cleanup flips it; responses
+        that arrive later are dropped. `abort()` alone isn't enough: a fetcher may ignore the signal, and a
+        response may already be resolving.
+      - **The error branch checks `ignore` first** - aborting makes the request reject, and that rejection is
+        expected, not something to show the user.
+      - **`[orderId, fetchStatus]`** - both are read inside. If a parent passes a new `fetchStatus` function on
+        every render, the Effect would re-run (and re-fetch) every render; the caller must keep it stable
+        (define it outside the component or memoise it).
+      - **The cleanup returns nothing async** - React calls it synchronously before the next setup and on
+        unmount.
+
+  - id: example
+    kind: example
+    concepts: [react-effect-synchronisation, react-state-structure]
+    title: "Project scenario: the wrong order status on the dashboard"
+    body: |
+      A SandPay merchant clicks quickly through orders in the dashboard: `ord_1001`, then `ord_1002`. The
+      status API is slow for `ord_1001` today (2.1 s) and fast for `ord_1002` (120 ms). The detail panel shows
+      **PAID** under the heading `ord_1002` - but `ord_1002` is PENDING. Support reports "the dashboard shows
+      wrong statuses".
+
+      What a tester and a developer check together:
+
+      - **Reproduce deterministically.** In DevTools, throttle the network or add a delay to one order's mock
+        response; the bug appears every time the first response is the slower one.
+      - **Evidence.** The Network panel shows two requests; the one for `ord_1001` finishes **last**. The
+        panel's heading and status come from different responses.
+      - **Root cause.** The Effect has no cleanup, so the late `setState` for `ord_1001` wins.
+      - **Fix and prove it.** Add the ignore flag and abort (above); write a component test with a fake server
+        whose responses the test resolves **in reverse order** - no timers, no luck - exactly as
+        `tests/react-state/use-order-status.test.tsx` in the practice project does.
+
+  - id: tests
+    kind: tests
+    concepts: [react-state-snapshot, react-state-structure, react-effect-synchronisation]
+    title: Tests that catch state and Effect bugs
+    body: |
+      | # | Case | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Click "+3" once | quantity +3, total updated in the same render | DOM text after the click |
+      | 2 | Click "+1" on a line | new quantity and total on screen | DOM text; props deep-equal before and after |
+      | 3 | Remove a line | line gone, total recalculated | `queryByRole` returns null; total text |
+      | 4 | Order id changes | "loading" immediately, never the previous order's status | value right after `rerender` |
+      | 5 | Responses arrive in reverse order | the latest order's status wins | resolve the first request last |
+      | 6 | Order id changes, then unmount | previous and current request signals aborted | `signal.aborted` on the fake requests |
+      | 7 | Request fails | error message shown | rejected fake request -> error state |
+      | 8 | Superseded request fails | no error shown | reject the old request after the id changed |
+      | 9 | Rendered in `<StrictMode>` | two setups, first aborted, one result applied | request list and signals |
+
+      Negative cases 5, 6, 8 and 9 are where Effect bugs hide. They need **controllable** fake promises; a test
+      that waits 100 ms and hopes the order is right is flaky by design.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [react-state-snapshot, react-state-structure, react-effect-synchronisation]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Reading state right after setting it** and expecting the new value. Use the value you computed
+        (`const next = count + 1; setCount(next); log(next)`) or an updater.
+      - **Mutating then setting the same object.** Symptom: data changes but the screen doesn't, or changes
+        late when something else re-renders. Search for `push`, `splice`, `sort`, `x.y =` on state.
+      - **Storing derived values** (`filteredOrders`, `total`) and syncing them in an Effect. Symptom: one
+        render with stale data, extra renders, values that drift. Calculate them during rendering.
+      - **Missing or lying dependencies.** `// eslint-disable-next-line` on the dependency rule is a bug
+        waiting: the Effect keeps old props. Fix the code instead.
+      - **Setting state unconditionally in an Effect without dependencies:** render -> Effect -> set state ->
+        render... an infinite loop ("like plugging a power outlet into itself", react.dev).
+      - **No cleanup** for subscriptions, timers and fetches. Strict Mode's double setup is the hint; races and
+        leaks are the production symptoms.
+      - **A new object or function as a dependency every render** - the Effect re-runs every time. Move it
+        inside the Effect, outside the component, or memoise it.
+
+      Debugging method: log in the component body ("render", with the values), in the Effect setup and in the
+      cleanup. React DevTools' Components panel shows current props and state, and its Profiler shows what
+      rendered and why. Reproduce with a deterministic test before fixing.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [react-state-structure, react-effect-synchronisation]
+    title: Memoisation, Effect Events and other options
+    body: |
+      - **`useMemo` / `useCallback` are performance tools, not correctness tools.** react.dev: _"You should
+        only rely on useMemo as a performance optimization. If your code doesn't work without it, find the
+        underlying problem and fix it first."_ Measure first: wrap the calculation in `console.time`; if the
+        interaction costs about **1 ms or more**, memoising may help - then measure again. React Compiler, when
+        a project uses it, memoises automatically and reduces the need for manual calls.
+      - **Effect Events** (`useEffectEvent`, available in React 19.2) let an Effect call the **latest**
+        version of a callback without that callback being a dependency - for example, logging with the latest
+        theme without reconnecting when the theme changes. Use it for non-reactive logic only.
+      - **`key` to reset state** is often simpler than an Effect that clears state when an id changes.
+      - **Data libraries and frameworks** handle caching, deduplication, races and loading states for you; the
+        raw Effect is still worth knowing to debug them and to test the edge cases.
+
+  - id: summary
+    kind: summary
+    concepts: [react-state-snapshot, react-state-structure, react-effect-synchronisation]
+    title: Quick reference
+    body: |
+      - Setting state changes it **for the next render**; the current handler keeps its snapshot.
+      - React batches the updates of one event; use `setX(x => ...)` to apply several updates in a row.
+      - Never mutate state objects or arrays; `map`, `filter`, spread - and copy before `sort`.
+      - Don't store what you can compute. Lift shared state to the closest common parent. Refs for values that
+        don't affect the screen.
+      - Effects are for synchronising with outside systems, after the commit. List every reactive value as a
+        dependency. Return a cleanup.
+      - Fetch in an Effect with an ignore flag and `AbortController`; remember which id a result belongs to.
+      - Strict Mode's `setup -> cleanup -> setup` in development is a test of your cleanup, not a bug to hide.
+      - `useMemo` / `useCallback` only after measuring.
+
+exercises:
+  - id: snapshot-alert
+    type: mcq
+    concept: react-state-snapshot
+    skill: application
+    title: What does the alert show?
+    prompt: |
+      `count` is 4 on screen. The user clicks once.
+
+      ```typescript
+      function handleClick() {
+        setCount(count + 1);
+        setCount(count + 1);
+        alert(count);
+      }
+      ```
+
+      What does the alert show, and what does the screen show after the click?
+    options:
+      - id: alert-4-screen-5
+        text: Alert 4, screen 5
+        feedback: Correct - both calls read the snapshot value 4 and ask for 5; the alert reads the same snapshot.
+      - id: alert-6-screen-6
+        text: Alert 6, screen 6
+        feedback: That assumes each setter changes count immediately. Setting state only changes it for the next render.
+      - id: alert-5-screen-5
+        text: Alert 5, screen 5
+        feedback: The alert runs in the same handler, with the same snapshot - count is still 4 there.
+      - id: alert-4-screen-6
+        text: Alert 4, screen 6
+        feedback: The alert part is right, but both calls compute 4 + 1. Only updater functions (c => c + 1) build on each other.
+    correct: [alert-4-screen-5]
+    hints:
+      - "Which value of `count` does this handler's closure hold?"
+      - "Both setters are given a value, not a function - what value?"
+    solution: |
+      **Alert 4, screen 5.** The handler was created during the render where `count` is 4. Each
+      `setCount(count + 1)` queues "replace with 5"; the alert reads the same snapshot. After the handler,
+      React renders once with 5. With `setCount(c => c + 1)` twice the screen would show 6 - and the alert
+      would still show 4.
+    followUp: |
+      Change the handler so the screen shows 6 **and** the alert shows the value that will be on screen.
+
+  - id: render-commit-order
+    type: order
+    concept: react-state-snapshot
+    skill: application
+    title: From click to Effect
+    prompt: |
+      A click handler calls `setStatus('REFUNDING')`, and the component has an Effect that depends on `status`.
+      Put the steps in order.
+    items:
+      - id: handler-runs
+        text: The click handler runs to the end; setStatus only queues an update
+      - id: render
+        text: React calls the component, and useState returns 'REFUNDING'
+      - id: commit
+        text: React changes the DOM nodes that differ from the previous render
+      - id: cleanup
+        text: React runs the previous Effect's cleanup
+      - id: setup
+        text: React runs the Effect setup with the new status
+    hints:
+      - "Effects run after the screen is updated."
+      - "Before re-synchronising, React stops the previous synchronisation."
+    solution: |
+      **Handler → render → commit → cleanup → setup.** Updates are batched until the handler ends. Rendering
+      computes the new JSX, the commit applies it, and only then are Effects processed: the previous run's
+      cleanup first, then the new setup.
+
+  - id: stale-attempts
+    type: debug
+    concept: react-state-snapshot
+    skill: analysis
+    title: The support message comes one click late
+    prompt: |
+      After the **third** failed capture attempt the button should show "Contact SandPay support". Testers see
+      it only after the fourth click. Click the line that causes it.
+    language: typescript
+    code: |
+      function CaptureButton({ capture }: { capture: () => Promise<boolean> }) {
+        const [attempts, setAttempts] = useState(0);
+        const [message, setMessage] = useState('');
+
+        async function handleClick() {
+          setAttempts(attempts + 1);
+          const ok = await capture();
+          if (!ok && attempts >= 3) setMessage('Contact SandPay support');
+        }
+
+        return <button onClick={handleClick}>{message || 'Capture'}</button>;
+      }
+    correctLines: [8]
+    lineNotes:
+      - line: 6
+        note: Only one update per click, so a plain value is fine here. The problem is what line 8 reads.
+      - line: 7
+        note: Awaiting doesn't refresh attempts. The closure keeps the snapshot of the render that created the handler.
+    hints:
+      - "On the third click, what is `attempts` inside this handler?"
+      - "Does the `await` give the handler a newer snapshot?"
+    solution: |
+      **Line 8.** On the third click, the handler was created when `attempts` was **2**; `setAttempts` doesn't
+      change that variable, and neither does the `await`. So `attempts >= 3` is false until the fourth click.
+      Fix: compute the new value once and use it - `const next = attempts + 1; setAttempts(next); ... if (!ok
+      && next >= 3)`.
+    followUp: |
+      If the user can click again while `capture()` is still running, `setAttempts(attempts + 1)` can lose
+      clicks. Which change to line 6 prevents that?
+
+  - id: mutated-array
+    type: mcq
+    concept: react-state-structure
+    skill: application
+    title: The new refund line doesn't appear
+    prompt: |
+      ```typescript
+      function addLine(line: RefundLine) {
+        lines.push(line);
+        setLines(lines);
+      }
+      ```
+
+      Clicking "Add line" does nothing on screen, but the line appears later when the user types in another
+      field. Why?
+    options:
+      - id: same-reference
+        text: setLines receives the same array object, so React sees no change and may skip the render; the mutation shows up at the next unrelated render
+        feedback: Correct - React compares with Object.is. Use setLines(ls => [...ls, line]).
+      - id: push-async
+        text: push is asynchronous in React state, so the line arrives later
+        feedback: push is a plain synchronous array method. The array did change - React just wasn't told about a new value.
+      - id: needs-effect
+        text: Adding to an array needs a useEffect to re-render
+        feedback: Effects are for outside systems. A new array passed to the setter re-renders without any Effect.
+      - id: key-missing
+        text: The list items have no key, so React can't show new ones
+        feedback: Missing keys cause warnings and reordering bugs, not a missing render. The cause is the reused array.
+    correct: [same-reference]
+    hints:
+      - "How does React decide whether the new state differs from the old?"
+    solution: |
+      React compares old and new state with `Object.is`. `push` changed the existing array and `setLines`
+      received that **same** array, so React can bail out. Typing elsewhere triggers a render that happens to
+      read the mutated array. Fix: `setLines(ls => [...ls, line])` (or `concat`).
+
+  - id: remove-derived-state
+    type: short
+    concept: react-state-structure
+    skill: analysis
+    title: Remove the stored filter result
+    prompt: |
+      ```typescript
+      const [orders, setOrders] = useState<Order[]>([]);
+      const [statusFilter, setStatusFilter] = useState<OrderStatus | 'ALL'>('ALL');
+      const [visible, setVisible] = useState<Order[]>([]);
+
+      useEffect(() => {
+        setVisible(statusFilter === 'ALL' ? orders : orders.filter((o) => o.status === statusFilter));
+      }, [orders, statusFilter]);
+      ```
+
+      Explain what is wrong with this design (at least two problems) and rewrite it.
+    hints:
+      - "Can `visible` be computed from other state?"
+      - "What does the screen show between the render with new orders and the Effect's re-render?"
+    modelAnswer: |
+      `visible` is **derived** from `orders` and `statusFilter`, so it shouldn't be state:
+
+      - Each change renders **twice**: first with the stale `visible`, then again after the Effect sets it -
+        one frame of wrong data and wasted work.
+      - It is a second source of truth that can drift, for example if someone calls `setVisible` elsewhere.
+      - More code, an Effect that isn't synchronising anything outside React.
+
+      ```typescript
+      const [orders, setOrders] = useState<Order[]>([]);
+      const [statusFilter, setStatusFilter] = useState<OrderStatus | 'ALL'>('ALL');
+      const visible = statusFilter === 'ALL' ? orders : orders.filter((o) => o.status === statusFilter);
+      ```
+
+      Only if measurement shows the filter is slow (about 1 ms or more per interaction) wrap it in `useMemo`.
+    solution: |
+      `visible` is derived from `orders` and `statusFilter`, so calculate it during rendering and delete the
+      state and the Effect. That removes the extra render with stale data and the risk of the copy drifting.
+      Memoise only after measuring.
+    rubric:
+      - Identifies visible as derived state that should be calculated during rendering
+      - Names the extra render with stale data (or the double render)
+      - Names the risk of the two values getting out of sync
+      - Rewrites it as a calculation, with useMemo only if measured
+
+  - id: strict-mode-twice
+    type: mcq
+    concept: react-effect-synchronisation
+    skill: analysis
+    title: The status feed connects twice
+    prompt: |
+      In development, the console shows `connect ord_1001` twice when the order page opens. In production it
+      appears once.
+
+      ```typescript
+      useEffect(() => {
+        console.log('connect', orderId);
+        statusFeed.connect(orderId);
+      }, [orderId]);
+      ```
+
+      What is the right conclusion?
+    options:
+      - id: missing-cleanup
+        text: Strict Mode runs setup, cleanup, setup in development; the Effect has no cleanup, so a connection leaks - add return () => statusFeed.disconnect(orderId)
+        feedback: Correct - with a cleanup you would see connect, disconnect, connect, and only one live connection.
+      - id: ref-guard
+        text: Add a ref that remembers the Effect already ran and skip the second run
+        feedback: That hides the warning sign. Without a cleanup, navigating away and back (or changing orderId) still leaks connections in production.
+      - id: empty-deps
+        text: Change the dependencies to [] so it only runs once
+        feedback: Strict Mode re-runs mount Effects too, and with [] the feed would no longer follow orderId - a stale-props bug.
+      - id: react-bug
+        text: It's a React development bug; ignore it because production is fine
+        feedback: It is deliberate. Strict Mode remounts to find Effects without cleanup.
+    correct: [missing-cleanup]
+    hints:
+      - "What does Strict Mode do to every component right after it mounts, in development?"
+      - "What would make two runs harmless?"
+    solution: |
+      Strict Mode remounts each component once in development, so the Effect runs setup → cleanup → setup.
+      Here there is no cleanup, so you can see the double connect. Return a cleanup that disconnects; then two
+      runs leave one connection, which is also what happens in production when `orderId` changes or the user
+      navigates away and back.
+
+  - id: effect-or-not
+    type: mcq
+    concept: react-effect-synchronisation
+    skill: application
+    title: Which one belongs in an Effect?
+    prompt: Which of these is a good use of `useEffect` in the SandPay dashboard?
+    options:
+      - id: subscribe
+        text: Subscribing to the order's live status feed (a WebSocket) while the order panel is on screen
+        feedback: Correct - an outside system kept in sync with what is shown, with a cleanup that unsubscribes.
+      - id: post-refund
+        text: Sending the refund POST when the user clicks "Refund"
+        feedback: That is caused by a specific user action - put it in the click handler. In an Effect it could run again on remount.
+      - id: compute-total
+        text: Computing the refund total when the lines change
+        feedback: The total is derived from state - calculate it during rendering.
+      - id: reset-form
+        text: Clearing the refund form state when orderId changes
+        feedback: Give the form a key={orderId}; React then starts it with fresh state, with no extra render.
+    correct: [subscribe]
+    hints:
+      - "Which option involves a system outside React that must stay in sync with the screen?"
+    solution: |
+      Only the **subscription** synchronises with an external system. The POST belongs in the event handler,
+      the total is a calculation during rendering, and resetting state for a new entity is done with a `key`.
+
+  - id: race-testdesign
+    type: testdesign
+    concept: react-effect-synchronisation
+    skill: application
+    title: Prove the order panel can't show a stale status
+    prompt: |
+      Design component tests for an order panel that fetches the status of `orderId` in an Effect. Cover races,
+      cancellation and errors. For each case give preconditions, steps, the expected result **and the
+      evidence** you check. Your tests must not depend on real timing.
+    hints:
+      - "Replace the network with a fake whose promises the test resolves or rejects."
+      - "What happens if the first request's answer arrives last?"
+      - "How can a test see that a request was cancelled?"
+    modelAnswer: |
+      Precondition for all: the panel gets a fake `fetchStatus(orderId, signal)` that records each call and
+      returns a promise the test controls.
+
+      1. **Happy path** - render with `ord_1001`; expect "loading"; resolve with PAID; expect PAID.
+         Evidence: rendered text, one recorded request.
+      2. **Id changes** - after PAID, re-render with `ord_1002`; expect "loading" immediately, not PAID.
+      3. **Reverse order** - render `ord_1001`, re-render `ord_1002`; resolve request 2 (PENDING), then request
+         1 (PAID); expect PENDING. Evidence: final text.
+      4. **Cancellation** - after the id change, request 1's `signal.aborted` is true and request 2's false;
+         after unmount, request 2's is true too.
+      5. **Error** - reject with "503 Service Unavailable"; expect the error message.
+      6. **Superseded error** - change the id, reject request 1; expect still "loading", no error.
+      7. **Strict Mode** - render inside `<StrictMode>`; expect two requests, the first aborted, and one
+         result shown.
+    solution: |
+      The key is a fake fetcher whose promises the test settles, so the race is reproduced on purpose: resolve
+      the first request **last** and assert the latest order wins; check `signal.aborted` for cancellation;
+      reject a superseded request and assert no error is shown; repeat the mount inside `<StrictMode>`.
+    rubric:
+      - Uses a controllable fake instead of timers or the real network
+      - Includes the reverse-order race and checks the final status
+      - Checks cancellation through the abort signal (or equivalent)
+      - Covers errors, including that a superseded request's error is not shown
+      - Gives evidence for every case
+
+  - id: refund-list-coding
+    type: coding
+    concept: react-state-structure
+    skill: application
+    title: Fix the refund list's state bugs
+    prompt: |
+      `RefundList` renders correctly the first time, but it has three state bugs: "+1" doesn't update the
+      screen, "+3" adds only one, and the total never changes. The props are frozen in the tests, so mutating
+      them throws. Fix the component without changing its markup.
+    project: fullstack
+    files:
+      - exercises/react-state/RefundList.tsx
+    test: tests/react-state/refund-list.test.tsx
+    command: npx vitest run tests/react-state/refund-list.test.tsx
+    hints:
+      - "Run the tests and read the first failure. Which line changes an object React already holds?"
+      - "Three calls with a plain value all start from the same snapshot."
+      - "Is `total` something you need to store?"
+    modelAnswer: |
+      ```typescript
+      function addQuantity(lines: RefundLine[], id: string, amount: number): RefundLine[] {
+        return lines.map((l) => (l.id === id ? { ...l, quantity: l.quantity + amount } : l));
+      }
+
+      const [lines, setLines] = useState<RefundLine[]>(() => [...initialLines]);
+      const total = totalOf(lines); // derived - always matches lines
+
+      function oneMore(id: string) {
+        setLines((current) => addQuantity(current, id, 1));
+      }
+      function addThree(id: string) {
+        for (let i = 0; i < 3; i++) setLines((current) => addQuantity(current, id, 1));
+      }
+      function remove(id: string) {
+        setLines((current) => current.filter((l) => l.id !== id));
+      }
+      ```
+
+      `map` with a spread creates a new array **and** a new object for the changed line, so nothing the parent
+      passed in is touched. Updater functions build on each other, so "+3" adds three. The total is calculated
+      during rendering, so it can't go stale.
+    solution: |
+      Replace mutation with `map` and a spread (new array, new line object), use updater functions for the
+      three updates in "+3", and compute `total` from `lines` during rendering instead of storing it. The
+      reference is `solutions/react-state/RefundList.tsx`.
+    rubric:
+      - Every test in refund-list.test.tsx passes
+      - No mutation of state or props - new arrays and new line objects
+      - Updater functions where several updates happen in one event
+      - total is computed during rendering, not stored in state
+
+  - id: order-status-coding
+    type: coding
+    concept: react-effect-synchronisation
+    skill: application
+    title: A race-free order status hook
+    prompt: |
+      `useOrderStatus(orderId, fetchStatus)` works for one quick request, but a slow response for a previous
+      order can overwrite the current one, requests are never cancelled, failures are not shown, and it doesn't
+      survive Strict Mode. Fix it so every test passes. Keep the exported types and the signature.
+    project: fullstack
+    files:
+      - exercises/react-state/useOrderStatus.ts
+    test: tests/react-state/use-order-status.test.tsx
+    command: npx vitest run tests/react-state/use-order-status.test.tsx
+    hints:
+      - "What should happen to the previous request when the Effect runs again?"
+      - "An `ignore` flag set in the cleanup, plus `controller.abort()`."
+      - "To show loading immediately on a new id without an extra Effect, remember which id the stored result belongs to."
+    modelAnswer: |
+      ```typescript
+      const [result, setResult] = useState<{ forId: string; outcome: Settled } | null>(null);
+
+      useEffect(() => {
+        const controller = new AbortController();
+        let ignore = false;
+        fetchStatus(orderId, controller.signal).then(
+          (value) => {
+            if (!ignore) setResult({ forId: orderId, outcome: { status: 'loaded', value } });
+          },
+          (error: unknown) => {
+            if (ignore) return;
+            const message = error instanceof Error ? error.message : String(error);
+            setResult({ forId: orderId, outcome: { status: 'error', message } });
+          },
+        );
+        return () => {
+          ignore = true;
+          controller.abort();
+        };
+      }, [orderId, fetchStatus]);
+
+      if (result === null || result.forId !== orderId) return { status: 'loading' };
+      return result.outcome;
+      ```
+
+      The cleanup runs before every re-run and on unmount, so each request is cancelled and its late result
+      ignored. "Loading" is derived during rendering. One limit: switching back to an order shown earlier
+      displays that order's last result while the new request runs - acceptable here, and easy to change by
+      also storing a request counter.
+    solution: |
+      Give each Effect run its own `AbortController` and `ignore` flag, set and abort them in the cleanup, skip
+      both the result and the error when `ignore` is true, and derive "loading" from which order the stored
+      result belongs to. The reference is `solutions/react-state/useOrderStatus.ts`.
+    rubric:
+      - Every test in use-order-status.test.tsx passes
+      - The cleanup both ignores late results and aborts the request
+      - Errors of aborted or superseded requests are not shown
+      - No Effect that only resets state; loading is derived (or reset by a key)
+
+  - id: effects-interview
+    type: interview
+    concept: react-effect-synchronisation
+    skill: analysis
+    title: When do you reach for useEffect?
+    prompt: |
+      "Walk me through how you decide whether something belongs in `useEffect`. Then tell me about a bug an
+      Effect caused and how you'd prevent it."
+    hints:
+      - "Start from what Effects are for, then list the alternatives."
+      - "Pick a concrete bug - a race, a leak or a loop - with evidence."
+    modelAnswer: |
+      Effects synchronise a component with a system **outside React** after the commit - a subscription, a
+      widget, a browser API, a request whose result is shown. Before writing one I check the alternatives: if
+      the value can be computed from props or state, I calculate it during rendering (memoising only if
+      measured); if it happens because the user did something, it goes in the event handler; if state should
+      reset for a new entity, I use a `key`.
+
+      When I do write one, I list every reactive value it reads as a dependency (the lint rule enforces it) and
+      return a cleanup that undoes the setup. Strict Mode's setup-cleanup-setup in development tells me whether
+      the cleanup works.
+
+      A bug: an order panel fetched the status in an Effect without cleanup. When a merchant clicked quickly,
+      the slower response for the previous order arrived last and overwrote the current one. I reproduced it
+      by delaying one mocked response, fixed it with an ignore flag and `AbortController` in the cleanup, and
+      added a test that resolves the requests in reverse order. In a larger app I'd use the framework's data
+      loading or a cache library, which handles this.
+    solution: |
+      A strong answer defines Effects as synchronisation with outside systems after the commit, rules out the
+      alternatives first (calculate during rendering, event handler, `key`), insists on complete dependencies
+      and a cleanup, explains Strict Mode's double run, and tells a concrete bug story - reproduced, fixed and
+      covered by a regression test.
+    rubric:
+      - Defines Effects as synchronisation with external systems after commit
+      - Names at least two alternatives (derive during render, event handler, key)
+      - Mentions dependencies and cleanup, and what Strict Mode's double run proves
+      - Gives a concrete bug with evidence, fix and a regression test
+    followUps:
+      - Why is an empty dependency array not a way to "run this once"?
+      - How would you call the latest onStatusChange callback from an Effect without reconnecting when it changes?
+      - What does a data-fetching library give you that a raw Effect doesn't?
+
+placement:
+  - id: place-updaters
+    type: mcq
+    concept: react-state-snapshot
+    skill: application
+    title: Two kinds of update in one handler
+    prompt: |
+      `qty` is 2. One click runs:
+
+      ```typescript
+      setQty(qty + 3);
+      setQty((q) => q * 2);
+      ```
+
+      What does the next render show?
+    options:
+      - id: ten
+        text: "10"
+        feedback: Correct - the value replaces (5), then the updater doubles the queued result (10).
+      - id: four
+        text: "4"
+        feedback: The updater doesn't start from the snapshot; it receives the result of the previous queued update (5).
+      - id: five
+        text: "5"
+        feedback: The updater isn't ignored - React applies queued updates in order.
+      - id: seven
+        text: "7"
+        feedback: That would be qty + 3 applied after doubling. React processes the queue in the order the calls were made.
+    correct: [ten]
+    solution: |
+      React queues "replace with 5" and then "q => q * 2". In the next render it processes the queue in order:
+      5, then 5 × 2 = **10**.
+
+  - id: place-shallow-copy
+    type: debug
+    concept: react-state-structure
+    skill: analysis
+    title: A copy that still mutates
+    prompt: The quantity changes in the data but the parent's original lines change too. Click the line responsible.
+    language: typescript
+    code: |
+      function oneMore(id: string) {
+        setLines((current) => {
+          const copy = [...current];
+          const line = copy.find((l) => l.id === id);
+          if (line) line.quantity += 1;
+          return copy;
+        });
+      }
+    correctLines: [5]
+    lineNotes:
+      - line: 3
+        note: The array copy is fine - but it is shallow, so the line objects inside are still the originals.
+    solution: |
+      **Line 5.** `[...current]` copies the array, not the objects. `line` is the same object as in the old
+      state (and in the parent's props), so `+= 1` mutates it. Replace the object instead:
+      `current.map(l => l.id === id ? { ...l, quantity: l.quantity + 1 } : l)`.
+
+  - id: place-cleanup-race
+    type: mcq
+    concept: react-effect-synchronisation
+    skill: application
+    title: Which cleanup prevents the race?
+    prompt: |
+      An Effect with dependency `[orderId]` fetches the order's status and calls `setStatus` with the result.
+      Users who switch orders quickly sometimes see the previous order's status. Which change fixes it?
+    options:
+      - id: ignore-flag
+        text: In the Effect, set let ignore = false; only call setStatus if !ignore; return () => { ignore = true }
+        feedback: Correct - each run's cleanup marks its own late result as stale (aborting the request as well is even better).
+      - id: empty-deps
+        text: Change the dependency array to []
+        feedback: Then the panel would never fetch the new order at all - the status would stay on the first order.
+      - id: use-memo
+        text: Wrap the fetch in useMemo
+        feedback: useMemo caches a calculation during rendering; it doesn't control when responses arrive.
+      - id: ref-latest
+        text: Store the status in a ref instead of state
+        feedback: A ref doesn't re-render, so the screen wouldn't update - and late responses would still overwrite it.
+    correct: [ignore-flag]
+    solution: |
+      Responses can arrive in any order. A cleanup that sets `ignore = true` (and ideally calls
+      `controller.abort()`) makes every superseded run drop its result, so only the current order's response
+      reaches `setStatus`.
+
+recall:
+  - id: recall-snapshot
+    concept: react-state-snapshot
+    prompt: What does a component see if it reads a state variable right after calling its setter?
+    answer: The old value. Setting state only changes it for the next render; the current render and its handlers keep their snapshot.
+  - id: recall-updater
+    concept: react-state-snapshot
+    prompt: When do you pass an updater function to a state setter?
+    answer: When the next state depends on the previous one and you may update it more than once (or from a stale closure), e.g. setCount(c => c + 1). React queues updaters and feeds each the previous result.
+  - id: recall-batching
+    concept: react-state-snapshot
+    prompt: What is batching in React?
+    answer: React waits until all code in an event handler has run, then processes the queued updates and renders once. Separate clicks are not batched together.
+  - id: recall-immutable
+    concept: react-state-structure
+    prompt: Name the array methods to avoid on state and what to use instead.
+    answer: Avoid push, unshift, pop, shift, splice, sort, reverse and index assignment. Use concat or spread to add, filter or slice to remove, map to replace, and copy before sorting.
+  - id: recall-derived
+    concept: react-state-structure
+    prompt: Where should a value that can be computed from props or state live?
+    answer: Nowhere - compute it during rendering. Storing it adds a second source of truth and an extra render.
+  - id: recall-ref
+    concept: react-state-structure
+    prompt: State or ref - how do you choose?
+    answer: If changing the value must update the screen, state. If not (a timer id, a DOM node, a previous value), a ref - changing ref.current doesn't re-render.
+  - id: recall-effect
+    concept: react-effect-synchronisation
+    prompt: What is an Effect for, and what must it return when it sets something up?
+    answer: Synchronising the component with a system outside React after the commit. It returns a cleanup that undoes the setup - unsubscribe, clear the timer, abort or ignore the fetch.
+  - id: recall-strict
+    concept: react-effect-synchronisation
+    prompt: Why do Effects run twice in development, and what should you do about it?
+    answer: Strict Mode mounts, unmounts and remounts each component in development (setup, cleanup, setup) to expose missing cleanup. Fix the cleanup; don't skip the second run.
+
+next:
+  - react-forms-and-validation
+  - react-routing-and-data-fetching
+  - frontend-state-management
