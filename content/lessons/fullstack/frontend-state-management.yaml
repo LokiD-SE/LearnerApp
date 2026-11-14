@@ -1,0 +1,1148 @@
+id: frontend-state-management
+title: Application state - context, reducers and server-state caching
+subject: fullstack
+module: react-frontend
+level: advanced
+status: published
+estimatedMinutes: 70
+summary: Where each kind of state should live - component, lifted, context, URL, form or a server-state cache - how a typed reducer and split contexts share client state without needless re-renders, and how stale-while-revalidate caching, query keys, invalidation and optimistic updates with rollback keep server data on screen without lying to the user.
+tags: [react, state management, context, useContext, useReducer, reducer, dispatch, prop drilling, re-render, useMemo, server state, cache, stale-while-revalidate, RFC 5861, query key, invalidation, optimistic update, rollback, TanStack Query, SWR, RTK Query, URL state, search params]
+
+environment: |
+  - **Versions:** React **19.2.9** (pinned in `practice/fullstack`), TypeScript 6.0, Vitest 5.0 with jsdom 30.1,
+    Testing Library (`@testing-library/react` 16.3.3, `@testing-library/user-event` 14.6.8), Node.js 24.
+    react.dev documented React 19.3 when it was read; everything used here exists in 19.2. Rendering
+    `<SomeContext value={...}>` as a provider is **React 19 and later**; older versions need
+    `<SomeContext.Provider>`.
+  - **Sources (read 2026-11-14):** react.dev Learn -
+    [Choosing the State Structure](https://react.dev/learn/choosing-the-state-structure),
+    [Extracting State Logic into a Reducer](https://react.dev/learn/extracting-state-logic-into-a-reducer),
+    [Passing Data Deeply with Context](https://react.dev/learn/passing-data-deeply-with-context),
+    [Scaling Up with Reducer and Context](https://react.dev/learn/scaling-up-with-reducer-and-context);
+    Reference - [useReducer](https://react.dev/reference/react/useReducer),
+    [useContext](https://react.dev/reference/react/useContext),
+    [createContext](https://react.dev/reference/react/createContext).
+    [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861) - HTTP Cache-Control Extensions for Stale Content
+    (Informational, May 2010), section 3 `stale-while-revalidate`.
+    TanStack Query v5 docs - [Overview](https://tanstack.com/query/latest/docs/framework/react/overview),
+    [Important Defaults](https://tanstack.com/query/latest/docs/framework/react/guides/important-defaults),
+    [Query Keys](https://tanstack.com/query/latest/docs/framework/react/guides/query-keys),
+    [Query Invalidation](https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation),
+    [Optimistic Updates](https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates).
+    SWR - [swr.vercel.app](https://swr.vercel.app/), [Mutation](https://swr.vercel.app/docs/mutation) and the
+    [SWR README](https://github.com/vercel/swr) (origin of the name). Redux Toolkit -
+    [RTK Query Overview](https://redux-toolkit.js.org/rtk-query/overview) and
+    [Automated Re-fetching](https://redux-toolkit.js.org/rtk-query/usage/automated-refetching). Quotations are
+    from these pages.
+  - **Library scope:** TanStack Query, SWR and RTK Query are described only as their documentation describes
+    them; option names (`staleTime`, `invalidateQueries`, `optimisticData`, `rollbackOnError`, cache tags) are
+    library-specific and version-specific - check the docs of the version you install. None of them is added
+    to the practice project; the exercise builds the core ideas by hand.
+  - **Run, not assumed:** the exercise tests in `practice/fullstack/tests/frontend-state` were run against the
+    unsolved files (they fail) and the reference solutions (they pass). The re-render counts quoted in the
+    "mistakes" section come from running the dashboard-filters test against a single memoised context (the
+    dispatch-only toolbar rendered 3 times instead of once).
+  - **Fictional:** the SandPay merchant dashboard, its orders (`ord_1001`), refunds and API are invented.
+    Amounts are integers in minor units (cents).
+
+prerequisites: [react-state-and-effects, typescript-for-applications]
+
+concepts:
+  - id: frontend-state-placement
+    name: Kinds of state and where each lives
+    summary: Local UI state stays in the component, state two siblings share is lifted to their closest parent, state many distant components need goes in context, shareable view state (filters, page, tab) goes in the URL, form drafts stay in the form, and data owned by the server is a cache - not client state - with its own rules.
+  - id: reducer-context-pattern
+    name: Typed reducers shared through split contexts
+    summary: A reducer is a pure function (state, action) => next state that gathers every update rule in one place; typed as a discriminated union it is checked for exhaustiveness. Shared through context, the state and the stable dispatch function go in separate contexts so components that only dispatch don't re-render, and hooks that read the context fail loudly outside the provider.
+  - id: server-state-cache
+    name: Server-state caching - keys, staleness and invalidation
+    summary: Server data is a cached copy identified by a query key; it is fresh for a stale time, then shown while it is revalidated in the background (stale-while-revalidate, named after RFC 5861), concurrent requests for one key are deduplicated, and a mutation invalidates every key it may have changed - usually by key prefix.
+  - id: optimistic-mutations
+    name: Optimistic updates and rollback
+    summary: An optimistic update shows the expected result before the server answers, keeps a snapshot of the previous cache entry, puts it back exactly if the server rejects the change, and invalidates the key when it succeeds so the server's own answer replaces the guess.
+
+objectives:
+  - Classify the state of a screen (local, shared, global client, URL, form, server) and choose where each piece should live.
+  - Explain prop drilling and the alternatives react.dev recommends before reaching for context.
+  - Write a typed reducer with exhaustive actions that never mutates state and returns the same object when nothing changes.
+  - Share a reducer through context with separate state and dispatch contexts, and explain which components re-render when the value changes.
+  - Design a server-state cache - query keys, stale time, deduplication and prefix invalidation - and trace what a stale-while-revalidate cache shows the user.
+  - Implement an optimistic update with an exact rollback, and design tests that prove the screen never keeps a rejected change.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [frontend-state-placement, server-state-cache]
+    title: The idea in plain language
+    body: |
+      Think of a merchant's **office**. Some things live on one person's desk - the half-written note, the
+      open drawer. Some things are pinned to the **team board** where everyone can see them - which shop is
+      selected, who is signed in. The **address on the envelope** says which report you are looking at, so you
+      can hand it to a colleague. And some things are **photocopies of documents kept at the bank** - the
+      order list, a payment's status.
+
+      The photocopies are the tricky part. They are never the truth; the bank is. A good office keeps the copy
+      with a **date stamp**, shows it while asking the bank for a fresh one, throws copies away when it knows
+      they changed ("we just refunded that order - the copy is out of date"), and if it pencils in a change
+      before the bank confirms it, it **keeps the original** so it can rub the pencil out.
+
+      Frontend state management is mostly about putting each thing in the right place: the desk (component
+      state), the board (context), the envelope (the URL), and the photocopy drawer (a server-state cache).
+
+  - id: what
+    kind: what
+    concepts: [frontend-state-placement, reducer-context-pattern, server-state-cache, optimistic-mutations]
+    title: The vocabulary
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Client state** | Data the browser owns: an open menu, the selected tab, a draft. Only the client changes it. |
+      | **Server state** | Data the server owns: orders, balances, a payment's status. The client holds a **copy** that can go out of date without the client doing anything. |
+      | **Prop drilling** | Passing a prop through components that don't use it, only to reach one that does. |
+      | **Context** | `createContext(defaultValue)` + a provider + `useContext` - lets any component below the provider read a value without props. |
+      | **Reducer** | A pure function `(state, action) => nextState` that holds all the update logic of one piece of state. |
+      | **Action** | A plain object describing what happened (`{ type: 'page-changed', page: 2 }`), passed to `dispatch`. |
+      | **Query key** | The identity of a cached server result, e.g. `['orders', 'PAID', 1]`. Same key, same cache entry. |
+      | **Stale time** | How long cached data counts as fresh. After it, the data is still shown but should be refetched. |
+      | **Stale-while-revalidate** | Show the stale copy immediately and refresh it in the background. The term comes from HTTP (RFC 5861). |
+      | **Invalidation** | Marking cached entries stale because something (usually a mutation) may have changed them. |
+      | **Deduplication** | Several components asking for the same key at once share one request. |
+      | **Optimistic update** | Showing the expected result of a change before the server confirms it, with a way to undo it. |
+      | **Rollback** | Restoring the cache entry from before the optimistic update when the server rejects the change. |
+
+  - id: when-placement
+    kind: when
+    concepts: [frontend-state-placement]
+    title: Where should this state live?
+    body: |
+      Ask the questions in order and stop at the first "yes":
+
+      | Question | Put it in | SandPay example |
+      | --- | --- | --- |
+      | Does the **server** own it, and could it change without this user? | A **server-state cache** (a library, or the pattern in this lesson) | The order list, an order's status, the balance |
+      | Should a **link, reload or the Back button** bring it back? | The **URL** (path or search params) | `?status=PAID&page=2`, the selected order `/orders/ord_1001` |
+      | Is it an **unsaved draft** of a form? | The **form** (state of the form component, or the form library) | The refund amount being typed |
+      | Can it be **calculated** from other state or props? | **Nowhere** - compute it while rendering | Total of the selected refunds |
+      | Is it used by **one** component? | **That component's** `useState` | Whether a row's menu is open |
+      | Is it used by **a few nearby** components? | **Lift it** to their closest common parent | Selected rows shared by the table and the bulk-action bar |
+      | Is it needed by **many components far apart**? | **Context** (often with a reducer) | Signed-in merchant, theme, dashboard filters used across panels |
+
+      react.dev's own rules for structuring state apply at every level: _"Avoid redundant state. If you can
+      calculate some information from the component's props or its existing state variables during rendering,
+      you should not put that information into that component's state."_ and _"Avoid duplication in state."_
+
+      Two warnings from experience:
+
+      - **Copying server data into context or `useState` is the most common state bug.** It creates a second
+        source of truth that nothing refreshes, so the dashboard shows "PENDING" long after the payment
+        settled.
+      - **Global is not a goal.** react.dev: _"Just because you need to pass some props several levels deep
+        doesn't mean you should put that information into context."_
+
+  - id: why-context
+    kind: why
+    concepts: [frontend-state-placement, reducer-context-pattern]
+    title: Lifting state, prop drilling, and what to try before context
+    body: |
+      [Lifting state up](#/lesson/react-state-and-effects) works until the closest common parent is far from
+      the components that need the value. Then every component in between receives a prop only to pass it on -
+      **prop drilling**. It is verbose, and every intermediate component changes when the data changes.
+
+      react.dev lists two alternatives to try **before** context:
+
+      1. **Just pass props.** _"It may feel like a slog, but it makes it very clear which components use which
+         data!"_
+      2. **Extract components and pass JSX as `children`.** If `<Layout orders={orders} />` only passes
+         `orders` down, write `<Layout><OrderTable orders={orders} /></Layout>` instead - the data skips the
+         layers that don't use it.
+
+      Then context, for which react.dev names typical uses: **theming**, the **current account**, **routing**
+      (_"Most routing solutions use context internally to hold the current route"_) and **managing state**
+      shared by distant components - often a reducer, which is the pattern below.
+
+  - id: internals-context
+    kind: internals
+    concepts: [reducer-context-pattern]
+    title: How context finds its value - and who re-renders
+    body: |
+      - `createContext(defaultValue)` creates a context object that _"does not hold any information"_ itself.
+        The default value is _"a 'last resort' fallback. It is static and never changes over time."_ It is
+        used only when there is **no provider above** the reader.
+      - A component calling `useContext(SomeContext)` _"receives the value of the innermost corresponding
+        context provider above it."_ Providers can be nested to override a value for part of the tree.
+      - When a provider receives a **different** value - compared with `Object.is` - React _"re-renders all the
+        children that use a particular context starting from the provider"_. And: _"Skipping re-renders with
+        memo does not prevent the children receiving fresh context values."_
+
+      Two consequences:
+
+      1. A provider value written as an object literal, `value={{ filters, dispatch }}`, is a **new object on
+         every render** of the provider, so every reader re-renders even if nothing in it changed. react.dev's
+         fix is `useMemo` for the object and `useCallback` for functions in it.
+      2. Memoising is not enough when one context carries **things that change at different rates**. Filters
+         change on every click; `dispatch` never changes (react.dev: _"The dispatch function has a stable
+         identity"_). Put them in one memoised object and a toolbar that only dispatches still re-renders on
+         every filter change. Put them in **two contexts** - react.dev's "Scaling Up with Reducer and Context"
+         uses `TasksContext` and `TasksDispatchContext` - and it doesn't.
+
+      A default of `null` plus a hook that throws turns "forgot the provider" from a silent `undefined` into a
+      clear error at the first render.
+
+  - id: visual-context
+    kind: visual
+    concepts: [reducer-context-pattern]
+    title: Split contexts in the dashboard
+    body: |
+      ```mermaid
+      flowchart TD
+        P["FiltersProvider - useReducer(filtersReducer)"] --> S["FiltersContext - value: filters"]
+        P --> D["FiltersDispatchContext - value: dispatch (stable)"]
+        S --> SUM["Summary - useFilters()"]
+        S --> TAB["OrderTable - useFilters()"]
+        D --> TB["Toolbar - useFiltersDispatch()"]
+        TB -- "dispatch({ type: 'page-changed' })" --> P
+      ```
+
+      Notice the loop: the toolbar **dispatches** an action up to the provider's reducer, the reducer returns new
+      filters, and only the readers of `FiltersContext` re-render. The toolbar reads only the dispatch context,
+      whose value never changes, so it is left alone.
+
+  - id: code-reducer
+    kind: code
+    concepts: [reducer-context-pattern]
+    title: A typed reducer with exhaustive actions
+    body: |
+      The actions are a discriminated union, so TypeScript narrows `action` in each `case` and the `never`
+      check fails to compile if a new action type is added and forgotten (see
+      [TypeScript for applications](#/lesson/typescript-for-applications)).
+
+      ```typescript
+      export type StatusFilter = 'ALL' | 'PENDING' | 'PAID' | 'FAILED';
+      export interface Filters { status: StatusFilter; search: string; page: number }
+
+      export type FiltersAction =
+        | { type: 'status-changed'; status: StatusFilter }
+        | { type: 'search-changed'; search: string }
+        | { type: 'page-changed'; page: number }
+        | { type: 'reset' };
+
+      export const initialFilters: Filters = { status: 'ALL', search: '', page: 1 };
+
+      function assertNever(value: never): never {
+        throw new Error(`Unhandled action: ${JSON.stringify(value)}`);
+      }
+
+      export function filtersReducer(state: Filters, action: FiltersAction): Filters {
+        switch (action.type) {
+          case 'status-changed':
+            if (action.status === state.status) return state;
+            return { ...state, status: action.status, page: 1 };
+          case 'search-changed': {
+            const search = action.search.trim();
+            if (search === state.search) return state;
+            return { ...state, search, page: 1 };
+          }
+          case 'page-changed':
+            if (!Number.isInteger(action.page) || action.page < 1 || action.page === state.page) return state;
+            return { ...state, page: action.page };
+          case 'reset':
+            return initialFilters;
+          default:
+            return assertNever(action);
+        }
+      }
+      ```
+
+  - id: code-provider
+    kind: code
+    concepts: [reducer-context-pattern]
+    title: The provider and its hooks (React 19)
+    body: |
+      ```typescript
+      const FiltersContext = createContext<Filters | null>(null);
+      const FiltersDispatchContext = createContext<Dispatch<FiltersAction> | null>(null);
+
+      export function FiltersProvider({ children }: { children: ReactNode }) {
+        const [filters, dispatch] = useReducer(filtersReducer, initialFilters);
+        return (
+          <FiltersContext value={filters}>
+            <FiltersDispatchContext value={dispatch}>{children}</FiltersDispatchContext>
+          </FiltersContext>
+        );
+      }
+
+      export function useFilters(): Filters {
+        const filters = useContext(FiltersContext);
+        if (filters === null) throw new Error('useFilters must be used inside <FiltersProvider>');
+        return filters;
+      }
+
+      export function useFiltersDispatch(): Dispatch<FiltersAction> {
+        const dispatch = useContext(FiltersDispatchContext);
+        if (dispatch === null) throw new Error('useFiltersDispatch must be used inside <FiltersProvider>');
+        return dispatch;
+      }
+      ```
+
+      Before React 19, write `<FiltersContext.Provider value={filters}>`. This is the reference solution of the
+      first coding exercise (`solutions/frontend-state/dashboardFilters.tsx`).
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [reducer-context-pattern]
+    title: Why those lines are written that way
+    body: |
+      - **`return state` when nothing changes.** react.dev (useReducer): _"If the new value you provide is
+        identical to the current state, as determined by an Object.is comparison, React will skip re-rendering
+        the component and its children."_ Returning `{ ...state }` "just in case" throws that away and
+        re-renders every reader.
+      - **`page: 1` on status and search changes.** A business rule lives in the reducer, not scattered over
+        three click handlers. Page 3 of "all orders" means nothing in "failed orders".
+      - **`trim()` in the reducer.** Normalising input in one place means `'ord_10 '` and `'ord_10'` are the
+        same state, so typing a trailing space doesn't refetch the list.
+      - **`assertNever`.** A compile-time guard for new actions, and a loud runtime error if an untyped caller
+        sends a bad one.
+      - **`createContext(null)` and the throwing hooks.** `null` can't be mistaken for real filters, and the
+        error names the fix.
+      - **Two providers.** `filters` changes; `dispatch` is stable. Each context carries one rate of change.
+
+  - id: what-server-state
+    kind: what
+    concepts: [server-state-cache]
+    title: Server state is a cache - stale-while-revalidate
+    body: |
+      Data the server owns behaves differently from client state: someone else can change it, it arrives
+      asynchronously, it can fail, and many components may want the same piece at once. TanStack Query's docs
+      put it this way: traditional state management libraries _"are great for working with client state"_ but
+      _"not so great at working with async or server state"_.
+
+      The usual strategy is **stale-while-revalidate**. The term comes from HTTP: RFC 5861 defines the
+      `stale-while-revalidate` Cache-Control extension, which _"indicates that caches MAY serve the response in
+      which it appears after it becomes stale, up to the indicated number of seconds"_, and says the cache
+      _"SHOULD attempt to revalidate it while still serving stale responses (i.e., without blocking)"_. Its
+      example:
+
+      ```http
+      Cache-Control: max-age=600, stale-while-revalidate=30
+      ```
+
+      _"indicates that it is fresh for 600 seconds, and it may continue to be served stale for up to an
+      additional 30 seconds while an asynchronous validation is attempted."_
+
+      A frontend cache applies the same idea to JavaScript data:
+
+      1. Each result is stored under a **query key** - `['orders', 'PAID', 1]`.
+      2. It is **fresh** for a stale time; reads during that time don't touch the network.
+      3. When it is **stale**, the cached copy is still shown at once while a background request refreshes it.
+      4. Requests for the same key that start while one is in flight **share** it (deduplication).
+      5. After a mutation, the keys it may have changed are **invalidated** - often every key starting with a
+         prefix, such as `['orders']` after a refund.
+
+      A request that **fails** must not replace good data with nothing, and must not be cached as if it
+      succeeded.
+
+  - id: visual-swr
+    kind: visual
+    concepts: [server-state-cache, optimistic-mutations]
+    title: The life of one cache entry
+    body: |
+      ```mermaid
+      stateDiagram-v2
+        [*] --> Missing
+        Missing --> Fetching: first read
+        Fetching --> Fresh: response stored
+        Fetching --> Missing: request failed
+        Fresh --> Stale: stale time elapsed
+        Fresh --> Stale: invalidated by a mutation
+        Stale --> Revalidating: next read shows stale data
+        Revalidating --> Fresh: new response stored
+        Fresh --> Optimistic: optimistic update
+        Optimistic --> Stale: server accepted, invalidate
+        Optimistic --> Fresh: server rejected, previous entry restored
+      ```
+
+      Notice that **Stale** is not "empty": the data is still there and still shown. And an optimistic entry
+      always leaves through the server's answer - either replaced by a refetch or rolled back exactly.
+
+  - id: code-cache
+    kind: code
+    concepts: [server-state-cache, optimistic-mutations]
+    title: The ideas in about sixty lines
+    collapsed: true
+    body: |
+      The second coding exercise builds this cache. Time comes from an injected clock, so tests are exact.
+
+      ```typescript
+      export type QueryKey = readonly (string | number)[];
+
+      const hash = (key: QueryKey) => JSON.stringify(key);
+      const startsWith = (key: QueryKey, prefix: QueryKey) => prefix.every((part, i) => key[i] === part);
+
+      export function createQueryCache({ now, staleTime }: { now: () => number; staleTime: number }) {
+        const entries = new Map<string, { key: QueryKey; entry: { data: unknown; updatedAt: number }; invalidated: boolean }>();
+        const inFlight = new Map<string, Promise<unknown>>();
+
+        function isStale(key: QueryKey): boolean {
+          const stored = entries.get(hash(key));
+          if (stored === undefined || stored.invalidated) return true;
+          return now() - stored.entry.updatedAt >= staleTime;
+        }
+
+        function invalidate(prefix: QueryKey): void {
+          for (const stored of entries.values()) if (startsWith(stored.key, prefix)) stored.invalidated = true;
+        }
+
+        function fetchQuery<T>(key: QueryKey, fetcher: () => Promise<T>): Promise<T> {
+          const cached = entries.get(hash(key));
+          if (cached !== undefined && !isStale(key)) return Promise.resolve(cached.entry.data as T);
+          const id = hash(key);
+          const pending = inFlight.get(id);
+          if (pending !== undefined) return pending as Promise<T>;  // deduplicate
+          const request = fetcher()
+            .then((data) => { set(key, data); return data; })        // a failure is never stored
+            .finally(() => inFlight.delete(id));
+          inFlight.set(id, request);
+          return request;
+        }
+
+        async function mutateOptimistic<T>(key: QueryKey, update: (old: T | undefined) => T, commit: () => Promise<void>) {
+          const id = hash(key);
+          const previous = entries.get(id);
+          const snapshot = previous && { ...previous, entry: { ...previous.entry } };
+          set(key, update(previous?.entry.data as T | undefined));     // show the guess now
+          try {
+            await commit();                                            // the real request
+          } catch (error) {
+            if (snapshot === undefined) entries.delete(id);
+            else entries.set(id, snapshot);                            // exact rollback
+            throw error;
+          }
+          invalidate(key);                                             // let the server's answer win
+        }
+        // get and set omitted - see solutions/frontend-state/queryCache.ts
+      }
+      ```
+
+      A real library adds what this leaves out: React hooks that subscribe components to keys, background
+      refetching when a stale key is read, garbage collection of unused entries, retries, and refetching on
+      window focus or reconnect.
+
+  - id: when-libraries
+    kind: tradeoffs
+    concepts: [server-state-cache, optimistic-mutations]
+    title: TanStack Query, SWR and RTK Query
+    body: |
+      In an application you would normally use a library rather than the hand-made cache. Each describes itself
+      in its own documentation as follows (check the docs of the version you install - option names change
+      between major versions):
+
+      | Library | What its docs say | Key ideas, in its own terms |
+      | --- | --- | --- |
+      | **TanStack Query** (v5) | It _"makes fetching, caching, synchronizing and updating server state in your web applications a breeze."_ | Query keys (_"have to be an Array at the top level"_), `staleTime` (by default cached data is considered **stale**), `queryClient.invalidateQueries({ queryKey: ['todos'] })` invalidates every key starting with `todos`; optimistic updates through `useMutation` and `onMutate`. |
+      | **SWR** (Vercel) | _"A React Hooks library for data fetching."_ Its README: the name _"is derived from `stale-while-revalidate`, a cache invalidation strategy popularized by HTTP RFC 5861."_ | `useSWR(key, fetcher)`; requests for the same key are deduplicated; `mutate` with `optimisticData` and `rollbackOnError` (default `true`). |
+      | **RTK Query** | _"A powerful data fetching and caching tool"_, _"an optional addon included in the Redux Toolkit package"_. | Endpoints in an API slice; a _"cache tag"_ system - queries provide tags, mutations invalidate tags, and invalidated queries refetch _"if there is an active subscription"_. |
+
+      How to choose, roughly: an app already on Redux gets RTK Query in the same store; TanStack Query has the
+      widest feature set (devtools, infinite queries, fine-grained cache control); SWR is the smallest API for
+      read-heavy screens. A framework with its own data loading (a router with loaders, server components)
+      may make a separate cache unnecessary for many screens.
+
+      **Trade-offs of optimistic updates.** They make the UI feel instant, but they are only safe when the
+      server almost always accepts the change and a rollback is understandable to the user. For money
+      movements - capturing a payment, issuing a refund - SandPay's dashboard shows **"Refund requested"**
+      (pending) instead of a final "Refunded", and lets the server's answer, or a webhook, decide
+      (see [webhooks and asynchronous status](#/lesson/webhooks-and-async-status)).
+
+  - id: url-state
+    kind: example
+    concepts: [frontend-state-placement]
+    title: The URL is state too
+    body: |
+      A merchant filters the dashboard to **failed orders, page 2**, and sends the link to support. If the
+      filters live only in context, support opens the link and sees page 1 of all orders. If they live in the
+      URL - `/orders?status=FAILED&page=2` - the link, a reload and the Back button all restore the same view.
+
+      Good candidates for the URL: filters, sort order, page, the selected tab, the id of the open record.
+      Bad candidates: secrets and tokens (URLs end up in logs, history and `Referer` headers), large drafts,
+      and anything that should not survive a reload.
+
+      With search params as the source of truth, the dashboard reads `status` and `page` from the URL and
+      changing a filter **navigates** instead of setting state. The browser API is `URLSearchParams`; routing
+      libraries wrap it (the next lesson,
+      [Routing and data fetching](#/lesson/react-routing-and-data-fetching), shows one). What a tester checks:
+
+      - Reload on page 2 of failed orders keeps page 2 of failed orders.
+      - Back after changing a filter returns to the previous filter.
+      - An invalid value (`?page=-3`, `?status=BOGUS`) falls back to a sensible default instead of crashing -
+        the same rule as `filtersReducer` ignoring impossible pages.
+
+  - id: tests
+    kind: tests
+    concepts: [reducer-context-pattern, server-state-cache, optimistic-mutations]
+    title: What to test
+    body: |
+      | # | Case | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Reducer: change status on page 3 | New object, page 1, old state untouched | `toEqual` on the result; the frozen input is unchanged |
+      | 2 | Reducer: same status again | **Same** object returned | `toBe(state)` |
+      | 3 | Reducer: page `0`, `-1`, `1.5` | State unchanged | `toBe(state)` |
+      | 4 | Hook outside its provider | Throws a message that names the provider | `toThrow('... inside <FiltersProvider>')` |
+      | 5 | Dispatch-only component, filters change | Not re-rendered | A render counter on a `memo` component |
+      | 6 | Fresh key read twice | One network call | Fetcher call count |
+      | 7 | Stale time elapsed | Refetched, new `updatedAt` | Fake clock moved by exactly the stale time |
+      | 8 | Two reads of one stale key at once | One request, both callers get its result | Deferred fetcher resolved by the test |
+      | 9 | Request fails | Nothing cached; next read retries | Entry `undefined`, second fetch succeeds |
+      | 10 | Invalidate `['orders', 'PAID']` | Only keys with that prefix are stale | `isStale` for siblings and other prefixes |
+      | 11 | Optimistic update accepted | Guess shown at once, key stale afterwards | Cache read **before** the commit settles |
+      | 12 | Optimistic update rejected | Exact previous entry back, including its time | `toEqual({ data, updatedAt })` |
+
+      Two habits make these tests reliable: **inject time** (a fake clock instead of `Date.now()` and sleeps)
+      and **control the network** (a fetcher whose promises the test resolves or rejects), as in
+      [React state and effects](#/lesson/react-state-and-effects).
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [frontend-state-placement, reducer-context-pattern, server-state-cache, optimistic-mutations]
+    title: Common mistakes and how to debug them
+    body: |
+      - **One context for everything.** Running the exercise's test against a single context holding
+        `useMemo(() => ({ filters, dispatch }), [filters])` made the dispatch-only toolbar render **3 times
+        instead of once** over two clicks: memoising stops re-renders when the provider re-renders for other
+        reasons, not when `filters` itself changes. Split contexts by rate of change.
+      - **A new object as the provider value** (`value={{ filters, dispatch }}`) - every reader re-renders on
+        every provider render.
+      - **Mutating in the reducer** (`state.page = 2; return state`) - React sees the same object and skips the
+        render; with a copy afterwards, the "previous" state other code holds has silently changed. Freeze test
+        inputs to catch it.
+      - **Server data copied into context or `useState`.** Nothing refreshes it. Symptom: a status that only
+        updates after a full reload.
+      - **Invalidating one exact key** after a mutation that changes many lists (`['orders', 'PAID', 1]`
+        instead of `['orders']`) - page 2 and the other filters keep the old data.
+      - **Rollback that restores the wrong thing** - re-reading the cache after the optimistic write, or
+        restoring the data but not its timestamp, so a rejected change leaves "fresh" wrong data.
+      - **Caching errors as data**, or deleting good data when a background refetch fails.
+
+      **Debugging method.** Decide which kind of state is wrong (client, URL, server copy). For client state,
+      log the actions and the reducer's output - a pure reducer replays exactly. For re-renders, use the React
+      DevTools Profiler or a render counter in a test. For server state, compare the cache entry and its
+      `updatedAt` with the network panel: was the request made, was it deduplicated, which key was
+      invalidated?
+
+  - id: summary
+    kind: summary
+    concepts: [frontend-state-placement, reducer-context-pattern, server-state-cache, optimistic-mutations]
+    title: Quick reference
+    body: |
+      - Server-owned data → a **cache** keyed by query keys; shareable view state → the **URL**; drafts → the
+        **form**; derivable values → **compute**; one component → `useState`; a few → **lift**; many and far →
+        **context**.
+      - Before context: pass props, or pass JSX as `children`.
+      - Reducer: pure, typed actions, exhaustive `never` check, `return state` when nothing changes.
+      - Context: `createContext(null)` + a hook that throws; separate **state** and **dispatch** contexts; a
+        new object as the value re-renders every reader.
+      - Cache: fresh for `staleTime`, then shown while revalidated; deduplicate in-flight requests; never cache
+        a failure; invalidate by **prefix** after mutations.
+      - Optimistic: snapshot, apply, commit, **exact** rollback on failure, invalidate on success. Prefer a
+        visible "pending" state for money movements.
+
+exercises:
+  - id: classify-state
+    type: mcq
+    concept: frontend-state-placement
+    skill: application
+    title: Where does the payment status live?
+    prompt: |
+      The SandPay order page shows an order's status (PENDING, PAID, FAILED). It is read by the header badge,
+      the timeline and the refund button. A teammate proposes to fetch it once and keep it in a
+      `DashboardContext` together with the theme and the signed-in merchant. What do you recommend?
+    options:
+      - id: cache
+        text: Keep it in a server-state cache under a key such as ['order', 'ord_1001'], read through a hook by all three components
+        feedback: Correct - the server owns the status and it changes without this user (the payment settles), so it needs staleness, refetching and invalidation, not a one-off copy.
+      - id: context
+        text: Context is fine - all three components need it, and context avoids prop drilling
+        feedback: Context solves how to share a value, not how to keep a server copy current. Nothing would refetch it when the payment settles.
+      - id: usestate-top
+        text: Lift it into useState in the page component and pass it down
+        feedback: That is the same single copy, only stored higher. It still goes stale silently.
+      - id: url
+        text: Put the status in the URL so a reload refreshes it
+        feedback: The URL is for state the user chooses (filters, ids). The status is data the server decides; a link containing it would show a stale status.
+    correct: [cache]
+    hints:
+      - "Who owns this value, and can it change without the user doing anything?"
+      - "Which option has a way to notice that the copy is out of date?"
+    solution: |
+      **A server-state cache.** Server state is a copy of something the server owns. It changes when the
+      payment settles, a webhook arrives or another user refunds. A cache keyed by `['order', 'ord_1001']` lets
+      all three components share one copy, refetch it when it is stale and invalidate it after a refund.
+      Context is still right for the theme and the signed-in merchant.
+    followUp: |
+      The same page has a "show raw JSON" toggle and the currently selected tab. Where does each go?
+
+  - id: drilling-alternative
+    type: mcq
+    concept: frontend-state-placement
+    skill: application
+    title: Prop drilling through a layout
+    prompt: |
+      ```typescript
+      <DashboardLayout merchant={merchant} orders={orders} />
+      // DashboardLayout passes both to <MainColumn>, which passes orders to <OrderTable>
+      // and merchant to <Greeting>. Neither DashboardLayout nor MainColumn uses them.
+      ```
+
+      Which change does react.dev suggest trying **first**?
+    options:
+      - id: children
+        text: Make the layout take children and render <DashboardLayout><Greeting merchant={merchant} /><OrderTable orders={orders} /></DashboardLayout>
+        feedback: Correct - extracting components and passing JSX as children removes the layers that only forward data.
+      - id: context-both
+        text: Put merchant and orders in one context
+        feedback: Context is the step after trying props and children - and orders are server data, which belongs in a cache rather than context.
+      - id: global-store
+        text: Move both into a global store
+        feedback: A store is a bigger tool for the same problem; the drilling here is caused by a layout that should take children.
+      - id: memo
+        text: Wrap MainColumn in memo
+        feedback: memo affects re-renders, not the number of props you have to pass through.
+    correct: [children]
+    hints:
+      - "The intermediate components don't use the data at all."
+      - "What can a layout accept instead of data props?"
+    solution: |
+      **Pass JSX as children.** react.dev: _"If you pass some data through many layers of intermediate
+      components that don't use that data (and only pass it further down), this often means that you forgot to
+      extract some components along the way."_ With `children`, the page renders `Greeting` and `OrderTable`
+      itself and the layout only places them.
+
+  - id: reducer-bug
+    type: debug
+    concept: reducer-context-pattern
+    skill: analysis
+    title: The filter changes but the list doesn't
+    prompt: |
+      Clicking "Paid only" dispatches `{ type: 'status-changed', status: 'PAID' }` (the action log shows it),
+      but the summary still says "Showing ALL orders". Click the line that causes it.
+    language: typescript
+    code: |
+      function filtersReducer(state: Filters, action: FiltersAction): Filters {
+        switch (action.type) {
+          case 'status-changed':
+            state.status = action.status;
+            state.page = 1;
+            return state;
+          case 'page-changed':
+            return { ...state, page: action.page };
+          default:
+            return state;
+        }
+      }
+    correctLines: [6]
+    lineNotes:
+      - line: 4
+        note: Mutating is the root of the problem, but the visible bug is what React does with the returned value - look at what is returned.
+      - line: 10
+        note: Returning state for unknown actions is fine (an exhaustive never check is better, but it doesn't cause this bug).
+    hints:
+      - "How does React decide whether a reducer produced a new state?"
+      - "Compare the object returned on line 6 with the current state using Object.is."
+    solution: |
+      **Line 6.** The reducer mutates `state` and returns **the same object**. React compares the old and new
+      state with `Object.is`, sees no change and skips the re-render. Return a new object:
+      `return { ...state, status: action.status, page: 1 };` - and don't mutate on lines 4-5 either.
+
+  - id: reorder-provider
+    type: order
+    concept: reducer-context-pattern
+    skill: application
+    title: Turn drilled state into reducer plus context
+    prompt: |
+      The filters are `useState` calls in the page, drilled through four components. Put the refactoring steps
+      in a safe order (react.dev's "Scaling Up with Reducer and Context" follows the same idea).
+    items:
+      - id: reducer
+        text: Move the update logic into a pure filtersReducer with typed actions and test it alone
+      - id: use-reducer
+        text: Replace the useState calls in the page with useReducer(filtersReducer, initialFilters)
+      - id: contexts
+        text: Create FiltersContext and FiltersDispatchContext with null defaults
+      - id: provider
+        text: Write FiltersProvider that owns the reducer and provides both values
+      - id: hooks
+        text: Add useFilters and useFiltersDispatch hooks that throw outside the provider
+      - id: remove-props
+        text: Replace the drilled props with the hooks, one component at a time, running the tests each time
+    hints:
+      - "Start with the part that can be tested without React."
+      - "The props can only go once there is something to read instead."
+    solution: |
+      Reducer first (pure and testable), then use it where the state already lives, then create the contexts,
+      the provider and the hooks, and only then remove the drilled props component by component. Each step
+      leaves the app working.
+
+  - id: rerender-analysis
+    type: short
+    concept: reducer-context-pattern
+    skill: analysis
+    title: Why does the toolbar re-render?
+    prompt: |
+      A profile shows that `Toolbar` (wrapped in `memo`, no props, calls only `useFiltersDispatch()`) renders
+      every time a filter changes. The provider is:
+
+      ```typescript
+      const value = useMemo(() => ({ filters, dispatch }), [filters]);
+      return <FiltersContext value={value}>{children}</FiltersContext>;
+      ```
+
+      and `useFiltersDispatch` returns `useContext(FiltersContext).dispatch`. Explain why, and fix it.
+    hints:
+      - "When does the memoised object change?"
+      - "Which components re-render when a context value changes - and does memo stop it?"
+    modelAnswer: |
+      The memoised object depends on `filters`, so every filter change creates a new value. React re-renders
+      **every** component that reads `FiltersContext` when its value changes (compared with `Object.is`), and
+      react.dev notes that `memo` doesn't prevent children receiving fresh context values. The toolbar reads
+      that context, so it re-renders even though it only uses `dispatch`, which never changes.
+
+      Fix: split the contexts. Provide `filters` in `FiltersContext` and `dispatch` in
+      `FiltersDispatchContext`; `useFiltersDispatch` reads only the second. Its value is stable, so the toolbar
+      no longer re-renders. A render counter in a test proves it.
+    rubric:
+      - Says the memoised value changes whenever filters change
+      - Explains that all readers of a context re-render on a new value, and memo does not stop it
+      - Notes dispatch is stable
+      - Fixes it by splitting state and dispatch into separate contexts
+      - Suggests a way to prove the fix (render counter, Profiler)
+    solution: |
+      `useMemo` helps only when the provider re-renders for other reasons. Here the value genuinely changes on
+      every filter change, and every reader of the context re-renders. Separate contexts for state and for the
+      stable `dispatch` mean dispatch-only components never see a new value.
+
+  - id: swr-timeline
+    type: mcq
+    concept: server-state-cache
+    skill: application
+    title: What does the merchant see?
+    prompt: |
+      The order list uses a cache with a stale time of 30 seconds. The list was fetched at 10:00:00. At
+      10:00:45 the merchant opens the Orders tab again. The server now has one more order. With
+      stale-while-revalidate, what happens?
+    options:
+      - id: stale-then-fresh
+        text: The cached list appears immediately; a background request runs, and the list updates with the new order when it arrives
+        feedback: Correct - stale data is still served at once, and revalidation happens without blocking.
+      - id: spinner
+        text: A loading spinner until the new list arrives, because the data is stale
+        feedback: That is a plain cache miss. Stale-while-revalidate exists precisely to avoid blocking on stale data.
+      - id: cached-only
+        text: The cached list, with no request until the merchant reloads the page
+        feedback: Stale data is revalidated when it is read; it is not kept forever.
+      - id: empty
+        text: An empty list, because stale entries are removed
+        feedback: Stale is not deleted - the data stays to be shown while it is refreshed.
+    correct: [stale-then-fresh]
+    hints:
+      - "Is the entry fresh or stale at 10:00:45?"
+      - "RFC 5861 - revalidate 'while still serving stale responses'."
+    solution: |
+      45 s > 30 s, so the entry is **stale**. The cache shows it immediately and starts a background request
+      ("revalidate"); when the response arrives it replaces the entry and the list re-renders with the new
+      order. A tester checks both moments: the old list appears instantly, and the new order appears without a
+      reload.
+
+  - id: invalidation-design
+    type: testdesign
+    concept: server-state-cache
+    skill: application
+    title: Test refund invalidation
+    prompt: |
+      After a successful refund of `ord_1001`, the dashboard must not show the old status anywhere: the order
+      page, the "PAID" list (any page) and the dashboard total. Design tests for the cache invalidation. Give
+      preconditions, steps, expected results **and evidence**.
+    hints:
+      - "Which query keys can contain ord_1001's status?"
+      - "How do you prove a key was refetched rather than just read from the cache?"
+      - "What about keys that must NOT be invalidated?"
+    modelAnswer: |
+      Preconditions: cache with entries `['order','ord_1001']`, `['orders','PAID',1]`, `['orders','PAID',2]`,
+      `['orders','FAILED',1]`, `['totals']`, `['merchant']`; a fake clock; a fake API that counts requests per
+      path.
+
+      1. **Invalidate on success** - refund succeeds; `isStale` is true for the order, both PAID pages and
+         totals. Evidence: `isStale` per key.
+      2. **Not too much** - `['merchant']` (and, if the rule says so, `['orders','FAILED',1]`) stays fresh.
+         Evidence: `isStale` false and no request on next read.
+      3. **Refetch** - reading the order page after the refund makes exactly one request and shows REFUNDED.
+         Evidence: request counter, rendered status.
+      4. **Failure** - refund rejected (409); nothing is invalidated, previous data is shown. Evidence:
+         `isStale` false, entry unchanged.
+      5. **Concurrent reads** - two components read the invalidated order at once; one request. Evidence:
+         counter is 1.
+    solution: |
+      List every key the mutation can affect, assert those are stale and that unrelated keys are not, prove a
+      refetch by counting requests through a fake API, and cover the failure path where nothing should be
+      invalidated. Use a fake clock so freshness is exact.
+    rubric:
+      - Lists the affected keys, including every page of the list
+      - Checks that unrelated keys stay fresh
+      - Proves refetching with request counts, not only isStale
+      - Covers the failed mutation
+      - Gives evidence for each case
+
+  - id: rollback-mcq
+    type: mcq
+    concept: optimistic-mutations
+    skill: analysis
+    title: The rollback that didn't
+    prompt: |
+      ```typescript
+      async function markShipped(id: string) {
+        cache.set(['order', id], { ...cache.get(['order', id])!.data, shipped: true });
+        try {
+          await api.ship(id);
+        } catch (error) {
+          const previous = cache.get(['order', id])!.data;
+          cache.set(['order', id], { ...previous, shipped: false });
+          throw error;
+        }
+      }
+      ```
+
+      When `api.ship` fails, what is wrong with the rollback?
+    options:
+      - id: reads-after
+        text: It reads the cache after the optimistic write, so it rebuilds from the guess and also gives the entry a new timestamp - the snapshot must be taken before the write
+        feedback: Correct - restore the exact previous entry (data and time) captured before the optimistic change.
+      - id: rethrow
+        text: It should not rethrow the error
+        feedback: Rethrowing is right - the caller must be able to show the failure. The problem is what is restored.
+      - id: nothing
+        text: Nothing - shipped goes back to false
+        feedback: Only if shipped was false before, and only that field. Any other field the guess changed, and the timestamp, are wrong.
+      - id: await
+        text: The cache.set should be awaited
+        feedback: set is synchronous here; awaiting it changes nothing.
+    correct: [reads-after]
+    hints:
+      - "What does the cache contain when the catch block runs?"
+      - "What else besides data does an entry carry?"
+    solution: |
+      Take the **snapshot before** the optimistic write and put that exact entry back on failure. This code
+      reads the cache after the guess, so it can only invert one field it knows about, and `set` stamps the
+      entry with the current time - a rejected change then looks freshly fetched and won't be refetched.
+
+  - id: filters-coding
+    type: coding
+    concept: reducer-context-pattern
+    skill: application
+    title: Dashboard filters with a reducer and split contexts
+    prompt: |
+      `dashboardFilters.tsx` shares the dashboard's order filters through context. The reducer mutates state,
+      forgets the page-reset and trimming rules and doesn't return the same object when nothing changes; the
+      hooks silently return `undefined` outside the provider; and a toolbar that only dispatches re-renders on
+      every filter change. Make every test pass. Keep the exported names and types.
+    project: fullstack
+    files:
+      - exercises/frontend-state/dashboardFilters.tsx
+    test: tests/frontend-state/dashboard-filters.test.tsx
+    command: npx vitest run tests/frontend-state/dashboard-filters.test.tsx
+    hints:
+      - "Run the tests and read the first failure. The test inputs are frozen - which line writes to them?"
+      - "When an action would not change anything, what should the reducer return so React skips the render?"
+      - "The toolbar test counts renders. Which context value changes on every click, and which never does?"
+    modelAnswer: |
+      ```typescript
+      case 'status-changed':
+        if (action.status === state.status) return state;
+        return { ...state, status: action.status, page: 1 };
+      // ... search trimmed and page validated the same way, 'reset' returns initialFilters,
+      // default: return assertNever(action);
+
+      const FiltersContext = createContext<Filters | null>(null);
+      const FiltersDispatchContext = createContext<Dispatch<FiltersAction> | null>(null);
+
+      export function FiltersProvider({ children }: { children: ReactNode }) {
+        const [filters, dispatch] = useReducer(filtersReducer, initialFilters);
+        return (
+          <FiltersContext value={filters}>
+            <FiltersDispatchContext value={dispatch}>{children}</FiltersDispatchContext>
+          </FiltersContext>
+        );
+      }
+
+      export function useFiltersDispatch(): Dispatch<FiltersAction> {
+        const dispatch = useContext(FiltersDispatchContext);
+        if (dispatch === null) throw new Error('useFiltersDispatch must be used inside <FiltersProvider>');
+        return dispatch;
+      }
+      ```
+
+      Returning `state` unchanged lets React skip renders; `page: 1` keeps the business rule in one place; two
+      contexts mean the toolbar reads only the stable `dispatch`.
+    solution: |
+      Make the reducer pure (spread, never assign), add the rules (page 1 on status and search changes, trimmed
+      search, integer page of at least 1, reset) and return the same object when nothing changes. Provide state
+      and dispatch in separate contexts with `null` defaults, and make both hooks throw a message naming the
+      provider. The reference is `solutions/frontend-state/dashboardFilters.tsx`.
+    rubric:
+      - Every test in dashboard-filters.test.tsx passes
+      - The reducer never mutates its input and has an exhaustive never check
+      - Unchanged actions return the same state object
+      - State and dispatch are in separate contexts; hooks throw outside the provider
+
+  - id: cache-coding
+    type: coding
+    concept: optimistic-mutations
+    skill: application
+    title: A tiny server-state cache with optimistic updates
+    prompt: |
+      `queryCache.ts` is a small version of what TanStack Query, SWR and RTK Query do. `get` and `set` work,
+      but staleness ignores time, invalidation matches only one exact key, every fetch goes to the network,
+      and a failed optimistic update leaves the guess in the cache. Make every test pass. Time comes from the
+      injected `now`; keep the exported names.
+    project: fullstack
+    files:
+      - exercises/frontend-state/queryCache.ts
+    test: tests/frontend-state/query-cache.test.ts
+    command: npx vitest run tests/frontend-state/query-cache.test.ts
+    hints:
+      - "isStale - fresh until staleTime has elapsed: compare now() - updatedAt with staleTime."
+      - "For deduplication, keep a Map from key hash to the promise in flight and delete it when it settles."
+      - "For rollback, copy the previous entry before the optimistic set, and put that copy back (or delete the key if there was none)."
+    modelAnswer: |
+      ```typescript
+      function isStale(key: QueryKey): boolean {
+        const stored = entries.get(hash(key));
+        if (stored === undefined || stored.invalidated) return true;
+        return now() - stored.entry.updatedAt >= staleTime;
+      }
+
+      function invalidate(prefix: QueryKey): void {
+        for (const stored of entries.values()) if (startsWith(stored.key, prefix)) stored.invalidated = true;
+      }
+
+      function fetchQuery<T>(key: QueryKey, fetcher: () => Promise<T>): Promise<T> {
+        const cached = get<T>(key);
+        if (cached !== undefined && !isStale(key)) return Promise.resolve(cached.data);
+        const id = hash(key);
+        const pending = inFlight.get(id);
+        if (pending !== undefined) return pending as Promise<T>;
+        const request = fetcher()
+          .then((data) => { set(key, data); return data; })
+          .finally(() => inFlight.delete(id));
+        inFlight.set(id, request);
+        return request;
+      }
+
+      async function mutateOptimistic<T>(key: QueryKey, update: (old: T | undefined) => T, commit: () => Promise<void>) {
+        const id = hash(key);
+        const previous = entries.get(id);
+        const snapshot = previous && { ...previous, entry: { ...previous.entry } };
+        set(key, update(previous?.entry.data as T | undefined));
+        try {
+          await commit();
+        } catch (error) {
+          if (snapshot === undefined) entries.delete(id);
+          else entries.set(id, snapshot);
+          throw error;
+        }
+        invalidate(key);
+      }
+      ```
+
+      `fetchQuery` returns the in-flight promise itself (not an `async` wrapper), so two callers in the same
+      tick share it; a rejected fetcher never reaches `set`, so failures are not cached.
+    solution: |
+      Use the clock for staleness, match invalidation by key prefix element by element, serve fresh entries
+      from the cache, share one in-flight promise per key, and snapshot the previous entry before an optimistic
+      write so a failure restores it exactly (or removes the key). Invalidate the key when the commit succeeds.
+      The reference is `solutions/frontend-state/queryCache.ts`.
+    rubric:
+      - Every test in query-cache.test.ts passes
+      - No real timers or Date.now - only the injected clock
+      - Failures are never cached; in-flight requests are cleared when they settle
+      - Rollback restores data and timestamp exactly; success invalidates the key
+
+  - id: state-interview
+    type: interview
+    concept: frontend-state-placement
+    skill: analysis
+    title: How do you manage state in a React app?
+    prompt: |
+      "Our dashboard keeps everything - the merchant, filters, the order list, payment statuses - in one big
+      global store, and statuses are often out of date. How would you structure state instead?"
+    hints:
+      - "Start by sorting the kinds of state."
+      - "Which of them goes out of date, and why?"
+    modelAnswer: |
+      I'd first separate **server state** from **client state**. Orders and payment statuses are owned by
+      SandPay's API; the store holds a copy that nothing refreshes, which is exactly why statuses are stale. I'd
+      move them to a server-state cache - TanStack Query, SWR or RTK Query if we're on Redux - with query keys
+      like `['orders', filters]` and `['order', id]`, a stale time that matches how fast the data changes,
+      background revalidation, and invalidation by prefix after mutations such as refunds. Status changes that
+      come from webhooks can invalidate keys too, or we poll pending orders.
+
+      Then client state: the **filters and page** go in the URL so links and reloads work; the signed-in
+      merchant and theme in context; drafts in the forms; anything derivable is computed. If some client state
+      is shared widely and has complex rules, a typed reducer in context, with state and dispatch in separate
+      contexts so dispatch-only components don't re-render.
+
+      For money movements I'd avoid optimistic "Refunded" - show "Refund requested" until the server confirms.
+      I'd prove the change with tests that use a fake clock and a controllable API: staleness, deduplication,
+      invalidation and rollback.
+    solution: |
+      A strong answer separates server and client state, explains why a global copy of server data goes stale,
+      proposes a cache with keys, staleness and invalidation, places the remaining client state (URL, context,
+      form, local, derived), mentions re-render cost and split contexts, and treats optimistic updates on money
+      carefully - with tests to prove it.
+    rubric:
+      - Distinguishes server state from client state and explains the staleness
+      - Proposes a cache with keys, stale time and invalidation after mutations
+      - Puts filters in the URL and other client state in the right place
+      - Mentions context re-renders and splitting state from dispatch
+      - Is careful with optimistic updates for payments, and mentions how to test
+    followUps:
+      - How would you choose the stale time for payment statuses versus the merchant profile?
+      - What would you do with an optimistic update when the user navigates away before the server answers?
+      - How would webhooks fit into your cache invalidation?
+
+placement:
+  - id: place-where
+    type: mcq
+    concept: frontend-state-placement
+    skill: application
+    title: Shareable filters
+    prompt: |
+      Support staff often ask merchants to "send the link to what you're looking at" on the order list
+      (status filter, search, page). Where should those filters live?
+    options:
+      - id: url
+        text: In the URL's search params
+        feedback: Correct - a link, a reload and Back all restore the same view.
+      - id: context
+        text: In a FiltersContext at the top of the app
+        feedback: Context shares filters between components but is lost on reload and isn't in the link.
+      - id: localstorage
+        text: In localStorage
+        feedback: localStorage survives reloads on that browser only; the link sent to support wouldn't include it.
+      - id: cache
+        text: In the server-state cache
+        feedback: The cache holds the server's results for those filters (the key includes them), not the user's choice itself.
+    correct: [url]
+    solution: |
+      View state that must survive a reload and be shareable belongs in the **URL**. The server-state cache
+      then uses the filters from the URL as part of its query key.
+
+  - id: place-same-object
+    type: debug
+    concept: reducer-context-pattern
+    skill: analysis
+    title: Needless renders on every keystroke
+    prompt: Every keystroke in the search box re-renders the whole order table, even when the trimmed search text is unchanged (typing spaces). Click the line responsible.
+    language: typescript
+    code: |
+      function filtersReducer(state: Filters, action: FiltersAction): Filters {
+        switch (action.type) {
+          case 'search-changed': {
+            const search = action.search.trim();
+            return { ...state, search, page: search === state.search ? state.page : 1 };
+          }
+          default:
+            return assertNever(action);
+        }
+      }
+    correctLines: [5]
+    lineNotes:
+      - line: 4
+        note: Trimming is right - it makes 'ord ' and 'ord' the same search.
+    solution: |
+      **Line 5** always returns a new object, so React never sees "no change". Add
+      `if (search === state.search) return state;` first - React then compares with `Object.is` and skips the
+      re-render.
+
+  - id: place-invalidate
+    type: mcq
+    concept: server-state-cache
+    skill: application
+    title: Which keys to invalidate after a refund
+    prompt: |
+      The cache holds `['orders', 'PAID', 1]`, `['orders', 'PAID', 2]`, `['orders', 'ALL', 1]`,
+      `['order', 'ord_1001']` and `['merchant']`. A refund of `ord_1001` succeeds. The cache invalidates by key
+      prefix. Which calls cover every list and the order, without touching the merchant?
+    options:
+      - id: prefixes
+        text: invalidate(['orders']) and invalidate(['order', 'ord_1001'])
+        feedback: Correct - the prefix ['orders'] reaches every filter and page; the order key is separate.
+      - id: exact
+        text: invalidate(['orders', 'PAID', 1]) and invalidate(['order', 'ord_1001'])
+        feedback: Page 2 of PAID and the ALL list still show the old status.
+      - id: everything
+        text: invalidate([])
+        feedback: An empty prefix matches every key, including the merchant - correct data, but needless refetches.
+      - id: order-only
+        text: invalidate(['order', 'ord_1001'])
+        feedback: The lists contain the order's status too, so they would stay stale.
+    correct: [prefixes]
+    solution: |
+      Invalidate the **prefix** that covers every list (`['orders']`) and the order's own key. TanStack Query's
+      `invalidateQueries({ queryKey: ['todos'] })` works the same way: _"Invalidate every query with a key that
+      starts with `todos`"_.
+
+  - id: place-rollback
+    type: order
+    concept: optimistic-mutations
+    skill: application
+    title: An optimistic update in the right order
+    prompt: Put the steps of a safe optimistic update in order.
+    items:
+      - id: snapshot
+        text: Copy the current cache entry (data and timestamp)
+      - id: apply
+        text: Write the expected result into the cache so the UI updates at once
+      - id: commit
+        text: Send the real request and wait for it
+      - id: settle
+        text: On failure restore the copy exactly and show the error; on success invalidate the key
+    solution: |
+      **Snapshot → apply → commit → restore or invalidate.** The snapshot must be taken before the guess is
+      written, otherwise there is nothing correct to roll back to.
+
+recall:
+  - id: recall-server-vs-client
+    concept: frontend-state-placement
+    prompt: What makes server state different from client state?
+    answer: The server owns it and it can change without this user; the client only holds a copy that arrives asynchronously, can fail, can go stale and is wanted by many components - so it needs a cache, not plain state.
+  - id: recall-before-context
+    concept: frontend-state-placement
+    prompt: What does react.dev suggest trying before context?
+    answer: Passing props (explicit data flow), and extracting components that take JSX as children so data skips the layers that only forward it.
+  - id: recall-url
+    concept: frontend-state-placement
+    prompt: Which state belongs in the URL?
+    answer: View state a link, reload or Back should restore - filters, sort, page, tab, the open record's id. Never secrets or tokens.
+  - id: recall-reducer-same
+    concept: reducer-context-pattern
+    prompt: Why should a reducer return the same state object when an action changes nothing?
+    answer: React compares the old and new state with Object.is and skips re-rendering when they are identical; a new copy re-renders every reader for nothing.
+  - id: recall-split
+    concept: reducer-context-pattern
+    prompt: Why put state and dispatch in separate contexts?
+    answer: Every reader of a context re-renders when its value changes, and memo doesn't stop it. dispatch is stable, so components that only dispatch read a context that never changes.
+  - id: recall-swr
+    concept: server-state-cache
+    prompt: What does stale-while-revalidate mean, and where does the term come from?
+    answer: Show the cached (stale) data immediately and refresh it in the background without blocking. It is an HTTP Cache-Control extension defined in RFC 5861.
+  - id: recall-invalidate
+    concept: server-state-cache
+    prompt: After a mutation, what should be invalidated?
+    answer: Every cached key whose data the mutation may have changed - usually by prefix (all lists of orders, every page) plus the record's own key - and nothing unrelated.
+  - id: recall-rollback
+    concept: optimistic-mutations
+    prompt: What must a rollback restore after a failed optimistic update?
+    answer: The exact entry from before the optimistic write - its data and its timestamp - taken as a snapshot before the write (or remove the key if there was none). Then show the error.
+
+next:
+  - react-routing-and-data-fetching
+  - react-forms-and-validation
+  - rest-api-design

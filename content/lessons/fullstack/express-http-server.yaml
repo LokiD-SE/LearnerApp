@@ -1,0 +1,1366 @@
+id: express-http-server
+title: An HTTP API with Node.js and Express
+subject: fullstack
+module: backend-api
+level: beginner
+status: published
+estimatedMinutes: 65
+summary: Build the server side of the request-response cycle - from a ten-line node:http server to an Express 5 API with routes, middleware, JSON bodies, a JSON 404, an error handler that leaks nothing, tests without a running server and a graceful shutdown. Every response shown here came from a real run.
+tags:
+  [
+    express,
+    express 5,
+    node:http,
+    http server,
+    routing,
+    route parameters,
+    path-to-regexp,
+    middleware,
+    next,
+    express.json,
+    body-parser,
+    req.body,
+    error handling,
+    error middleware,
+    '404',
+    async handlers,
+    supertest,
+    app.listen,
+    graceful shutdown,
+    SIGTERM,
+  ]
+
+environment: |
+  - **Runtime and framework:** **Node.js 24** (v24.21.0, from this repository's `.nvmrc`) and **Express 5.3.0**
+    (the version pinned in `practice/fullstack`), which uses body-parser 2.4.0 and the `router` package with
+    path-to-regexp 8 syntax. Every request and response in this lesson was captured with `curl` 8.5 or
+    `fetch` against these versions on Linux in November 2026; `Date` headers and `ETag` values change on
+    every run.
+  - **Express documentation (5.x):** [Migrating to Express 5](https://expressjs.com/en/guide/migrating-5.html)
+    (path syntax, rejected promises, `req.body`, `res.status`, `app.listen`), [Routing](https://expressjs.com/en/guide/routing.html),
+    [Writing middleware](https://expressjs.com/en/guide/writing-middleware.html) ("middleware functions that are
+    loaded first are also executed first"), [Using middleware](https://expressjs.com/en/guide/using-middleware.html)
+    (`next('route')`, `next('router')`), [Error handling](https://expressjs.com/en/guide/error-handling.html)
+    (four-argument handlers, the default error handler), [FAQ - How do I handle 404
+    responses?](https://expressjs.com/en/starter/faq.html), [Health checks and graceful
+    shutdown](https://expressjs.com/en/advanced/healthcheck-graceful-shutdown.html) and the
+    [5.x API reference](https://expressjs.com/en/5x/api.html).
+  - **Body parsing:** the [body-parser README](https://github.com/expressjs/body-parser#readme) (`express.json()` is
+    body-parser's JSON parser): `limit` defaults to `'100kb'`, `strict` to `true`, `type` to `application/json`;
+    the error types `entity.parse.failed` (400) and `entity.too.large` (413).
+  - **Node.js:** [HTTP](https://nodejs.org/docs/latest-v24.x/api/http.html) (`http.createServer`, `server.close()`,
+    which since v19 also closes idle keep-alive connections).
+  - **HTTP semantics:** [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) sections 15.3.2 (201 Created and
+    `Location`), 15.5.1 (400), 15.5.5 (404), 15.5.14 (413 Content Too Large) and 15.6.1 (500).
+  - **Testing:** [supertest](https://github.com/forwardemail/supertest#readme) 7.3 - "if the server is not already
+    listening for connections then it is bound to an ephemeral port for you".
+  - **Fictional:** SandPay, its merchant API, every order id and amount. Amounts are integer minor units (2599 is
+    25.99).
+  - **Not covered here:** REST design and versioning ([REST API design](#/lesson/rest-api-design)), schema
+    validation with zod and Problem Details ([Input validation and error
+    handling](#/lesson/input-validation-and-error-handling)), databases, authentication and security headers.
+
+prerequisites:
+  - node-runtime-and-npm
+  - http-request-response-anatomy
+
+concepts:
+  - id: express-routing-and-params
+    name: Routes, methods and route parameters in Express 5
+    summary: A route is a method plus a path pattern plus a handler. Route parameters (:id) arrive in req.params; Express 5's path syntax names every wildcard (/*splat), writes optional parts in braces ({/:format}) and rejects the old ? and regexp characters with a TypeError at start-up.
+  - id: express-middleware-pipeline
+    name: The middleware pipeline and the request-response cycle
+    summary: Every request passes through middleware in the order it was registered. Each function either ends the cycle by sending a response or calls next(); doing neither hangs the request, and sending twice throws ERR_HTTP_HEADERS_SENT. express.json() is middleware too - it fills req.body only for JSON requests and rejects bad or oversized bodies.
+  - id: express-error-handling
+    name: Errors, 404s and the error handler
+    summary: In Express 5 a thrown error or rejected promise in a handler goes to the error-handling middleware - the functions with four arguments (err, req, res, next). A 404 is not an error; it is a last ordinary middleware. Replace the default handler, which sends the stack trace outside production, with JSON that leaks nothing.
+  - id: express-app-and-server
+    name: Separating the app from the server
+    summary: Build and export the app without calling listen(), so tests drive it in memory with supertest and a separate entry file starts the server. In production, handle listen errors and SIGTERM - stop accepting connections, let in-flight requests finish, then exit.
+
+objectives:
+  - Write a minimal HTTP server with `node:http` and explain what Express adds on top of it.
+  - Define routes with methods and route parameters in Express 5 syntax, and fix routes written in Express 4 syntax.
+  - Trace a request through a middleware stack and predict which functions run, in which order, for a given request.
+  - Explain when `req.body` is filled, `undefined` or rejected, and the status codes `express.json()` produces.
+  - Write a JSON 404 handler and a four-argument error handler that maps known errors to 4xx codes and never leaks internals.
+  - Structure an Express project so tests use supertest without a fixed port, and shut the server down gracefully on SIGTERM.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [express-middleware-pipeline]
+    title: The idea in plain language
+    body: |
+      Think of a **restaurant kitchen pass**. An order ticket comes in and slides along a line of stations:
+      someone stamps it with a number, someone checks the order is readable, then the station for *that
+      dish* cooks it, and the plate goes out. If no station makes that dish, the ticket reaches the end of
+      the line and someone says "we don't serve that". If a station drops the plate, the ticket goes
+      straight to the manager, who apologises to the customer **without explaining which cook dropped
+      it**.
+
+      An Express app is that line:
+
+      - the **ticket** is the request (`req`), and the **plate** is the response (`res`);
+      - each **station** is a middleware function, in the order you registered it;
+      - passing the ticket on is calling **`next()`**; serving the plate is **`res.json()`** - and a plate
+        can only be served **once**;
+      - the end of the line is your **404 handler**, and the manager is your **error handler**.
+
+      As a tester you have been on the other side of this pass for years - you sent the requests and read
+      the responses. This lesson is about building the kitchen.
+
+  - id: what
+    kind: what
+    concepts: [express-routing-and-params, express-app-and-server]
+    title: From node:http to Express
+    body: |
+      Node can serve HTTP with no framework at all. This is a complete server (`plain.mjs`):
+
+      ```javascript
+      import { createServer } from 'node:http';
+
+      const server = createServer((req, res) => {
+        if (req.method === 'GET' && req.url === '/health') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok' }));
+          return;
+        }
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+      });
+
+      server.listen(3000, () => console.log('listening on http://localhost:3000'));
+      ```
+
+      ```plaintext
+      $ curl -si http://localhost:3000/health
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+      Date: Sat, 14 Nov 2026 06:05:45 GMT
+      Connection: keep-alive
+      Keep-Alive: timeout=5
+      Transfer-Encoding: chunked
+
+      {"status":"ok"}
+      ```
+
+      One function receives **every** request. Everything else is your problem: matching methods and
+      paths, pulling `:id` out of `/orders/ord_1001`, reading and parsing the body stream, setting
+      headers, handling errors. Express is a thin layer that solves exactly those problems:
+
+      | You need | `node:http` | Express 5 |
+      |---|---|---|
+      | Match method and path | `if (req.method === ... && req.url === ...)` | `app.get('/orders/:id', handler)` |
+      | Path parameters | parse `req.url` yourself | `req.params.id` |
+      | JSON body | collect the stream, `JSON.parse`, handle errors | `app.use(express.json())` then `req.body` |
+      | JSON response | `writeHead` + `end(JSON.stringify(...))` | `res.status(201).json(order)` |
+      | Shared steps (logging, ids, auth) | call them by hand in every branch | middleware, `app.use(...)` |
+      | Errors | try/catch everywhere | one error-handling middleware |
+
+      Underneath, Express still uses `node:http`: `app.listen(3000)` creates an `http.Server` with the app
+      as its request listener and returns that server.
+
+      **Vocabulary.** An **app** is the object returned by `express()`. A **route** is a method, a path
+      pattern and one or more handlers. **Middleware** is any function `(req, res, next)` that runs during
+      the request; route handlers are middleware too. A **router** (`express.Router()`) is a mini-app you
+      mount on a path.
+
+  - id: why
+    kind: why
+    concepts: [express-middleware-pipeline, express-error-handling]
+    title: Why it matters to a full stack developer
+    body: |
+      The frontend you built in the React lessons needs an API to talk to: list orders, show one, create
+      a refund. Express is the most widely used Node.js web framework, and its model - an ordered pipeline
+      of middleware - is shared by many others (Koa, Connect, and in spirit Fastify's hooks and NestJS's
+      interceptors), so learning it well transfers.
+
+      The bugs testers find in APIs are very often pipeline bugs:
+
+      - a request that **hangs** until the client times out (a middleware that never calls `next()`);
+      - an invalid request that gets a **400 but still changes data** (a handler that responds and keeps
+        going);
+      - a **500 page with a stack trace**, file paths and a database host name (the default error handler
+        outside production);
+      - an HTML `Cannot GET /refunds` from an API that promises JSON everywhere (no 404 handler);
+      - missing request ids or log lines for exactly the requests that failed (middleware registered in
+        the wrong order).
+
+      Knowing how the pipeline works lets you **predict** these bugs when you write the server, and
+      **diagnose** them in minutes when you test someone else's.
+
+  - id: internals
+    kind: internals
+    concepts: [express-middleware-pipeline, express-error-handling]
+    title: How a request moves through the pipeline
+    body: |
+      Express keeps one ordered list - the **stack** - of everything you registered with `app.use(...)`,
+      `app.get(...)`, `app.post(...)` and so on. For each request it walks that list **from the top**:
+
+      1. Skip entries whose path (and, for routes, method) don't match the request.
+      2. Call the first match with `(req, res, next)`.
+      3. That function does one of three things:
+         - **ends the cycle** by sending a response (`res.json`, `res.send`, `res.end`, `res.sendStatus`) -
+           nothing further runs for this request;
+         - calls **`next()`** - Express continues to the next matching entry;
+         - calls **`next(err)`**, throws, or (in Express 5) returns a **rejected promise** - Express skips
+           every ordinary middleware and jumps to the next **error-handling** middleware: a function with
+           **four** parameters `(err, req, res, next)`.
+      4. If the walk reaches the end with no response, Express's built-in **final handler** answers -
+         `404 Cannot GET /path` - or, if there was an error, a 500 (or the error's own `status`).
+
+      Two special values: `next('route')` skips the remaining handlers of the current route, and
+      `next('router')` leaves the current router. The Express guide notes that `next('route')` only works in
+      handlers loaded with `app.METHOD()` or `router.METHOD()`.
+
+      **Order is the whole design.** The Express guide says it in one line: "middleware functions that are
+      loaded first are also executed first". A logger registered after `express.json()` never sees the
+      requests `express.json()` rejected; a 404 handler registered before the routes answers every request.
+
+      **Express 5 and promises.** The migration guide: "Request middleware and handlers that return rejected
+      promises are now handled by forwarding the rejected value as an Error to the error handling
+      middleware." So in Express 5 an `async` handler that throws behaves like `next(err)`. In Express 4 the
+      same handler left the request hanging and produced an unhandled rejection - which is why older code
+      wraps every handler in `try/catch` or an `asyncHandler` helper.
+
+  - id: visual
+    kind: visual
+    concepts: [express-middleware-pipeline, express-error-handling]
+    title: "The pipeline of the SandPay orders API"
+    body: |
+      Follow a request from the top. Ordinary middleware passes it on with `next()`; any error jumps
+      straight to the four-argument handler; a request no route answered falls through to the 404 handler.
+
+      ```mermaid
+      flowchart TD
+        A[Request arrives] --> B[requestId middleware]
+        B -->|next| C[express.json]
+        C -->|bad JSON or too large - next err| H[Error handler - four arguments]
+        C -->|next| D{Does a route match?}
+        D -->|GET /orders/:id| E[Route handler]
+        D -->|no| F[404 handler]
+        E -->|res.json| R[Response sent - cycle ends]
+        E -->|throws or rejects| H
+        F --> R
+        H --> R
+      ```
+
+      What to notice: there are **three** ways out of the line - a handler responds, the 404 handler
+      responds, or the error handler responds. A function that does none of these (no response, no
+      `next()`) leaves the client waiting forever.
+
+  - id: first-api
+    kind: code
+    concepts: [express-routing-and-params, express-middleware-pipeline]
+    title: A first Express API - and what it really answers
+    body: |
+      `app.mjs` builds the app; `server.mjs` starts it (more on that split later).
+
+      ```javascript
+      // app.mjs
+      import express from 'express';
+
+      const orders = new Map([
+        ['ord_1001', { id: 'ord_1001', amountMinor: 2599, currency: 'EUR', status: 'PAID' }],
+      ]);
+
+      const app = express();
+      app.use(express.json());
+
+      app.use((req, res, next) => {
+        const started = Date.now();
+        res.on('finish', () => {
+          console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - started} ms)`);
+        });
+        next();
+      });
+
+      app.get('/orders/:id', (req, res) => {
+        const order = orders.get(req.params.id);
+        if (!order) {
+          res.status(404).json({ error: 'order not found' });
+          return;
+        }
+        res.json(order);
+      });
+
+      app.post('/orders', (req, res) => {
+        console.log('req.body =', req.body);
+        const { amountMinor, currency } = req.body ?? {};
+        const id = `ord_${1000 + orders.size + 1}`;
+        const order = { id, amountMinor, currency, status: 'PENDING' };
+        orders.set(id, order);
+        res.status(201).location(`/orders/${id}`).json(order);
+      });
+
+      app.get('/slow-report', async () => {
+        throw new Error('report database unavailable');
+      });
+
+      export default app;
+      ```
+
+      Real responses from Node 24 and Express 5.3.0:
+
+      ```plaintext
+      $ curl -si http://localhost:3000/orders/ord_1001
+      HTTP/1.1 200 OK
+      X-Powered-By: Express
+      Content-Type: application/json; charset=utf-8
+      Content-Length: 69
+      ETag: W/"45-GuM+lwQQH6lTHswIG8ksUZXrsQg"
+      Date: Sat, 14 Nov 2026 06:05:56 GMT
+      Connection: keep-alive
+      Keep-Alive: timeout=5
+
+      {"id":"ord_1001","amountMinor":2599,"currency":"EUR","status":"PAID"}
+
+      $ curl -s -w ' %{http_code}\n' http://localhost:3000/orders/ord_9999
+      {"error":"order not found"} 404
+
+      $ curl -si -X POST http://localhost:3000/orders -H 'Content-Type: application/json' \
+          -d '{"amountMinor":1250,"currency":"EUR"}'
+      HTTP/1.1 201 Created
+      X-Powered-By: Express
+      Location: /orders/ord_1002
+      Content-Type: application/json; charset=utf-8
+      ...
+      {"id":"ord_1002","amountMinor":1250,"currency":"EUR","status":"PENDING"}
+      ```
+
+      `res.json()` set `Content-Type`, `Content-Length` and a weak `ETag` for you. The 201 carries a
+      `Location` header because RFC 9110 (15.3.2) says the created resource "is identified by either a
+      Location header field in the response or, if no Location header field is received, by the target
+      URI" - and the target URI here is the collection, not the new order.
+
+      Now the requests a tester sends next - same server, real output:
+
+      ```plaintext
+      $ curl -s -w ' %{http_code}\n' -X POST http://localhost:3000/orders -d '{"amountMinor":1250,"currency":"EUR"}'
+      {"id":"ord_1003","status":"PENDING"} 201
+      ```
+
+      No `-H 'Content-Type: application/json'`, so curl sent `application/x-www-form-urlencoded`,
+      `express.json()` skipped the body, and the server log shows `req.body = undefined`. The handler
+      happily created an order with **no amount and no currency**. Validation is not optional - it is the
+      exercise at the end of this lesson and the subject of [Input validation and error
+      handling](#/lesson/input-validation-and-error-handling).
+
+  - id: routing
+    kind: code
+    concepts: [express-routing-and-params]
+    title: Routes and parameters in Express 5 syntax
+    body: |
+      ```javascript
+      app.get('/orders', listOrders);                 // GET only
+      app.post('/orders', createOrder);               // POST only
+      app.get('/orders/:id', getOrder);               // req.params.id
+      app.post('/orders/:id/refunds', createRefund);  // two levels, one parameter
+      app.all('/legacy', gone);                       // any method
+
+      const refunds = express.Router();               // a mini-app
+      refunds.get('/:refundId', getRefund);
+      app.use('/refunds', refunds);                   // GET /refunds/rf_1 -> getRefund
+      ```
+
+      Express 5 moved to a stricter path syntax (path-to-regexp 8). The migration guide lists the changes;
+      these are the ones you will meet first. Real results:
+
+      ```javascript
+      app.get('/*', handler);              // Express 4 style
+      // TypeError: Missing parameter name at index 2: /*; visit https://git.new/pathToRegexpError for info
+
+      app.get('/orders/:id?', handler);    // Express 4 optional parameter
+      // TypeError: Unexpected ? at index 11: /orders/:id?; visit https://git.new/pathToRegexpError for info
+
+      app.get('/files/*path', (req, res) => res.json(req.params));
+      // GET /files/2026/11/settlement.csv -> {"path":["2026","11","settlement.csv"]}
+
+      app.get('/exports/:merchant{/:format}', (req, res) => res.json(req.params));
+      // GET /exports/m_42      -> {"merchant":"m_42"}
+      // GET /exports/m_42/csv  -> {"merchant":"m_42","format":"csv"}
+      ```
+
+      | Express 4 | Express 5 | Note |
+      |---|---|---|
+      | `/*` | `/*splat` (or `/{*splat}` to also match `/`) | wildcards need a name, and capture an **array** of segments |
+      | `/:format?` | `{/:format}` | optional parts go in braces; an unmatched one is **left out** of `req.params` |
+      | `/[discussion\|page]/:slug` | `['/discussion/:slug', '/page/:slug']` | regexp characters in strings are gone |
+
+      The TypeErrors are thrown **when the route is registered**, so an Express 4 path crashes the app at
+      start-up - a loud failure, which is good: a smoke test that starts the server catches it.
+
+      Parameters are always **strings** (or arrays of strings for wildcards). `/orders/42` gives
+      `req.params.id === '42'`, never the number 42 - convert and validate it like any other input.
+
+  - id: body-parsing
+    kind: internals
+    concepts: [express-middleware-pipeline]
+    title: What express.json() does with the body
+    body: |
+      `express.json()` is body-parser's JSON parser. It reads the body **only** when the request's
+      `Content-Type` matches its `type` option (default `application/json`), parses it and sets
+      `req.body`. Its defaults, from the body-parser README: `limit` `'100kb'`, `strict` `true` (only objects
+      and arrays are accepted at the top level), `inflate` `true` (gzip, deflate and - the Express 5 migration
+      guide lists it as an improvement - Brotli bodies are decompressed).
+
+      Real outcomes, same server as above:
+
+      | Request | Status | What happened |
+      |---|---|---|
+      | `Content-Type: application/json`, valid object | handler runs | `req.body` is the parsed object |
+      | no JSON `Content-Type` | handler runs | `req.body` is **`undefined`** (it was `{}` in Express 4) |
+      | `{"amountMinor":1250,` (truncated) | **400** | error with `type: 'entity.parse.failed'` |
+      | a 200 kB JSON object | **413** | `PayloadTooLargeError`, `limit: 102400`, `type: 'entity.too.large'` |
+      | `"hello"` (a JSON string, not an object) | **400** | `strict` rejects non-object, non-array JSON |
+
+      The server log for those three rejected requests (stack frames removed):
+
+      ```plaintext
+      SyntaxError: Expected double-quoted property name in JSON at position 20 (line 1 column 21)
+        expose: true,
+        statusCode: 400,
+        status: 400,
+        body: '{"amountMinor":1250,',
+        type: 'entity.parse.failed'
+      }
+      PayloadTooLargeError: request entity too large
+        expected: 200013,
+        length: 200013,
+        limit: 102400,
+        type: 'entity.too.large'
+      }
+      ```
+
+      Notice what is **missing** from that log: the request logger's `POST /orders -> 400` lines. The
+      logger was registered **after** `express.json()`, and a parse error jumps straight to the error
+      handlers, so the logger never ran. Those are exactly the requests you most want logged. Register
+      request ids and logging **first**.
+
+      413 is "Content Too Large" in RFC 9110 (15.5.14): the server refuses because "the request content is
+      larger than the server is willing or able to process". Keep the default limit unless an endpoint
+      really needs more - the body-parser README warns that high limits increase memory use and response
+      times.
+
+  - id: errors
+    kind: code
+    concepts: [express-error-handling]
+    title: A JSON 404 and an error handler that leaks nothing
+    body: |
+      With no handlers of your own, Express answers an unknown route and an error with **HTML** - real
+      output:
+
+      ```plaintext
+      $ curl -si http://localhost:3000/refunds
+      HTTP/1.1 404 Not Found
+      X-Powered-By: Express
+      Content-Security-Policy: default-src 'none'
+      X-Content-Type-Options: nosniff
+      Content-Type: text/html; charset=utf-8
+      Content-Length: 146
+      ...
+      <pre>Cannot GET /refunds</pre>
+      ```
+
+      and for `GET /slow-report` (the `async` handler that throws) a **500** whose HTML body is the error's
+      **stack trace** - `Error: report database unavailable` followed by file paths from the server's disk.
+      The Express guide explains why: the default error handler writes the stack to the client, and "the
+      stack trace is not included in the production environment". With `NODE_ENV=production` the same
+      request returned only `<pre>Internal Server Error</pre>`. Relying on an environment variable to hide
+      internals is fragile; an API should answer JSON either way.
+
+      The fix is two middleware functions, registered **last**, after every route:
+
+      ```javascript
+      // 404: not an error - nothing matched. The Express FAQ: "add a middleware function at the
+      // very bottom of the stack (below all other functions) to handle a 404 response".
+      app.use((req, res) => {
+        res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}` });
+      });
+
+      // Error handler: FOUR parameters, or Express treats it as ordinary middleware.
+      app.use((err, req, res, next) => {
+        if (res.headersSent) return next(err); // too late to send JSON - let Express close the connection
+        const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+        if (status >= 500) console.error(err); // full details in the server log only
+        res.status(status).json({
+          error: status >= 500 ? 'internal_error' : 'bad_request',
+          message: status >= 500 ? 'Something went wrong' : err.message,
+        });
+      });
+      ```
+
+      Real results with those two registered:
+
+      ```plaintext
+      GET /refunds -> 404 {"error":"not_found","message":"No route for GET /refunds"}
+      GET /boom -> 500 {"error":"internal_error","message":"Something went wrong"}
+      POST /orders -> 400 {"error":"bad_request","message":"Unexpected end of JSON input"}
+      ```
+
+      `GET /boom` is an `async` handler that throws `new Error('ledger timeout')`: Express 5 forwarded the
+      rejection to the error handler, the client got a generic 500 and the server log got the real error.
+      The 400 came from body-parser's error, which carries `status: 400` and `expose: true` - the library's
+      signal that its message is safe to show. Even so, many teams map known error **types** to their own
+      codes instead of echoing library messages; the coding exercise does that.
+
+      `res.headersSent`: once a response has started (a stream, a partly written body), you cannot change
+      its status or headers. The Express guide's own handler checks this first and delegates to the
+      default handler, which "closes the connection and fails the request".
+
+  - id: app-and-server
+    kind: steps
+    concepts: [express-app-and-server]
+    title: Separate the app from the server, then shut down gracefully
+    body: |
+      1. **Export the app, don't listen in it.** `app.mjs` builds routes and middleware and exports `app`.
+         Nothing in it opens a port.
+      2. **Start it in a tiny entry file.** `server.mjs` imports the app, reads the port from configuration
+         ([The Node.js runtime, npm and package.json](#/lesson/node-runtime-and-npm)) and listens:
+
+         ```javascript
+         // server.mjs
+         import app from './app.mjs';
+
+         const port = Number(process.env.PORT ?? 3000);
+         const server = app.listen(port, (error) => {
+           if (error) throw error; // Express 5 passes listen errors (e.g. EADDRINUSE) to this callback
+           console.log(`SandPay orders API on http://localhost:${port}`);
+         });
+
+         process.on('SIGTERM', () => {
+           console.log('SIGTERM received: closing the HTTP server');
+           server.close(() => {
+             console.log('HTTP server closed');
+           });
+         });
+         ```
+
+         The `error` argument is new in Express 5: the migration guide says `app.listen` now "will invoke
+         the user-provided callback function (if provided) when the server receives an error event". If you
+         ignore it, a port clash is easy to miss.
+      3. **Test the app, not the server.** supertest takes the app itself and, per its README, binds it to
+         an "ephemeral port for you", so tests need no fixed port, no separate process and no clean-up:
+
+         ```typescript
+         import request from 'supertest';
+         import app from './app.mjs';
+
+         test('unknown orders are a JSON 404', async () => {
+           const res = await request(app).get('/orders/ord_9999');
+           expect(res.status).toBe(404);
+           expect(res.body).toEqual({ error: 'order not found' });
+         });
+         ```
+
+         A factory - `createOrdersApp(store)` - is even better: each test builds a fresh app with its own
+         in-memory store, so tests never share data. That is the shape of this lesson's practice project.
+      4. **Shut down gracefully.** When a platform replaces your container it sends **SIGTERM** first. The
+         Express guide: the app "should stop accepting new requests, finish all the ongoing requests, clean
+         up the resources it used ... then exit". `server.close()` does the first two: it stops accepting
+         connections and, since Node 19, closes idle keep-alive connections, while requests in progress
+         finish. A real run - one slow request in flight (1 s), then SIGTERM, then a new request:
+
+         ```plaintext
+         new request: 000 Failed to connect to localhost port 3004 after 0 ms: Couldn't connect to server
+         in-flight: {"status":"done"} 200
+         listening
+         SIGTERM received: closing the HTTP server
+         HTTP server closed
+         exit code 0
+         ```
+
+         The new request was refused, the request already running still got its 200, and the process exited
+         with 0 on its own once nothing was left to do. Close database pools inside the `close` callback.
+         Platforms wait only so long (a grace period) before they kill the process, so keep long requests
+         short or add a timeout.
+
+  - id: example
+    kind: example
+    concepts: [express-middleware-pipeline, express-error-handling, express-app-and-server]
+    title: "Project example: reviewing the first SandPay orders API"
+    body: |
+      A developer opens a pull request with the first version of SandPay's merchant orders API and asks you
+      to review and test it before the dashboard team starts using it. You read `app.ts` top to bottom -
+      **the order of `app.use` and `app.get` calls is the behaviour** - and ask:
+
+      - **Is a request id set first?** If not, failed requests can't be traced across the gateway and the
+        logs. Send a request with `X-Request-Id: test-123` and check it comes back.
+      - **Is the logger before the body parser?** Send malformed JSON and check the request appears in the
+        log.
+      - **Does every branch end?** Each `if` that sends a response needs a `return`; each middleware needs a
+        `next()` on every path. Look for handlers that respond inside a condition and keep going.
+      - **Are 404 and error handlers last, JSON, and four-argument?** Request `/does-not-exist`; force an
+        error (stop the database container) and check the body has no stack, path or host name.
+      - **Is the app exported without `listen`?** If tests start a real server on port 3000, they will
+        collide in CI.
+      - **What happens on SIGTERM?** Start a slow request, send `kill -TERM <pid>`, and check the request
+        completes and the process exits 0.
+
+      Two findings would block the merge in most teams: a 500 that leaks the stack trace (an information
+      disclosure the security team will flag) and a validation branch that responds 400 but still writes to
+      the database (a data-integrity bug - see the debug exercise).
+
+  - id: tests
+    kind: tests
+    concepts: [express-routing-and-params, express-middleware-pipeline, express-error-handling, express-app-and-server]
+    title: Tests for an Express API's plumbing
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      |---|---|---|---|---|
+      | 1 | Known resource | `GET /orders/ord_1001` | 200, JSON, the order | status, `Content-Type`, body |
+      | 2 | Unknown id | `GET /orders/ord_9999` | 404 JSON `order_not_found` | status, body |
+      | 3 | Unknown route | `GET /refundz` | 404 **JSON**, not HTML | `Content-Type` |
+      | 4 | Create | `POST /orders` valid JSON | 201, `Location: /orders/<id>`, body is the order | headers, body, then `GET` the Location |
+      | 5 | Missing Content-Type | POST the same JSON as `text/plain` | 400 (or 415), **nothing created** | status, then `GET /orders` count unchanged |
+      | 6 | Malformed JSON | truncated body | 400 JSON, request logged with its id | body, server log |
+      | 7 | Oversized body | 200 kB JSON | 413 JSON | status, body |
+      | 8 | Invalid field | `amountMinor: -500` | 400 and **nothing created** | status, then list unchanged |
+      | 9 | Server failure | make the store reject (stop the DB) | 500 JSON, no stack, path or host in body; full error in log | body, server log |
+      | 10 | Request id | send `X-Request-Id: test-123`; send none | echoed; a fresh UUID when none | response header |
+      | 11 | No hang | every route under failure | responds within the client timeout | test timeout, curl `--max-time` |
+      | 12 | Graceful shutdown | slow request in flight, then SIGTERM | in-flight request gets 200; new connections refused; exit code 0 | curl output, `echo $?` |
+
+      Cases 5 and 8 need **two** assertions: the response **and** the state afterwards - the bug in the
+      debug exercise passes a status-only check.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [express-middleware-pipeline, express-error-handling, express-routing-and-params]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Responding without `return`.** The handler keeps running after `res.status(400).json(...)`. A real
+        run of a validation branch without `return`: the client got `400 {"error":"invalid_order"}`, the
+        order with `amountMinor: -500` **was stored anyway**, and the log showed
+        `Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client` from the second
+        `res.json`. When the second call sends no body (`res.json(undefined)`), it doesn't even throw - the
+        bug is silent. Write `res.status(400).json(...); return;` (or `return res.status(400).json(...)`).
+      - **Neither responding nor calling `next()`.** The request hangs; a real run with a 1.5 s client
+        timeout ended in `TimeoutError` and no server-side error at all. Debug: log at the start of each
+        middleware and see which one is the last to run.
+      - **Middleware in the wrong order.** Logger after `express.json()` (rejected bodies are never logged);
+        404 handler before the routes (everything is 404); `express.json()` after the routes (`req.body` is
+        `undefined` in every handler).
+      - **An error handler with three parameters.** Express recognises error handlers by having **four**
+        parameters. `(err, req, res)` is treated as ordinary middleware - its first argument is actually
+        `req`. Keep `next` even when you don't call it.
+      - **Express 4 paths in Express 5.** `/*` and `/:id?` throw a `TypeError` at registration; use
+        `/*splat` and `{/:id}`.
+      - **Trusting `req.body` and `req.params`.** `req.body` may be `undefined`, an array or any shape;
+        params are strings. Validate both.
+      - **Leaking errors.** `res.status(500).json({ error: err.message })` sends database host names and
+        SQL fragments to the client. Log details server-side; send a code and a request id.
+
+      **A debugging method for "the API returned the wrong thing":** reproduce with `curl -si` (headers
+      matter), find the request's id in the server log, list the stack in registration order, and walk it
+      by hand for that method and path: which entries match, which respond, which call `next`?
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [express-middleware-pipeline, express-app-and-server]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **Express is minimal on purpose.** No built-in validation, no OpenAPI, no dependency injection, no
+        structured logging. You add libraries (zod, an OpenAPI generator, pino) - flexible, but every team's
+        Express app looks a little different.
+      - **Alternatives** (check their current documentation before choosing): **Fastify** (schema-based
+        validation and serialisation, a plugin system), **Hono** (small, runs on many JavaScript runtimes),
+        **NestJS** (an opinionated framework with modules and decorators, which can run on Express or
+        Fastify), Next.js route handlers when the API lives with a React app. The request-response and
+        middleware ideas carry over to all of them.
+      - **`X-Powered-By: Express`** is sent by default and tells attackers what you run. The Express
+        [security best practices](https://expressjs.com/en/advanced/best-practice-security.html) suggest
+        `app.disable('x-powered-by')` to reduce fingerprinting, and note it "does not prevent a sophisticated
+        attacker" from identifying Express - keep dependencies patched.
+      - **One process, one core.** Express runs on Node's single JavaScript thread; scale with several
+        processes or containers behind a load balancer, and keep CPU-heavy work out of handlers.
+      - **Graceful shutdown has a deadline.** Long downloads, WebSockets and keep-alive clients can outlast
+        the platform's grace period; `server.closeIdleConnections()` and `server.closeAllConnections()`
+        (Node `http` docs) exist for the last resort.
+
+  - id: summary
+    kind: summary
+    concepts: [express-routing-and-params, express-middleware-pipeline, express-error-handling, express-app-and-server]
+    title: Quick reference
+    body: |
+      - A **route** = method + path + handler: `app.get('/orders/:id', h)`; params are strings in `req.params`.
+      - Express 5 paths: `/*splat`, `{/:optional}`; old `?`, `*` and regexp characters throw at start-up.
+      - Middleware runs **in registration order**; each one **responds or calls `next()`** - and responds at
+        most once (`return` after sending).
+      - `express.json()`: parses only `application/json`; otherwise `req.body` is `undefined`; bad JSON 400,
+        over 100 kB 413, non-object JSON 400.
+      - Express 5 forwards thrown errors and **rejected promises** to error handlers.
+      - **404 handler** = last ordinary middleware; **error handler** = four parameters, registered last,
+        JSON, no stack or message for 5xx; check `res.headersSent`.
+      - Export the **app**; `listen` in a separate entry file; test with `request(app)` from supertest.
+      - SIGTERM → `server.close()` → in-flight requests finish → close pools → exit 0.
+
+exercises:
+  - id: stack-order
+    type: order
+    concept: express-middleware-pipeline
+    skill: application
+    title: Register the SandPay API's middleware in the right order
+    prompt: |
+      Put these registrations in the order they must appear in `app.ts`, so that every request - including
+      malformed JSON and unknown routes - gets a request id and a log line, every route can read
+      `req.body`, unknown paths get a JSON 404 and every error gets JSON.
+    items:
+      - id: request-id
+        text: "app.use(requestId())"
+      - id: logger
+        text: "app.use(requestLogger())"
+      - id: json
+        text: "app.use(express.json())"
+      - id: routes
+        text: "app.use('/orders', ordersRouter)"
+      - id: not-found
+        text: "app.use(notFound)"
+      - id: errors
+        text: "app.use(errorHandler)  // (err, req, res, next)"
+    hints:
+      - Which steps must run even for requests whose body can't be parsed?
+      - Which step must run before any handler reads req.body?
+      - The 404 handler runs only if nothing before it responded; the error handler is reached by skipping, so it can sit at the very end.
+    solution: |
+      **requestId, requestLogger, express.json, routes, notFound, errorHandler.** The id and logger come
+      first so that requests rejected by `express.json()` (which jumps straight to the error handler) are
+      still identified and logged. The parser must come before the routes that read `req.body`. The 404
+      handler must be after every route, or it answers everything. The error handler goes last; errors skip
+      ordinary middleware to reach it wherever they start. (Logger before request id also works if the
+      logger reads the id lazily on `finish` - but id first is the simple, safe rule.)
+    followUp: |
+      A teammate adds `app.use(authenticate)` that answers 401 when there is no token. Where does it go,
+      and what would happen to the `/health` endpoint if it went first?
+
+  - id: missing-log-lines
+    type: mcq
+    concept: express-middleware-pipeline
+    skill: analysis
+    title: Where are the failed requests in the log?
+    prompt: |
+      Support reports merchants getting 400 responses from `POST /orders`, but the request log - one line per
+      request, written on the response's `finish` event - has **no** 400 lines at all, only 200s and 201s.
+      The app registers, in order: `express.json()`, the logger, the routes, an error handler. What is the
+      most likely cause?
+    options:
+      - id: order
+        text: The 400s come from express.json() rejecting the bodies; that error jumps to the error handler and skips the logger registered after it.
+        feedback: Correct - errors skip ordinary middleware, and the logger is ordinary middleware registered after the parser. In a real run, the malformed and oversized requests produced no logger line.
+      - id: finish-not-fired
+        text: Node doesn't emit 'finish' for 4xx responses.
+        feedback: The 'finish' event fires for every completed response whatever its status - the 404 for an unknown order is logged fine.
+      - id: client-side
+        text: The 400s are produced by the merchants' HTTP clients, not the server.
+        feedback: Clients don't invent status codes; a 400 came from somewhere in your stack. Assume your own pipeline first, and prove it.
+      - id: log-level
+        text: The logger filters out client errors to reduce noise.
+        feedback: Nothing in the description filters by status - and if it did, the 404s would be missing too. Look at where the logger sits in the stack.
+    correct: [order]
+    hints:
+      - Which middleware can produce a 400 for POST /orders before any route runs?
+      - When next(err) is called, which middleware functions are skipped?
+    solution: |
+      `express.json()` turns malformed or oversized bodies into errors (`entity.parse.failed` 400,
+      `entity.too.large` 413). An error jumps to the next **four-argument** middleware, skipping the logger
+      that was registered after the parser. **Confirm** by sending a truncated JSON body yourself and
+      checking the log: no line. **Fix:** register the request id and logger before `express.json()`, and
+      log in the error handler too.
+
+  - id: express5-paths
+    type: mcq
+    concept: express-routing-and-params
+    skill: analysis
+    title: The app won't start after the upgrade
+    prompt: |
+      After upgrading from Express 4 to 5, the API crashes on start-up with:
+
+      ```plaintext
+      TypeError: Missing parameter name at index 2: /*; visit https://git.new/pathToRegexpError for info
+      ```
+
+      The code has `app.get('/*', serveDashboard)` to send the React app's `index.html` for any path. What is
+      the fix?
+    options:
+      - id: named-root
+        text: Name the wildcard and wrap it in braces so / also matches - app.get('/{*splat}', serveDashboard).
+        feedback: Correct - Express 5 wildcards need a name, and /*splat alone doesn't match the root path; /{*splat} matches both.
+      - id: named
+        text: app.get('/*splat', serveDashboard) - and nothing else changes.
+        feedback: It fixes the crash, but the migration guide notes /*splat "matches any path without the root path" - GET / would now be a 404.
+      - id: question
+        text: app.get('/:path?', serveDashboard)
+        feedback: The ? optional syntax was removed too - this throws "Unexpected ?" at registration - and it would match only one segment anyway.
+      - id: downgrade
+        text: Pin path-to-regexp 0.1.x in package.json to keep the old syntax.
+        feedback: Express 5's router depends on its own path-to-regexp version; fighting the dependency tree hides the problem instead of migrating the route.
+    correct: [named-root]
+    hints:
+      - The error says the wildcard is missing something that :id has.
+      - Does /*splat match / itself? Check the migration guide.
+    solution: |
+      Express 5 requires named wildcards: `/*splat`. That alone doesn't match `/`, so a single-page app's
+      fallback should use `/{*splat}`. `req.params.splat` is an **array** of segments. **Confirm** with a
+      start-up smoke test and requests to `/` and `/orders/ord_1001`.
+
+  - id: missing-return
+    type: debug
+    concept: express-middleware-pipeline
+    skill: analysis
+    title: The 400 that still creates the order
+    prompt: |
+      A tester reports that `POST /orders` with `{"amountMinor": -500, "currency": "EUR"}` correctly returns
+      **400**, yet the order appears in `GET /orders` afterwards, and the server log shows
+      `ERR_HTTP_HEADERS_SENT`. Click the line that causes it.
+    language: javascript
+    code: |
+      app.post('/orders', async (req, res) => {
+        const { amountMinor, currency } = req.body ?? {};
+        if (!Number.isInteger(amountMinor) || amountMinor <= 0 || !/^[A-Z]{3}$/.test(currency ?? '')) {
+          res.status(400).json({ error: 'invalid_order' });
+        }
+        const order = await store.create({ amountMinor, currency });
+        res.status(201).json(order);
+      });
+    correctLines: [4]
+    lineNotes:
+      - line: 2
+        note: The `?? {}` correctly guards against req.body being undefined - this line is fine.
+      - line: 6
+        note: This is where the bad order is written, but it is only reached because the previous branch didn't stop. Awaiting here is fine in Express 5.
+      - line: 7
+        note: This is where ERR_HTTP_HEADERS_SENT is thrown - the symptom, not the cause.
+    hints:
+      - Sending a response doesn't stop a JavaScript function.
+      - After line 4 runs, which lines still run?
+      - The fix is one word.
+    solution: |
+      **Line 4** sends the 400 but doesn't **return**, so the function continues: line 6 stores the invalid
+      order and line 7 tries to send a second response, throwing `ERR_HTTP_HEADERS_SENT` (which Express 5
+      forwards to the error handler; the client never sees it because the 400 was already sent). A real run
+      reproduced exactly this: client `400`, order with `-500` stored. Fix: `return res.status(400).json(...)`
+      or a `return;` after it. Test both the response **and** the state afterwards.
+    followUp: |
+      Write a supertest test that would have caught this bug. Which two things does it assert?
+
+  - id: hanging-request
+    type: mcq
+    concept: express-middleware-pipeline
+    skill: application
+    title: Requests to /reports hang
+    prompt: |
+      ```javascript
+      app.use('/reports', (req, res, next) => {
+        if (!req.get('X-Merchant-Id')) {
+          res.status(400).json({ error: 'merchant_required' });
+          return;
+        }
+        console.log('merchant', req.get('X-Merchant-Id'));
+      });
+      app.get('/reports/settlements', listSettlements);
+      ```
+
+      Requests **with** the header hang until the client times out; requests without it get the 400. Why?
+    options:
+      - id: no-next
+        text: The middleware never calls next() on the success path, so the request stops there without a response.
+        feedback: Correct - a middleware must either respond or call next() on every path. Add next() after the log line.
+      - id: no-await
+        text: listSettlements is async and Express 5 doesn't wait for it.
+        feedback: Express 5 handles async handlers fine - and listSettlements is never even reached.
+      - id: header-case
+        text: req.get is case-sensitive, so the header is never found.
+        feedback: req.get is case-insensitive - and if it never found the header, every request would get the 400, not hang.
+      - id: use-vs-get
+        text: app.use doesn't match /reports/settlements, only /reports exactly.
+        feedback: app.use matches the path and everything under it; the middleware does run (it logs), it just never passes the request on.
+    correct: [no-next]
+    hints:
+      - What are the only two ways a middleware can let the request continue to a response?
+      - Follow the success path to the end of the function.
+    solution: |
+      On the success path the middleware logs and returns without calling `next()` or responding, so
+      nothing else runs and the client waits forever. A real run with a 1.5 s client timeout ended in
+      `TimeoutError`, with no server-side error to hint at it. **Confirm** by adding a log at the start of
+      `listSettlements` - it never prints. Fix: call `next()` after the log line.
+
+  - id: body-undefined
+    type: mcq
+    concept: express-middleware-pipeline
+    skill: application
+    title: req.body is undefined
+    prompt: |
+      `app.use(express.json())` is registered before the routes. A test using `fetch` gets a 500 from
+      `POST /orders` with `TypeError: Cannot destructure property 'amountMinor' of 'req.body' as it is
+      undefined`. The request was:
+
+      ```javascript
+      await fetch('/orders', { method: 'POST', body: JSON.stringify({ amountMinor: 1250, currency: 'EUR' }) });
+      ```
+
+      What is the cause?
+    options:
+      - id: content-type
+        text: fetch sent the string with Content-Type text/plain, so express.json() skipped the body and Express 5 left req.body undefined.
+        feedback: "Correct - express.json() only parses requests whose Content-Type matches application/json. Add headers: { 'Content-Type': 'application/json' }, and guard req.body on the server."
+      - id: express4
+        text: Express 5 removed req.body; use req.json() instead.
+        feedback: req.body still exists in Express 5; it is undefined (instead of {}) when no parser ran. There is no req.json().
+      - id: limit
+        text: The body exceeds express.json()'s default limit.
+        feedback: That would be a 413 from the parser, not undefined in the handler - and this body is a few dozen bytes.
+      - id: stringify
+        text: JSON.stringify produced invalid JSON.
+        feedback: Invalid JSON with the right Content-Type gives a 400 entity.parse.failed, not an undefined body.
+    correct: [content-type]
+    hints:
+      - Which header does express.json() look at before reading the body?
+      - What does fetch set as Content-Type for a string body?
+    solution: |
+      For a string body, `fetch` sets `Content-Type: text/plain;charset=UTF-8`. `express.json()` only parses
+      `application/json`, so it calls `next()` without touching the body - and in Express 5 `req.body` stays
+      `undefined` (Express 4 gave `{}`). **Confirm** by logging `req.get('content-type')`. Fix the client
+      header, and make the server answer 400 (or 415) instead of crashing when the body is missing.
+
+  - id: orders-app
+    type: coding
+    concept: express-routing-and-params
+    skill: application
+    title: Build the orders routes
+    prompt: |
+      Implement `createOrdersApp(store)` for the SandPay merchant API: `GET /orders`, `GET /orders/:id` (JSON
+      404 `order_not_found` for an unknown id) and `POST /orders`, which validates `amountMinor` (a positive
+      integer) and `currency` (three capital letters), answers 201 with a `Location` header, and answers 400
+      `invalid_order` - creating nothing - for anything else, including a body that isn't JSON. Every store
+      method returns a promise; a store that rejects must end in a 500, never a hung request. Don't call
+      `listen()` - the tests use supertest.
+    project: fullstack
+    files:
+      - exercises/express/orders-app.ts
+    test: tests/express/orders-app.test.ts
+    command: npx vitest run tests/express/orders-app.test.ts
+    hints:
+      - "Start with `app.use(express.json())`; without it every POST sees `req.body === undefined`."
+      - Make the handlers `async` and `await` the store - Express 5 sends rejections to the error handler, which answers 500 by default.
+      - "`Number.isSafeInteger(x) && x > 0` rejects 12.5, 0, -100 and the string '1250' in one check."
+      - "Return right after every `res.status(...).json(...)` inside an `if`, and use `res.status(201).location(...).json(order)` for the create."
+    modelAnswer: |
+      ```typescript
+      export function createOrdersApp(store: OrderStore): Express {
+        const app = express();
+        app.use(express.json());
+
+        app.get('/orders', async (req, res) => {
+          res.json({ orders: await store.list() });
+        });
+
+        app.get('/orders/:id', async (req, res) => {
+          const order = await store.get(req.params.id);
+          if (!order) {
+            res.status(404).json({ error: 'order_not_found' });
+            return;
+          }
+          res.json(order);
+        });
+
+        app.post('/orders', async (req, res) => {
+          const body: unknown = req.body; // undefined when the request wasn't JSON
+          const { amountMinor, currency } = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+          const validAmount = Number.isSafeInteger(amountMinor) && (amountMinor as number) > 0;
+          const validCurrency = typeof currency === 'string' && /^[A-Z]{3}$/.test(currency);
+          if (!validAmount || !validCurrency) {
+            res.status(400).json({ error: 'invalid_order' });
+            return;
+          }
+          const order = await store.create({ amountMinor: amountMinor as number, currency: currency as string });
+          res.status(201).location(`/orders/${order.id}`).json(order);
+        });
+
+        return app;
+      }
+      ```
+
+      The `return` after each early response is what keeps an invalid order out of the store. Treating
+      `req.body` as `unknown` forces the checks TypeScript would otherwise let you skip. Awaiting inside
+      `async` handlers is enough for the "store rejects" test because Express 5 forwards the rejection; in
+      Express 4 that test would time out.
+    rubric:
+      - Every test in tests/express/orders-app.test.ts passes.
+      - The app is returned, not started - no listen() call in the file.
+      - Each early response is followed by return, so nothing runs after a 404 or 400.
+      - req.body is treated as untrusted (it may be undefined or any shape) and amounts are checked as integers, not with parseFloat.
+      - Store calls are awaited inside async handlers, with no swallowed errors (no empty catch blocks).
+    followUp: |
+      Add `DELETE /orders/:id` that answers 204 with no body, 404 for an unknown id and 409 when the order is
+      already PAID. What would your tests assert about the response body of the 204?
+
+    solution: |
+      Parse JSON, add three async routes that await the store, return after every early response, check
+      `amountMinor` with `Number.isSafeInteger` and `currency` with `/^[A-Z]{3}$/`, and answer 201 with
+      `Location`. Express 5 turns a rejected store call into a 500. The full reference is in
+      `solutions/express/orders-app.ts`.
+
+  - id: middleware-trio
+    type: coding
+    concept: express-error-handling
+    skill: application
+    title: Request ids, a JSON 404 and a safe error handler
+    prompt: |
+      Implement the three middleware functions in `middleware.ts`. `requestId()` reuses a safe incoming
+      `X-Request-Id` (1-64 letters, digits or hyphens) or generates a UUID, stores it in
+      `res.locals.requestId` and returns it in the response header. `notFound` answers `404 { error:
+      "not_found", requestId }`. `errorHandler` maps malformed JSON to `400 malformed_json`, oversized
+      bodies to `413 payload_too_large`, and anything else to `500 internal_error` - logging the error on
+      the server but never sending its message or stack - and passes the error on when the response has
+      already started. The test file wires them into an app in the recommended order.
+    project: fullstack
+    files:
+      - exercises/express/middleware.ts
+    test: tests/express/middleware.test.ts
+    command: npx vitest run tests/express/middleware.test.ts
+    hints:
+      - "`req.get('X-Request-Id')` returns the header or undefined; `randomUUID()` comes from `node:crypto`."
+      - Set the response header in requestId itself, before next(), so even error responses carry it.
+      - body-parser's errors have a `type` property - 'entity.parse.failed' and 'entity.too.large'.
+      - "Check `res.headersSent` first and call `next(err)` if it is true. The handler must keep four parameters."
+    modelAnswer: |
+      ```typescript
+      const SAFE_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+      export function requestId(): RequestHandler {
+        return (req, res, next) => {
+          const incoming = req.get('X-Request-Id');
+          const id = incoming !== undefined && SAFE_ID.test(incoming) ? incoming : randomUUID();
+          res.locals.requestId = id;
+          res.set('X-Request-Id', id);
+          next();
+        };
+      }
+
+      export const notFound: RequestHandler = (req, res) => {
+        res.status(404).json({ error: 'not_found', requestId: res.locals.requestId });
+      };
+
+      export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+        if (res.headersSent) {
+          next(err);
+          return;
+        }
+        const type = typeof err === 'object' && err !== null ? (err as { type?: unknown }).type : undefined;
+        let status = 500;
+        let code = 'internal_error';
+        if (type === 'entity.parse.failed') {
+          status = 400;
+          code = 'malformed_json';
+        } else if (type === 'entity.too.large') {
+          status = 413;
+          code = 'payload_too_large';
+        } else {
+          console.error(`[${String(res.locals.requestId)}]`, err);
+        }
+        res.status(status).json({ error: code, requestId: res.locals.requestId });
+      };
+      ```
+
+      Validating the incoming id matters: it is echoed into headers and logs, so an attacker-controlled
+      value must be short and plain. Mapping errors by their `type` instead of echoing `err.message` means
+      the client sees only codes you chose, and the request id lets support find the full error in the log.
+    rubric:
+      - Every test in tests/express/middleware.test.ts passes.
+      - The error handler declares four parameters and checks res.headersSent before writing.
+      - No error message, stack, host name or SQL is ever sent for a 5xx; the full error is logged with the request id.
+      - The incoming request id is validated before it is reused.
+      - Known client errors are mapped by a stable property (err.type), not by matching message text.
+    followUp: |
+      Extend `errorHandler` so that errors your own code throws can choose their status: a class
+      `HttpError(status, code)`. Which statuses would you allow it to set, and why should a 5xx from it still
+      hide the message?
+
+    solution: |
+      `requestId` validates and reuses the header or generates a UUID, then sets `res.locals.requestId` and
+      the response header before `next()`. `notFound` answers a JSON 404. `errorHandler` has four
+      parameters, delegates when `res.headersSent`, maps `entity.parse.failed` to 400 and `entity.too.large`
+      to 413, and logs everything else while sending only `internal_error`. Reference:
+      `solutions/express/middleware.ts`.
+
+  - id: test-design-orders-api
+    type: testdesign
+    concept: express-error-handling
+    skill: analysis
+    title: An API test plan for POST /orders
+    prompt: |
+      Design HTTP-level tests for `POST /orders` on the SandPay orders API (Express 5, JSON only, request ids,
+      JSON 404 and error handler). Give at least eight cases with preconditions, the request, the expected
+      response **and the evidence** - including what you check *after* the response.
+    hints:
+      - Vary the body, the headers and the state of the store.
+      - Which bugs are invisible if you only check the status code?
+      - What should a client never see in a 500?
+    modelAnswer: |
+      1. **Valid order** - empty store; POST `{"amountMinor":1250,"currency":"EUR"}` as JSON → 201, `Location:
+         /orders/<id>`, body matches. Evidence: headers, body, then `GET` the Location returns the same order.
+      2. **Invalid amount, nothing stored** - POST `amountMinor: -500` → 400 `invalid_order`. Evidence: status
+         **and** `GET /orders` count unchanged (catches the missing-`return` bug).
+      3. **Amount as string / decimal / zero** - `"1250"`, `12.5`, `0` → 400 each, nothing stored.
+      4. **Currency** - `"eur"`, `"EURO"`, missing → 400.
+      5. **Wrong Content-Type** - same JSON as `text/plain` → 400 (or 415 if specified), not 500 and not an
+         empty order. Evidence: status, list unchanged.
+      6. **Malformed JSON** - truncated body → 400 `malformed_json` JSON with a request id; the request appears
+         in the server log. Evidence: body, `X-Request-Id`, log search by id.
+      7. **Oversized body** - 200 kB → 413 JSON.
+      8. **Store down** - stub the store to reject (or stop the database container) → 500 `internal_error`
+         within the timeout; body contains no stack, path, host or SQL; log contains the error with the same
+         request id.
+      9. **Request id echo** - send `X-Request-Id: qa-001` → echoed; send an unsafe value → replaced by a UUID.
+      10. **Method and route** - `PUT /orders` → 404 JSON (or 405 if the API defines it); `POST /order` → 404
+          JSON, not HTML.
+    rubric:
+      - Checks state after the response for at least one rejected request (nothing stored).
+      - Covers body type and shape problems separately from Content-Type and malformed JSON.
+      - Includes a server-failure case and checks the 500 body leaks nothing.
+      - Uses the request id as evidence linking the response to the server log.
+      - Checks Content-Type of error responses (JSON, not HTML).
+      - Includes the size limit (413).
+
+    solution: |
+      Good plans test the response **and** the state after it (nothing stored on a 400), separate
+      Content-Type, malformed JSON, size and field problems, force a server failure and check the 500
+      leaks nothing, and use the request id to tie each response to its log line.
+
+  - id: why-separate-app
+    type: short
+    concept: express-app-and-server
+    skill: analysis
+    title: Why does the test suite hang in CI?
+    prompt: |
+      The API's `app.ts` ends with `app.listen(3000)` and exports `app`. Tests import it and use supertest.
+      Locally the suite passes; in CI it sometimes fails with `EADDRINUSE` and sometimes never exits. Explain
+      both symptoms and the structural fix.
+    hints:
+      - What does importing app.ts do, besides giving you the app?
+      - CI may run several test files in parallel worker processes.
+      - Who closes the server that listen() opened?
+    modelAnswer: |
+      Importing `app.ts` **runs** `app.listen(3000)`, so every test worker that imports it opens a real
+      server on port 3000. Parallel workers collide - the second gets `EADDRINUSE` (in Express 5 passed to
+      the listen callback, or emitted as an error). Nothing ever calls `server.close()`, so the open listening
+      socket keeps the process alive and the test runner never exits. supertest doesn't need any of that: given
+      the app, it binds an ephemeral port itself for each request. Fix: `app.ts` builds and exports the app
+      (better, a `createApp(deps)` factory); a separate `server.ts` is the only file that calls `listen`, reads
+      the port from configuration and handles SIGTERM.
+    rubric:
+      - Explains that importing the module calls listen as a side effect.
+      - Connects parallel workers to EADDRINUSE.
+      - Explains that an open server keeps the process (and the test runner) alive.
+      - Proposes exporting the app or a factory, with listen in a separate entry file.
+      - Mentions supertest binding its own ephemeral port.
+
+    solution: |
+      Importing `app.ts` calls `listen(3000)` as a side effect: parallel workers collide (`EADDRINUSE`) and
+      the never-closed server keeps the runner alive. Export the app or a `createApp()` factory with no side
+      effects, listen only in `server.ts`, and let supertest bind its own ephemeral port.
+
+  - id: interview-request-lifecycle
+    type: interview
+    concept: express-middleware-pipeline
+    skill: analysis
+    title: "\"Walk me through what happens when a request hits your Express API\""
+    prompt: |
+      An interviewer asks: "A client sends `POST /orders` with a JSON body to your Express API. Walk me
+      through everything that happens until the response is sent - and tell me where it can go wrong."
+    modelAnswer: |
+      Node's `http` server parses the request line and headers and calls the Express app, which walks its
+      middleware stack **in registration order**. First cross-cutting middleware: a request id, logging,
+      maybe CORS and authentication - each calls `next()` or ends the request (401). Then `express.json()`:
+      if `Content-Type` is `application/json` it reads the body up to its limit (100 kB by default), parses it
+      and sets `req.body`; malformed JSON becomes a 400 error, too large a 413, and a non-JSON request leaves
+      `req.body` undefined. The router matches method and path - `POST /orders` - and runs the handler:
+      validate the body, call the service or database, send `201` with a `Location` header and the order.
+
+      Where it goes wrong: a middleware that neither responds nor calls `next()` hangs the request; a handler
+      that responds without `return` keeps running - writing data or sending twice (`ERR_HTTP_HEADERS_SENT`);
+      a thrown error or rejected promise (forwarded automatically in Express 5) goes to the four-argument
+      error handler, which should log the details with the request id and send a generic JSON 500; nothing
+      matching falls through to a JSON 404 handler registered after the routes. In tests I build the app
+      without `listen` and drive it with supertest; in production SIGTERM triggers `server.close()` so
+      in-flight requests finish.
+    rubric:
+      - Describes the stack walked in registration order, with next() or a response at each step.
+      - Explains express.json() - Content-Type check, limit, parse errors, req.body.
+      - Mentions validation before side effects, and 201 with Location.
+      - Names at least two failure modes - hang, double send, missing return, leaked stack.
+      - Describes the error handler (four parameters) and 404 handler placement.
+      - Mentions Express 5 forwarding async errors, or how Express 4 differed.
+    followUps:
+      - How would you add authentication only to /orders and not to /health?
+      - What changes if the handler streams a large CSV and the database fails halfway through?
+      - How do you test that no route ever returns HTML?
+    hints:
+      - Start at the socket and end at res.json - name each middleware.
+      - For each step, ask "what if this fails?"
+    solution: |
+      Request → middleware in registration order (id, logging, auth) → express.json() (Content-Type, limit,
+      parse) → route handler (validate, persist, 201 + Location) → response; errors and rejections jump to
+      the four-argument handler; unmatched requests reach the JSON 404; hangs, double sends and leaked stacks
+      are the classic failures.
+
+placement:
+  - id: place-optional-param
+    type: mcq
+    concept: express-routing-and-params
+    skill: application
+    title: One route for two URLs
+    prompt: |
+      In Express 5, one route must answer both `GET /exports/m_42` and `GET /exports/m_42/csv`, with the
+      merchant id and the optional format in `req.params`. Which path does it?
+    options:
+      - id: braces
+        text: "'/exports/:merchant{/:format}'"
+        feedback: Correct - braces mark an optional part in Express 5; a real run gave {"merchant":"m_42"} and {"merchant":"m_42","format":"csv"}.
+      - id: question
+        text: "'/exports/:merchant/:format?'"
+        feedback: That is Express 4 syntax; Express 5 throws "Unexpected ?" when the route is registered.
+      - id: required
+        text: "'/exports/:merchant/:format'"
+        feedback: Both parameters are required here, so /exports/m_42 would be a 404.
+      - id: star
+        text: "'/exports/*'"
+        feedback: Unnamed wildcards throw "Missing parameter name" in Express 5, and a wildcard wouldn't give you named merchant and format parameters.
+    correct: [braces]
+    solution: |
+      Express 5 writes optional segments in braces: `{/:format}`. When it doesn't match, `format` is simply
+      absent from `req.params`. The `?` suffix and unnamed `*` from Express 4 throw a `TypeError` at start-up.
+
+  - id: place-404-first
+    type: mcq
+    concept: express-middleware-pipeline
+    skill: analysis
+    title: Everything is a 404
+    prompt: |
+      ```javascript
+      app.use(express.json());
+      app.use((req, res) => res.status(404).json({ error: 'not_found' }));
+      app.use('/orders', ordersRouter);
+      app.use(errorHandler);
+      ```
+
+      `GET /orders/ord_1001` - an order that exists - returns `404 {"error":"not_found"}`. Why?
+    options:
+      - id: order
+        text: The 404 handler is registered before the router; it matches every request and responds, so the router never runs.
+        feedback: Correct - middleware runs in registration order, and a function without a path matches every request. Move the 404 handler after every route.
+      - id: router-prefix
+        text: The router's paths must repeat the /orders prefix.
+        feedback: Routes inside a router mounted at /orders are written relative to it ('/:id'). The router never gets the chance to run here anyway.
+      - id: json
+        text: express.json() rejects GET requests, which have no body.
+        feedback: express.json() skips requests without a JSON body and calls next(); it doesn't reject GETs.
+      - id: error-handler
+        text: The error handler converts every response into a 404.
+        feedback: The error handler only runs for errors, and nothing here throws. The 404 handler is the one responding.
+    correct: [order]
+    solution: |
+      Express walks the stack top to bottom. `app.use(fn)` without a path matches every request; the 404
+      handler responds and never calls `next()`, so the router after it is unreachable. The Express FAQ puts
+      the 404 handler "at the very bottom of the stack".
+
+  - id: place-async-error
+    type: mcq
+    concept: express-error-handling
+    skill: application
+    title: An async handler throws
+    prompt: |
+      In an **Express 5** app with a JSON error handler registered last, this handler runs and the database
+      call rejects:
+
+      ```javascript
+      app.get('/orders', async (req, res) => {
+        res.json(await db.listOrders()); // rejects with Error('connection refused')
+      });
+      ```
+
+      What does the client get?
+    options:
+      - id: error-handler
+        text: The JSON response from the error handler (for example a 500), because Express 5 forwards the rejected promise to it.
+        feedback: Correct - Express 5 passes rejected promises from handlers to the error-handling middleware as if next(err) had been called.
+      - id: hang
+        text: Nothing - the request hangs, and Node logs an unhandled rejection.
+        feedback: That was Express 4's behaviour without a try/catch or wrapper. Express 5 forwards the rejection.
+      - id: crash
+        text: The process crashes, so the connection is reset.
+        feedback: Express catches the rejection, so it never becomes an unhandled rejection that would end the process.
+      - id: html
+        text: Express's HTML 500 page with the stack trace, ignoring the custom handler.
+        feedback: The default handler is used only when no error handler responds; here the custom one is registered and runs first.
+    correct: [error-handler]
+    solution: |
+      The migration guide: rejected promises from middleware and handlers are forwarded "as an Error to the
+      error handling middleware". The custom four-argument handler answers; it should log the error and send a
+      generic JSON 500.
+
+  - id: place-test-app
+    type: mcq
+    concept: express-app-and-server
+    skill: application
+    title: Testing without a port
+    prompt: |
+      You want API tests that run in parallel, need no free port and leave nothing running. How should the
+      code be structured?
+    options:
+      - id: factory
+        text: Export a createApp() that builds the app without listen(); tests call request(createApp()) with supertest; a separate server file calls listen.
+        feedback: Correct - supertest binds the app to an ephemeral port per request, and each test gets a fresh app.
+      - id: listen-random
+        text: Call app.listen(0) at the bottom of app.ts so the OS picks a free port, and export the server.
+        feedback: Port 0 avoids collisions, but importing the file still starts a server that someone must close - the runner can hang on the open handle.
+      - id: one-server
+        text: Start the real server once before all tests on port 3000 and point the tests at it.
+        feedback: That shares state between tests and fails as soon as two suites or a developer's server use port 3000.
+      - id: mock-express
+        text: Mock express so that routes are called directly as functions.
+        feedback: You would no longer test routing, middleware order, parsing or the error handler - the very things that break.
+    correct: [factory]
+    solution: |
+      Build the app in a module with no side effects (ideally a factory taking its dependencies), and listen
+      only in the entry file. supertest "binds to an ephemeral port for you" when given an app.
+
+recall:
+  - id: recall-what-express-adds
+    concept: express-routing-and-params
+    prompt: Name four things Express adds on top of node:http.
+    answer: Routing by method and path with req.params, middleware (app.use), body parsing (express.json, req.body), response helpers (res.status().json(), headers) and centralised error handling.
+  - id: recall-express5-paths
+    concept: express-routing-and-params
+    prompt: How do you write a wildcard and an optional parameter in Express 5?
+    answer: Wildcards need a name - /*splat (array of segments), or /{*splat} to also match /. Optional parts go in braces - /exports/:merchant{/:format}. The old ? and unnamed * throw a TypeError at registration.
+  - id: recall-middleware-rule
+    concept: express-middleware-pipeline
+    prompt: What must every middleware or handler do on every path through it?
+    answer: Either send exactly one response (then return) or call next() / next(err). Doing neither hangs the request; responding twice throws ERR_HTTP_HEADERS_SENT.
+  - id: recall-json-body
+    concept: express-middleware-pipeline
+    prompt: When is req.body undefined in Express 5, and what does express.json() do with bad bodies?
+    answer: When no parser ran - for example the Content-Type wasn't application/json. Malformed or non-object JSON gives a 400 (entity.parse.failed); a body over the limit (100kb by default) gives a 413 (entity.too.large).
+  - id: recall-error-handler
+    concept: express-error-handling
+    prompt: How does Express recognise an error handler, and where do you register it?
+    answer: By its four parameters (err, req, res, next). Register it after all routes and the 404 handler; errors skip ordinary middleware to reach it.
+  - id: recall-404
+    concept: express-error-handling
+    prompt: Why doesn't a 404 reach the error handler, and how do you return a JSON 404?
+    answer: A 404 isn't an error - it means nothing matched. Add an ordinary middleware at the very bottom of the stack (after the routes) that responds with status 404 and JSON.
+  - id: recall-default-handler
+    concept: express-error-handling
+    prompt: What does Express's default error handler send outside production?
+    answer: An HTML page containing the error's stack trace (file paths included). In production (NODE_ENV=production) only the status text. Replace it with your own JSON handler.
+  - id: recall-graceful
+    concept: express-app-and-server
+    prompt: What should an Express server do on SIGTERM?
+    answer: Call server.close() - stop accepting new connections, let in-flight requests finish (idle keep-alive connections are closed) - then close database pools and exit 0 before the platform's grace period ends.
+
+next:
+  - rest-api-design
+  - input-validation-and-error-handling
+  - openapi-contract-first
