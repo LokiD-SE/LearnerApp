@@ -10,6 +10,13 @@ test.use({ storageState: { cookies: [], origins: [] } });
 
 const LESSON = 'Idempotency keys and duplicate payment requests';
 const profileList = (page: Page) => page.getByRole('list', { name: 'Profiles' });
+const pick = async (page: Page, name: string, pin: string) => {
+  await profileList(page)
+    .getByRole('button', { name: new RegExp(name) })
+    .click();
+  await page.getByLabel('PIN', { exact: true }).fill(pin);
+  await page.getByRole('button', { name: 'Unlock' }).click();
+};
 const switchProfile = (page: Page) => page.getByRole('button', { name: 'Switch profile' }).click();
 
 test('a fresh browser shows the five profiles; a new profile follows the name rules', async ({ page }) => {
@@ -42,7 +49,7 @@ test('a fresh browser shows the five profiles; a new profile follows the name ru
 
 test('each profile keeps its own progress and resumes where it stopped', async ({ page }) => {
   await page.goto('./#/');
-  await profileList(page).getByRole('button', { name: /Gayu/ }).click();
+  await pick(page, 'Gayu', '4568');
   await expect(page.getByRole('heading', { name: 'Welcome, Gayu' })).toBeVisible();
   await page.goto('./#/lesson/idempotency-keys');
   await expect(page.getByRole('heading', { level: 1, name: LESSON })).toBeVisible();
@@ -50,15 +57,38 @@ test('each profile keeps its own progress and resumes where it stopped', async (
   await expect(page.getByRole('link', { name: 'Resume study' })).toBeVisible();
 
   await switchProfile(page);
-  await profileList(page)
-    .getByRole('button', { name: /Kishore/ })
-    .click();
+  await pick(page, 'Kishore', '2030');
   await expect(page.getByRole('heading', { name: 'Welcome, Kishore' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Resume study' })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Start here' })).toBeVisible();
 
   await switchProfile(page);
-  await profileList(page).getByRole('button', { name: /Gayu/ }).click();
+  await pick(page, 'Gayu', '4568');
   await page.getByRole('link', { name: 'Resume study' }).click();
   await expect(page.getByRole('heading', { level: 1, name: LESSON })).toBeVisible();
+});
+
+test('a profile needs its PIN; a wrong PIN, a PIN change and the forgot-PIN email', async ({ page }) => {
+  await page.goto('./#/');
+  await profileList(page).getByRole('button', { name: /Raji/ }).click();
+  await page.getByLabel('PIN', { exact: true }).fill('4568');
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  await expect(page.getByRole('alert')).toHaveText('Wrong PIN');
+
+  await page.getByRole('button', { name: 'Change PIN' }).click();
+  await page.getByLabel('Current PIN').fill('2030');
+  await page.getByLabel('New PIN', { exact: true }).fill('7777');
+  await page.getByLabel('Confirm new PIN').fill('7777');
+  await page.getByRole('button', { name: 'Change PIN' }).first().click();
+  await expect(page.getByRole('status')).toHaveText('PIN changed. Sign in with the new PIN.');
+
+  await page.getByRole('button', { name: 'Forgot PIN?' }).click();
+  await expect(page.getByRole('link', { name: 'Email a reset request' })).toHaveAttribute(
+    'href',
+    /^mailto:lokeshdevamuthu@gmail\.com/,
+  );
+  await page.getByRole('button', { name: 'Back to sign in' }).click();
+  await page.getByLabel('PIN', { exact: true }).fill('7777');
+  await page.getByRole('button', { name: 'Unlock' }).click();
+  await expect(page.getByRole('heading', { name: 'Welcome, Raji' })).toBeVisible();
 });

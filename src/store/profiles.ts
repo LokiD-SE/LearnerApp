@@ -1,6 +1,6 @@
 /**
  * Learner profiles on a shared device: who is studying now, and a summary of each profile's
- * progress. There is no password - picking a profile signs in. Each profile's full progress
+ * progress. Signing in needs the profile's PIN (see src/security/pin.ts). Each profile's full progress
  * (a ProgressState) lives under its own localStorage key, so profiles never see each other's
  * data; the registry here keeps only the summary shown on the profile screen.
  *

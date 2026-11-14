@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'preact/hooks';
 import { useProfiles } from '../../store/ProfilesContext';
 import { MAX_NAME_LENGTH, addProfile, signIn, validateFirstName } from '../../store/profiles';
+import { PinGate } from '../components/PinGate';
 
-/** Shown when nobody is signed in: pick a profile (no password) or add one. */
+/** Shown when nobody is signed in: pick a profile and enter its PIN, or add one. */
 export function ProfilesPage() {
-  const { state, update, warning, dismissWarning } = useProfiles();
+  const { state, update, store, warning, dismissWarning } = useProfiles();
+  const [locked, setLocked] = useState<string | undefined>();
   const [name, setName] = useState('');
   const [error, setError] = useState<string | undefined>();
   const profiles = Object.entries(state.profiles);
@@ -49,7 +51,9 @@ export function ProfilesPage() {
         </div>
       )}
       <h1 tabIndex={-1}>Who is learning?</h1>
-      <p class="lead">Pick your profile. Each profile keeps its own progress on this device.</p>
+      <p class="lead">
+        Pick your profile and enter its PIN. Each profile keeps its own progress on this device.
+      </p>
 
       <ul class="profile-list" aria-label="Profiles">
         {profiles.map(([id, profile]) => (
@@ -57,7 +61,8 @@ export function ProfilesPage() {
             <button
               type="button"
               class="profile-button"
-              onClick={() => update((current) => signIn(current, id))}
+              onClick={() => setLocked(id)}
+              aria-pressed={locked === id}
             >
               <span class="profile-avatar" aria-hidden="true">
                 {profile.firstName.charAt(0)}
@@ -70,6 +75,17 @@ export function ProfilesPage() {
           </li>
         ))}
       </ul>
+
+      {locked && state.profiles[locked] && (
+        <PinGate
+          key={locked}
+          id={locked}
+          firstName={state.profiles[locked].firstName}
+          store={store}
+          onUnlock={() => update((current) => signIn(current, locked))}
+          onCancel={() => setLocked(undefined)}
+        />
+      )}
 
       <form class="card add-profile" onSubmit={onSubmit} noValidate>
         <h2>Add a profile</h2>
