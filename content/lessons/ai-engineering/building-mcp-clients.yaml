@@ -1,0 +1,1568 @@
+id: building-mcp-clients
+title: Building an MCP client and tool discovery
+subject: ai-engineering
+module: model-context-protocol
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Build the client half of the Model Context Protocol by hand, from the 2026-07-28 specification - launch a server over stdio, send self-describing JSON-RPC requests and match responses by id, time out and cancel, page through tools/list and cache it, turn MCP tools into a model provider's tools, and run the host's model loop with approvals, tool errors and multi round-trip requests. Every wire message and output shown was produced by the code shown, against a small SandPay MCP server and an offline scripted model.
+tags:
+  [
+    MCP,
+    Model Context Protocol,
+    MCP client,
+    MCP host,
+    JSON-RPC 2.0,
+    stdio transport,
+    request id,
+    _meta,
+    protocolVersion,
+    clientCapabilities,
+    server/discover,
+    tools/list,
+    tools/call,
+    pagination,
+    nextCursor,
+    ttlMs,
+    cacheScope,
+    list_changed,
+    subscriptions/listen,
+    notifications/cancelled,
+    timeouts,
+    isError,
+    protocol errors,
+    tool discovery,
+    tool name mapping,
+    multi round-trip requests,
+    MRTR,
+    InputRequiredResult,
+    requestState,
+    elicitation,
+    sampling,
+    roots,
+    legacy initialize,
+    function calling,
+    agents,
+  ]
+
+environment: |
+  - **Protocol:** the [Model Context Protocol specification, revision
+    2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) - the current release (GitHub release
+    `2026-07-28`, published 28 July 2026) - read from the specification's source in
+    [github.com/modelcontextprotocol/modelcontextprotocol](https://github.com/modelcontextprotocol/modelcontextprotocol)
+    (`docs/specification/2026-07-28/`) as documented on 18 November 2026. Pages used: Key Changes (changelog),
+    Overview (`basic/index` - messages, error codes, statelessness, `_meta`), Versioning and Compatibility,
+    Transports / stdio, Multi Round-Trip Requests, Cancellation, Subscriptions, Discovery (`server/discover`),
+    Tools, Pagination, Caching, Elicitation, Sampling, Roots and Deprecated Features. Quotations are from those
+    pages. **This revision is stateless and has no `initialize` handshake;** revisions 2025-11-25 and earlier
+    ("legacy" in the specification's terms) do, and are described here only where a client must interoperate.
+  - **Base protocol:** [JSON-RPC 2.0](https://www.jsonrpc.org/specification), which MCP builds on.
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`, standard library only (`subprocess`, `threading`,
+    `queue`, `json`); pytest for the exercises. No MCP SDK is installed: the client is written by hand from the
+    specification, so you see every message. Every wire message and output in this lesson was printed by the
+    code shown, run on Linux on 18 November 2026 against `practice/ai/support/mcp_client_fixture.py`, a
+    hand-written stdio server that speaks revision 2026-07-28. Timings (0.05 s timeouts) are chosen for the
+    demo, not recommendations.
+  - **No real model, no network, no key.** The model is `ScriptedLLM` from `practice/ai/support/llm_fake.py`:
+    it replays replies you script and records every request. It shows what the **host code** does with a tool
+    call, an error or a final answer; it says nothing about how a real model chooses tools.
+  - **Official SDK, from the docs, not run here:** the Python client tutorial "Build an MCP client"
+    ([modelcontextprotocol.io/docs/develop/build-client](https://modelcontextprotocol.io/docs/develop/build-client),
+    2026-07-28 docs: "You must use the Python MCP SDK 2.0.0 or higher"; `Client`, `StdioServerParameters`,
+    `stdio_client`, `list_tools`, `call_tool`) and "Client Best Practices"
+    ([modelcontextprotocol.io/docs/develop/clients/client-best-practices](https://modelcontextprotocol.io/docs/develop/clients/client-best-practices):
+    progressive discovery, caching, prompt caching). SDK names change between major versions; check the
+    tutorial for the version you install.
+  - **Provider-specific, as documented on 18 November 2026 (not called - no API key is used):** Anthropic
+    [Define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use) - a tool
+    `name` "Must match the regex `^[a-zA-Z0-9_-]{1,128}$`", `input_schema`, `tool_result` blocks with
+    `tool_use_id` and `is_error`. MCP tool names may also contain dots, so the host maps names.
+  - **Synthetic data:** SandPay is a fictional payments company. Merchants `m-204` and `m-311`, payouts
+    `po_1039`, `po_1042`, `po_2001`, refund `rf_7`, the server `sandpay-payouts` and the host
+    `sandpay-support-host` were invented for this lesson. The fixture's `requestState` is plain base64 JSON for
+    readability; the specification requires integrity protection (HMAC or AEAD) when the state influences
+    authorization or business logic.
+  - **Not repeated here:** the tool-use round trip and its safety rules -
+    [Tool use and function calling](#/lesson/tool-use-and-function-calling); the agent loop and its stop
+    conditions - [Agent loops and workflow patterns](#/lesson/agent-loops-and-workflow-patterns); hosts, clients,
+    servers and primitives - [MCP architecture](#/lesson/mcp-architecture); transports in depth -
+    [The MCP lifecycle, JSON-RPC and transports](#/lesson/mcp-lifecycle-and-transports); the server side -
+    [Building an MCP server](#/lesson/building-mcp-servers); OAuth for remote servers -
+    [MCP security and authorization](#/lesson/mcp-security-and-authorization).
+
+prerequisites:
+  - mcp-architecture
+  - mcp-lifecycle-and-transports
+  - tool-use-and-function-calling
+
+concepts:
+  - id: mcp-client-connection
+    name: The client connection - self-describing requests, ids, timeouts and shutdown over stdio
+    summary: Over stdio the client launches the server as a subprocess and exchanges newline-delimited JSON-RPC messages - one message per line, no embedded newlines, nothing else on stdout. In revision 2026-07-28 there is no handshake - every request carries `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `params._meta`. Each request gets an id that is not null and not in use by another outstanding request; the client reads lines until the response with that id arrives, hands notifications to their handler and ignores responses nobody is waiting for. It times out every request and, on stdio, sends `notifications/cancelled` for it. It shuts down by closing the server's stdin, waiting, then terminating. A dual-era client probes with `server/discover` and falls back to `initialize` only on a non-modern error or silence.
+  - id: mcp-client-tool-discovery
+    name: Tool discovery - pagination, caching and converting MCP tools for a model
+    summary: '`tools/list` is paginated with opaque cursors - follow `nextCursor` until it is absent (an empty string is still a cursor). List results carry `ttlMs` and `cacheScope` - reuse the list while `now < t_received + ttlMs`, treat an absent or negative TTL as 0, and drop the cache at once on `notifications/tools/list_changed` (delivered on a `subscriptions/listen` stream the client opened). Before offering tools to a model the host converts each one to the provider''s format, maps names the provider rejects (MCP allows dots), prefixes a host-chosen server key to keep names unique across servers, keeps a route back to the original name, and skips invalid definitions instead of failing the whole list.'
+  - id: mcp-client-model-loop
+    name: The host's model loop over MCP tools - errors, approvals and multi round-trip requests
+    summary: 'The model proposes calls; the host decides and the server executes. For each call the host checks the route, asks for approval where needed, sends `tools/call` and returns one result per call to the model. A result with `isError: true` is a tool execution error the model can correct; a JSON-RPC error is a protocol error; a timeout is cancelled - all three go back to the model as error results, so the loop keeps going until an answer or the turn cap. When the server needs input it answers `resultType: "input_required"` with `inputRequests` (for example `elicitation/create`) and an opaque `requestState`; the client asks the user and retries the same call as a new request with a new id, `inputResponses` and the exact `requestState`. Sampling and roots are deprecated in 2026-07-28.'
+
+objectives:
+  - Write a JSON-RPC client for the stdio transport that sends 2026-07-28 requests with the required `_meta` fields, matches responses by id, passes notifications on, and ignores late responses.
+  - Implement request timeouts that send `notifications/cancelled`, and shut a server down in the order the stdio page gives.
+  - Page through `tools/list` with opaque cursors and cache the result with `ttlMs` and `list_changed` invalidation.
+  - Convert MCP tool definitions into a model provider's tool format, with name mapping, server prefixes, routes back and skipped definitions.
+  - Implement the host's model loop over MCP tools - routing, approval, tool execution errors versus protocol errors, timeouts and the turn cap.
+  - Handle a multi round-trip request - answer `inputRequests`, echo `requestState` exactly, retry with a new id - and explain which client features are deprecated.
+  - Design positive and negative tests for an MCP client with a real server subprocess and a scripted model.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: The idea in plain language
+    body: |
+      SandPay's support team wants an assistant that can answer merchants' questions about payouts. The payout
+      team already runs a small **MCP server**, `sandpay-payouts`, with tools such as `get_payout` and
+      `list_payouts`. Your job is the other side: the **host** application the support agent uses, and the
+      **MCP client** inside it that talks to that server.
+
+      Think of the client as a switchboard operator with a phone line to one department:
+
+      - It **dials** the department - launches the server process - and every call it places states which
+        version of the protocol it speaks and what it can do, because the department keeps no notes between calls.
+      - It gives every call a **ticket number** (the JSON-RPC `id`) and matches each answer to its ticket. Some
+        messages are just announcements (notifications) and need no ticket.
+      - It asks for the department's **catalogue** of services (`tools/list`), page by page, and keeps a copy for
+        as long as the department says the catalogue stays fresh - or until the department announces a change.
+      - It **translates** that catalogue for the model the host uses, which has its own rules for tool names.
+      - When the model wants a service, the operator **checks** it is allowed, places the call, and passes the
+        answer back - including "that payout does not exist", which the model can fix, and "this line went dead",
+        which the operator cancels after a timeout.
+      - When the department needs something from the customer ("please confirm this refund"), it does not call
+        the customer itself; it tells the operator what it needs, and the operator **asks the user and calls
+        again** with the answer.
+
+      This lesson builds that operator in about 300 lines of plain Python, straight from the specification, so
+      that later - when an SDK does it for you - you know what happens on the wire and how to test it.
+
+  - id: what
+    kind: what
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Terms you need
+    body: |
+      | Term | Meaning (2026-07-28 unless stated) |
+      | --- | --- |
+      | **Host** | the application the user runs; it "Creates and manages multiple client instances", "Enforces security policies and consent requirements" and "Coordinates AI/LLM integration" (Architecture) |
+      | **Client** | a connector inside the host; it "Communicates with exactly one server" and "Attaches protocol version and capabilities to every request" |
+      | **stdio transport** | the client launches the server as a subprocess; messages are JSON-RPC, "delimited by newlines, and MUST NOT contain embedded newlines" |
+      | **Request / response / notification** | JSON-RPC 2.0 messages. A request has an `id` that "MUST NOT be `null`"; a response carries the same `id` and either `result` or `error`; a notification has no `id` and gets no response |
+      | **`_meta` per-request fields** | `io.modelcontextprotocol/protocolVersion` (required), `io.modelcontextprotocol/clientCapabilities` (required), `io.modelcontextprotocol/clientInfo` (SHOULD) |
+      | **`resultType`** | required on every result: `"complete"` or `"input_required"`; absent means `"complete"` (an earlier-revision server); any other value the client does not recognise "MUST be considered invalid" |
+      | **`server/discover`** | returns `supportedVersions`, `capabilities`, `serverInfo` and optional `instructions`; servers MUST implement it, clients MAY call it |
+      | **Cursor / `nextCursor`** | opaque pagination token for `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list` |
+      | **`ttlMs` / `cacheScope`** | caching hints on list, discover and `resources/read` results: freshness in milliseconds, `"public"` or `"private"` |
+      | **`subscriptions/listen`** | a long-lived request that delivers opted-in notifications such as `notifications/tools/list_changed` |
+      | **Tool execution error** | a normal result with `isError: true` - "actionable feedback that language models can use to self-correct" |
+      | **Protocol error** | a JSON-RPC `error` response - unknown tool, malformed request, server error |
+      | **`notifications/cancelled`** | tells the server to stop a request (`requestId`, optional `reason`); on stdio it is the only way to cancel |
+      | **Multi round-trip request (MRTR)** | the server answers `input_required` with `inputRequests` and/or `requestState`; the client retries the original request with `inputResponses` |
+      | **Elicitation** | an input request (`elicitation/create`) asking the user for data, in `form` or `url` mode |
+      | **Sampling, roots** | client features that let a server ask for an LLM completion or the client's directories - **deprecated** in 2026-07-28 |
+      | **Legacy / modern / dual-era** | specification terms: legacy revisions (2025-11-25 and earlier) start with an `initialize` handshake; modern ones do not; dual-era code supports both |
+
+  - id: why
+    kind: why
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Why write a client - and why know what it does
+    body: |
+      Without MCP, every host writes its own adapter for every tool provider: the support assistant has a
+      hand-coded `get_payout` function, the finance chatbot another one, the IDE plugin a third. MCP moves the tool
+      to a server that any MCP host can use, and moves the integration work into one generic piece of code: the
+      client. Write it once and every MCP server - local over stdio or remote over HTTP - becomes usable by your
+      model.
+
+      That generic piece of code carries a lot of responsibility, which is why you should understand it even if an
+      SDK writes most of it:
+
+      - **Correctness on the wire.** A response matched to the wrong id gives the model the answer to a different
+        question. A server that prints a log line to stdout breaks the stream. A missing `_meta` field gets every
+        request rejected with `-32602`.
+      - **Liveness.** A hung tool must not hang the conversation: the specification says implementations
+        "SHOULD establish timeouts for all sent requests" and, on stdio, cancel with `notifications/cancelled`.
+      - **Context and cost.** The tool list goes into every model request. Re-fetching it on every turn wastes
+        round trips; never refreshing it means calling tools that no longer exist; offering hundreds of tools
+        "consume[s] the majority of the context window" (Client Best Practices).
+      - **Safety.** The Tools page says "there SHOULD always be a human in the loop with the ability to deny tool
+        invocations", that clients SHOULD "Show tool inputs to the user before calling the server", "Validate tool
+        results before passing to LLM" and "Implement timeouts for tool calls". Those are host decisions; the
+        server cannot make them for you.
+      - **Change.** Revision 2026-07-28 removed the `initialize` handshake, replaced server-initiated requests with
+        multi round-trip requests and deprecated sampling and roots. Clients written against older tutorials break
+        in specific, testable ways - knowing the wire tells you where.
+
+  - id: connection-internals
+    kind: internals
+    concepts: [mcp-client-connection]
+    title: Inside the connection - one line per message, ids, timeouts and shutdown
+    body: |
+      **Framing (stdio page).** "The server reads JSON-RPC messages from `stdin` and writes JSON-RPC messages to
+      `stdout`", one message per line. The server "MAY write UTF-8 strings to `stderr`" for logging, and the client
+      "SHOULD NOT assume `stderr` output indicates error conditions". The server "MUST NOT write anything to its
+      `stdout` that is not a valid MCP message", and the client "MUST NOT write JSON-RPC _responses_" - in this
+      revision servers send no requests over stdio at all ("The server MUST NOT write JSON-RPC _requests_ to
+      `stdout`"). `json.dumps` without `indent` never emits a raw newline (newlines inside strings become `\n`),
+      so one `json.dumps(...) + "\n"` per message is correct framing.
+
+      **What the client reads.** "All messages share this single channel": responses correlated by `id`,
+      notifications about an in-flight request (such as `notifications/progress`), and notifications for an active
+      `subscriptions/listen` request, which the client "MUST correlate" with the
+      `io.modelcontextprotocol/subscriptionId` in `_meta`. So a client waiting for response 7 reads lines in a loop:
+      a message with `method` and no `id` is a notification - hand it on; a response with another id is not this
+      request's - skip it; the response with id 7 ends the wait.
+
+      **Self-describing requests.** "Servers MUST NOT rely on prior requests over the same connection to establish
+      context (e.g., capabilities, protocol version, client identity). Every request supplies this metadata in its
+      `_meta` field." A request missing a required field "is malformed; the server MUST reject it with JSON-RPC
+      error code `-32602`". If the server does not support the version, it answers `-32022`
+      (UnsupportedProtocolVersion) with `data.supported`, and "The client SHOULD select a mutually supported
+      version from the `supported` list and retry". A process is not a session: "an open connection, such as a
+      STDIO process, is not a conversation or session".
+
+      **Ids.** "Requests MUST include a string or integer ID", it "MUST NOT be `null`", and it "MUST NOT match the
+      ID of any other request the sender has issued and not yet received a response for". A counter that only
+      goes up satisfies all three.
+
+      **Errors versus results.** An error response has `error.code` and `error.message`. MCP uses the standard
+      JSON-RPC codes (`-32700`, `-32600` to `-32603`) and reserves `-32020` to `-32099` for itself; in 2026-07-28
+      the defined ones are `-32020` HeaderMismatch, `-32021` MissingRequiredClientCapability and `-32022`
+      UnsupportedProtocolVersion. A result must carry `resultType`; "clients MUST treat an absent `resultType` as
+      `"complete"`" and must treat an unrecognised value as invalid.
+
+      **Timeouts and cancellation (Cancellation page).** "When the request has not received a success or error
+      response within the timeout period, the sender SHOULD cancel the request and stop waiting for a response."
+      On stdio "The client MUST send a `notifications/cancelled` notification referencing the request ID". The
+      notification may cross the response on the wire, so "The client SHOULD ignore any response to the cancelled
+      request that arrives afterward" - which the id loop above already does. Implementations "MAY choose to reset
+      the timeout clock when receiving a progress notification" but "SHOULD always enforce a maximum timeout".
+
+      **Shutdown.** The client "SHOULD initiate shutdown by: 1. Closing the input stream to the child process (the
+      server). 2. Waiting for the server to exit. 3. If the server does not exit within a reasonable time, forcibly
+      terminating the process" - on POSIX "from `SIGTERM` to `SIGKILL`". If the server dies unexpectedly, "the
+      client SHOULD restart it"; in-flight requests are lost and can be retried, and `subscriptions/listen`
+      streams must be opened again.
+
+      **Talking to older servers.** A legacy server expects `initialize` first. A dual-era client "SHOULD probe with
+      `server/discover` before sending any other request". If it gets a `DiscoverResult`, the server is modern; a
+      recognised modern error such as `-32022` also means modern ("Do not fall back to `initialize`"); "any other
+      error, or does not respond within a reasonable timeout: the server is legacy". The fallback "MUST NOT be keyed
+      to one specific error code". Our fixture in `--legacy` mode answers the probe with `-32600 Server not
+      initialized` - one of many possible legacy replies.
+
+  - id: discovery-internals
+    kind: internals
+    concepts: [mcp-client-tool-discovery]
+    title: Inside discovery - pages, freshness and turning MCP tools into model tools
+    body: |
+      **Pagination.** "Pagination in MCP uses an opaque cursor-based approach". A page may include `nextCursor`;
+      the client sends it back as `params.cursor`. Clients "MUST treat cursors as opaque tokens": no parsing, no
+      changing, and no conclusions "other than whether a non-null value was provided (e.g. an empty string is a
+      valid cursor and thus MUST NOT be treated as the end of results)". Page size "is determined by the server,
+      and clients MUST NOT assume a fixed page size". Our fixture returns two tools per page; its cursors happen to
+      be base64 JSON, and the client must not care.
+
+      **Caching.** Servers "MUST include caching hints" on complete results of `server/discover`, the four list
+      methods and `resources/read`. A result is fresh while `now < t_received + ttlMs`; "If `ttlMs` is absent,
+      clients SHOULD assume a default of `0`"; a negative TTL is treated as 0. TTL is a freshness hint, not a
+      polling interval: clients "SHOULD NOT treat TTL as a polling interval that triggers automatic background
+      refetches". `cacheScope: "private"` responses "MUST NOT be shared across authorization contexts". Results of
+      MRTR retries "MUST NOT be cached".
+
+      **Change notifications.** A server that declares `tools.listChanged` "SHOULD send a notification to clients
+      that have opened a `subscriptions/listen` stream with `toolsListChanged: true`". The server first sends
+      `notifications/subscriptions/acknowledged`, then `notifications/tools/list_changed`, each tagged with the
+      subscription id. When such a notification arrives while the cached list is still fresh, "the notification
+      invalidates the cached response". (In 2026-07-28 the stream replaces the older HTTP GET endpoint and
+      `resources/subscribe`.)
+
+      **Two names for one tool.** MCP tool names "SHOULD" use letters, digits, `_`, `-` and `.`, and be unique
+      within one server. Anthropic's Messages API (provider-specific) requires `^[a-zA-Z0-9_-]{1,128}$` - no dots.
+      A host that aggregates servers also "SHOULD implement a disambiguation strategy such as prefixing tool names
+      with a server identifier", and "The server `name` (from `serverInfo`) is not guaranteed to be unique across
+      servers and SHOULD NOT be relied upon". So the host:
+
+      1. prefixes a **key it chose itself** in its configuration (`payouts`), not the server's self-reported name;
+      2. replaces characters the provider rejects (`refunds.status` becomes `payouts__refunds_status`);
+      3. keeps a **route** from the provider name back to `(server, original MCP name)` - the server only knows
+         `refunds.status`;
+      4. skips a definition that cannot be offered (no `inputSchema` object, which "MUST be a valid JSON Schema
+         object (not `null`)") and reports why, rather than failing the whole list; two tools that map to the same
+         provider name are both skipped, because guessing would route calls to the wrong tool.
+
+      **Field mapping (provider-specific).** MCP's `inputSchema` becomes the Messages API's `input_schema`;
+      `description` stays `description`. MCP's optional `title` is for display. Tool `annotations` (such as
+      `readOnlyHint`) are hints only: "clients MUST consider tool annotations to be untrusted unless they come
+      from trusted servers".
+
+  - id: loop-internals
+    kind: internals
+    concepts: [mcp-client-model-loop]
+    title: Inside the model loop - errors, approvals and multi round-trip requests
+    body: |
+      **Who does what.** "Tools in MCP are designed to be model-controlled" - the model picks them - but the
+      host runs the loop: it sends the user's question with the converted tools, reads tool calls from the reply,
+      and for each call decides, calls the server and returns a result. This is the round trip from
+      [Tool use and function calling](#/lesson/tool-use-and-function-calling), with an MCP server behind each tool.
+
+      **Two kinds of failure.** The Tools page separates them:
+
+      | | Protocol error | Tool execution error |
+      | --- | --- | --- |
+      | Shape | JSON-RPC `error` with a code | a normal result with `isError: true` |
+      | Examples | "Unknown tool", malformed request, server errors | "API failures", "Input validation errors", "Business logic errors" |
+      | To the model? | "Clients MAY provide protocol errors to language models, though these are less likely to result in successful recovery" | "Clients SHOULD provide tool execution errors to language models to enable self-correction" |
+
+      Our host turns both - and a timeout, an unknown route and a refused approval - into a `tool_result` with
+      `is_error: true` and a short reason. The model then has a chance to recover ("Ids look like po_1039"), and
+      the loop's turn cap stops it if it cannot.
+
+      **Approval.** Applications "SHOULD ... Present confirmation prompts to the user for operations", and clients
+      SHOULD "Prompt for user confirmation on sensitive operations" and "Show tool inputs to the user before
+      calling the server". The host's `approve(name, arguments)` hook is where that lives; a refusal never reaches
+      the server.
+
+      **Multi round-trip requests.** In 2026-07-28 a server never sends the client a request. When it needs input
+      to finish `tools/call`, `prompts/get` or `resources/read`, it returns:
+
+      ```json
+      {"resultType": "input_required",
+       "inputRequests": {"confirm": {"method": "elicitation/create", "params": {"mode": "form", "message": "...", "requestedSchema": {"...": "..."}}}},
+       "requestState": "<opaque>"}
+      ```
+
+      The client rules are short: if `inputRequests` is present the client "MUST construct the requested inputs
+      before retrying"; it "MUST echo back the exact value" of `requestState` and "MUST NOT inspect, parse, modify"
+      it; if there was no `requestState`, it "MUST NOT include one in the retry"; and "The JSON-RPC `id` MUST be
+      different between the initial request and the retry, as they are independent requests". Answers go in
+      `inputResponses`, keyed like the requests. The server may ask again, so the client caps the rounds.
+
+      **Elicitation answers.** An elicitation result has `action`: `"accept"` (with `content`), `"decline"` ("User
+      explicitly declined") or `"cancel"` ("User dismissed without making an explicit choice"). Clients that support
+      it declare `elicitation` in `clientCapabilities` on each request (`{"form": {}}`, `{"url": {}}`; an empty object
+      means form only), and servers "MUST NOT send an `inputRequests` that the client has not declared support
+      for". Form mode must not be used for "passwords, API keys, access tokens, or payment credentials" - those
+      need URL mode.
+
+      **Deprecated client features.** Sampling (the server asks the client's model for a completion) and roots (the
+      server asks for the client's directories) still work inside MRTR but are **deprecated** in 2026-07-28: "New
+      implementations SHOULD NOT adopt" them; the migration paths are "Integrate directly with LLM provider APIs"
+      and "Pass directories or files via tool parameters, resource URIs, or server configuration". A new client
+      should declare neither capability.
+
+  - id: when
+    kind: when
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: When to write a client by hand, use an SDK, or skip MCP
+    body: |
+      | Situation | Usually best |
+      | --- | --- |
+      | a production host in Python, TypeScript, Java, Kotlin, C# or Ruby | the official SDK for that language - it tracks the specification's revisions |
+      | learning the protocol, testing a server, a language without an SDK | a small hand-written client like this one |
+      | a test harness that must send *invalid* messages (missing `_meta`, reused ids) | hand-written - SDKs are designed to stop you |
+      | one in-house tool used by one application | a plain function and the provider's tool use - MCP adds a process and a protocol you do not need |
+      | the same tools for many hosts (IDE, chat app, agents) | an MCP server, with SDK clients in each host |
+      | hundreds of tools across many servers | a client plus progressive discovery (`search_tools`, load definitions on demand) - see Client Best Practices |
+
+      Whatever writes the bytes, the **host decisions** stay yours: which servers to start, which tools to offer,
+      what needs approval, timeouts, turn caps, and how errors reach the model.
+
+  - id: visual
+    kind: visual
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: One question through the host, the client and the server
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant U as User
+        participant H as Host (model loop)
+        participant M as Model
+        participant C as MCP client
+        participant S as MCP server (stdio)
+        H->>C: start (launch subprocess)
+        C->>S: tools/list (_meta: version, capabilities)
+        S-->>C: page 1 + nextCursor, ttlMs
+        C->>S: tools/list (cursor)
+        S-->>C: last page (no nextCursor)
+        C-->>H: tools, converted and routed
+        U->>H: question
+        H->>M: messages + tools
+        M-->>H: tool_use payouts__get_payout
+        H->>U: approve? (sensitive tools)
+        H->>C: route to get_payout
+        C->>S: tools/call (id 5)
+        S-->>C: result id 5 (isError false)
+        C-->>H: text
+        H->>M: tool_result (is_error false)
+        M-->>H: final answer
+        H-->>U: answer
+        H->>C: stop
+        C->>S: close stdin, wait, terminate if needed
+      ```
+
+      Notice that the model never talks to the server and the server never talks to the user: the host sits in
+      the middle of both conversations, which is exactly where approval, timeouts and error handling belong.
+
+  - id: wire-transcript
+    kind: code
+    concepts: [mcp-client-connection]
+    title: The wire, as the client saw it
+    body: |
+      The client sends `server/discover`, a good `tools/call` and a call to a tool that does not exist. `>>` is
+      what the client wrote to the server's stdin, `<<` what it read from its stdout (long lines are real and
+      unwrapped):
+
+      ```plaintext
+      >> {"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"sandpay-support-host","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{"elicitation":{"form":{}}}}}}
+      << {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"ttlMs":60000,"cacheScope":"public","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sandpay-payouts","version":"0.3.0"}}}}
+      >> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_payout","arguments":{"payout_id":"po_1042"},"_meta":{...same _meta...}}}
+      << {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"{\"payout_id\": \"po_1042\", \"merchant_id\": \"m-204\", \"amount_minor\": 98050, \"currency\": \"EUR\", \"status\": \"in_transit\"}"}],"isError":false,"structuredContent":{"payout_id":"po_1042","merchant_id":"m-204","amount_minor":98050,"currency":"EUR","status":"in_transit"},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sandpay-payouts","version":"0.3.0"}}}}
+      >> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_balance","arguments":{},"_meta":{...same _meta...}}}
+      << {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Unknown tool: get_balance"}}
+      McpError -32602 Unknown tool: get_balance
+      server exit code: 0 | stderr: ['[sandpay-payouts] started (protocol 2026-07-28)', '[sandpay-payouts] stdin closed']
+      ```
+
+      (`{...same _meta...}` replaces the repeated `_meta` object to save space; everything else is verbatim.)
+      Things to notice: every request repeats `_meta` - there is no handshake to remember it; the good call returns
+      both a text block and `structuredContent` (the Tools page says a tool with structured content "SHOULD also
+      return the serialized JSON in a TextContent block"); the unknown tool is a **protocol error**, not
+      `isError`; the server's logs went to stderr; and closing stdin made the server exit with code 0.
+
+      A timeout, with the server honouring the cancellation:
+
+      ```plaintext
+      >> {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow_report","arguments":{"seconds":0.2},"_meta":{...same _meta...}}}
+      >> {"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"timed out after 0.05s"}}
+      RequestTimeout: tools/call (id 1) timed out after 0.05s
+      >> {"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{...same _meta...}}}
+      << {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],...}}
+      ignored: []
+      server exit code: 0 | stderr: ['[sandpay-payouts] started (protocol 2026-07-28)', '[sandpay-payouts] cancel received for 1', '[sandpay-payouts] request 1 cancelled; no response sent', '[sandpay-payouts] stdin closed']
+      ```
+
+      And the era probe against the fixture in its normal and `--legacy` modes:
+
+      ```plaintext
+      [] modern: ['2026-07-28']
+      ['--legacy'] McpError -32600 Server not initialized -> legacy server, fall back to initialize
+      ```
+
+  - id: request-code
+    kind: code
+    concepts: [mcp-client-connection]
+    title: "The core of the client: request()"
+    collapsed: true
+    body: |
+      From `practice/ai/solutions/mcp/client_rpc.py` (the full file also has the stdio transport, `notify` and the
+      error classes). `transport.receive(timeout)` returns the next stdout line, or `None` if nothing arrives in
+      time; a reader thread fills a queue so the wait can time out.
+
+      ```python
+      def request(self, method, params=None, timeout=5.0, meta=None):
+          req_id = self.new_id()
+          body = dict(params or {})
+          body["_meta"] = {**request_meta(self.client_info, self.capabilities, self.protocol_version), **(meta or {})}
+          self.transport.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": body}, separators=(",", ":")))
+          deadline = time.monotonic() + timeout
+          while True:
+              left = deadline - time.monotonic()
+              line = self.transport.receive(left) if left > 0 else None
+              if line is None:
+                  self.cancelled.add(req_id)
+                  self.notify("notifications/cancelled", {"requestId": req_id, "reason": f"timed out after {timeout}s"})
+                  raise RequestTimeout(f"{method} (id {req_id}) timed out after {timeout}s")
+              try:
+                  message = json.loads(line)
+              except json.JSONDecodeError as exc:
+                  raise ProtocolError(f"not JSON: {line[:80]!r}") from exc
+              if "method" in message and "id" not in message:
+                  self.on_notification(message)
+                  continue
+              if message.get("id") != req_id:
+                  self.ignored.append(message)
+                  continue
+              if "error" in message:
+                  err = message["error"]
+                  raise McpError(err.get("code"), err.get("message", ""), err.get("data"))
+              result = message.get("result")
+              if not isinstance(result, dict):
+                  raise ProtocolError(f"response {req_id} has no result object")
+              kind = result.get("resultType", "complete")
+              if kind not in KNOWN_RESULT_TYPES:
+                  raise ProtocolError(f"unknown resultType {kind!r}")
+              return {**result, "resultType": kind}
+      ```
+
+      This client sends one request at a time and blocks, which keeps it short. A host that runs tool calls in
+      parallel needs one reader that dispatches each response to the waiting caller by id (a dictionary of
+      futures) - the same id rule, just concurrent. The SDKs do that.
+
+  - id: loop-line-by-line
+    kind: line-by-line
+    concepts: [mcp-client-model-loop, mcp-client-tool-discovery]
+    title: The host's handling of one tool call - line by line
+    body: |
+      From `practice/ai/solutions/mcp/client_loop.py`:
+
+      ```python
+      def _run_one(name, arguments, routes, approve, answer_input, timeout):
+          route = routes.get(name)                                              # 1
+          if route is None:
+              return f"Unknown tool {name!r}. Use one of: {', '.join(sorted(routes))}.", True
+          client, mcp_name = route                                              # 2
+          if not approve(name, arguments):                                      # 3
+              return f"The user did not approve {name}; do not retry it.", True
+          try:
+              result = call_tool_with_input(client, mcp_name, arguments, answer_input, timeout=timeout)  # 4
+          except McpError as exc:                                               # 5
+              return f"Protocol error {exc.code}: {exc.message}", True
+          except RequestTimeout:                                                # 6
+              return f"{name} timed out after {timeout}s and was cancelled.", True
+          return result_to_text(result), bool(result.get("isError", False))     # 7
+      ```
+
+      1. **Route by the provider name.** The model can only name tools it was offered - or invent one. An invented
+         name gets an error result that lists the real ones; nothing reaches any server.
+      2. **The route gives back the MCP name** (`refunds.status`, dots and all) and the client for the server that
+         owns it. Never send the provider name to the server.
+      3. **Approval happens before the call**, with the arguments the user will see. A refusal is an error result
+         that says not to retry, so the model explains instead of looping.
+      4. **`call_tool_with_input` handles MRTR** - it retries with `inputResponses` and the echoed `requestState`
+         until the result is complete or the round cap is hit.
+      5. **A protocol error** (unknown tool on the server, bad params) becomes an error result with its code. The
+         specification only says clients MAY pass these to the model; we do, briefly, so the turn is not lost.
+      6. **A timeout** has already sent `notifications/cancelled` (inside `request`); the model hears that the tool
+         timed out, not a stack trace.
+      7. **`isError` decides `is_error`.** A tool execution error such as "Payout 'po_1024' not found" is exactly
+         the feedback the model can act on. `result_to_text` joins text blocks and replaces images, audio and
+         resource links with short markers, falling back to `structuredContent` only when there is no content.
+
+      The loop around it (`run_host_loop`) appends the assistant turn unchanged, then **one** user message with a
+      `tool_result` for every tool call, each tagged with its `tool_use_id`, and stops at an answer or after
+      `max_turns` model calls.
+
+  - id: loop-run
+    kind: code
+    concepts: [mcp-client-model-loop, mcp-client-tool-discovery]
+    title: Discovery and the loop, run end to end
+    body: |
+      Paging through the fixture's five tools (two per page) and converting them:
+
+      ```plaintext
+      page 1: ['get_payout', 'list_payouts'] nextCursor='eyJvIjogMn0=' ttlMs=60000
+      page 2: ['refunds.status', 'confirm_refund'] nextCursor='eyJvIjogNH0=' ttlMs=60000
+      page 3: ['slow_report'] nextCursor=None ttlMs=60000
+      provider names: ['payouts__get_payout', 'payouts__list_payouts', 'payouts__refunds_status', 'payouts__confirm_refund', 'payouts__slow_report']
+      route: payouts__refunds_status -> ('payouts', 'refunds.status')
+      skipped: []
+      ```
+
+      The model (scripted) first asks for a payout id the merchant mistyped, then recovers:
+
+      ```python
+      llm = ScriptedLLM([
+          {"tool": "payouts__get_payout", "input": {"payout_id": "po_1024"}},
+          {"tool": "payouts__list_payouts", "input": {"merchant_id": "m-204"}},
+          "Merchant m-204 has two payouts: po_1039 (1250.00 EUR, paid) and po_1042 (980.50 EUR, in transit).",
+      ])
+      out = run_host_loop(llm, "Where is the latest payout for merchant m-204? I think it is po_1024.", tools, routes,
+                          approve=lambda n, a: True, answer_input=lambda k, r: {"action": "cancel"})
+      ```
+
+      ```plaintext
+      tool payouts__get_payout {"payout_id": "po_1024"} is_error=True
+        Payout 'po_1024' not found. Ids look like po_1039.
+      tool payouts__list_payouts {"merchant_id": "m-204"} is_error=False
+        [{"payout_id": "po_1039", "merchant_id": "m-204", "amount_minor": 125000, "currency": "EUR", "status": "paid"}
+      model calls: 3 | stopped: end_turn
+      answer: Merchant m-204 has two payouts: po_1039 (1250.00 EUR, paid) and po_1042 (980.50 EUR, in transit).
+      tools offered: 5 | messages in last request: 5
+      ```
+
+      The second line of each tool entry is the first 110 characters of what the model received. The last request
+      held five messages: the question, two assistant tool calls and two user messages with one `tool_result`
+      each. (With a real model the recovery is not guaranteed; the script only shows that the host delivered an
+      error the model *could* act on.)
+
+      A multi round-trip `confirm_refund`, with the user approving:
+
+      ```plaintext
+      >> {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"confirm_refund","arguments":{"refund_id":"rf_7"},"_meta":{...same _meta...}}}
+      << {"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","inputRequests":{"confirm":{"method":"elicitation/create","params":{"mode":"form","message":"Approve refund rf_7 of 84.00 EUR?","requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Approve the refund"}},"required":["approve"]}}}},"requestState":"eyJyZWZ1bmRfaWQiOiAicmZfNyJ9"}}
+      -- ask the user (confirm): Approve refund rf_7 of 84.00 EUR?
+      >> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"confirm_refund","arguments":{"refund_id":"rf_7"},"inputResponses":{"confirm":{"action":"accept","content":{"approve":true}}},"requestState":"eyJyZWZ1bmRfaWQiOiAicmZfNyJ9","_meta":{...same _meta...}}}
+      << {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"Refund rf_7 approved."}],"isError":false,"structuredContent":{"refund_id":"rf_7","status":"approved"},...}}
+      final: Refund rf_7 approved. | isError: False
+      ```
+
+      The retry has a new id (2), the same name and arguments, the answer under the same key (`confirm`) and the
+      `requestState` byte for byte. The interim `input_required` result has no `ttlMs`: it is not cacheable.
+
+  - id: sdk-code
+    kind: code
+    concepts: [mcp-client-connection, mcp-client-model-loop]
+    title: The same client with the official Python SDK (from the docs, not run here)
+    body: |
+      The 2026-07-28 "Build an MCP client" tutorial (Python tab; "You must use the Python MCP SDK 2.0.0 or higher")
+      connects like this - quoted, shortened, **not run in this lesson** (the SDK is not installed):
+
+      ```python
+      from mcp import Client, StdioServerParameters
+      from mcp.client.stdio import stdio_client
+
+      def server_params(server_script_path: str) -> StdioServerParameters:
+          ...
+          return StdioServerParameters(command=command, args=[server_script_path])
+
+      async def main() -> None:
+          async with Client(stdio_client(server_params(sys.argv[1]))) as client:
+              tool_list = await client.list_tools()
+              tool_names = [tool.name for tool in tool_list.tools]
+              ...
+      ```
+
+      and inside its query loop it converts and calls tools:
+
+      ```python
+      available_tools = [{
+          "name": tool.name,
+          "description": tool.description,
+          "input_schema": tool.input_schema
+      } for tool in tool_list.tools]
+      ...
+      result = await client.call_tool(tool_use.name, tool_use.input)
+      ...
+      "is_error": result.is_error
+      ```
+
+      The tutorial explains: "That `async with` is the entire connection lifecycle. Entering it launches the server
+      and agrees a protocol version with it; leaving it disconnects and shuts the subprocess down", and "A tool that
+      raises does not raise here: it answers with `is_error` set". It caps the loop with `MAX_TOOL_TURNS = 10`.
+
+      Map it to this lesson: `Client` + `stdio_client` are `StdioTransport` + `RpcClient`; `list_tools()` is one
+      `tools/list` call (check your SDK version for automatic pagination before relying on it); the conversion
+      copies MCP names unchanged, which works for one server whose tool names have no dots - with several servers,
+      or names like `refunds.status`, you add the prefixing and routing of `to_provider_tools`. Older tutorials use
+      `ClientSession` and an explicit `initialize()` call: that is the legacy handshake.
+
+  - id: build-steps
+    kind: steps
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Building a client, step by step
+    body: |
+      1. **Configure servers in the host**, each with a key you choose (`payouts`), a command and arguments, and
+         the environment it needs (stdio servers "retrieve credentials from the environment").
+      2. **Launch** the subprocess with pipes for stdin, stdout and stderr. Start a reader for stdout (lines into a
+         queue) and one for stderr (into your logs - not an error signal).
+      3. **Probe** with `server/discover` if you must support legacy servers; otherwise call any method and handle
+         `-32022` by retrying with a version from `data.supported`.
+      4. **Send requests** with a fresh integer id and the required `_meta`; read lines until that id's response;
+         hand notifications on; ignore other ids.
+      5. **Time out every request**; on stdio send `notifications/cancelled` with the request id.
+      6. **Discover tools**: page `tools/list` until there is no `nextCursor`; cache with `ttlMs`; open
+         `subscriptions/listen` with `toolsListChanged: true` if the server declared `listChanged` and invalidate on
+         the notification.
+      7. **Convert** tools for your provider: prefix your server key, map names to the provider's rules, keep
+         routes back, skip and log invalid definitions.
+      8. **Run the model loop**: route, approve, call, map `isError` / protocol errors / timeouts to error results,
+         handle `input_required` with the user, cap the turns.
+      9. **Shut down**: close stdin, wait, then `SIGTERM`, then `SIGKILL`. Restart on unexpected exit and re-open
+         subscriptions.
+      10. **Test** each step against a real server subprocess and a scripted model, including the failure paths.
+
+  - id: example
+    kind: example
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: "Example: reviewing the SandPay support host before release"
+    body: |
+      The support host connects to `sandpay-payouts` and, new this release, to a second server `sandpay-refunds`
+      owned by another team. As the tester you read the client's logs from a staging run and find:
+
+      - `tools offered: 9`, but `sandpay-refunds` exposes `refunds.status` and so does `sandpay-payouts`. Both
+        became `refunds_status` in an earlier build, and the model's calls went to whichever server was registered
+        last. **Check:** provider names are prefixed with the host's server key and clashes are skipped, with a
+        log line. Evidence: the converted tool list and the route table.
+      - A `tools/call` to `slow_report` waited 120 s, then the user gave up. **Check:** a per-request timeout,
+        `notifications/cancelled` with the right `requestId`, and a late response ignored. Evidence: the wire log
+        (cancel line) and `ignored` entries; a test with the fixture's `--ignore-cancel` mode.
+      - After the payouts team deployed a new tool, the assistant kept saying "I cannot look up settlement dates"
+        for an hour. **Check:** the host's cache respects `ttlMs` (60000 here) and drops the list on
+        `notifications/tools/list_changed`. Evidence: fetch count before and after the notification.
+      - `confirm_refund` sometimes failed with "requestState missing or does not match this request".
+        **Check:** the retry echoes `requestState` exactly and does not reuse it for a different call made in
+        parallel ("They MUST NOT be used for any other request"). Evidence: the two wire lines of the round trip.
+      - A server upgrade printed a banner to stdout and every request after it failed with "not JSON".
+        **Check:** this is the server breaking the transport rule; the client should report it clearly (it does:
+        `ProtocolError: not JSON: ...`), and the server owner must log to stderr.
+
+      None of these needed a real model: the fixture server plus `ScriptedLLM` reproduce each one deterministically.
+
+  - id: tests
+    kind: tests
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Testing an MCP client
+    body: |
+      Use a **real server subprocess** for the transport and a **scripted model** for the loop. Positive and
+      negative cases, each with its evidence:
+
+      | # | Case | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | `server/discover` | complete result, `supportedVersions` includes ours | parsed result; the sent line has both required `_meta` fields |
+      | 2 | three requests | three different integer ids | recorded sent lines |
+      | 3 | argument containing `\n` | each sent message is one line | recorded sent lines |
+      | 4 | unknown tool | `McpError` with `-32602` | exception code and message |
+      | 5 | unsupported version | `McpError` `-32022`, `data.supported` | exception data |
+      | 6 | progress notification before the result | handler receives it; request still returns its result | handler list |
+      | 7 | timeout | `RequestTimeout`; last sent line is `notifications/cancelled` with that `requestId` and no `id` | sent lines |
+      | 8 | late reply after cancel (`--ignore-cancel`) | next request returns its own result; late reply in `ignored` | `ignored` ids |
+      | 9 | result without `resultType` / with `"partial"` | treated as complete / `ProtocolError` | fake transport |
+      | 10 | shutdown, good and stubborn server | exit code 0 / non-zero after terminate | process exit code |
+      | 11 | pagination with `""` cursor, repeated cursor, endless pages | continues / `ProtocolError` / page cap | requests' params |
+      | 12 | name with dots, clashing names, missing schema | mapped / both skipped / skipped with reason | converted list, routes, skipped |
+      | 13 | cache TTL, absent and negative TTL, `list_changed` | one fetch while fresh / refetch / refetch after notification | fetch counter with an injected clock |
+      | 14 | loop happy path | answer, two model calls, tool_result with matching `tool_use_id` | `ScriptedLLM.calls` |
+      | 15 | tool execution error then recovery | first result `is_error: true` with the server's message | tool log, second request |
+      | 16 | unknown route, refused approval | error results; no `tools/call` sent | count of sent requests |
+      | 17 | MRTR accept / decline / no `requestState` / endless | retry with new id and echoed state / error result / no state sent / round cap | sent lines |
+
+      Two habits make these tests reliable: tear down the subprocess in the test itself (close stdin, then kill),
+      so a broken `close()` cannot leave servers running; and keep every wait short and bounded (the fixture's
+      slow tool takes 0.2 s, timeouts are 0.05 s).
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | Following a legacy tutorial: `initialize` first, `_meta` only once | modern server rejects everything (`-32602` or unknown method) | send the per-request `_meta` on every request; probe with `server/discover` if you also support legacy servers |
+      | Taking the next line as the response | answers swapped after a timeout or a notification | match by `id`; route notifications; ignore unknown ids |
+      | Reusing ids or using `null` | wrong answers, rejected requests | a counter that only goes up |
+      | No timeout | one hung tool hangs the conversation | per-request timeout + `notifications/cancelled` |
+      | Treating `""` as "no more pages" | tools after the first page missing | stop only when `nextCursor` is absent |
+      | Re-fetching tools every turn, or never | latency and cost / calls to removed tools | cache by `ttlMs`, invalidate on `list_changed` |
+      | Sending the provider name to the server | `-32602 Unknown tool: payouts__refunds_status` | route back to the original MCP name |
+      | Prefixing with `serverInfo.name` | two servers called `server`, calls go to the wrong one | prefix with the host's own configuration key |
+      | Raising on `isError` | the loop stops on a typo the model could fix | return it as a tool result with `is_error: true` |
+      | Same id or edited `requestState` on an MRTR retry | server rejects the retry | new id; echo `requestState` byte for byte |
+      | Declaring `sampling` / `roots` in a new client | deprecated features to maintain | leave them out; give the server what it needs through tool parameters |
+      | Killing the server first | lost writes, no graceful exit | close stdin, wait, then terminate, then kill |
+
+      **Debugging method.** Log the wire: every line sent and received, with the request id, plus the server's
+      stderr. Most client bugs are visible there - a missing `_meta` key, a mismatched id, a cancel that went to the
+      wrong request, a banner line on stdout. Then reproduce with the fixture and a scripted model, fix, and keep
+      the reproduction as a test.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Trade-offs and alternatives
+    body: |
+      - **Blocking, one request at a time vs concurrent.** This client is easy to read and test, but a slow tool
+        blocks the others. Concurrent clients keep a table of pending ids and futures; tests must then cover
+        interleaved responses.
+      - **All tools in context vs progressive discovery.** Offering every tool is simplest and fine for a few;
+        Client Best Practices suggests switching to a `search_tools` meta-tool once definitions take "a percentage
+        of the context window. For example, 1%-5%". Changing the `tools` array mid-conversation also breaks provider
+        prompt caching, so add definitions after the cache breakpoint or route through one stable meta-tool.
+      - **Pass protocol errors to the model or not.** Passing a short message keeps the turn going; hiding it and
+        answering "the tool is unavailable" is safer when messages may leak internals. Either way, log the code.
+      - **Approval for every call vs sensitive calls only.** Approving everything is safe but tiring; users click
+        through. Approve by your own list of sensitive tools - not by the server's `destructiveHint`, which is
+        untrusted unless the server is.
+      - **TTL caching vs freshness.** A long TTL saves round trips but serves stale lists between notifications;
+        TTL 0 is always fresh and always slow. Follow the server's hint, and refetch early after an unexpected
+        "unknown tool" error ("Clients MAY re-fetch before the TTL expires").
+      - **Hand-written vs SDK.** Hand-written teaches and tests; an SDK handles revisions, HTTP, auth and
+        concurrency. Keep a small hand-written harness even when you ship the SDK - it can send the invalid messages
+        your server tests need.
+
+  - id: summary
+    kind: summary
+    concepts: [mcp-client-connection, mcp-client-tool-discovery, mcp-client-model-loop]
+    title: Quick reference
+    body: |
+      - **stdio:** one JSON-RPC message per line; logs on stderr; client writes requests and notifications only.
+      - **Every request (2026-07-28):** `_meta` with `protocolVersion` and `clientCapabilities` (required) and
+        `clientInfo` (should). No `initialize`.
+      - **Ids:** integer or string, never `null`, never reused while outstanding; match responses by id.
+      - **Results:** `resultType` `complete` or `input_required`; absent means complete; unknown is invalid.
+      - **Timeouts:** always; on stdio cancel with `notifications/cancelled` + `requestId`; ignore late replies.
+      - **Shutdown:** close stdin, wait, `SIGTERM`, `SIGKILL`; restart on crash and re-open subscriptions.
+      - **Legacy servers:** probe with `server/discover`; fall back only on a non-modern error or silence.
+      - **Discovery:** follow `nextCursor` until absent (`""` is a cursor); cache `now < t_received + ttlMs`;
+        `list_changed` invalidates.
+      - **Conversion:** host-chosen server prefix, provider name rules, routes back, skip invalid and clashing.
+      - **Loop:** route, approve, call; `isError` / protocol error / timeout become `is_error: true` results; cap
+        turns.
+      - **MRTR:** answer `inputRequests`, echo `requestState` exactly (or omit if absent), new id, cap rounds.
+      - **Deprecated:** sampling, roots, logging - do not adopt in a new client.
+
+exercises:
+  - id: id-rules
+    type: mcq
+    concept: mcp-client-connection
+    skill: recall
+    title: Which id is allowed?
+    prompt: |
+      The client has sent request id `7` and is still waiting for its response. Which id may its next request use?
+    options:
+      - id: eight
+        text: '`8`'
+        feedback: Correct - a string or integer that no outstanding request uses.
+      - id: seven
+        text: '`7`, because the server will answer in order'
+        feedback: An id "MUST NOT match the ID of any other request the sender has issued and not yet received a response for". Responses are matched by id, not order.
+      - id: null-id
+        text: '`null`, because the client does not need this response'
+        feedback: In MCP a request id "MUST NOT be `null`". If no response is wanted, send a notification (no id at all).
+      - id: float
+        text: '`7.5`, to show it follows 7'
+        feedback: MCP requests "MUST include a string or integer ID"; a fraction is neither.
+    correct: [eight]
+    hints:
+      - What makes an id useful for matching?
+    solution: |
+      Ids exist so responses can be matched; any string or integer not currently outstanding works. A counter
+      that only goes up is the simplest correct choice.
+
+  - id: missing-meta
+    type: mcq
+    concept: mcp-client-connection
+    skill: application
+    title: Every request fails with -32602
+    prompt: |
+      A client written from a 2025 tutorial calls `initialize`, then sends
+      `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` to a 2026-07-28-only server. Every request gets
+      `-32602`. What is the fix?
+    options:
+      - id: meta
+        text: Put `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `params._meta` of every request
+        feedback: Correct - "A request missing any required field is malformed; the server MUST reject it with JSON-RPC error code `-32602`".
+      - id: initialize-again
+        text: Send `initialize` again before each request
+        feedback: 2026-07-28 has no handshake; servers "MUST NOT rely on prior requests over the same connection" for version or capabilities.
+      - id: initialized
+        text: Send `notifications/initialized` after `initialize`
+        feedback: That completed the legacy handshake; the changelog lists it as removed in 2026-07-28.
+      - id: header
+        text: Add an `MCP-Protocol-Version` header
+        feedback: That header is part of Streamable HTTP; stdio has "no header layer" - metadata lives in `_meta`.
+    correct: [meta]
+    hints:
+      - Where does a stateless server find the version and capabilities?
+    solution: |
+      In 2026-07-28 each request carries its own protocol version and capabilities in `_meta`; without them it is
+      malformed. A dual-era client probes with `server/discover` to choose between this and the legacy handshake.
+
+  - id: era-probe
+    type: mcq
+    concept: mcp-client-connection
+    skill: analysis
+    title: Modern or legacy?
+    prompt: |
+      A dual-era client sends `server/discover` (with 2026-07-28 in `_meta`) to a stdio server and receives
+      `{"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-09-30"]}}}`.
+      What should it do?
+    options:
+      - id: modern-retry
+        text: Treat the server as modern; retry with a version from `supported` if the client supports one, else report an error
+        feedback: Correct - a recognised modern error identifies a modern server; "Do not fall back to `initialize`".
+      - id: fallback
+        text: Fall back to the `initialize` handshake, since discovery failed
+        feedback: The fallback happens on "any other error, or does not respond"; `-32022` is a recognised modern error.
+      - id: retry-same
+        text: Retry the same request, the server may have been busy
+        feedback: The error says exactly what the server supports; the same request will fail the same way.
+      - id: code-rule
+        text: Fall back whenever the code is not -32601
+        feedback: The fallback "MUST NOT be keyed to one specific error code" - legacy servers reply in many ways or not at all.
+    correct: [modern-retry]
+    hints:
+      - Is `-32022` a code a legacy server would send?
+    solution: |
+      The probe has three outcomes: a `DiscoverResult` (modern), a recognised modern error such as `-32022`
+      (modern, pick a supported version), anything else or silence (legacy, fall back to `initialize`).
+
+  - id: late-reply
+    type: mcq
+    concept: mcp-client-connection
+    skill: analysis
+    title: The answer to the wrong question
+    prompt: |
+      Logs: request 4 (`slow_report`) timed out and the client sent `notifications/cancelled` for 4. It then sent
+      request 5 (`get_payout po_1039`). The model was told the payout result was "Reconciliation report: 3
+      payouts, 0 differences." What is the bug?
+    options:
+      - id: by-order
+        text: The client took the next line as the response to 5 instead of matching the id, so the late reply to 4 was used
+        feedback: Correct - the server may answer a cancelled request anyway; the client "SHOULD ignore any response to the cancelled request that arrives afterward".
+      - id: server-bug
+        text: The server must never answer a cancelled request, so this is only a server bug
+        feedback: Cancellation can cross the response on the wire; the specification makes both sides handle the race. The client mismatched ids.
+      - id: timeout-short
+        text: The timeout was too short; raise it so cancellations never happen
+        feedback: Longer timeouts make it rarer, not impossible; matching by id fixes it.
+      - id: same-id
+        text: Request 5 should have reused id 4, since 4 was cancelled
+        feedback: Reusing the id would make the late reply look exactly like the answer to 5.
+    correct: [by-order]
+    hints:
+      - What links a response to a request?
+    solution: |
+      Read lines until the response whose `id` equals the request's; skip (and log) others. A test with a server
+      that ignores cancellation reproduces it.
+
+  - id: empty-cursor
+    type: mcq
+    concept: mcp-client-tool-discovery
+    skill: application
+    title: Three tools missing
+    prompt: |
+      A server's first `tools/list` page returns `"nextCursor": ""`. The client shows 20 tools; the server has 23.
+      What happened?
+    options:
+      - id: empty-valid
+        text: The client treated the empty string as "no more pages"; it must send it back as the cursor
+        feedback: Correct - "an empty string is a valid cursor and thus MUST NOT be treated as the end of results".
+      - id: page-size
+        text: The client should ask for a page size of 50
+        feedback: '"Page size is determined by the server, and clients MUST NOT assume a fixed page size"; there is no page-size parameter.'
+      - id: decode
+        text: The client should decode the cursor to find the offset
+        feedback: Cursors are opaque - "Don't attempt to parse or modify cursors".
+      - id: server-wrong
+        text: The server is wrong; an empty cursor must mean the end
+        feedback: The end is an absent `nextCursor`, not an empty one.
+    correct: [empty-valid]
+    hints:
+      - What exactly signals the last page?
+    solution: |
+      Loop while `nextCursor` is not `None` (absent), and guard against a repeated cursor and too many pages.
+
+  - id: ttl-cache
+    type: mcq
+    concept: mcp-client-tool-discovery
+    skill: application
+    title: When to fetch the tool list again
+    prompt: |
+      At t = 100 s a `tools/list` result arrived with `ttlMs: 30000`. At t = 110 s the client receives
+      `notifications/tools/list_changed` on its subscription. The model needs the tools at t = 112 s. What should
+      the client do?
+    options:
+      - id: refetch
+        text: Fetch again - the notification made the cached list stale even though the TTL had 20 s left
+        feedback: Correct - "the notification invalidates the cached response and it should be considered immediately stale".
+      - id: use-cache
+        text: Use the cache until t = 130 s, then fetch
+        feedback: TTL is the default freshness; a change notification overrides it.
+      - id: poll
+        text: Fetch every 30 s in the background from now on
+        feedback: Clients "SHOULD NOT treat TTL as a polling interval"; fetch when the data is needed and stale.
+      - id: ignore
+        text: Ignore the notification; notifications are only for the UI
+        feedback: The list really changed; the model may call removed tools or miss new ones.
+    correct: [refetch]
+    hints:
+      - Which signal is newer information - the TTL or the notification?
+    solution: |
+      Fresh means `now < t_received + ttlMs` **and** no invalidation since. The notification invalidates; the next
+      access refetches.
+
+  - id: name-mapping
+    type: mcq
+    concept: mcp-client-tool-discovery
+    skill: analysis
+    title: Unknown tool payouts__refunds_status
+    prompt: |
+      The host offered `payouts__refunds_status` to the model. When the model called it, the server answered
+      `-32602 Unknown tool: payouts__refunds_status`. What is wrong?
+    options:
+      - id: route-back
+        text: The host sent the provider name to the server; it must route back to the original MCP name `refunds.status`
+        feedback: Correct - the server only knows its own names; the route table maps provider names back.
+      - id: dots
+        text: The server should rename its tool without dots
+        feedback: Dots are allowed in MCP tool names; the provider's rule is the host's problem.
+      - id: prefix
+        text: The prefix is wrong; use the server's `serverInfo.name`
+        feedback: The prefix is fine; and `serverInfo.name` "SHOULD NOT be relied upon for disambiguation".
+      - id: list-again
+        text: The tool list was stale; fetch it again
+        feedback: The tool exists - under its MCP name. Refetching would not change what the host sends.
+    correct: [route-back]
+    hints:
+      - Which of the two names does the server know?
+    solution: |
+      Converting a name is a one-way change unless you keep a route. Store `provider name -> (server, MCP name)`
+      when converting and use it for every call.
+
+  - id: error-kinds
+    type: mcq
+    concept: mcp-client-model-loop
+    skill: application
+    title: What does the model see?
+    prompt: |
+      `tools/call get_payout {"payout_id": "po_1024"}` returns
+      `{"resultType":"complete","content":[{"type":"text","text":"Payout 'po_1024' not found. Ids look like po_1039."}],"isError":true}`.
+      What should the host do?
+    options:
+      - id: tool-result-error
+        text: Send it to the model as a tool_result with is_error true and the text, and continue the loop
+        feedback: Correct - a tool execution error is "actionable feedback that language models can use to self-correct".
+      - id: raise
+        text: Raise an exception and end the conversation with "something went wrong"
+        feedback: That throws away feedback the model could use; clients "SHOULD provide tool execution errors to language models".
+      - id: retry
+        text: Retry the same call three times
+        feedback: The same input fails the same way; the model needs to change the input.
+      - id: protocol
+        text: Treat it as a protocol error because the payout does not exist
+        feedback: Protocol errors are JSON-RPC `error` responses (unknown tool, malformed request); this is a normal result with `isError`.
+    correct: [tool-result-error]
+    hints:
+      - Is this a JSON-RPC error response or a result?
+    solution: |
+      `isError: true` is part of a successful JSON-RPC exchange: the tool ran and failed. Hand it to the model as an
+      error result; keep the turn cap so it cannot loop forever.
+
+  - id: mrtr-retry
+    type: mcq
+    concept: mcp-client-model-loop
+    skill: application
+    title: Retrying after input_required
+    prompt: |
+      Request id 12 (`tools/call confirm_refund {"refund_id": "rf_7"}`) returned `resultType: "input_required"`
+      with an `elicitation/create` under key `confirm` and `requestState: "abc"`. The user accepts. What does the
+      client send?
+    options:
+      - id: right
+        text: 'A new request (id 13) - same name and arguments, `inputResponses: {"confirm": {...}}`, `requestState: "abc"`'
+        feedback: Correct - new id, answers keyed like the requests, state echoed exactly.
+      - id: same-id
+        text: The same request with id 12 plus `inputResponses`
+        feedback: The id "MUST be different between the initial request and the retry, as they are independent requests".
+      - id: response
+        text: A JSON-RPC response with id 12 carrying the elicitation result
+        feedback: That was the legacy server-initiated pattern; in 2026-07-28 the client never writes responses - it retries the original request.
+      - id: decoded-state
+        text: The retry with `requestState` decoded to check it belongs to rf_7
+        feedback: Clients "MUST NOT inspect, parse, modify, or make any assumptions about" `requestState`.
+    correct: [right]
+    hints:
+      - Is the retry the same request or a new one?
+    solution: |
+      MRTR keeps the server stateless: everything it needs comes back on the retry. The client's job is to collect
+      answers, echo the state untouched and use a new id.
+
+  - id: deprecated-features
+    type: mcq
+    concept: mcp-client-model-loop
+    skill: recall
+    title: What should a new client declare?
+    prompt: |
+      You are writing a new 2026-07-28 client for the support host. The server's docs mention sampling and roots.
+      Which capabilities should your client declare?
+    options:
+      - id: elicitation-only
+        text: '`elicitation` (the user can be asked), and not `sampling` or `roots`'
+        feedback: Correct - sampling and roots are deprecated in 2026-07-28; "New implementations SHOULD NOT adopt" them.
+      - id: all
+        text: '`elicitation`, `sampling` and `roots`, to be safe'
+        feedback: Declaring them lets servers depend on deprecated features you then must maintain.
+      - id: none-needed
+        text: None - capabilities were negotiated by `initialize`
+        feedback: There is no `initialize` in 2026-07-28; capabilities go in `_meta` on every request.
+      - id: sampling
+        text: '`sampling` only, so the server can use your model'
+        feedback: The migration path for sampling is to "Integrate directly with LLM provider APIs".
+    correct: [elicitation-only]
+    hints:
+      - Check the deprecated features registry.
+    solution: |
+      Declare what you support and want servers to use. In 2026-07-28 that is elicitation; give servers files and
+      directories through tool parameters instead of roots.
+
+  - id: host-loop-order
+    type: order
+    concept: mcp-client-model-loop
+    skill: recall
+    title: One tool call, from the model to the model
+    prompt: |
+      Put the host's steps for one tool call in order, from the model's reply to the next model request.
+    items:
+      - id: read-call
+        text: Read the tool_use block (provider name, input, id) from the model's reply
+      - id: route
+        text: Look up the route to (server client, original MCP tool name)
+      - id: approve
+        text: Show the input to the user and get approval if the tool is sensitive
+      - id: call
+        text: Send tools/call with a new id and the per-request _meta, with a timeout
+      - id: mrtr
+        text: If the result is input_required, ask the user and retry with inputResponses and the echoed requestState
+      - id: map
+        text: Turn the complete result (or the error) into a tool_result with is_error and the call's tool_use_id
+      - id: send
+        text: Append the assistant turn and the tool results, and call the model again
+    hints:
+      - The server never sees the provider name.
+      - Approval happens before anything reaches the server.
+    solution: |
+      Read, route, approve, call, handle input, map, send. Routing before approval lets the prompt show which
+      server and tool will run; mapping every outcome to a `tool_result` keeps the conversation valid.
+
+  - id: request-debug
+    type: debug
+    concept: mcp-client-connection
+    skill: analysis
+    title: A client that answers the wrong question
+    prompt: |
+      Click **every** line that breaks the specification or makes the client misbehave over stdio (2026-07-28).
+    language: python
+    code: |
+      def request(self, method, params=None, timeout=5.0):
+          req_id = self.last_id
+          body = dict(params or {})
+          body["_meta"] = request_meta(self.client_info, self.capabilities)
+          self.transport.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": body}, indent=2))
+          deadline = time.monotonic() + timeout
+          while True:
+              line = self.transport.receive(deadline - time.monotonic())
+              if line is None:
+                  raise RequestTimeout(method)
+              message = json.loads(line)
+              if "method" in message and "id" not in message:
+                  self.on_notification(message)
+                  continue
+              if "error" in message:
+                  raise McpError(message["error"]["code"], message["error"]["message"])
+              return message["result"]
+    correctLines: [2, 5, 10, 15]
+    lineNotes:
+      - line: 4
+        note: Adding the per-request `_meta` on every request is exactly what 2026-07-28 requires.
+      - line: 12
+        note: A message with a method and no id is a notification; passing it on is correct.
+    hints:
+      - Is the id ever new?
+      - What does `indent=2` put inside the message?
+      - What must happen on stdio when you stop waiting?
+      - Whose response is the first non-notification line?
+    solution: |
+      **Line 2** reuses the same id for every request - ids must not repeat while outstanding (use a counter).
+      **Line 5** sends pretty-printed JSON, which contains newlines; stdio messages "MUST NOT contain embedded
+      newlines". **Line 10** gives up without sending `notifications/cancelled` for the id. **Line 15** (and the
+      return after it) accepts the first response of any id - check `message.get("id") == req_id` first and skip
+      the rest.
+    followUp: |
+      Add the missing `resultType` handling: absent means complete, `input_required` is returned to the caller,
+      anything else is a protocol error.
+
+  - id: serverinfo-short
+    type: short
+    concept: mcp-client-tool-discovery
+    skill: analysis
+    title: Why not prefix tools with serverInfo.name?
+    prompt: |
+      A colleague proposes naming tools `<serverInfo.name>__<tool>` so the host needs no configuration. Explain
+      why the specification advises against it and what to use instead.
+    modelAnswer: |
+      `serverInfo` is self-reported: the specification says `clientInfo`/`serverInfo` "are self-reported by the
+      sender and are not verified by the protocol", that implementations "SHOULD NOT rely on them for security
+      decisions", and in the Tools page that "The server `name` (from `serverInfo`) is not guaranteed to be unique
+      across servers and SHOULD NOT be relied upon for disambiguation". Two servers can share a name by accident,
+      and a malicious server can copy a trusted server's name so that calls meant for the trusted one are routed to
+      it (or approvals keyed by name apply to it). Use a key the host operator chose in the host's configuration
+      for each server connection, map it to the client object, and keep routes from provider names to
+      `(that key's client, original MCP name)`.
+    rubric:
+      - Says serverInfo is self-reported and not unique, citing or paraphrasing the specification.
+      - Names a concrete harm - collisions or a server impersonating another to receive calls.
+      - Proposes a host-chosen configuration key per server connection.
+      - Mentions keeping a route back to the original tool name.
+    hints:
+      - Who decides what `serverInfo.name` says?
+    solution: |
+      The host, not the server, must own the names that decide routing; use your configuration key.
+
+  - id: client-testdesign
+    type: testdesign
+    concept: mcp-client-model-loop
+    skill: application
+    title: Test plan for the support host's MCP client
+    prompt: |
+      Design test cases for the SandPay support host's MCP client and model loop (transport, discovery, loop). For
+      each case give preconditions, steps, the expected result and the evidence you would capture. Use no real
+      model and no network.
+    modelAnswer: |
+      Preconditions for all: the fixture server as a subprocess (normal, `--ignore-cancel`, `--ignore-eof`,
+      `--legacy` modes), a recording transport wrapper, `ScriptedLLM`, an injected clock, teardown that closes
+      stdin and kills.
+
+      1. **Required metadata** - send `server/discover`. Expected: complete result. Evidence: the sent line has
+         `protocolVersion` and `clientCapabilities` in `_meta`.
+      2. **Version mismatch** - client version `2099-01-01`. Expected: `McpError -32022` with `data.supported`.
+         Evidence: exception.
+      3. **Ids** - three requests. Expected: three distinct integers. Evidence: sent lines.
+      4. **Framing** - an argument containing a newline. Expected: one line per message. Evidence: sent lines.
+      5. **Timeout and cancel** - slow tool 0.2 s, timeout 0.05 s. Expected: `RequestTimeout`, last sent line
+         `notifications/cancelled` with that `requestId`; next request answered normally. Evidence: sent lines,
+         server stderr "cancel received".
+      6. **Late reply** - same with `--ignore-cancel`. Expected: late reply recorded in `ignored`, next result
+         correct. Evidence: `ignored` ids.
+      7. **Shutdown** - normal and `--ignore-eof`. Expected: exit 0 / terminated. Evidence: exit codes, no
+         leftover processes.
+      8. **Era probe** - `--legacy`. Expected: non-modern error, fall back. Evidence: error code and the decision.
+      9. **Pagination** - five tools over three pages; fake server with `""` cursor and a repeated cursor.
+         Expected: five tools / continues / `ProtocolError`. Evidence: request params.
+      10. **Conversion** - dotted name, clash, missing schema. Expected: mapped / both skipped / skipped. Evidence:
+          tools, routes, skipped reasons.
+      11. **Cache** - TTL, `list_changed`. Expected: fetch counts 1 then 2. Evidence: counter with clock.
+      12. **Loop** - happy path; tool error then recovery; unknown tool; refused approval; turn cap. Expected:
+          answers and `is_error` flags as designed; no `tools/call` for refused or unknown. Evidence:
+          `ScriptedLLM.calls`, tool log, count of sent requests.
+      13. **MRTR** - accept, decline, no `requestState`, endless `input_required`. Expected: retry with new id and
+          echoed state / error result / no state sent / round cap. Evidence: sent lines.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Covers transport rules - metadata, ids, framing, timeout with cancellation, late replies and shutdown.
+      - Covers discovery - pagination edge cases, conversion and caching with invalidation.
+      - Covers the loop - tool execution errors, protocol errors, approval refusal and the turn cap.
+      - Covers MRTR - new id, echoed requestState, decline and a round limit.
+      - Uses a real server subprocess and a scripted model rather than a real model or network.
+    hints:
+      - List every way a request can end, then every way discovery can go wrong.
+      - How would you prove a refused tool was never sent to the server?
+    solution: |
+      One case per outcome of the transport, discovery and loop, each proved from the wire log, counters and the
+      scripted model's recorded requests.
+
+  - id: client-interview
+    type: interview
+    concept: mcp-client-model-loop
+    skill: analysis
+    title: "Interview: how does an MCP client work?"
+    prompt: |
+      *"You're building our agent's integration with MCP servers. Walk me through what the client does, from
+      starting a local server to returning a tool result to the model - and what can go wrong."*
+    modelAnswer: |
+      For a local server the host launches it as a subprocess and talks newline-delimited JSON-RPC over stdin and
+      stdout; logs go to stderr. In the current revision, 2026-07-28, there is no handshake: every request carries
+      its protocol version and client capabilities in `_meta`, and the server keeps no session state. If I also
+      support older servers I probe with `server/discover` and fall back to `initialize` on a non-modern error.
+
+      Each request gets a fresh id; I read until the matching response, pass notifications on, and ignore stray
+      responses. Every request has a timeout; on stdio I cancel with `notifications/cancelled`.
+
+      Discovery is `tools/list` with opaque cursors until there is no `nextCursor`; I cache using `ttlMs` and
+      invalidate on `tools/list_changed` from a `subscriptions/listen` stream. I convert tools for the model
+      provider - prefix with my own server key, map names the provider rejects, keep a route back, skip invalid
+      definitions.
+
+      In the loop the model proposes calls; I route, ask for approval for sensitive tools, call, and return one
+      `tool_result` per call. `isError: true` is a tool execution error the model can fix; JSON-RPC errors and
+      timeouts also come back as error results; the turn count is capped. If a server needs user input it returns
+      `input_required` with an elicitation; I ask the user and retry with a new id, `inputResponses` and the exact
+      `requestState`. Sampling and roots are deprecated, so I don't declare them.
+
+      What goes wrong: mismatched ids after timeouts, stdout pollution, stale tool lists, name collisions across
+      servers, treating tool errors as crashes, and trusting tool descriptions or annotations - tool output and
+      metadata are untrusted input. I test all of it with the real server process and a scripted model.
+    rubric:
+      - Describes stdio framing and that 2026-07-28 requests carry their own version and capabilities (no handshake).
+      - Explains id correlation, timeouts and cancellation.
+      - Explains pagination, caching with TTL and list_changed, and name conversion with routes back.
+      - Distinguishes tool execution errors from protocol errors and returns both to the model safely, with a turn cap.
+      - Explains approvals and the multi round-trip request flow for user input.
+      - Treats tool results and metadata as untrusted and mentions how to test offline.
+    followUps:
+      - How would you run three tool calls from one model turn in parallel over one stdio connection?
+      - What changes for a remote server over Streamable HTTP?
+      - How do you keep hundreds of tools from filling the context window?
+      - What would you log, and what must you never log?
+    hints:
+      - Structure it as - transport, discovery, loop, failure modes.
+    solution: |
+      Transport rules, discovery and caching, the host loop with approvals and MRTR, and the failure modes with
+      offline tests - that is the shape interviewers listen for.
+
+  - id: client-rpc-code
+    type: coding
+    concept: mcp-client-connection
+    skill: application
+    title: The JSON-RPC layer over stdio
+    prompt: |
+      In `client_rpc.py`, implement `request_meta`, `RpcClient.notify`, `RpcClient.request` (fresh id, `_meta`,
+      read until the matching id, notifications to the handler, other ids to `ignored`, error and `resultType`
+      handling, timeout with `notifications/cancelled`) and `StdioTransport.close` (close stdin, wait, terminate,
+      kill). The tests start the fixture server as a real subprocess.
+    project: ai
+    files:
+      - exercises/mcp/client_rpc.py
+    test: tests/mcp/test_client_rpc.py
+    command: .venv/bin/python -m pytest tests/mcp/test_client_rpc.py
+    hints:
+      - "Serialise with `json.dumps(..., separators=(\",\", \":\"))` - no indent, so no newlines."
+      - "In the read loop: notification first (method and no id), then other ids, then error, then result."
+      - "On timeout: remember the id, send the cancel notification, then raise."
+      - "close(): `stdin.close()`, `wait(timeout=grace)`, then `terminate()`, then `kill()`."
+    modelAnswer: |
+      See the `request()` listing in the lesson. The other pieces:
+
+      ```python
+      def request_meta(client_info, capabilities, protocol_version=PROTOCOL_VERSION):
+          return {META_VERSION: protocol_version, META_CLIENT: dict(client_info), META_CAPS: dict(capabilities)}
+
+      def notify(self, method, params=None):
+          message = {"jsonrpc": "2.0", "method": method}
+          if params is not None:
+              message["params"] = params
+          self.transport.send(json.dumps(message, separators=(",", ":")))
+
+      def close(self, grace=1.0):
+          if self.process.poll() is None:
+              self.process.stdin.close()
+              try:
+                  return self.process.wait(timeout=grace)
+              except subprocess.TimeoutExpired:
+                  self.process.terminate()
+                  try:
+                      return self.process.wait(timeout=grace)
+                  except subprocess.TimeoutExpired:
+                      self.process.kill()
+          return self.process.wait()
+      ```
+
+      The request loop never trusts order - only ids - and a result without `resultType` is completed for the
+      caller, while an unknown one is rejected.
+    rubric:
+      - Every test in tests/mcp/test_client_rpc.py passes.
+      - Ids come from a counter and are never reused or null.
+      - Messages are single lines; notifications have no id.
+      - A timeout sends notifications/cancelled for the request id before raising.
+      - Shutdown closes stdin first and escalates only if the server does not exit.
+    solution: |
+      Match by id, not by order; cancel on timeout; shut down gently first.
+
+  - id: client-tools-code
+    type: coding
+    concept: mcp-client-tool-discovery
+    skill: application
+    title: Discover, convert and cache tools
+    prompt: |
+      In `client_tools.py`, implement `list_tool_pages` (follow `nextCursor`; `""` is a cursor; repeated cursor and
+      page cap raise `ProtocolError`), `check_tool`, `provider_name`, `to_provider_tools` (prefix, name mapping,
+      routes back, skipped reasons, clashes skipped) and `ToolCatalog.tools` / `on_notification` (TTL freshness,
+      absent or negative TTL = 0, `list_changed` invalidates).
+    project: ai
+    files:
+      - exercises/mcp/client_tools.py
+    test: tests/mcp/test_client_tools.py
+    command: .venv/bin/python -m pytest tests/mcp/test_client_tools.py
+    hints:
+      - "Loop condition: `cursor is None` ends the loop - not `not cursor`."
+      - "Convert first, then remove every provider name that appeared twice, from both the tools and the routes."
+      - "Freshness: store `received + ttl_ms / 1000` and compare `now < fresh_until`."
+    modelAnswer: |
+      ```python
+      def list_tool_pages(client, max_pages=50):
+          pages, seen, cursor = [], set(), None
+          for _ in range(max_pages):
+              result = client.request("tools/list", {} if cursor is None else {"cursor": cursor})
+              pages.append(result)
+              cursor = result.get("nextCursor")
+              if cursor is None:
+                  return pages
+              if cursor in seen:
+                  raise ProtocolError(f"server repeated cursor {cursor!r}")
+              seen.add(cursor)
+          raise ProtocolError(f"more than {max_pages} pages of tools")
+
+      def provider_name(server_key, tool_name):
+          name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{server_key}__{tool_name}")
+          if not PROVIDER_NAME.match(name):
+              raise ValueError(f"tool name {name!r} cannot be offered to the model (1-128 characters)")
+          return name
+      ```
+
+      `to_provider_tools` checks each definition, converts `inputSchema` to `input_schema`, records
+      `routes[name] = (server_key, tool["name"])`, and drops names that occur twice. `ToolCatalog.tools` returns the
+      cached list while `clock() < fresh_until`, otherwise fetches all pages and sets `fresh_until` from the first
+      page's `ttlMs`; `on_notification` sets `fresh_until = 0` on `notifications/tools/list_changed`.
+    rubric:
+      - Every test in tests/mcp/test_client_tools.py passes.
+      - Cursors are never parsed; only an absent nextCursor ends the loop.
+      - Provider names use a host-chosen key and routes keep the original MCP name.
+      - Invalid and clashing definitions are skipped with a reason instead of failing the list.
+      - The cache follows ttlMs and is invalidated by list_changed.
+    solution: |
+      Pages until absent, names the provider accepts with a way back, and a cache that trusts the TTL until a
+      notification says otherwise.
+
+  - id: client-loop-code
+    type: coding
+    concept: mcp-client-model-loop
+    skill: application
+    title: The host's model loop over MCP tools
+    prompt: |
+      In `client_loop.py`, implement `result_to_text`, `call_tool_with_input` (MRTR - answer `inputRequests`, echo
+      `requestState` only if sent, new request per retry, round cap), `run_host_loop` and `_run_one` (route,
+      approve, call; unknown route, refusal, protocol error, timeout and `isError` all become error results). The
+      tests use `ScriptedLLM` and the fixture server.
+    project: ai
+    files:
+      - exercises/mcp/client_loop.py
+    test: tests/mcp/test_client_loop.py
+    command: .venv/bin/python -m pytest tests/mcp/test_client_loop.py
+    hints:
+      - "Append `{\"role\": \"assistant\", \"content\": reply.content}` unchanged, then one user message with every tool_result."
+      - "`call_tool_with_input`: build the retry params from scratch each round so stale fields never leak."
+      - "Approval and routing happen before any request reaches the server."
+    modelAnswer: |
+      ```python
+      def call_tool_with_input(client, name, arguments, answer_input, max_rounds=3, timeout=5.0):
+          params = {"name": name, "arguments": arguments}
+          for _ in range(max_rounds + 1):
+              result = client.request("tools/call", params, timeout=timeout)
+              if result.get("resultType", "complete") != "input_required":
+                  return result
+              responses = {key: answer_input(key, req) for key, req in (result.get("inputRequests") or {}).items()}
+              params = {"name": name, "arguments": arguments, "inputResponses": responses}
+              if "requestState" in result:
+                  params["requestState"] = result["requestState"]
+          raise RuntimeError(f"{name}: still input_required after {max_rounds} retries")
+      ```
+
+      `run_host_loop` calls the model with the tools until a reply has no tool calls or `max_turns` is reached; for
+      each call it uses `_run_one` (see the line-by-line section) and adds a `tool_result` with the call's id.
+    rubric:
+      - Every test in tests/mcp/test_client_loop.py passes.
+      - Tool execution errors, protocol errors, timeouts, unknown tools and refusals all reach the model as error results.
+      - Refused or unknown tools never reach the server.
+      - MRTR retries use a new request, echo requestState exactly and stop after a round limit.
+      - The loop has a turn cap and keeps assistant turns unchanged.
+    solution: |
+      The host decides, the server executes, and every outcome becomes a tool_result the model can read.
+
+placement:
+  - id: place-timeout
+    type: mcq
+    concept: mcp-client-connection
+    skill: application
+    title: A tool call hangs over stdio
+    prompt: |
+      A `tools/call` to a local stdio server has had no response for 30 s, past your timeout. What does the client
+      do?
+    options:
+      - id: cancel
+        text: Send notifications/cancelled with the request id, stop waiting, and ignore a response if one arrives later
+        feedback: Correct - on stdio this notification is the only cancellation signal.
+      - id: kill
+        text: Kill the server process at once
+        feedback: That ends every other request and subscription too; cancel the one request.
+      - id: wait
+        text: Keep waiting; MCP requests cannot be cancelled
+        feedback: Implementations "SHOULD establish timeouts for all sent requests" and cancel on timeout.
+      - id: resend
+        text: Send the same request again with the same id
+        feedback: The id is still outstanding; reusing it breaks correlation, and the work may run twice.
+    correct: [cancel]
+    solution: |
+      Timeouts end in `notifications/cancelled` (stdio) and a client that ignores late replies by matching ids.
+
+  - id: place-pages
+    type: mcq
+    concept: mcp-client-tool-discovery
+    skill: application
+    title: The second server's search tool
+    prompt: |
+      Your host connects to two servers that both expose a tool named `search`, and both report
+      `serverInfo.name: "search-server"`. How do you offer both to the model?
+    options:
+      - id: host-key
+        text: Prefix each with a key from the host's own configuration and keep routes back to (server, search)
+        feedback: Correct - disambiguate with names you control, never with self-reported ones.
+      - id: serverinfo
+        text: Prefix with serverInfo.name
+        feedback: It is the same for both and "SHOULD NOT be relied upon for disambiguation".
+      - id: first-wins
+        text: Offer the first one only; duplicates are a server error
+        feedback: Tool names only need to be unique within one server; aggregation is the host's job.
+      - id: last-wins
+        text: Offer one `search`; route to whichever server was registered last
+        feedback: Calls would silently go to the wrong server.
+    correct: [host-key]
+    solution: |
+      Clients aggregating servers "SHOULD implement a disambiguation strategy such as prefixing tool names with a
+      server identifier" - the identifier the host chose.
+
+  - id: place-mrtr
+    type: mcq
+    concept: mcp-client-model-loop
+    skill: analysis
+    title: input_required with no inputRequests
+    prompt: |
+      A `tools/call` returns `{"resultType": "input_required", "requestState": "q9"}` and nothing else. What
+      should the client do?
+    options:
+      - id: retry-state
+        text: Retry the call at once as a new request with requestState "q9"
+        feedback: Correct - without inputRequests "the client MAY retry the original request immediately", echoing the state.
+      - id: error
+        text: Report a protocol error, because there is nothing to answer
+        feedback: An InputRequiredResult needs at least one of the two fields; requestState alone is valid.
+      - id: same-id
+        text: Retry with the same id and requestState
+        feedback: The retry is an independent request and needs a new id.
+      - id: cache
+        text: Cache the result and return it to the model
+        feedback: Interim input_required results are not cacheable and are not an answer.
+    correct: [retry-state]
+    solution: |
+      MRTR retries are new requests that carry exactly what the server asked for - here only its opaque state.
+
+recall:
+  - id: recall-stdio
+    concept: mcp-client-connection
+    prompt: What are the stdio framing rules a client depends on?
+    answer: One JSON-RPC message per line, no embedded newlines; the server writes only MCP messages to stdout and may log to stderr; the client writes only requests and notifications to stdin.
+  - id: recall-meta
+    concept: mcp-client-connection
+    prompt: What must every 2026-07-28 request carry, and where?
+    answer: In params._meta - io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities (required) and io.modelcontextprotocol/clientInfo (should). There is no initialize handshake.
+  - id: recall-shutdown
+    concept: mcp-client-connection
+    prompt: How does a client shut down a stdio server?
+    answer: Close the server's stdin, wait for it to exit, then terminate it (SIGTERM, then SIGKILL on POSIX) if it does not exit in time.
+  - id: recall-pagination
+    concept: mcp-client-tool-discovery
+    prompt: When has a client seen every page of tools/list?
+    answer: When a result has no nextCursor. Cursors are opaque; an empty string is still a cursor.
+  - id: recall-cache
+    concept: mcp-client-tool-discovery
+    prompt: When is a cached tool list fresh?
+    answer: While now < t_received + ttlMs and no tools/list_changed notification has arrived since; absent or negative ttlMs counts as 0.
+  - id: recall-errors
+    concept: mcp-client-model-loop
+    prompt: How do tool execution errors and protocol errors differ?
+    answer: A tool execution error is a normal result with isError true - send it to the model so it can self-correct. A protocol error is a JSON-RPC error response (unknown tool, malformed request); clients may pass it on, but it is less likely to help.
+  - id: recall-mrtr
+    concept: mcp-client-model-loop
+    prompt: What are the client's rules for a multi round-trip retry?
+    answer: Answer every inputRequest, put the answers in inputResponses under the same keys, echo requestState exactly (omit it if none was sent), and send the retry as a new request with a new id.
+
+next:
+  - mcp-security-and-authorization
+  - mcp-multi-agent-architectures
+  - building-mcp-servers

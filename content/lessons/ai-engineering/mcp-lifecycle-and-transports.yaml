@@ -1,0 +1,1500 @@
+id: mcp-lifecycle-and-transports
+title: The MCP lifecycle, JSON-RPC and transports
+subject: ai-engineering
+module: model-context-protocol
+level: advanced
+status: published
+estimatedMinutes: 135
+summary: How an MCP client and server agree on what they are speaking and move messages between them - JSON-RPC 2.0 requests, notifications and responses; the stdio binding's one-message-per-line framing; protocol versions and capabilities declared on every request in the current, stateless 2026-07-28 revision, the server/discover probe, and the initialize handshake that older servers still expect; Streamable HTTP with its headers, SSE response streams and validation rules; and timeouts, cancellation and shutdown. Every wire message shown was produced by the code shown, talking to a real subprocess over stdio.
+tags:
+  [
+    MCP,
+    Model Context Protocol,
+    lifecycle,
+    JSON-RPC,
+    JSON-RPC 2.0,
+    stdio,
+    newline-delimited JSON,
+    framing,
+    Streamable HTTP,
+    SSE,
+    Server-Sent Events,
+    protocol version,
+    version negotiation,
+    capability negotiation,
+    initialize,
+    notifications/initialized,
+    server/discover,
+    _meta,
+    MCP-Protocol-Version,
+    Mcp-Method,
+    Mcp-Name,
+    Mcp-Session-Id,
+    UnsupportedProtocolVersionError,
+    HeaderMismatch,
+    stateless protocol,
+    dual-era,
+    cancellation,
+    notifications/cancelled,
+    timeouts,
+    shutdown,
+    ping,
+    agents,
+  ]
+
+environment: |
+  - **Specification:** the Model Context Protocol specification, revision **2026-07-28** - the version
+    `https://modelcontextprotocol.io/specification/latest` redirected to on 18 November 2026 - read from the
+    Markdown sources in the [specification
+    repository](https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/docs/specification/2026-07-28):
+    [Overview and messages](https://modelcontextprotocol.io/specification/2026-07-28/basic),
+    [Versioning and Compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+    [Transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports),
+    [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),
+    [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http),
+    [Cancellation](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation),
+    [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover) and the
+    [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog). Quotations are from those
+    pages as documented on 18 November 2026.
+  - **The previous revision, 2025-11-25** - the last one with the `initialize` handshake, which the 2026-07-28
+    pages call "legacy": [Lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
+    [Transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) (sessions, the GET
+    stream) and [Ping](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/ping), as
+    documented on 18 November 2026. Many servers you meet will still speak it; check which revision a server
+    and your SDK implement before relying on a detail.
+  - **JSON-RPC:** the [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification), section 4.1
+    (notifications) and 5.1 (the error object and the reserved codes -32700 and -32600 to -32603).
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`, standard library only - no MCP SDK is installed, by
+    design: the exercises implement the wire protocol by hand so every rule is visible. Every output in this
+    lesson was printed by the code shown, run on Linux on 18 November 2026; the stdio demo starts a real
+    subprocess and talks to it through pipes. Nothing is random and no clock is read, so the output is the same
+    on any machine. The code run is the reference solutions of this lesson's exercises:
+    `practice/ai/solutions/mcp/lifecycle_framing.py`, `lifecycle_negotiation.py` and `lifecycle_session.py`.
+  - **Not run here:** the Streamable HTTP messages are the specification's own examples, adapted to SandPay
+    names; no HTTP server was started. The official SDKs implement all of this for you - this lesson does not
+    describe any SDK's API; read the SDK documentation for that.
+  - **Synthetic data:** SandPay is a fictional payments company. The `sandpay-merchant-lookup` server, the
+    `sandpay-desk` client, merchant `m-204`, the merchant "Café Rosa" and every id were invented for this
+    lesson.
+  - **Not repeated here:** hosts, clients, servers and the three server primitives -
+    [MCP architecture](#/lesson/mcp-architecture); tool definitions and the tool loop -
+    [Tool use and function calling](#/lesson/tool-use-and-function-calling).
+
+prerequisites:
+  - mcp-architecture
+  - tool-use-and-function-calling
+  - http-request-response-anatomy
+
+concepts:
+  - id: mcp-lifecycle-jsonrpc-stdio
+    name: JSON-RPC messages, the stdio binding and in-flight requests
+    summary: Every MCP message is JSON-RPC 2.0 in UTF-8 - a request (method and a string or integer id, never null), a notification (method, no id, never answered) or a response (the same id with result or error). On stdio the client launches the server as a subprocess and they exchange one message per line; messages must not contain embedded newlines, stdout carries only MCP messages and logs go to stderr. A reader buffers bytes until a newline and decodes complete lines only. Every request gets a timeout; on stdio a timed-out or abandoned request is cancelled with notifications/cancelled, late responses are ignored, and closing the server's stdin is the shutdown signal.
+  - id: mcp-lifecycle-versioning
+    name: Protocol versions and capabilities - per request (current), with the legacy handshake as history
+    summary: Since revision 2026-07-28 MCP is stateless - every request carries its protocol version and client capabilities in _meta, a request missing them is rejected with -32602, an unknown version gets UnsupportedProtocolVersionError (-32022) listing the supported versions, and the client retries with one of them. server/discover returns versions, capabilities and identity, and is the stdio probe that tells a modern server from a legacy one. History, kept for backward compatibility - legacy servers (2025-11-25 and earlier) expect the initialize handshake that 2026-07-28 removed; dual-era clients fall back to it only when the probe shows a legacy server.
+  - id: mcp-lifecycle-streamable-http
+    name: Streamable HTTP - one POST per message, headers and response streams
+    summary: Streamable HTTP has one MCP endpoint; the client POSTs every message, accepting application/json and text/event-stream, and the server answers each request with one JSON object or an SSE stream scoped to that request. The protocol version, method and tool or resource name are mirrored into the MCP-Protocol-Version, Mcp-Method and Mcp-Name headers, and the server must reject a header that disagrees with the body (400, -32020). Revision 2026-07-28 removed sessions, the GET stream and resumable streams; closing a response stream cancels its request. Servers validate Origin and bind to localhost when local.
+
+objectives:
+  - Classify a JSON-RPC message as a request, notification, result or error, and name the JSON-RPC and MCP error code a malformed or unsupported message should get.
+  - Write a stdio framer and decoder that never emit embedded newlines, survive chunks split mid-message or mid-character, and report parse errors without stopping.
+  - Trace a modern request through version and capability checks, and a dual-era client through the server/discover probe and the fallback to initialize.
+  - Explain what the 2026-07-28 revision removed (initialize, sessions, ping) and why, and implement the legacy handshake a dual-era client still needs for backward compatibility.
+  - Explain how a Streamable HTTP request is sent and answered, which headers it needs, and how a server validates them.
+  - Design timeouts, cancellation and shutdown for a client, and test that late responses are ignored.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: The idea in plain language
+    body: |
+      SandPay's support desk uses an AI assistant. When an agent asks "is merchant m-204 live?", the assistant's
+      MCP client asks a small `sandpay-merchant-lookup` server. Before that question can be asked and answered,
+      three things must be settled - the same three that any two parties exchanging letters must settle:
+
+      - **The envelope.** Which bits are the address, which are the reply-to number, and how a reply finds its
+        question. MCP uses **JSON-RPC 2.0**: every question (request) has an `id`, every answer (response)
+        carries the same `id`, and a note that needs no answer (notification) has none.
+      - **The language.** Both sides must speak the same version of the protocol and know which optional
+        features the other supports. Until 2025 this was settled once, at the start of a conversation, with an
+        `initialize` handshake. Since the **2026-07-28** revision every letter states its own language on the
+        envelope - the protocol is **stateless**, so any letter can be read on its own.
+      - **The postal service.** How letters physically travel. For a server running on the same machine, the
+        client starts it as a child process and they write lines to each other through pipes (**stdio**). For
+        a remote server, every letter is an HTTP POST and every answer comes back in the HTTP response
+        (**Streamable HTTP**).
+
+      And because posts get lost, there are rules for giving up on an answer (timeouts), saying "never mind"
+      (cancellation) and closing the post office (shutdown). This lesson builds all three layers in plain Python,
+      runs a real server subprocess, and shows exactly what goes over the wire.
+
+  - id: what
+    kind: what
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Terms you need
+    body: |
+      | Term | Meaning (MCP 2026-07-28 unless marked) |
+      | --- | --- |
+      | **Request** | `{"jsonrpc": "2.0", "id": ..., "method": ..., "params": ...}`. The id is a string or integer; "Unlike base JSON-RPC, the ID MUST NOT be `null`", and it must not repeat an id still waiting for a response. |
+      | **Notification** | a request without `id`. "The receiver MUST NOT send a response." |
+      | **Response** | the request's `id` plus `result` (which "MUST include a `resultType` field", `"complete"` for ordinary results) or `error` (`code` integer, `message` string, optional `data`). |
+      | **Error codes** | JSON-RPC's `-32700` parse error, `-32600` invalid request, `-32601` method not found, `-32602` invalid params, `-32603` internal error; MCP's `-32020` HeaderMismatch, `-32021` MissingRequiredClientCapability, `-32022` UnsupportedProtocolVersion. |
+      | **Transport (binding)** | how messages are framed and delivered. "Protocol semantics are identical on every transport." The standard ones are stdio and Streamable HTTP. |
+      | **stdio** | the client launches the server as a subprocess; newline-delimited JSON-RPC on stdin/stdout; stderr for logs. |
+      | **Streamable HTTP** | one MCP endpoint; each client message is an HTTP POST; each answer is one JSON object or an SSE stream scoped to that request. |
+      | **SSE** | Server-Sent Events, `Content-Type: text/event-stream` - a response body that delivers several events, here notifications followed by the final response. |
+      | **`_meta`** | metadata inside `params` (and results). Requests carry `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` (both required) and, optionally, `io.modelcontextprotocol/clientInfo`. |
+      | **Capabilities** | optional features each side declares - server: `tools`, `resources`, `prompts`...; client: for example `elicitation`. A server "MUST NOT rely on capabilities the client has not declared". |
+      | **`server/discover`** | the request every modern server "MUST implement": it returns `supportedVersions`, `capabilities` and the server's identity. |
+      | **Modern / legacy / dual-era** | the specification's own words: modern = per-request metadata (2026-07-28 and later); legacy = the `initialize` handshake (2025-11-25 and earlier); dual-era = an implementation that supports both. |
+      | **`initialize`** (legacy) | the first request of a legacy session: version, capabilities and client info; the server answers with its own; the client then sends `notifications/initialized`. |
+      | **Cancellation** | abandoning an in-flight request: on stdio, `notifications/cancelled` with the `requestId`; on Streamable HTTP, closing that request's response stream. |
+
+  - id: why
+    kind: why
+    concepts: [mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Why the lifecycle exists - and why it changed
+    body: |
+      A client and a server are written by different teams, released on different days and updated at different
+      times. Without an agreed version, one side sends a field the other has never heard of; without agreed
+      capabilities, a server asks a client for something it cannot do. The lifecycle is the part of the protocol
+      that makes two independently built programs fail **clearly** instead of misbehaving silently.
+
+      The **legacy** design solved this once per connection: `initialize` fixed the version and capabilities for
+      the whole session, and HTTP servers could hand out an `Mcp-Session-Id`. That works, but it ties every
+      request to the connection or session it arrived on - so a load balancer has to send all of a session's
+      requests to the same server instance, a restart loses the session, and a request cannot be understood on
+      its own.
+
+      The **2026-07-28** changelog lists the fix as its first two major changes: it removes "protocol-level
+      sessions and the `Mcp-Session-Id` header" and makes "MCP stateless: remove the
+      `initialize`/`notifications/initialized` handshake. Every request now carries its protocol version and
+      client capabilities in `_meta`". The overview states the rule a server lives by:
+
+      > Servers **MUST NOT** rely on prior requests over the same connection to establish context (e.g.,
+      > capabilities, protocol version, client identity). Every request supplies this metadata in its `_meta`
+      > field.
+
+      For an engineer or tester the payoff is concrete: any request can go to any server instance, a restarted
+      stdio server needs no handshake ("in-flight requests are simply lost and the client can retry them"), and
+      every request can be checked on its own. The cost is that clients must now cope with **two eras** of
+      servers for a while - which is why half of this lesson is about telling them apart.
+
+  - id: internals-messages
+    kind: internals
+    concepts: [mcp-lifecycle-jsonrpc-stdio]
+    title: JSON-RPC messages and stdio framing, underneath
+    body: |
+      **Telling messages apart.** A receiver looks at the keys: `method` with `id` is a request, `method`
+      without `id` is a notification, `result` or `error` is a response. MCP narrows JSON-RPC in a few places
+      that matter for tests:
+
+      - The id of a request is a string or an integer and **never `null`** (JSON-RPC allows null; MCP does not).
+        `true` is not an integer, even though Python's `bool` is a subclass of `int` - a classic validator bug.
+      - An error response carries the request's id "except in error cases where the ID could not be read due a
+        malformed request" - then the id is null or absent. That is the only response without a usable id.
+      - Results carry `resultType`; "clients **MUST** treat an absent `resultType` as `"complete"`" because
+        older servers do not send it.
+
+      **Framing on stdio.** The stdio page is short and strict:
+
+      > Messages are delimited by newlines, and **MUST NOT** contain embedded newlines.
+      > The server **MAY** write UTF-8 strings to `stderr` for any logging purposes ...
+      > The server **MUST NOT** write anything to its `stdout` that is not a valid MCP message.
+
+      Writing is easy with a JSON library: `json.dumps` escapes a newline inside a string as the two characters
+      `\n`, so the frame contains exactly one raw newline - the one you append. Reading is where bugs live. A
+      pipe delivers **bytes in chunks of whatever size the operating system chooses**. A chunk can end in the
+      middle of a message, contain several messages, or split a multi-byte UTF-8 character such as `é` (two
+      bytes). A correct reader appends each chunk to a buffer, cuts off every complete line, and decodes
+      **only complete lines** - never a chunk on its own.
+
+      A line that is not JSON gets a JSON-RPC **parse error** (-32700) with a null id - the id could not be read.
+      Valid JSON that is not a valid message gets **invalid request** (-32600), with the id when it is readable.
+      Either way the reader carries on with the next line; one bad line must not kill the connection.
+
+  - id: internals-versions
+    kind: internals
+    concepts: [mcp-lifecycle-versioning]
+    title: Versions and capabilities, request by request
+    body: |
+      **Modern (2026-07-28).** Every client request carries, in `params._meta`:
+
+      | Key | Required | Example |
+      | --- | --- | --- |
+      | `io.modelcontextprotocol/protocolVersion` | yes | `"2026-07-28"` |
+      | `io.modelcontextprotocol/clientCapabilities` | yes | `{}` (declare nothing) |
+      | `io.modelcontextprotocol/clientInfo` | no ("SHOULD" be sent) | `{"name": "sandpay-desk", "version": "0.4.0"}` |
+
+      The server checks each request independently:
+
+      1. A required field missing - "the server **MUST** reject it with JSON-RPC error code `-32602` (Invalid
+         params). On HTTP, the response status **MUST** be `400 Bad Request`."
+      2. A version it does not implement - "it **MUST** respond with an `UnsupportedProtocolVersionError`
+         listing the versions it does support": code `-32022`, `data: {"supported": [...], "requested": ...}`.
+         The client "**SHOULD** select a mutually supported version from the `supported` list and retry".
+      3. The request needs a client capability that was not declared - `MissingRequiredClientCapabilityError`
+         (`-32021`) with `data.requiredCapabilities`.
+
+      `clientInfo` and the server's `serverInfo` are "self-reported ... and are not verified" - for display and
+      logs, never for security decisions.
+
+      **`server/discover`** returns the server's `supportedVersions`, `capabilities`, `serverInfo` and optional
+      `instructions`. Clients **MAY** call it first, but do not have to: they can send any request and handle
+      -32022.
+
+      **Telling the eras apart on stdio.** There is no HTTP status code on a pipe, so a dual-era client
+      "**SHOULD** probe with `server/discover` before sending any other request". Three outcomes:
+
+      - a `DiscoverResult` - modern; pick a version from `supportedVersions`;
+      - a recognised modern error such as -32022 - modern, just not this version; "Do **not** fall back to
+        `initialize`";
+      - "any other error, or does not respond within a reasonable timeout" - legacy; fall back to `initialize`.
+        This fallback "**MUST NOT** be keyed to one specific error code": legacy servers answer unknown requests
+        with "implementation-defined errors (commonly `-32601` or `-32602`) or not at all".
+
+      **History - the legacy handshake (2025-11-25 and earlier, removed in 2026-07-28).** This is not part of
+      the current protocol; you meet it only when a dual-era client falls back to an older server. The session starts with `initialize`, which "**MUST** be the first interaction".
+      The client sends its latest version, its capabilities and `clientInfo`. "If the server supports the
+      requested protocol version, it **MUST** respond with the same version. Otherwise, the server **MUST**
+      respond with another protocol version it supports. This **SHOULD** be the _latest_". If the client does
+      not support that version "it **SHOULD** disconnect". Otherwise it "**MUST** send an `initialized`
+      notification". Until the server has answered, the client "**SHOULD NOT** send requests other than pings",
+      and for the whole session both sides "**MUST** ... Only use capabilities that were successfully
+      negotiated". Legacy also had a `ping` request that must be answered "promptly with an empty response";
+      2026-07-28 removed `ping`.
+
+  - id: internals-http
+    kind: internals
+    concepts: [mcp-lifecycle-streamable-http]
+    title: Streamable HTTP, underneath
+    body: |
+      The server exposes **one MCP endpoint** (for example `https://mcp.sandpay.example/mcp`). The 2026-07-28 rules:
+
+      - **Sending.** "Every JSON-RPC message sent from the client **MUST** be a new HTTP POST request to the MCP
+        endpoint", with an `Accept` header listing both `application/json` and `text/event-stream`, and a body
+        that is "a single JSON-RPC _request_ or _notification_".
+      - **Answering a notification.** Accepted - `202 Accepted` with no body; not accepted - an HTTP error such
+        as `400`.
+      - **Answering a request.** Either `Content-Type: application/json` (one JSON object) or
+        `Content-Type: text/event-stream` - an SSE stream that may carry notifications about **this** request
+        (such as `notifications/progress`) before the final response. "The client **MUST** support both."
+        The server "**MUST NOT** send independent JSON-RPC _requests_ on this stream." When a server needs input
+        from the client (elicitation, for example) it returns an `InputRequiredResult` (`resultType:
+        "input_required"`) and the client retries the original request with the answers - the Multi Round-Trip
+        Requests pattern.
+      - **Headers mirrored from the body.** `MCP-Protocol-Version` on every POST, `Mcp-Method` on all requests,
+        and `Mcp-Name` (from `params.name` or `params.uri`) on `tools/call`, `resources/read` and `prompts/get`.
+        They exist so load balancers and gateways can route without parsing JSON, so the server "**MUST**
+        reject requests where the values specified in the headers do not match the corresponding values in the
+        request body" - `400 Bad Request` with `HeaderMismatch` (`-32020`). The reason given: otherwise "a load
+        balancer routing on the header value while the MCP server executes based on the body value" could be
+        tricked.
+      - **Status codes.** Unsupported version - `400` with -32022; unknown method - `404` with -32601 (the JSON
+        body tells it apart from a 404 of a server that has no MCP endpoint at all).
+      - **Security.** Servers "**MUST** validate the `Origin` header" against DNS rebinding (`403 Forbidden` if
+        it is present and invalid) and, when local, "**SHOULD** bind only to localhost (127.0.0.1)".
+
+      **What 2026-07-28 removed** (it was in 2025-03-26 to 2025-11-25): the `Mcp-Session-Id` session (and
+      `DELETE` to end it), the standalone `GET` stream for server-initiated messages, server-sent requests on SSE
+      streams, and resumable streams with `Last-Event-ID`. A modern-only server facing an older client "**SHOULD**"
+      answer `GET` or `DELETE` with `405 Method Not Allowed`, ignore an `Mcp-Session-Id` header ("do not mint or
+      echo session IDs") and ignore `Last-Event-ID`. Long-lived change notifications now arrive on the response
+      stream of a `subscriptions/listen` request instead. If a response stream breaks, "the in-flight request"
+      is lost and the client "**MUST** re-issue it as a new request with a new request ID".
+
+  - id: when
+    kind: when
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-streamable-http, mcp-lifecycle-versioning]
+    title: Which transport, and which era
+    body: |
+      | Situation | Usually |
+      | --- | --- |
+      | a server on the user's machine, started by the host (local files, a CLI, a dev tool) | **stdio** - no network port, the server lives and dies with the client, credentials come from the environment (the spec says stdio implementations "**SHOULD NOT**" follow the HTTP authorization spec and should "retrieve credentials from the environment") |
+      | a shared server many users or agents reach over the network | **Streamable HTTP**, with the authorization spec, Origin checks and TLS |
+      | a reliable byte stream that is not a pipe (Unix socket, TCP) | a custom transport that "**SHOULD** reuse the stdio framing" |
+      | a new client or server today | modern (2026-07-28): per-request `_meta`, no handshake |
+      | you must reach servers you do not control | **dual-era** client: probe with `server/discover` on stdio, or try a modern request and inspect a `400` body on HTTP, then fall back to `initialize` |
+      | a server many old clients still use | dual-era server: serve `initialize` with legacy semantics, serve requests that carry `_meta` statelessly |
+
+      **What the lifecycle does not replace:** authorization (who may call the server - see
+      [MCP security and authorization](#/lesson/mcp-security-and-authorization)), input validation of tool
+      arguments, and your application's own state - "State that needs to span multiple requests ... **MUST** be
+      referenced by an explicit identifier the client passes on each request", for example a handle in a tool
+      argument.
+
+  - id: visual
+    kind: visual
+    concepts: [mcp-lifecycle-versioning]
+    title: A dual-era client connecting over stdio
+    body: |
+      What to notice: the probe decides the era once per server process; only "any other error or no answer"
+      leads to `initialize`, and a modern error leads to a retry with a supported version.
+
+      ```mermaid
+      sequenceDiagram
+          participant C as sandpay-desk (client)
+          participant S as server subprocess
+          C->>S: server/discover (_meta protocolVersion 2026-07-28)
+          alt DiscoverResult
+              S-->>C: supportedVersions, capabilities, serverInfo
+              Note over C,S: modern - every request carries _meta
+              C->>S: tools/list (_meta)
+              S-->>C: result (resultType complete)
+          else -32022 UnsupportedProtocolVersion
+              S-->>C: error data.supported
+              Note over C: modern - retry with a supported version
+          else any other error, or timeout
+              S-->>C: e.g. -32601, or nothing
+              Note over C,S: legacy - fall back to the handshake
+              C->>S: initialize (protocolVersion, capabilities, clientInfo)
+              S-->>C: protocolVersion, capabilities, serverInfo
+              C--)S: notifications/initialized
+              C->>S: tools/list (only negotiated capabilities)
+          end
+          Note over C,S: shutdown - client closes stdin, server exits
+      ```
+
+  - id: stdio-demo
+    kind: code
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning]
+    title: "A real stdio session: probe, wrong version, missing metadata, broken line"
+    body: |
+      A tiny modern server (`stdio_server.py`, about 30 lines) reads stdin with the exercise's `LineDecoder`,
+      checks each request with `check_request_meta`, answers `server/discover`, and logs to stderr. The client
+      starts it with `subprocess.Popen`, writes frames with `encode_message` and reads the replies. The heart
+      of the server loop:
+
+      ```python
+      while True:
+          chunk = sys.stdin.buffer.read1(4096)
+          if not chunk:  # stdin closed: the client's shutdown signal
+              print("stdin closed, exiting", file=sys.stderr)
+              break
+          for frame in dec.feed(chunk):
+              if frame.kind == "invalid":
+                  out.write(encode_message(frame.error)); continue
+              if frame.kind != "request":
+                  print(f"ignored {frame.kind} {frame.message.get('method')}", file=sys.stderr); continue
+              req = frame.message
+              error = check_request_meta(req, SUPPORTED)
+              if error:
+                  out.write(encode_message(error))
+              elif req["method"] == "server/discover":
+                  out.write(encode_message({"jsonrpc": "2.0", "id": req["id"], "result": {
+                      "resultType": "complete", "supportedVersions": SUPPORTED,
+                      "capabilities": {"tools": {}}, "_meta": SERVER_INFO}}))
+              else:
+                  out.write(encode_message({"jsonrpc": "2.0", "id": req["id"],
+                                            "error": {"code": -32601, "message": "Method not found"}}))
+          out.flush()
+      ```
+
+      The client sends four messages: the probe; `tools/list` declaring version 2025-11-25; `tools/list` with
+      no `_meta`; and a line cut off in the middle. Then it closes stdin. Output (`>>` written to the server's
+      stdin, `<<` read from its stdout):
+
+      ```plaintext
+      >> {"jsonrpc":"2.0","id":"probe-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"sandpay-desk","version":"0.4.0"}}}}
+      << {"jsonrpc":"2.0","id":"probe-1","result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sandpay-merchant-lookup","version":"0.1.0"}}}}
+      era: modern | version: 2026-07-28
+      >> {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"sandpay-desk","version":"0.4.0"}}}}
+      << {"jsonrpc":"2.0","id":2,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"],"requested":"2025-11-25"}}}
+      era: modern-retry
+      >> {"jsonrpc":"2.0","id":3,"method":"tools/list"}
+      << {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params","data":{"missing":["io.modelcontextprotocol/protocolVersion","io.modelcontextprotocol/clientCapabilities"]}}}
+      >> {"jsonrpc":"2.0","id":4,   (truncated line)
+      << {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+      server exit code: 0 | stderr: stdin closed, exiting
+      ```
+
+      Read it as a tester:
+
+      - The probe's result tells the client everything it needs - versions, capabilities, identity - and the
+        client picks 2026-07-28, the newest version both support.
+      - The -32022 error has the request's id and lists `supported`, so the client can retry without guessing.
+      - The request without `_meta` is malformed: -32602, as the spec requires. The `data` naming the missing
+        keys is this server's choice - the spec does not define it - and it makes the failure easy to debug.
+      - The broken line gets a parse error with `id: null` (the id could not be read), and the server keeps
+        running. The `"id":4` request never gets a real answer - the client's timeout must handle that.
+      - Closing stdin made the server exit with code 0: the graceful shutdown the stdio page describes.
+      - Every frame is one line; the server's log went to stderr, never to stdout.
+
+  - id: framing-line-by-line
+    kind: line-by-line
+    concepts: [mcp-lifecycle-jsonrpc-stdio]
+    title: The framer and decoder - line by line
+    body: |
+      ```python
+      def encode_message(message):
+          if not isinstance(message, dict):
+              raise FramingError(f"a JSON-RPC message is a JSON object, not {type(message).__name__}")
+          text = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+          return text.encode("utf-8") + b"\n"
+      ```
+
+      - `json.dumps` escapes control characters inside strings, so a `\n` in a merchant name becomes the two
+        characters backslash and n - the frame's only raw newline is the one appended.
+      - `ensure_ascii=False` keeps `é` as two UTF-8 bytes instead of the six-character escape `é`. Both
+        are valid JSON; this one is shorter and easier to read in logs. The spec's rule is only that messages
+        "**MUST** be UTF-8 encoded".
+      - `separators=(",", ":")` drops the spaces - compact frames, nothing more.
+
+      ```python
+      def feed(self, chunk):
+          self._buffer.extend(chunk)
+          frames = []
+          while True:
+              newline = self._buffer.find(b"\n")
+              if newline < 0:
+                  return frames
+              line = bytes(self._buffer[:newline])
+              del self._buffer[: newline + 1]
+              if line.endswith(b"\r"):
+                  line = line[:-1]
+              frames.append(self._decode_line(line))
+      ```
+
+      - The buffer holds **bytes**. Searching for `b"\n"` in bytes is safe because in UTF-8 the byte `0x0A`
+        never appears inside a multi-byte character - so a split `é` simply waits in the buffer.
+      - One `feed` can return zero, one or many frames; the caller loops over them.
+      - Stripping one `\r` is a tolerance for CRLF writers; the spec does not mention CR.
+      - `_decode_line` decodes UTF-8 and parses JSON, and turns failures into error frames (-32700 or -32600)
+        instead of exceptions - one bad line must not stop the loop.
+
+      Output of the reference decoder fed one tools/call frame cut inside the `é` of "Café Rosa", then the rest
+      plus two more lines (a notification and a request with `"id": null`):
+
+      ```plaintext
+      frame bytes: 116 | newlines: 1
+      chunk 1: 105 bytes -> [] pending=105
+      chunk 2: 133 bytes -> ['request', 'notification', 'invalid'] pending=0
+      error for the null id: {"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid Request", "data": "id must be a string or integer"}}
+      ```
+
+  - id: handshake-code
+    kind: code
+    concepts: [mcp-lifecycle-versioning]
+    title: "History: the legacy handshake, as a dual-era client still needs it"
+    body: |
+      Not the current protocol - 2026-07-28 removed this handshake. A dual-era client still implements it for
+      the fallback path that the 2026-07-28 Versioning page specifies. `LegacyClientSession` (exercise
+      `lifecycle_session.py`) has four states - `new`, `initializing`, `ready`,
+      `closed` - and refuses anything the 2025-11-25 lifecycle does not allow. The rules in `request`:
+
+      ```python
+      if self.state in ("new", "closed"):
+          raise LifecycleError(f"cannot send '{method}' in state '{self.state}'")
+      if method == "initialize":
+          raise LifecycleError("initialize is only sent once")
+      if self.state == "initializing" and method != "ping":
+          raise LifecycleError(f"only ping may be sent before the initialize response (got '{method}')")
+      capability = required_capability(method)   # tools/ -> "tools", resources/ -> "resources", ...
+      if capability is not None and capability not in self.server_capabilities:
+          raise LifecycleError(f"'{method}' needs the server capability '{capability}', which was not negotiated")
+      ```
+
+      A run against a scripted older server that answers with 2025-06-18 and only the `tools` capability:
+
+      ```plaintext
+      refused: cannot send 'tools/list' in state 'new'
+      send: {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "sandpay-desk", "version": "0.4.0"}}}
+      refused: only ping may be sent before the initialize response (got 'tools/list')
+      send: {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+      send: {"jsonrpc": "2.0", "method": "notifications/initialized"} | state: ready | version: 2025-06-18
+      send: {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+      refused: 'resources/list' needs the server capability 'resources', which was not negotiated
+      ```
+
+      The client asked for its latest version, 2025-11-25; the server did not support it and answered with its
+      own latest, 2025-06-18; the client supports that too, so it continues - and from now on speaks 2025-06-18.
+      Had the server answered 2024-11-05, the client would have closed the session.
+
+  - id: http-code
+    kind: code
+    concepts: [mcp-lifecycle-streamable-http]
+    title: "Streamable HTTP on the wire (from the specification, not run here)"
+    body: |
+      A `tools/call` POST, following the specification's example, with SandPay names. Header values mirror
+      the body: `MCP-Protocol-Version` = `_meta` protocolVersion, `Mcp-Method` = `method`, `Mcp-Name` =
+      `params.name`:
+
+      ```http
+      POST /mcp HTTP/1.1
+      Host: mcp.sandpay.example
+      Content-Type: application/json
+      Accept: application/json, text/event-stream
+      MCP-Protocol-Version: 2026-07-28
+      Mcp-Method: tools/call
+      Mcp-Name: find_merchant
+
+      {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_merchant","arguments":{"query":"m-204"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+      ```
+
+      The server may answer with one JSON object (`200 OK`, `Content-Type: application/json`) or open an SSE
+      stream for this request and send progress notifications before the final response, which "**SHOULD**
+      terminate the stream". Rejections the specification defines:
+
+      | The request ... | HTTP status | JSON-RPC error |
+      | --- | --- | --- |
+      | has `Mcp-Name: refund_payment` but `params.name` is `find_merchant` | `400 Bad Request` | `-32020` HeaderMismatch |
+      | lacks a required header (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) | `400 Bad Request` | `-32020` HeaderMismatch |
+      | declares a version the server does not implement | `400 Bad Request` | `-32022` with `data.supported` |
+      | lacks a required `_meta` field | `400 Bad Request` | `-32602` Invalid params |
+      | names a method the server does not implement | `404 Not Found` | `-32601` Method not found |
+      | comes from a page with an invalid `Origin` | `403 Forbidden` | optional, with no `id` |
+      | is a GET or DELETE from an older client (modern-only server) | `405 Method Not Allowed` (SHOULD) | - |
+
+      A notification POST that the server accepts gets `202 Accepted` with no body. To cancel, the client
+      closes the SSE response stream - "The server **MUST** treat a client disconnect as cancellation of that
+      request"; no `notifications/cancelled` is sent over HTTP.
+
+  - id: timeouts
+    kind: internals
+    concepts: [mcp-lifecycle-jsonrpc-stdio]
+    title: Timeouts, cancellation and shutdown
+    body: |
+      From the Cancellation page:
+
+      - "Implementations **SHOULD** establish timeouts for all sent requests". On timeout, the sender "**SHOULD**
+        cancel the request and stop waiting" - on stdio by sending `notifications/cancelled`
+        (`{"requestId": ..., "reason": ...}`), on HTTP by closing the response stream.
+      - A progress notification **MAY** reset the timeout clock, but implementations "**SHOULD** always enforce
+        a maximum timeout, regardless of progress notifications".
+      - Cancellations "**MUST** only reference requests that ... Were previously issued by the client [and] Are
+        believed to still be in-progress". Servers **SHOULD** stop work and not answer; they **MAY** ignore a
+        cancellation for an unknown or finished request.
+      - Cancellation races the response: "The client **SHOULD** ignore any response to the cancelled request
+        that arrives afterward."
+
+      `PendingRequests` (exercise) implements this with an injected clock. Timeout 30 s, maximum 120 s, two
+      requests started at t=0, progress for request 5 at t=20 and t=45:
+
+      ```plaintext
+      t=20: progress for 5
+      t=31: expire -> [{'requestId': 6, 'reason': 'timeout after 31s'}]
+      t=45: progress for 5
+      t=74: expire -> []
+      t=75: expire -> [{'requestId': 5, 'reason': 'timeout after 75s'}]
+      t=80: response for 6 -> ignore
+      ```
+
+      Request 6 had no progress and was cancelled once its 30 s deadline had passed (checked at t=31).
+      Request 5's deadline moved to 50, then to 75. The late answer to 6 is dropped - the user was already told
+      it timed out.
+
+      **Shutdown on stdio** (2026-07-28): the client "**SHOULD**" close the server's stdin, wait for it to exit,
+      and if it does not exit "within a reasonable time", terminate it (on POSIX, typically escalating from
+      `SIGTERM` to `SIGKILL`). Servers "**SHOULD** exit promptly when their standard input is closed" - "the
+      primary graceful-shutdown signal and the only portable one". If the server dies unexpectedly, the client
+      "**SHOULD** restart it"; because the protocol is stateless, lost requests are retried against the new
+      process.
+
+  - id: steps
+    kind: steps
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning]
+    title: Connecting a dual-era client to an unknown stdio server, step by step
+    body: |
+      1. Start the server process with stdin, stdout and stderr as pipes. Read stderr in the background (log it;
+         the client "**SHOULD NOT** assume `stderr` output indicates error conditions").
+      2. Send `server/discover` with `_meta` naming your preferred modern version, your capabilities and
+         `clientInfo`. Start its timeout.
+      3. Classify the answer: a result with `supportedVersions` - modern; a modern error (-32020 to -32022) -
+         modern, retry with a version from `data.supported`; anything else or no answer - legacy.
+      4. Cache the era for the lifetime of the process ("Clients **SHOULD** cache the result").
+      5. Modern: send every request with the full `_meta`; never rely on anything an earlier request said.
+         Legacy: send `initialize`, check the answered version (disconnect if you do not support it), send
+         `notifications/initialized`, then only use the capabilities the server declared.
+      6. Track every request id until its response arrives; on timeout or user cancel send
+         `notifications/cancelled` and ignore the late response.
+      7. Shut down by closing stdin, waiting, then terminating. On an unexpected exit, restart and retry.
+
+  - id: example
+    kind: example
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: "Example: the merchant lookup that stopped answering"
+    body: |
+      After a dependency upgrade, SandPay's support assistant shows "merchant lookup timed out" for every
+      question. Evidence collected by the tester:
+
+      - The client's debug log shows `server/discover` sent, then nothing for 10 s, then a fallback to
+        `initialize`, then nothing again.
+      - The server's stderr is empty. Running the server by hand and typing a request shows this on stdout,
+        **before** the JSON answer:
+
+        ```plaintext
+        Loading merchant index (2 shards)...
+        {"jsonrpc":"2.0","id":"probe-1","result":{...}}
+        ```
+
+      Diagnosis: the upgraded library prints a progress line to **stdout**. The client's decoder reads
+      `Loading merchant index (2 shards)...` as a line, gets a parse error, and - because this client
+      implementation dropped unparseable lines silently - never sees the answer on the next line as belonging to
+      anything it trusted. The spec rule broken is "The server **MUST NOT** write anything to its `stdout` that
+      is not a valid MCP message."
+
+      What the tester checks after the fix (send library output to stderr) and adds to the regression suite:
+
+      - Start the server, send the probe, and assert that **every** stdout line parses as a JSON-RPC message.
+      - Assert the probe is answered within the timeout and classified "modern".
+      - Assert that a garbage line sent to the server produces a -32700 error and the server still answers the
+        next request.
+      - On the client side: a parse error on stdout is logged loudly, not swallowed.
+
+      The same class of bug exists on HTTP as a gateway that buffers SSE events - the server spec answers it
+      with "servers **SHOULD** include the `X-Accel-Buffering: no` header" on SSE responses.
+
+  - id: tests
+    kind: tests
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Test cases for an MCP server's lifecycle and transport
+    body: |
+      | # | Case | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | `server/discover` with a supported version | result with `resultType: "complete"`, `supportedVersions`, `capabilities`, `serverInfo` | the response line |
+      | 2 | `tools/list` declaring `1900-01-01` | error -32022, same id, `data.supported` and `data.requested` | response; on HTTP status 400 |
+      | 3 | `tools/list` without `_meta`, then with only the version | -32602 both times; on HTTP 400 | response |
+      | 4 | two requests with different versions on one connection | each answered according to its own `_meta` | both responses - proves statelessness |
+      | 5 | a line that is not JSON, followed by a valid request | -32700 with `id: null`; the valid request is answered | both lines; server still running |
+      | 6 | request with `"id": null` | -32600 (invalid request), never a result | response |
+      | 7 | a notification | no response at all | nothing on stdout within a short wait |
+      | 8 | anything written to stdout during start-up and errors | every line is a valid JSON-RPC message | capture all stdout, parse each line |
+      | 9 | close stdin | the process exits on its own | exit code and elapsed time |
+      | 10 | HTTP: `Mcp-Name` differs from `params.name` | 400 with -32020; tool not executed | response; tool spy |
+      | 11 | HTTP: no `MCP-Protocol-Version` header | 400 with -32020, unless the server documents support for pre-2025-06-18 clients | response |
+      | 12 | HTTP: `GET /mcp` and an `Mcp-Session-Id` header (modern-only server) | 405 for GET; the session header ignored and never echoed | responses and their headers |
+      | 13 | HTTP: request with `Origin: https://evil.example` | 403 | status |
+      | 14 | legacy server: `initialize` with a version it lacks | answers its latest supported version | `result.protocolVersion` |
+      | 15 | cancel a slow request (stdio `notifications/cancelled`, HTTP close the stream) | work stops; no response sent afterwards | server log, absence of a response |
+
+      Negative cases matter as much as positive ones: most interop bugs are an error answered with the wrong code,
+      or a request that should have been refused and ran.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | `print()` debug output in a stdio server | client parse errors, hangs, "server not responding" | log to stderr; test that every stdout line parses |
+      | decoding each chunk instead of each line | intermittent `UnicodeDecodeError` or JSON errors with non-ASCII data or large messages | buffer bytes, split on `b"\n"`, decode complete lines |
+      | pretty-printed JSON (`indent=2`) on stdio | the peer sees several broken "messages" | compact, single-line JSON |
+      | treating `True` as a valid id, or accepting `null` | ids that never match a response | check `isinstance(x, bool)` before `int`; reject null |
+      | falling back to `initialize` only on -32601 | a legacy server that answers -32602 or stays silent is treated as broken | fall back on any non-modern error **or** a timeout |
+      | falling back to `initialize` after -32022 | a modern server gets a legacy handshake it does not understand | -32022 means modern: retry with `data.supported` |
+      | server remembers the version from the first request (modern) | wrong behaviour when a client sends requests with different versions, or after a load balancer moves it | read `_meta` on every request |
+      | gateway routes on `Mcp-Name`, server executes the body | a request for one tool executes another | server rejects header/body mismatches with -32020 |
+      | no timeout, or progress resets it forever | a stuck tool blocks the conversation | per-request timeout plus a maximum |
+      | delivering a response after cancelling | the user sees an answer to a question they abandoned | track cancelled ids; ignore late responses |
+
+      **Debugging method:** capture the wire first. On stdio, wrap the server command in a small script that tees
+      stdin and stdout to files (or read your client's frame log); on HTTP, log the request headers and body
+      and the response status and body. Then check, in order: is every line one valid JSON-RPC message? Does
+      every request carry `_meta` with a version the server lists? Do the ids of responses match outstanding
+      requests? Only then look at tool logic.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Trade-offs and alternatives
+    body: |
+      - **Stateless vs handshake.** Per-request metadata makes every request bigger and repeats the same
+        capabilities each time; in return any instance can serve any request and there is no session to lose.
+        The handshake was cheaper on the wire but tied requests to a connection or a session id.
+      - **Probing costs a round trip.** A modern-only client may skip `server/discover`; the spec still
+        RECOMMENDS the probe on stdio because "some legacy servers ... would process an era-ambiguous method (such
+        as `tools/call`) under legacy semantics" - a deterministic failure is better than a quiet wrong result.
+      - **stdio vs HTTP.** stdio needs no network security but serves one client process per server process; HTTP
+        serves many clients and can be scaled, but needs authorization, Origin checks, TLS and care with proxies
+        (buffering, idle timeouts - hence the SSE keep-alive comments the spec encourages on long streams).
+      - **JSON vs SSE answers.** One JSON object is simplest; SSE lets a long tool report progress. Clients must
+        support both, so tests must cover both.
+      - **Hand-written protocol vs SDK.** This lesson writes the wire by hand to show the rules; production code
+        should use an official SDK and keep conformance tests like the ones above, because the protocol changes
+        between revisions - 2026-07-28 changed the handshake, sessions, error codes and the resource-not-found
+        code (-32002 became -32602).
+
+  - id: summary
+    kind: summary
+    concepts: [mcp-lifecycle-jsonrpc-stdio, mcp-lifecycle-versioning, mcp-lifecycle-streamable-http]
+    title: Quick reference
+    body: |
+      - Request = method + string/integer id (never null); notification = no id, never answered; response = same
+        id + `result` (with `resultType`) or `error` (`code`, `message`, `data`).
+      - Codes: -32700 parse, -32600 invalid request, -32601 method not found, -32602 invalid params,
+        -32020 header mismatch, -32021 missing client capability, -32022 unsupported version.
+      - stdio: one JSON message per line, no embedded newlines, stdout only for MCP, logs to stderr; buffer bytes,
+        decode complete lines; close stdin to shut down.
+      - Modern (2026-07-28): `_meta` on every request with `protocolVersion` and `clientCapabilities`; no
+        handshake, no sessions, no ping; `server/discover` for versions, capabilities, identity.
+      - Dual-era on stdio: probe with `server/discover`; modern error - retry; other error or timeout -
+        `initialize`.
+      - Legacy: `initialize` first, server echoes or offers its latest version, client sends
+        `notifications/initialized`, only negotiated capabilities.
+      - Streamable HTTP: POST per message, Accept both types, answer JSON or SSE per request; headers
+        `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` must match the body (400 / -32020); validate Origin.
+      - Timeouts on every request with a maximum; cancel (stdio notification, HTTP close stream); ignore late
+        responses.
+
+exercises:
+  - id: kind-of-message
+    type: mcq
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: recognition
+    title: Which line is a valid MCP request?
+    prompt: |
+      A stdio server receives these four lines. Which one is a valid MCP **request** under revision 2026-07-28?
+    options:
+      - id: string-id
+        text: '`{"jsonrpc":"2.0","id":"lookup-7","method":"tools/list","params":{"_meta":{...}}}`'
+        feedback: Correct - a string id, a method and params. MCP allows string or integer ids.
+      - id: null-id
+        text: '`{"jsonrpc":"2.0","id":null,"method":"tools/list","params":{"_meta":{...}}}`'
+        feedback: JSON-RPC allows a null id, but MCP says the ID "MUST NOT be null". This is invalid.
+      - id: no-id
+        text: '`{"jsonrpc":"2.0","method":"tools/list","params":{"_meta":{...}}}`'
+        feedback: Without an id this is a notification - the server must not answer it, so it cannot be a request.
+      - id: bool-id
+        text: '`{"jsonrpc":"2.0","id":true,"method":"tools/list","params":{"_meta":{...}}}`'
+        feedback: '`true` is a boolean, not an integer - a common bug in Python, where `bool` subclasses `int`.'
+    correct: [string-id]
+    hints:
+      - What makes a request different from a notification?
+      - MCP narrows JSON-RPC's rules for ids in one way.
+    solution: |
+      Request = method + id, and the id is a string or integer, never null. Without an id it is a notification.
+      Validators should check for `bool` before `int`.
+
+  - id: stdout-print
+    type: mcq
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: analysis
+    title: The server that answers too much
+    prompt: |
+      A new stdio server works when you test its functions directly, but every client reports parse errors and
+      then times out. Its stderr is empty. Captured stdout:
+
+      ```plaintext
+      Merchant index ready (412 merchants)
+      {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}}
+      ```
+
+      What is the most likely cause, and how do you confirm it?
+    options:
+      - id: stdout-log
+        text: The server writes a log line to stdout; confirm by checking that every stdout line parses as JSON-RPC, then send logs to stderr
+        feedback: Correct - stdout must carry only MCP messages. The first line is not JSON, so the client's decoder reports a parse error.
+      - id: wrong-version
+        text: The server supports the wrong protocol version
+        feedback: A version mismatch produces a -32022 error from the server or a retry; it does not produce non-JSON lines.
+      - id: needs-initialize
+        text: The client forgot to send initialize first
+        feedback: The server's answer is a DiscoverResult - it is a modern server that needs no handshake.
+      - id: crlf
+        text: The server uses CRLF line endings
+        feedback: Nothing in the capture shows CR characters, and the first line is plain text, not a message.
+    correct: [stdout-log]
+    hints:
+      - Read the first line of stdout as the client's decoder would.
+      - What may a stdio server write to stdout, according to the spec?
+    solution: |
+      "The server MUST NOT write anything to its stdout that is not a valid MCP message." Move the log to stderr
+      and add a test that parses every stdout line.
+
+  - id: split-character
+    type: mcq
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: application
+    title: The bug that only French merchants see
+    prompt: |
+      A client reads the server's stdout like this:
+
+      ```python
+      while chunk := proc.stdout.read1(4096):
+          for line in chunk.decode("utf-8").splitlines():
+              handle(json.loads(line))
+      ```
+
+      Most lookups work, but large answers - and some answers for "Café Rosa" - fail with `UnicodeDecodeError` or
+      `JSONDecodeError`. What is the fix?
+    options:
+      - id: buffer-lines
+        text: Keep a byte buffer across reads, split it on b"\n", and decode and parse only complete lines
+        feedback: Correct - a chunk can end mid-message or between the two bytes of é; only complete lines are safe to decode.
+      - id: ascii
+        text: Make the server use ensure_ascii=True so there are no multi-byte characters
+        feedback: That hides the UTF-8 half of the bug but not the other half - a large message still arrives in several chunks.
+      - id: bigger-read
+        text: Read 1 MB at a time instead of 4096 bytes
+        feedback: The operating system decides chunk boundaries; a bigger read only makes the failure rarer.
+      - id: errors-ignore
+        text: Use chunk.decode("utf-8", errors="ignore")
+        feedback: That silently deletes bytes - "Caf Rosa" - and still parses half messages.
+    correct: [buffer-lines]
+    hints:
+      - Who decides where a chunk from a pipe ends?
+      - Is "a chunk" the same thing as "a message"?
+    solution: |
+      Framing is by newline, not by read. Buffer bytes, cut complete lines, then decode - exactly what
+      `LineDecoder.feed` does.
+
+  - id: retry-after-32022
+    type: mcq
+    concept: mcp-lifecycle-versioning
+    skill: application
+    title: The server does not speak your version
+    prompt: |
+      Your client sends `tools/call` with `_meta` protocolVersion `2026-07-28` and gets:
+
+      ```json
+      {"jsonrpc":"2.0","id":9,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2027-03-01"],"requested":"2026-07-28"}}}
+      ```
+
+      Your client supports `2026-07-28` and `2025-11-25`. What should it do?
+    options:
+      - id: surface
+        text: Surface an error to the user - no mutually supported version exists
+        feedback: Correct - the client "SHOULD select a mutually supported version from the supported list and retry, or surface an error to the user if no compatible version exists".
+      - id: initialize
+        text: Fall back to the initialize handshake with 2025-11-25
+        feedback: -32022 is a recognised modern error, so the server is modern - "Do not fall back to initialize".
+      - id: retry-same
+        text: Retry the same request; the error may be transient
+        feedback: The error lists what the server supports; retrying the same version gets the same answer.
+      - id: use-2027
+        text: Retry with 2027-03-01 because the server said so
+        feedback: The client does not implement 2027-03-01; sending that version promises behaviour it cannot deliver.
+    correct: [surface]
+    hints:
+      - Intersect the two lists.
+      - Which kind of server returns -32022?
+    solution: |
+      Pick from the intersection of the two lists; it is empty, so report an actionable error ("server needs
+      protocol 2027-03-01; update the client"). Never fall back to the handshake after a modern error.
+
+  - id: probe-minus-32601
+    type: mcq
+    concept: mcp-lifecycle-versioning
+    skill: analysis
+    title: What does the probe answer tell you?
+    prompt: |
+      Your dual-era client sends `server/discover` over stdio to a server it has never seen. The answer is
+      `{"jsonrpc":"2.0","id":"probe-1","error":{"code":-32601,"message":"Method not found"}}`. Next step?
+    options:
+      - id: legacy
+        text: Treat the server as legacy and send initialize
+        feedback: Correct - -32601 is not a modern error, so this is "any other error"; fall back to the handshake.
+      - id: broken
+        text: Give up; every modern server must implement server/discover, so this server is broken
+        feedback: That is true of modern servers - which is exactly why this answer means the server is not modern.
+      - id: retry-version
+        text: Retry server/discover with 2025-11-25 in _meta
+        feedback: Legacy servers do not read _meta versions at all; changing it does not help.
+      - id: tools-list
+        text: Send tools/list with _meta and see if that works
+        feedback: The spec warns that a legacy server may process such an "era-ambiguous method" under legacy semantics - a quiet wrong result.
+    correct: [legacy]
+    hints:
+      - Which three outcomes does the stdio backward-compatibility section list?
+      - Is -32601 one of the codes the 2026-07-28 spec defines?
+    solution: |
+      DiscoverResult - modern; modern error (-32020 to -32022) - modern, retry; anything else or silence -
+      legacy, `initialize`. Do not key the fallback to -32601 alone - legacy servers also answer -32602 or nothing.
+
+  - id: missing-capabilities
+    type: mcq
+    concept: mcp-lifecycle-versioning
+    skill: application
+    title: An empty object is not the same as nothing
+    prompt: |
+      Over Streamable HTTP, a client sends `tools/list` with `_meta` containing only
+      `"io.modelcontextprotocol/protocolVersion": "2026-07-28"`. The client supports no optional features. What
+      does a conforming server answer?
+    options:
+      - id: invalid-params
+        text: 400 Bad Request with JSON-RPC error -32602 (Invalid params)
+        feedback: Correct - clientCapabilities is required on every request; a client with no features sends {}.
+      - id: list
+        text: 200 with the tool list, since the client needs no capabilities for tools/list
+        feedback: The field is required regardless of the method - a request missing it "is malformed".
+      - id: missing-cap
+        text: 400 with -32021 MissingRequiredClientCapability
+        feedback: -32021 is for a capability the request needs but the client did not declare; here the whole field is missing.
+      - id: unsupported
+        text: 400 with -32022 listing the supported versions
+        feedback: The version is fine; the problem is the missing capabilities field.
+    correct: [invalid-params]
+    hints:
+      - Which _meta fields are marked "Required - Yes"?
+    solution: |
+      Send `"io.modelcontextprotocol/clientCapabilities": {}` when you support nothing optional. A missing required
+      field is -32602, and on HTTP status 400.
+
+  - id: header-mismatch
+    type: mcq
+    concept: mcp-lifecycle-streamable-http
+    skill: application
+    title: The header says one tool, the body another
+    prompt: |
+      A POST arrives at SandPay's MCP endpoint with `Mcp-Name: find_merchant` and a body whose `params.name` is
+      `refund_payment`. The API gateway rate-limits by `Mcp-Name`. What must the server do?
+    options:
+      - id: reject
+        text: Reject with 400 Bad Request and error -32020 (HeaderMismatch), without running any tool
+        feedback: Correct - the server "MUST reject requests where the values specified in the headers do not match" the body.
+      - id: body-wins
+        text: Run refund_payment - the body is the source of truth
+        feedback: The body is the source of truth, but running it lets a client bypass the gateway's per-tool policy.
+      - id: header-wins
+        text: Run find_merchant - the gateway already approved it
+        feedback: The server executes based on the body; ignoring the body is the inconsistency the rule prevents.
+      - id: forbidden-403
+        text: Answer 403 Forbidden
+        feedback: 403 is for an invalid Origin. A header/body mismatch is 400 with -32020.
+    correct: [reject]
+    hints:
+      - Why are these headers there at all?
+    solution: |
+      Mirrored headers let intermediaries route without parsing JSON; mismatches are rejected (400, -32020) so the
+      router and the server can never act on different values.
+
+  - id: http-cancel
+    type: mcq
+    concept: mcp-lifecycle-streamable-http
+    skill: application
+    title: Cancelling over HTTP
+    prompt: |
+      Over Streamable HTTP (2026-07-28), the user presses Stop while a `tools/call` is streaming progress over SSE.
+      How does the client cancel it?
+    options:
+      - id: close-stream
+        text: Close that request's SSE response stream
+        feedback: Correct - "Closing the SSE response stream is the cancellation signal"; no notification is expected.
+      - id: post-cancelled
+        text: POST a notifications/cancelled notification with the requestId
+        feedback: That is the stdio mechanism. On Streamable HTTP the spec says no notifications/cancelled is required or expected.
+      - id: delete
+        text: Send DELETE to the MCP endpoint with the Mcp-Session-Id
+        feedback: DELETE ended a whole legacy session; 2026-07-28 has no sessions, and a modern server answers 405.
+      - id: ignore
+        text: Nothing - just ignore the response when it arrives
+        feedback: Ignoring late responses is right, but the server would keep working (and maybe acting) on a request nobody wants.
+    correct: [close-stream]
+    hints:
+      - Each request has its own response stream on HTTP. What does that make possible?
+    solution: |
+      HTTP: close the response stream (the server MUST treat a disconnect as cancellation). stdio: send
+      `notifications/cancelled`. Both: ignore any late response.
+
+  - id: session-header
+    type: mcq
+    concept: mcp-lifecycle-streamable-http
+    skill: analysis
+    title: An old client sends a session id
+    prompt: |
+      SandPay's new server supports only 2026-07-28. Its logs show requests carrying `Mcp-Session-Id: 1868a90c`
+      and a `GET /mcp` from the same client. What should the server do?
+    options:
+      - id: ignore-405
+        text: Ignore the Mcp-Session-Id header and answer the GET with 405 Method Not Allowed
+        feedback: Correct - the spec says such a server SHOULD ignore the header (and not mint or echo ids) and answer GET or DELETE with 405.
+      - id: not-found-404
+        text: Answer 404 for the unknown session so the client re-initialises
+        feedback: That is legacy behaviour (a terminated session gets 404). A modern-only server has no sessions to look up.
+      - id: echo
+        text: Echo the session id back so the client keeps working
+        feedback: The server must not mint or echo session ids - that would pretend to support sessions it does not have.
+      - id: open-sse
+        text: Open a standalone SSE stream for the GET
+        feedback: The standalone GET stream was removed; change notifications now come from a subscriptions/listen request.
+    correct: [ignore-405]
+    hints:
+      - Look for the "Earlier Streamable HTTP Revisions" section.
+    solution: |
+      Modern-only server facing an older client: 405 for GET/DELETE, ignore `Mcp-Session-Id` and `Last-Event-ID`.
+      The old client then fails visibly - legacy clients have no fall-forward.
+
+  - id: progress-timeout
+    type: mcq
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: application
+    title: A tool that keeps saying "still working"
+    prompt: |
+      A client uses a 30 s timeout, reset by progress notifications, with a 120 s maximum. A `tools/call` sent at
+      t=0 receives a progress notification every 20 s and never finishes. When is it cancelled?
+    options:
+      - id: at-120
+        text: At t=120, the maximum timeout
+        feedback: Correct - progress keeps pushing the deadline, but never past start + maximum.
+      - id: at-30
+        text: At t=30
+        feedback: Progress at t=20 moved the deadline to t=50, and so on.
+      - id: never
+        text: Never, as long as progress keeps arriving
+        feedback: That is the failure the spec warns about - always enforce a maximum timeout "regardless of progress notifications".
+      - id: at-140
+        text: At t=140, 30 s after the last progress at t=120
+        feedback: The maximum caps the deadline at 120; a later progress cannot extend it.
+    correct: [at-120]
+    hints:
+      - Write down the deadline after each progress notification, then apply the cap.
+    solution: |
+      Deadline after progress = min(now + timeout, start + maximum) = min(t + 30, 120). At t=120 the request is
+      cancelled with `notifications/cancelled` (stdio) and any later response ignored.
+
+  - id: handshake-order
+    type: order
+    concept: mcp-lifecycle-versioning
+    skill: recall
+    title: "History: the legacy handshake, in order"
+    prompt: Put the steps of a legacy (2025-11-25) MCP session over stdio in order - the fallback path a dual-era client follows after the probe identifies a legacy server.
+    items:
+      - id: launch
+        text: The client launches the server as a subprocess
+      - id: initialize
+        text: The client sends initialize with its latest protocol version, its capabilities and clientInfo
+      - id: answer
+        text: The server answers with the same version (or its latest), its capabilities and serverInfo
+      - id: check
+        text: The client checks the answered version and disconnects if it does not support it
+      - id: initialized
+        text: The client sends notifications/initialized
+      - id: operate
+        text: Both sides exchange requests, using only negotiated capabilities
+      - id: close
+        text: The client closes the server's stdin and waits for it to exit
+    hints:
+      - Only pings may come before the server's answer to initialize.
+    solution: |
+      Launch, initialize, answer, check the version, initialized, operation, shutdown by closing stdin. In
+      2026-07-28 the middle four steps disappear - each request carries its own version and capabilities.
+
+  - id: debug-server-loop
+    type: debug
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: analysis
+    title: Find the two lines that break the stdio rules
+    prompt: |
+      This SandPay stdio server loop works in a quick manual test but breaks real clients. Select the **two** lines
+      that violate the stdio binding.
+    language: python
+    code: |
+      import json, sys
+
+      def serve(handle):
+          for raw in sys.stdin.buffer:
+              line = raw.decode("utf-8").rstrip("\r\n")
+              request = json.loads(line)
+              print(f"handling {request.get('method')}")
+              reply = handle(request)
+              if reply is not None:
+                  sys.stdout.write(json.dumps(reply, indent=2) + "\n")
+                  sys.stdout.flush()
+    correctLines: [7, 10]
+    lineNotes:
+      - line: 4
+        note: Iterating `sys.stdin.buffer` yields complete lines of bytes, so this framing is fine.
+      - line: 6
+        note: An unparseable line raises and stops the server - worth fixing (answer -32700 and continue), but it is not a stdio framing rule.
+      - line: 9
+        note: Not answering notifications is correct - handle() returns None for them.
+    hints:
+      - Which stream may carry only MCP messages?
+      - What does `indent=2` do to a message with nested objects?
+    solution: |
+      Line 7 prints a log line to stdout - logs belong on stderr. Line 10 pretty-prints, putting newlines inside
+      the message, but "Messages ... MUST NOT contain embedded newlines". Use compact JSON and
+      `print(..., file=sys.stderr)`.
+
+  - id: why-stateless
+    type: short
+    concept: mcp-lifecycle-streamable-http
+    skill: analysis
+    title: What did removing sessions buy?
+    prompt: |
+      SandPay runs its MCP server behind a load balancer with six instances. Explain what the 2026-07-28 removal
+      of `initialize` and `Mcp-Session-Id` changes for routing, restarts and testing - and what the server must do
+      instead for state that spans requests.
+    modelAnswer: |
+      With legacy sessions, the version and capabilities were fixed at `initialize` and an HTTP server could assign
+      `Mcp-Session-Id`; every later request of that session had to reach an instance that knew the session, so the
+      load balancer needed sticky routing and a restart or failover lost sessions (clients got 404 and had to
+      initialise again). In 2026-07-28 each request carries its version and capabilities in `_meta` (mirrored in
+      `MCP-Protocol-Version`), so any instance can serve any request, instances can restart freely, and the
+      routing layer can even route on headers. Testing gets simpler: each request can be tested alone, and a test
+      can prove statelessness by sending different versions on one connection. State that really spans requests
+      must be referenced by an explicit identifier the client passes each time - for example a server-minted
+      handle in a tool argument - and stored where every instance can read it.
+    rubric:
+      - Says legacy sessions tied requests to an instance (sticky routing) and were lost on restart.
+      - Says every modern request carries version and capabilities, so any instance can serve it.
+      - Mentions a testing consequence (requests testable alone, or a statelessness test).
+      - Says cross-request state uses explicit identifiers passed on each request, stored in shared storage.
+    hints:
+      - What did an instance need to remember about a session, and where?
+    solution: |
+      Sessions made the server stateful per client; per-request `_meta` makes every request self-contained, so
+      routing, restarts and tests get simpler, and real state moves to explicit handles.
+
+  - id: lifecycle-testdesign
+    type: testdesign
+    concept: mcp-lifecycle-versioning
+    skill: application
+    title: Conformance tests for a dual-era stdio server
+    prompt: |
+      SandPay's merchant-lookup server claims to be **dual-era**: modern 2026-07-28 and legacy 2025-11-25 over
+      stdio. Design test cases that would catch the most likely lifecycle bugs. For each give preconditions,
+      steps, the expected result and the evidence you would keep.
+    modelAnswer: |
+      Preconditions for all: start the server as a subprocess with pipes; capture stdout and stderr to files;
+      a harness that writes frames and reads lines with a timeout.
+
+      1. **Discover** - send `server/discover` with 2026-07-28. Expected: result with `resultType: "complete"`,
+         `supportedVersions` containing 2026-07-28 and 2025-11-25, `capabilities`, `serverInfo`. Evidence: the line.
+      2. **Modern request without handshake** - `tools/list` with full `_meta`. Expected: a result. Evidence: line.
+      3. **Missing fields** - no `_meta`; then version only. Expected: -32602 both times, same ids.
+      4. **Unknown version** - `1900-01-01`. Expected: -32022 with `supported` and `requested`.
+      5. **Statelessness** - on one process send a modern request with 2026-07-28 and one with an unsupported
+         version. Expected: the first succeeds, the second gets -32022 - the first did not "set" anything.
+      6. **Legacy path** - new process; `initialize` with 2025-11-25. Expected: same version echoed, capabilities,
+         `serverInfo`; after `notifications/initialized`, `tools/list` works. Evidence: transcript.
+      7. **Legacy version fallback** - `initialize` with 2026-01-01 (not a legacy version it knows). Expected: the
+         server answers with its latest legacy version it supports. Evidence: `result.protocolVersion`.
+      8. **Framing robustness** - a garbage line, then a valid request. Expected: -32700 with id null, then a
+         normal answer; process still alive.
+      9. **Clean stdout** - parse every stdout line of the whole run. Expected: all valid JSON-RPC. Evidence: the
+         capture file and a count.
+      10. **Shutdown** - close stdin. Expected: exit within a few seconds, code 0. Evidence: exit code and time.
+      11. **Cancellation** - start a slow tool, send `notifications/cancelled`. Expected: no response for that id
+          afterwards; the server answers the next request. Evidence: transcript and server log.
+    rubric:
+      - Each case has preconditions, steps, an expected result and evidence.
+      - Covers both eras - discover/modern requests and the initialize path.
+      - Includes negative cases with exact codes (-32602, -32022, -32700).
+      - Includes a statelessness test and a clean-stdout test.
+      - Includes shutdown or cancellation behaviour.
+    hints:
+      - List what the server must do on each path, then one negative case per rule.
+      - How do you prove a server did not remember something?
+    solution: |
+      Cover discover, modern requests, the legacy handshake, every rejection code, statelessness, framing
+      robustness, clean stdout and shutdown - with the transcript as evidence for each.
+
+  - id: lifecycle-interview
+    type: interview
+    concept: mcp-lifecycle-versioning
+    skill: analysis
+    title: "Interview: what happens when a host connects to an MCP server?"
+    prompt: |
+      "Walk me through what happens on the wire when an AI application connects to an MCP server and calls its
+      first tool - and what changed in the 2026 revision of the protocol."
+    modelAnswer: |
+      Everything is JSON-RPC 2.0: requests with an id, responses with the same id and a result or error, and
+      notifications without an id. The transport is either stdio - the host launches the server as a subprocess
+      and they exchange one JSON message per line on stdin and stdout, logs on stderr - or Streamable HTTP, where
+      every message is a POST to one endpoint and each request is answered with JSON or an SSE stream for that
+      request.
+
+      Before 2026, the client first sent `initialize` with its latest version, capabilities and client info; the
+      server answered with the same or its latest version and its capabilities, the client sent
+      `notifications/initialized`, and then called `tools/list` and `tools/call`, using only negotiated features.
+      HTTP servers could add an `Mcp-Session-Id`.
+
+      Revision 2026-07-28 made MCP stateless: no handshake, no sessions. Every request carries its protocol
+      version and client capabilities in `_meta`, and on HTTP the version, method and tool name are mirrored into
+      headers that must match the body. A wrong version gets -32022 with the supported list, and the client
+      retries. `server/discover` returns versions, capabilities and identity. Clients that must work with old
+      servers probe with `server/discover` on stdio and fall back to `initialize` on a non-modern error or
+      timeout. Around all of it: timeouts on every request, cancellation (a notification on stdio, closing the
+      stream on HTTP), and shutdown by closing stdin.
+    rubric:
+      - Names JSON-RPC 2.0 and the three message kinds.
+      - Describes both transports correctly (stdio lines; HTTP POST with JSON or SSE).
+      - Describes the legacy handshake (initialize, version answer, initialized, negotiated capabilities).
+      - Describes the 2026-07-28 change (per-request _meta, no sessions, -32022 retry, server/discover).
+      - Mentions timeouts or cancellation or the dual-era probe.
+    followUps:
+      - How would you test that a server is really stateless?
+      - What goes wrong if a stdio server prints a log line to stdout?
+      - Why must Streamable HTTP headers match the body?
+    hints:
+      - Structure it as - message format, transport, version and capabilities, then failure handling.
+    solution: |
+      JSON-RPC over stdio or Streamable HTTP; legacy = handshake then operation; modern = every request
+      self-describing via `_meta`, `server/discover` and -32022 retries; plus timeouts, cancellation, shutdown.
+
+  - id: framing-code
+    type: coding
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: application
+    title: Frame and decode JSON-RPC on stdio
+    prompt: |
+      In `lifecycle_framing.py`, implement `encode_message` (one compact UTF-8 line ending in exactly one
+      newline), `classify` (request, notification, result, error or invalid with a reason) and `LineDecoder.feed`
+      (buffer bytes across chunks, decode only complete lines, strip one CR, turn bad lines into -32700 or -32600
+      error frames and keep going).
+    project: ai
+    files:
+      - exercises/mcp/lifecycle_framing.py
+    test: tests/mcp/test_lifecycle_framing.py
+    command: .venv/bin/python -m pytest tests/mcp/test_lifecycle_framing.py
+    hints:
+      - "Ids: check bool before int - isinstance(True, int) is True in Python."
+      - "feed: loop on self._buffer.find(b'\\n'); slice the line out, delete it from the buffer, then decode."
+      - "Invalid JSON and invalid UTF-8 are both parse errors; catch UnicodeDecodeError and json.JSONDecodeError."
+    modelAnswer: |
+      ```python
+      def encode_message(message):
+          if not isinstance(message, dict):
+              raise FramingError(f"a JSON-RPC message is a JSON object, not {type(message).__name__}")
+          return json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+      def feed(self, chunk):
+          self._buffer.extend(chunk)
+          frames = []
+          while (newline := self._buffer.find(b"\n")) >= 0:
+              line = bytes(self._buffer[:newline])
+              del self._buffer[: newline + 1]
+              if line.endswith(b"\r"):
+                  line = line[:-1]
+              frames.append(self._decode_line(line))
+          return frames
+      ```
+
+      `_decode_line` does `json.loads(line.decode("utf-8"))`; on failure it returns a parse-error frame with
+      id null, and when `classify` says invalid it returns an invalid-request frame with the reason as `data`
+      and the id when it is a valid id. `classify` checks `jsonrpc`, then `method` (request or notification),
+      then `result`/`error` (exclusive; error responses may lack an id).
+    rubric:
+      - Every test in tests/mcp/test_lifecycle_framing.py passes.
+      - Decoding happens per complete line, never per chunk.
+      - A bad line produces an error frame and the decoder keeps working.
+      - The id check rejects null and booleans.
+    solution: |
+      Newline framing on bytes, compact JSON out, and error frames instead of exceptions - that is the whole
+      stdio binding's data path.
+
+  - id: negotiation-code
+    type: coding
+    concept: mcp-lifecycle-versioning
+    skill: application
+    title: Per-request versions, the discover probe and legacy negotiation
+    prompt: |
+      In `lifecycle_negotiation.py`, implement `check_request_meta` (the server's -32602 and -32022 checks),
+      `choose_version`, `classify_probe_reply` (modern, modern-retry or legacy), `negotiate_legacy` (the
+      2025-11-25 server's answer to initialize) and `client_accepts_legacy`.
+    project: ai
+    files:
+      - exercises/mcp/lifecycle_negotiation.py
+    test: tests/mcp/test_lifecycle_negotiation.py
+    command: .venv/bin/python -m pytest tests/mcp/test_lifecycle_negotiation.py
+    hints:
+      - "Treat a value of the wrong type as missing - a version must be a string and capabilities an object."
+      - "Versions are YYYY-MM-DD strings, so max() of valid versions is the newest."
+      - "Probe: only a result with supportedVersions is modern; only codes in MODERN_ERROR_CODES are modern-retry."
+    modelAnswer: |
+      ```python
+      def check_request_meta(request, supported):
+          params = request.get("params")
+          meta = params.get("_meta") if isinstance(params, dict) else None
+          meta = meta if isinstance(meta, dict) else {}
+          missing = []
+          if not isinstance(meta.get(PROTOCOL_VERSION_KEY), str):
+              missing.append(PROTOCOL_VERSION_KEY)
+          if not isinstance(meta.get(CLIENT_CAPABILITIES_KEY), dict):
+              missing.append(CLIENT_CAPABILITIES_KEY)
+          if missing:
+              return _error(request.get("id"), INVALID_PARAMS, "Invalid params", {"missing": missing})
+          version = meta[PROTOCOL_VERSION_KEY]
+          if version not in supported:
+              return _error(request.get("id"), UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
+                            {"supported": list(supported), "requested": version})
+          return None
+
+      def classify_probe_reply(reply):
+          if reply is None:
+              return "legacy"
+          result = reply.get("result")
+          if isinstance(result, dict) and isinstance(result.get("supportedVersions"), list):
+              return "modern"
+          error = reply.get("error")
+          if isinstance(error, dict) and error.get("code") in MODERN_ERROR_CODES:
+              return "modern-retry"
+          return "legacy"
+      ```
+
+      `choose_version` returns `max(set(a) & set(b))` or None; `negotiate_legacy` echoes a supported version or
+      returns `max(server_supported)`; `client_accepts_legacy` is a membership test.
+    rubric:
+      - Every test in tests/mcp/test_lifecycle_negotiation.py passes.
+      - The legacy fallback is not keyed to one error code, and a timeout (None) means legacy.
+      - A -32022 answer never leads to initialize.
+      - The -32022 error lists the supported versions and the requested one.
+    solution: |
+      Validate `_meta` on every request; classify probe answers by what modern servers can send; in the legacy
+      era, echo or offer the newest version.
+
+  - id: session-code
+    type: coding
+    concept: mcp-lifecycle-versioning
+    skill: application
+    title: In-flight requests, and the legacy fallback handshake
+    prompt: |
+      In `lifecycle_session.py`, implement `LegacyClientSession.start`, `on_initialize_response` and `request`
+      (states new, initializing, ready, closed; only ping before the answer; only negotiated capabilities) and
+      `PendingRequests.on_progress`, `on_response`, `cancel` and `expire` (timeouts with a maximum, cancellation
+      notifications, late responses ignored). The clock is injected, so the tests never sleep.
+    project: ai
+    files:
+      - exercises/mcp/lifecycle_session.py
+    test: tests/mcp/test_lifecycle_session.py
+    command: .venv/bin/python -m pytest tests/mcp/test_lifecycle_session.py
+    hints:
+      - "request: check the state first, then initialize-again, then the ping rule, then the capability."
+      - "on_progress: new deadline = min(now + timeout, started + max_timeout)."
+      - "expire: collect the overdue ids first, then cancel each - do not change a dict while iterating it."
+    modelAnswer: |
+      ```python
+      def on_initialize_response(self, response):
+          if self.state != "initializing":
+              raise LifecycleError(f"no initialize request is outstanding (state is '{self.state}')")
+          result = response.get("result")
+          if not isinstance(result, dict) or result.get("protocolVersion") not in self.client_supported:
+              self.state = "closed"
+              return None
+          self.protocol_version = result["protocolVersion"]
+          self.server_capabilities = result.get("capabilities") or {}
+          self.state = "ready"
+          return {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+      def expire(self):
+          now = self.clock()
+          overdue = [rid for rid, deadline in self._deadline.items() if now >= deadline]
+          return [self.cancel(rid, f"timeout after {now - self._started[rid]:g}s") for rid in overdue]
+      ```
+
+      `cancel` removes the id from the in-flight maps, remembers it in `cancelled` and returns the
+      `notifications/cancelled` message; `on_response` delivers only ids still in flight.
+    rubric:
+      - Every test in tests/mcp/test_lifecycle_session.py passes.
+      - Out-of-order and un-negotiated requests are refused with a message naming the state or capability.
+      - Progress never extends a request past its maximum timeout.
+      - Responses to cancelled or unknown ids are ignored.
+    solution: |
+      The lifecycle is a small state machine plus a table of in-flight ids - write both so that what the spec
+      forbids is impossible, not just discouraged.
+
+placement:
+  - id: place-chunks
+    type: mcq
+    concept: mcp-lifecycle-jsonrpc-stdio
+    skill: application
+    title: Reading a stdio server correctly
+    prompt: A client reads an MCP server's stdout from a pipe. Which reading strategy is correct?
+    options:
+      - id: buffer
+        text: Append each read to a byte buffer and decode every complete newline-terminated line in it
+        feedback: Correct - newline framing on bytes, decoding only complete lines.
+      - id: per-read
+        text: Decode each read() result as UTF-8 and parse it as one JSON message
+        feedback: A read can hold part of a message, several messages, or half a UTF-8 character.
+      - id: json-stream
+        text: Keep parsing until json.loads succeeds, ignoring newlines
+        feedback: The stdio binding is defined by newlines; ignoring them breaks error recovery after one bad message.
+      - id: stderr
+        text: Read stdout and stderr together, since the server may answer on either
+        feedback: Responses come only on stdout; stderr is for logs and is not an error signal.
+    correct: [buffer]
+    solution: |
+      Buffer bytes, split on newline, decode complete lines; report a bad line with -32700 and keep reading.
+
+  - id: place-probe
+    type: mcq
+    concept: mcp-lifecycle-versioning
+    skill: analysis
+    title: Modern or legacy?
+    prompt: |
+      A dual-era client probes an unknown stdio server with `server/discover`. The server answers
+      `{"jsonrpc":"2.0","id":"p1","error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25","2026-07-28"],"requested":"2027-03-01"}}}`.
+      The client supports 2027-03-01 and 2026-07-28. What next?
+    options:
+      - id: retry-2026
+        text: Retry with 2026-07-28 in _meta - the server is modern
+        feedback: Correct - -32022 identifies a modern server; 2026-07-28 is in both lists.
+      - id: initialize
+        text: Fall back to initialize with 2025-11-25
+        feedback: A recognised modern error means do not fall back - and the client does not support 2025-11-25 anyway.
+      - id: initialize-2026
+        text: Send initialize with 2026-07-28
+        feedback: 2026-07-28 has no initialize; the version travels in _meta on every request.
+      - id: abort
+        text: Abort - the server rejected the request
+        feedback: The error lists a version both sides support; the spec says select it and retry.
+    correct: [retry-2026]
+    solution: |
+      Modern error - modern server: pick the newest version in both lists and retry. Only non-modern errors or
+      silence lead to `initialize`.
+
+  - id: place-http
+    type: mcq
+    concept: mcp-lifecycle-streamable-http
+    skill: application
+    title: A Streamable HTTP request that must be refused
+    prompt: |
+      A 2026-07-28 server receives `POST /mcp` with `MCP-Protocol-Version: 2026-07-28` but a body whose `_meta`
+      protocolVersion is `2025-11-25`. What is the correct response?
+    options:
+      - id: mismatch
+        text: 400 Bad Request with JSON-RPC error -32020 (HeaderMismatch)
+        feedback: Correct - the header must match the body's version, otherwise HeaderMismatch.
+      - id: body
+        text: Serve it as 2025-11-25, since the body is the source of truth
+        feedback: The body is the source of truth, but a mismatch must be rejected so intermediaries and server never disagree.
+      - id: unsupported
+        text: 400 with -32022 listing the supported versions
+        feedback: The versions disagree with each other; that is a header mismatch, not an unsupported version.
+      - id: accepted-202
+        text: 202 Accepted
+        feedback: 202 is for an accepted notification; this is a request, and it is invalid.
+    correct: [mismatch]
+    solution: |
+      Mirrored headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) must match the body; any mismatch or
+      missing header is 400 with -32020.
+
+recall:
+  - id: recall-message-kinds
+    concept: mcp-lifecycle-jsonrpc-stdio
+    prompt: How do you tell a JSON-RPC request, notification and response apart, and what does MCP add about ids?
+    answer: Request = method + id; notification = method without id (never answered); response = id + result or error. MCP ids are strings or integers and must not be null or reused while still in flight.
+  - id: recall-stdio-rules
+    concept: mcp-lifecycle-jsonrpc-stdio
+    prompt: What are the stdio binding's framing rules?
+    answer: One JSON-RPC message per line, no embedded newlines, UTF-8; stdout carries only MCP messages, logs go to stderr; the client shuts down by closing the server's stdin.
+  - id: recall-modern-meta
+    concept: mcp-lifecycle-versioning
+    prompt: What must every 2026-07-28 request carry, and what happens if it is missing or unsupported?
+    answer: "_meta io.modelcontextprotocol/protocolVersion and clientCapabilities (clientInfo recommended). Missing: -32602 (HTTP 400). Unsupported version: -32022 with data.supported; the client retries with a common version."
+  - id: recall-probe
+    concept: mcp-lifecycle-versioning
+    prompt: How does a dual-era client tell a modern stdio server from a legacy one?
+    answer: Probe with server/discover. DiscoverResult - modern; a modern error such as -32022 - modern, retry; any other error or no answer within a timeout - legacy, fall back to initialize.
+  - id: recall-legacy-handshake
+    concept: mcp-lifecycle-versioning
+    prompt: "History: summarise the legacy initialize handshake that 2026-07-28 removed, and when a client still uses it."
+    answer: Client sends initialize (latest version, capabilities, clientInfo); server answers the same version or its latest, with its capabilities; client disconnects if it cannot speak it, else sends notifications/initialized; only pings before the answer; only negotiated capabilities afterwards. Used today only as a dual-era fallback for legacy servers.
+  - id: recall-http-headers
+    concept: mcp-lifecycle-streamable-http
+    prompt: Which headers does a Streamable HTTP request need, and what if they disagree with the body?
+    answer: MCP-Protocol-Version on every POST, Mcp-Method on every request, Mcp-Name for tools/call, resources/read and prompts/get (plus Accept with application/json and text/event-stream). A mismatch or missing header is 400 with -32020 HeaderMismatch.
+  - id: recall-cancel
+    concept: mcp-lifecycle-jsonrpc-stdio
+    prompt: How is a request cancelled on each transport, and what about late responses?
+    answer: stdio - send notifications/cancelled with the requestId; Streamable HTTP - close the request's response stream. Timeouts may be reset by progress but need a maximum; the client ignores responses that arrive after cancelling.
+
+next:
+  - building-mcp-servers
+  - building-mcp-clients
+  - mcp-security-and-authorization

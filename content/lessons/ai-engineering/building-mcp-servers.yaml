@@ -1,0 +1,1614 @@
+id: building-mcp-servers
+title: Building an MCP server
+subject: ai-engineering
+module: model-context-protocol
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Build SandPay's ledger MCP server by hand from the 2026-07-28 specification - tools with input and output schemas, the two error paths (JSON-RPC protocol errors and isError tool results), cursor pagination and cache hints, resources and URI templates, prompts, change notifications over subscriptions/listen, the stateless per-request _meta envelope and server/discover, and a newline-delimited stdio transport tested as a real subprocess. The official Python SDK (MCPServer, formerly FastMCP) and the MCP Inspector are quoted from their documentation.
+tags:
+  [
+    MCP,
+    Model Context Protocol,
+    MCP server,
+    tools/list,
+    tools/call,
+    inputSchema,
+    outputSchema,
+    structuredContent,
+    isError,
+    JSON-RPC 2.0,
+    pagination,
+    nextCursor,
+    ttlMs,
+    cacheScope,
+    resources,
+    resource templates,
+    RFC 6570,
+    prompts,
+    list_changed,
+    subscriptions/listen,
+    server/discover,
+    stateless,
+    _meta,
+    protocol version,
+    stdio,
+    newline-delimited JSON,
+    MCPServer,
+    FastMCP,
+    MCP Inspector,
+    tool annotations,
+    agents,
+    LLM,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`, standard library only (`json`, `re`, `base64`, `subprocess`),
+    pytest 9.2.0 for the exercises. Every output in this lesson was printed by the code shown, run on Linux on
+    18 November 2026. Nothing is random, so the output is the same on any machine. The code run is the reference
+    solutions of this lesson's exercises: `practice/ai/solutions/mcp/server_tools.py`, `server_resources.py` and
+    `server_stdio.py`.
+  - **No MCP SDK is installed or used.** The server is written by hand against the specification so that every
+    message is visible. The official SDK and Inspector snippets below are **quoted from their documentation, not
+    run here**.
+  - **Specification:** [Model Context Protocol, revision
+    2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) - the latest revision as documented on
+    18 November 2026 (`https://modelcontextprotocol.io/specification/latest` redirects to it, and its
+    `schema.ts` sets `LATEST_PROTOCOL_VERSION = "2026-07-28"`). Pages used: Overview, Base Protocol (messages,
+    error codes, statelessness, `_meta`), [Versioning and
+    Compatibility](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning), [Key
+    Changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog), Server Features
+    ([overview](https://modelcontextprotocol.io/specification/2026-07-28/server),
+    [Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools),
+    [Resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources),
+    [Prompts](https://modelcontextprotocol.io/specification/2026-07-28/server/prompts),
+    [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)), Utilities
+    ([Pagination](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/pagination),
+    [Caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching)), [Subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions)
+    and the [stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio);
+    the source is the [specification repository](https://github.com/modelcontextprotocol/modelcontextprotocol)
+    (`docs/specification/2026-07-28/` and `schema/2026-07-28/schema.ts`). Quotations are from those pages.
+  - **Earlier revisions differ.** 2025-11-25 and earlier start with an `initialize` handshake and use
+    `-32002` for a missing resource; they appear here only as labelled history. The Python SDK's "What's new in
+    v2" notes that 2025-era clients are, "today, ... most clients". Where this lesson says "the spec", it means
+    2026-07-28.
+  - **Standards:** [JSON-RPC 2.0](https://www.jsonrpc.org/specification);
+    [RFC 6570](https://datatracker.ietf.org/doc/html/rfc6570) URI Template (this server implements only simple
+    level-1 `{name}` expressions); JSON Schema 2020-12 (the hand-written validator covers a documented subset).
+  - **SDK and tools, from their docs, not run here (as documented on 18 November 2026):** the [MCP Python
+    SDK](https://github.com/modelcontextprotocol/python-sdk) v2 (`mcp` 2.3.0 on PyPI, Python 3.11+), its
+    [README](https://github.com/modelcontextprotocol/python-sdk/blob/main/README.md), [What's new in
+    v2](https://py.sdk.modelcontextprotocol.io/whats-new/) (`FastMCP` renamed `MCPServer`), [Handling
+    errors](https://py.sdk.modelcontextprotocol.io/servers/handling-errors/) and
+    [Testing](https://py.sdk.modelcontextprotocol.io/get-started/testing/); the [MCP
+    Inspector](https://github.com/modelcontextprotocol/inspector) v2 README. SDKs change quickly - check the
+    pages before you rely on a detail.
+  - **Synthetic data:** SandPay is a fictional payments company (`https://api.sandpay.example`). Merchants
+    `m_204` and `m_311`, payments `pay_1042`, `pay_1043` and `pay_2001`, payouts `po_1031`, `po_1039` and
+    `po_1044`, and the `sandpay://` URI scheme were invented for this lesson.
+  - **Not repeated here:** hosts, clients, servers and the three primitives in outline - [MCP
+    architecture](#/lesson/mcp-architecture); the transports and the versions in depth - [The MCP lifecycle,
+    JSON-RPC and transports](#/lesson/mcp-lifecycle-and-transports); how a model loop calls tools - [Tool use and
+    function calling](#/lesson/tool-use-and-function-calling); authorization over HTTP - [MCP security and
+    authorization](#/lesson/mcp-security-and-authorization).
+
+prerequisites:
+  - tool-use-and-function-calling
+  - mcp-architecture
+  - mcp-lifecycle-and-transports
+
+concepts:
+  - id: mcp-server-tools
+    name: Tools on an MCP server - definitions, calls, the two error paths and pagination
+    summary: A tool is a name, a description, an inputSchema (a JSON Schema object) and optionally an outputSchema and annotations. tools/list returns the definitions in a deterministic order, page by page with an opaque nextCursor, plus the cache hints ttlMs and cacheScope. tools/call validates the arguments and runs the tool. An unknown tool or a malformed request is a JSON-RPC protocol error (-32602); invalid arguments, failed API calls and broken business rules are tool execution errors - a normal result with isError true and a message the model can act on. Structured results go in structuredContent, must match the outputSchema, and are also serialised into a text block. Crashes return a generic message; details stay in the server log.
+  - id: mcp-server-resources-prompts
+    name: Resources, URI templates, prompts and change notifications
+    summary: Resources are application-controlled context named by URIs - fixed ones in resources/list, parameterised ones as RFC 6570 URI templates in resources/templates/list, and contents from resources/read. A missing resource is JSON-RPC error -32602 with the URI in data, never an empty contents array, and every URI is validated before use. Prompts are user-controlled templates (slash commands) whose arguments are named strings; missing required arguments are -32602. In 2026-07-28 change notifications flow only on a subscriptions/listen stream the client opened with a filter - the server acknowledges the subset it honours and tags every notification with the listen request's id as io.modelcontextprotocol/subscriptionId.
+  - id: mcp-server-stateless-stdio
+    name: The stateless envelope, server/discover and the stdio transport
+    summary: In 2026-07-28 there is no initialize handshake and no session - every request carries its protocol version and client capabilities (required) and client info (optional) in params._meta, the server checks them on every request (-32602 if missing, -32022 UnsupportedProtocolVersion listing the supported versions if unknown) and never relies on earlier requests. Results carry resultType and SHOULD carry serverInfo in _meta. server/discover is mandatory. Over stdio the server reads one JSON-RPC message per line from stdin, writes one per line to stdout with no embedded newlines and nothing else, logs to stderr, answers no notification, and exits when stdin closes - which is also how you test it as a real subprocess.
+
+objectives:
+  - Write MCP tool definitions with input and output schemas and annotations, and return tools/list pages with a deterministic order, an opaque cursor and cache hints.
+  - Decide for any failure whether a server returns a JSON-RPC protocol error or an isError tool result, and justify the choice.
+  - Implement resources/read for fixed URIs and RFC 6570 templates with URI validation and the specified not-found error.
+  - Implement prompts/list and prompts/get with required-argument checks, and emit list_changed and resources/updated notifications only on subscriptions that asked for them.
+  - Validate the per-request _meta of the 2026-07-28 revision, implement server/discover, and answer legacy initialize requests with a useful error.
+  - Build a newline-delimited stdio server and test it in memory and as a real subprocess, including notifications, parse errors and shutdown on end of input.
+  - Map a hand-written server to the official Python SDK's MCPServer decorators and its in-memory test client.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: The idea in plain language
+    body: |
+      SandPay's support team wants its AI assistant to look up payments, read the payout schedule and issue small
+      refunds. They also use two other assistants - one in the IDE, one in a chat app - and would like all three
+      to reach the ledger the same way. Writing a custom plug-in for each assistant would mean three integrations
+      to build, secure and test.
+
+      An **MCP server** is the ledger's single, standard socket. Any MCP client - inside any host application -
+      can plug into it and ask three kinds of question:
+
+      - **"What can you do?"** - the server lists **tools** such as `get_payment` and `refund_payment`, each with a
+        JSON Schema for its arguments. The model picks a tool; the client calls it; the server runs it.
+      - **"What can I read?"** - the server lists **resources** such as `sandpay://docs/refund-policy` and the
+        template `sandpay://merchants/{merchant_id}/payouts`. The application decides what to read and put in
+        context.
+      - **"What templates do you offer the user?"** - **prompts** such as `summarise_payouts`, which a person
+        picks from a menu like a slash command.
+
+      Think of a restaurant kitchen with a pass. The waiter (the client) does not cook; it reads the menu (lists),
+      places an order (a call) and carries back the plate (a result). If the order is for a dish that does not
+      exist, the pass refuses the ticket (a protocol error). If the kitchen is out of salmon, the plate comes back
+      with a note - "out of salmon, try the trout" - that the diner can act on (a tool result with `isError`).
+
+      The 2026-07-28 revision adds one more rule that shapes every line of the server: **each order ticket is
+      complete on its own.** The waiter writes the protocol version and what it can handle on every ticket; the
+      kitchen never remembers anything about the waiter between tickets. That makes the server simple to scale
+      and simple to test: feed it one line of JSON, read one line back.
+
+  - id: what
+    kind: what
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: Terms you need
+    body: |
+      | Term | Meaning (MCP 2026-07-28) | In this lesson's server |
+      | --- | --- | --- |
+      | **Server** | "Services that provide context and capabilities" to clients inside a host | `ToolServer`, `ResourceServer`, `server_stdio.py` |
+      | **Tool** | "Executable functions that allow models to perform actions or retrieve information"; model-controlled | `get_payment`, `refund_payment`, `list_merchant_payments` |
+      | **`inputSchema` / `outputSchema`** | JSON Schema (default dialect 2020-12) for the arguments / for `structuredContent` | `{"type": "object", ...}` per tool |
+      | **Annotations** | hints such as `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` - untrusted unless the server is trusted | `get_payment` is read-only |
+      | **Tool execution error** | a normal result with `isError: true` - "actionable feedback that language models can use to self-correct" | refund too large, bad id format |
+      | **Protocol error** | a JSON-RPC `error` - unknown tool, malformed request, server error | `-32602 Unknown tool: delete_ledger` |
+      | **Resource** | "Structured data or content that provides additional context"; application-controlled; named by a URI | `sandpay://docs/refund-policy` |
+      | **Resource template** | a parameterised resource described by an RFC 6570 URI template | `sandpay://merchants/{merchant_id}/payouts` |
+      | **Prompt** | "Pre-defined templates or instructions"; user-controlled, for example slash commands | `summarise_payouts` |
+      | **Cursor** | an opaque string for the next page of a list; clients must not parse it | `dG9vbHM6Mg==` |
+      | **`ttlMs` / `cacheScope`** | how long a list or read result may be considered fresh, and whether a shared cache may keep it (`public`) or only the same authorization context (`private`) | tool list public, payouts private |
+      | **`resultType`** | required on every result: `"complete"`, or `"input_required"` for a multi round-trip request | always `"complete"` here |
+      | **`_meta`** | per-request metadata; 2026-07-28 puts the protocol version, client capabilities and client info there | checked by `check_meta` |
+      | **`server/discover`** | the RPC every server MUST implement: supported versions, capabilities, identity, instructions | `discover()` |
+      | **`subscriptions/listen`** | a long-lived request whose response stream carries the change notifications the client asked for | `listen()` |
+      | **stdio transport** | the client starts the server as a subprocess; newline-delimited JSON-RPC on stdin/stdout | `serve()` |
+
+      MCP messages are [JSON-RPC 2.0](https://www.jsonrpc.org/specification) **requests** (with an `id`),
+      **responses** (a `result` or an `error` with the same `id`) and **notifications** (no `id`, never
+      answered). MCP adds that a request id "MUST NOT be `null`".
+
+  - id: why
+    kind: why
+    concepts: [mcp-server-tools, mcp-server-stateless-stdio]
+    title: Why build a server, and why by hand first
+    body: |
+      **The problem MCP solves** is the many-to-many integration. Without a standard, every AI application needs
+      its own connector to every system. With MCP, SandPay writes one server and every MCP-capable host can use
+      it; each host writes one client and can use every server. The specification's overview compares this to the
+      Language Server Protocol, which did the same for editors and programming languages.
+
+      **Why the details matter to an engineer or tester.** The server is where a model's guess meets real money:
+
+      - The model chooses tool names and arguments. If the server does not validate them, a hallucinated
+        `amount_minor` reaches the ledger. The spec's Tools page says servers **MUST** "validate all tool inputs",
+        "implement proper access controls", "rate limit tool invocations" and "sanitize tool outputs".
+      - The *kind* of error decides whether the agent can recover. A tool execution error goes back to the model,
+        which can correct itself; a protocol error usually goes to the host, and the model learns nothing.
+      - A stdio server that prints one debug line to stdout corrupts the stream: the spec says the server "MUST
+        NOT write anything to its `stdout` that is not a valid MCP message".
+      - 2026-07-28 removed the handshake. A server written for the older, session-based revisions that remembers
+        capabilities from an earlier request now breaks a MUST NOT.
+
+      **Why by hand first.** The official SDKs hide all of this - which is exactly what you want in production
+      and exactly what you do not want while learning or debugging. When a client says "the server returned
+      -32022" or a host shows nothing after a tool call, you need to know what the wire looked like. The
+      exercises build each layer in plain Python; a later code section then shows the same server
+      with the Python SDK so you can see what it does for you.
+
+  - id: internals-tools
+    kind: internals
+    concepts: [mcp-server-tools]
+    title: Tools - listing, calling and the two error paths
+    body: |
+      **Declaring support.** A server with tools declares the `tools` capability (in its `server/discover`
+      result); `listChanged: true` adds that it will send change notifications. A server that declares it "MUST
+      respond to `tools/list` requests with the set of tools currently available to the requesting client". That
+      set "MAY vary by the authorization presented on the request" but "MUST NOT vary per-connection or as a side
+      effect of other requests on the connection".
+
+      **Listing.** Servers "SHOULD return tools in a deterministic order" - stable order lets clients cache the
+      list and "improves LLM prompt cache hit rates when tools are included in model context". The list is
+      paginated: the server picks the page size, adds `nextCursor` when more remain, and the client sends it back
+      as `params.cursor`. Clients "MUST treat cursors as opaque tokens", and the server "SHOULD" answer an invalid
+      cursor with `-32602`. Every complete list result also carries the cache hints `ttlMs` (milliseconds the
+      result may be considered fresh, `>= 0`) and `cacheScope` (`"public"` or `"private"`).
+
+      The reference `list_tools` sorts by name and encodes the offset as an opaque cursor. Real output, two tools
+      per page:
+
+      ```plaintext
+      page 1: ['get_payment', 'list_merchant_payments'] nextCursor = dG9vbHM6Mg==
+      page 2: ['refund_payment'] False
+      bad cursor -> {"code": -32602, "message": "Invalid cursor"}
+      ```
+
+      (`dG9vbHM6Mg==` is base64 for `tools:2`. The client must not know or care.)
+
+      **Tool names** SHOULD be 1-128 characters from `A-Z a-z 0-9 _ - .`, case-sensitive and unique within the
+      server. Names are not unique across servers - a client that aggregates several servers "SHOULD implement a
+      disambiguation strategy such as prefixing tool names with a server identifier".
+
+      **Calling.** `tools/call` carries `name` and `arguments` (an object). The spec sorts failures into two
+      mechanisms:
+
+      | Failure | Mechanism | Who sees it |
+      | --- | --- | --- |
+      | unknown tool, malformed request (not a valid `CallToolRequest`), server errors | **protocol error**: JSON-RPC `error`, for example `-32602` | the client; "Clients MAY provide protocol errors to language models, though these are less likely to result in successful recovery" |
+      | API failures, input validation errors ("date in wrong format, value out of range"), business logic errors | **tool execution error**: a result with `isError: true` | the model; "Clients SHOULD provide tool execution errors to language models to enable self-correction" |
+
+      Real output from the reference server:
+
+      ```plaintext
+      refund_payment -> {"resultType": "complete", "content": [{"type": "text", "text": "Refund of 9000 exceeds the refundable 8400 (EUR minor units) on pay_1042."}], "isError": true}
+      refund_payment -> {"resultType": "complete", "content": [{"type": "text", "text": "Invalid arguments for refund_payment: arguments.payment_id: does not match ^pay_[0-9]{4,8}$; arguments.amount_minor: less than 1"}], "isError": true}
+      delete_ledger -> ProtocolError {"code": -32602, "message": "Unknown tool: delete_ledger"}
+      ```
+
+      **Structured results.** If a tool has an `outputSchema`, "Servers MUST provide structured results that
+      conform to this schema" and clients SHOULD validate them. `structuredContent` "can be any JSON value". For
+      backwards compatibility "a tool that returns structured content SHOULD also return the serialized JSON in a
+      TextContent block":
+
+      ```plaintext
+      get_payment -> {"resultType": "complete", "content": [{"type": "text", "text": "{\"amount_minor\": 8400, \"currency\": \"EUR\", \"id\": \"pay_1042\", \"merchant_id\": \"m_204\", \"refunded_minor\": 0, \"status\": \"captured\"}"}], "structuredContent": {"id": "pay_1042", "merchant_id": "m_204", "amount_minor": 8400, "currency": "EUR", "status": "captured", "refunded_minor": 0}, "isError": false}
+      ```
+
+      If the server's own output breaks its `outputSchema`, that is the server's bug, not something the model can
+      fix - the reference raises a `-32603` protocol error and logs it. A tool that **crashes** (an unexpected
+      exception) returns `isError: true` with a generic message - "Tool get_report failed with an internal
+      error" - and the exception text goes only to the server's log, because a `KeyError` or SQL text may
+      describe internals.
+
+      **Content types** besides text: `image` and `audio` (base64 `data` plus `mimeType`), `resource_link` (a URI
+      the client can read) and `resource` (an embedded resource). All accept annotations (`audience`,
+      `priority`, `lastModified`).
+
+      **Annotations are hints.** `schema.ts` says all `ToolAnnotations` properties are hints and "Clients should
+      never make tool use decisions based on `ToolAnnotations` received from untrusted servers". Defaults:
+      `readOnlyHint` false, `destructiveHint` true, `idempotentHint` false, `openWorldHint` true - so an
+      unannotated tool is assumed to be the riskiest kind.
+
+  - id: internals-resources
+    kind: internals
+    concepts: [mcp-server-resources-prompts]
+    title: Resources, templates, prompts and notifications
+    body: |
+      **Resources** are "application-driven": the host decides what to read - from a picker, a search, or
+      heuristics. Each has a `uri`, a `name`, and optionally `title`, `description`, `mimeType`, `size`, icons and
+      annotations. Three methods:
+
+      - `resources/list` - the fixed resources, paginated and cacheable.
+      - `resources/templates/list` - URI templates ([RFC 6570](https://datatracker.ietf.org/doc/html/rfc6570)),
+        for resources there are too many of to list, such as one payouts feed per merchant.
+      - `resources/read` with `params.uri` - returns `contents`, each with the `uri`, a `mimeType` and either
+        `text` or a base64 `blob`. One read MAY return several contents (a directory, for example).
+
+      A template only describes a *shape*. Matching `sandpay://merchants/m_999/payouts` against
+      `sandpay://merchants/{merchant_id}/payouts` says the URI is well-formed, not that merchant `m_999` exists -
+      your code must answer that. The spec's error rule for 2026-07-28: "If the requested resource does not exist,
+      servers MUST return a JSON-RPC error with code `-32602` (Invalid Params)", and "MUST NOT return an empty
+      `contents` array for a non-existent resource" (an empty array is ambiguous). Earlier revisions used
+      `-32002`, so clients "SHOULD also accept" it. Security: servers "MUST validate all resource URIs" and "MUST
+      sanitize file paths to prevent directory traversal attacks when serving `file://` resources".
+
+      Real output:
+
+      ```plaintext
+      read: {"resultType": "complete", "contents": [{"uri": "sandpay://merchants/m_204/payouts", "mimeType": "application/json", "text": "[{\"amount_minor\": 120500, \"currency\": \"EUR\", \"id\": \"po_1039\", \"status\": \"paid\"}, {\"amount_minor\": 98000, \"currency\": \"EUR\", \"id\": \"po_1031\", \"status\": \"paid\"}]"}], "ttlMs": 60000, "cacheScope": "private"}
+      read sandpay://merchants/m_999/payouts -> {"code": -32602, "message": "Resource not found", "data": {"uri": "sandpay://merchants/m_999/payouts"}}
+      read sandpay://docs/..%2F..%2Fetc%2Fpasswd -> {"code": -32602, "message": "Resource not found", "data": {"uri": "sandpay://docs/..%2F..%2Fetc%2Fpasswd"}}
+      ```
+
+      Note the cache scope. The Caching page: `"public"` means the response "does not contain user-specific data"
+      and any shared gateway may serve it to any user; `"private"` means caches "MUST NOT be shared across
+      authorization contexts". A merchant's payouts are private; the refund policy is public. The same page warns
+      that servers "MUST NOT rely on `cacheScope` alone to prevent unauthorized access".
+
+      **Prompts** are "user-controlled" - "Interactive templates invoked by user choice", typically slash
+      commands. `prompts/list` returns `name`, optional `title`, `description` and `arguments` (`name`,
+      `description`, `required`). `prompts/get` takes `name` and `arguments` - in `schema.ts` a map of string to
+      **string** - and returns `messages` with a `role` (`user` or `assistant`) and content. Errors: invalid prompt
+      name and missing required arguments are both `-32602`.
+
+      ```plaintext
+      prompt: {"resultType": "complete", "description": "Summarise one merchant's recent payouts for a support reply.", "messages": [{"role": "user", "content": {"type": "text", "text": "Summarise the recent payouts of SandPay merchant m_204 in formal language. Use only the payouts resource for that merchant."}}]}
+      prompt missing -> {"code": -32602, "message": "Missing required arguments", "data": {"missing": ["merchant_id"]}}
+      ```
+
+      **Change notifications.** In 2026-07-28 a client that wants them sends `subscriptions/listen` with a
+      `notifications` filter: `toolsListChanged`, `promptsListChanged`, `resourcesListChanged` (booleans) and
+      `resourceSubscriptions` (URIs). The rules the reference `listen` follows:
+
+      - "The server MUST NOT send notification types the client has not explicitly requested."
+      - The first message MUST be `notifications/subscriptions/acknowledged`, whose `notifications` field "reflects
+        the subset the server agreed to honor".
+      - Every notification on the stream carries `io.modelcontextprotocol/subscriptionId` in `_meta` - the JSON-RPC
+        id of the `subscriptions/listen` request. On stdio, where everything shares one channel, clients MUST use
+        it to tell subscriptions apart.
+
+      A server with no tools cannot honour `toolsListChanged`, and a URI it cannot read is not worth watching:
+
+      ```plaintext
+      ack: {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 7}, "notifications": {"promptsListChanged": true, "resourceSubscriptions": ["sandpay://merchants/m_204/payouts"]}}}
+      sent: {"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 7}, "uri": "sandpay://merchants/m_204/payouts"}}
+      sent: {"jsonrpc": "2.0", "method": "notifications/prompts/list_changed", "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 7}}}
+      ```
+
+      A notification is a hint to re-fetch, not the data: on `resources/updated` the client reads the URI again; on
+      `list_changed` it lists again. The Caching page adds that a notification received while a cached result is
+      still fresh "invalidates the cached response".
+
+  - id: internals-envelope
+    kind: internals
+    concepts: [mcp-server-stateless-stdio]
+    title: The stateless envelope and the stdio transport
+    body: |
+      **No handshake.** The 2026-07-28 changelog: "Make MCP stateless: remove the `initialize`/`notifications/initialized`
+      handshake. Every request now carries its protocol version and client capabilities in `_meta`." The Base
+      Protocol page lists the per-request fields:
+
+      | `_meta` key | Required |
+      | --- | --- |
+      | `io.modelcontextprotocol/protocolVersion` | yes |
+      | `io.modelcontextprotocol/clientCapabilities` | yes |
+      | `io.modelcontextprotocol/clientInfo` | no (clients SHOULD send it) |
+      | `io.modelcontextprotocol/logLevel` | no |
+
+      "A request missing any required field is malformed; the server MUST reject it with JSON-RPC error code
+      `-32602`." A version the server does not implement gets `UnsupportedProtocolVersionError`, code `-32022`,
+      with `data.supported` and `data.requested`, and the client "SHOULD select a mutually supported version from
+      the `supported` list and retry". Servers "MUST NOT rely on prior requests over the same connection to
+      establish context (e.g., capabilities, protocol version, client identity)". If the server needs a capability
+      the client did not declare on *this* request, it returns `MissingRequiredClientCapabilityError` (`-32021`).
+
+      Results: every result "MUST include a `resultType`"; servers "SHOULD include"
+      `io.modelcontextprotocol/serverInfo` in each result's `_meta`. Client and server info are "self-reported" and
+      "SHOULD NOT" drive security decisions.
+
+      **`server/discover`** "Servers MUST implement" it: `supportedVersions`, `capabilities`, `serverInfo` in
+      `_meta`, optional `instructions` for the model, and the cache hints. Clients MAY call it first - and on
+      stdio a client that also supports older servers SHOULD, as a probe: a `DiscoverResult` or a recognised
+      modern error means a modern server; any other error or a timeout means a legacy one, and the client falls
+      back to `initialize`.
+
+      **Legacy clients.** The Versioning page: a modern-only server "SHOULD name the protocol versions it supports
+      in any error it returns to an `initialize` request ... legacy clients have no fall-forward mechanism, and this
+      message may be the only diagnostic they can surface to users." The exact error code is implementation-defined;
+      the reference uses `-32602`.
+
+      **stdio framing** (the stdio transport page):
+
+      - "The server reads JSON-RPC messages from `stdin` and writes JSON-RPC messages to `stdout`."
+      - "Messages are delimited by newlines, and MUST NOT contain embedded newlines." `json.dumps` without
+        `indent` never emits a raw newline (a newline inside a string is escaped as `\n`).
+      - "The server MAY write UTF-8 strings to `stderr` for any logging purposes" and "MUST NOT write anything to
+        its `stdout` that is not a valid MCP message."
+      - "The server MUST NOT write JSON-RPC requests to `stdout`" - server-to-client questions travel inside
+        results (the multi round-trip pattern), not as requests.
+      - Shutdown: the client closes the server's stdin, waits, then escalates (on POSIX `SIGTERM`, then `SIGKILL`).
+        "Servers SHOULD exit promptly when their standard input is closed."
+
+      The reference server run from a terminal, with a file of six lines (a discover, a tool call, a request at
+      the old version, a legacy `initialize`, a notification and a line that is not JSON), stdout only:
+
+      ```bash
+      .venv/bin/python solutions/mcp/server_stdio.py < requests.jsonl 2>/dev/null
+      ```
+
+      ```plaintext
+      {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"SandPay ledger tools. Amounts are integers in minor units (cents); ids look like m_204.","ttlMs":3600000,"cacheScope":"public","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sandpay-ledger","version":"0.3.0"}}}}
+      {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"{\"available_minor\": 312050, \"currency\": \"EUR\"}"}],"structuredContent":{"available_minor":312050,"currency":"EUR"},"isError":false,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"sandpay-ledger","version":"0.3.0"}}}}
+      {"jsonrpc":"2.0","id":3,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"],"requested":"2025-11-25"}}}
+      {"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"This server speaks MCP 2026-07-28 only and has no initialize handshake","data":{"supported":["2026-07-28"]}}}
+      {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+      ```
+
+      Five responses for six lines: the notification got none. Its stderr, separately:
+
+      ```plaintext
+      server/discover -> ok
+      tools/call -> ok
+      tools/list -> error -32022
+      initialize -> error -32602
+      notifications/cancelled (notification)
+      parse error
+      ```
+
+      Exit status 0: the loop ended when stdin reached end of file.
+
+  - id: when
+    kind: when
+    concepts: [mcp-server-tools, mcp-server-resources-prompts]
+    title: Which primitive, and when not to write a server
+    body: |
+      The spec's control hierarchy decides the primitive:
+
+      | You want to... | Use | Because |
+      | --- | --- | --- |
+      | let the model act or fetch on its own judgement (look up a payment, issue a refund) | **tool** | "Model-controlled" |
+      | give the application data it can choose to put in context (policies, a merchant's payouts) | **resource** | "Application-controlled" |
+      | give the person a ready-made task to start (summarise payouts, draft a dispute reply) | **prompt** | "User-controlled" |
+
+      Grey areas: data the model should fetch itself mid-task is better as a read-only tool *and* a resource; a tool
+      can also return a `resource_link` so the client can read the full content.
+
+      **When an MCP server is the wrong tool:**
+
+      - One application, one model provider, two functions: the provider's native tool use is simpler (see [Tool use
+        and function calling](#/lesson/tool-use-and-function-calling)). MCP pays off when several hosts or several
+        teams share an integration.
+      - A bulk data pipeline: MCP is for interactive context and actions, not moving millions of rows.
+      - Anything that needs a guarantee the protocol does not give - for example, that a person approved a refund.
+        The spec says hosts SHOULD keep "a human in the loop with the ability to deny tool invocations"; your server
+        must still enforce limits itself (see [MCP security and authorization](#/lesson/mcp-security-and-authorization)).
+
+      **Hand-written vs SDK.** Use an official SDK for real servers: it validates against the schema, handles both
+      protocol eras and the transports, and is tested by its maintainers. Write by hand to learn, to debug what the
+      SDK sends, or in a language without an SDK - and then test it against the spec as the exercises do.
+
+  - id: visual
+    kind: visual
+    concepts: [mcp-server-tools, mcp-server-stateless-stdio]
+    title: One request through the server
+    body: |
+      ```mermaid
+      flowchart TD
+        L[line from stdin] --> P{valid JSON?}
+        P -->|no| PE[error -32700, id null]
+        P -->|yes| R{jsonrpc 2.0, method a string?}
+        R -->|no| IR[error -32600]
+        R -->|yes| N{has an id?}
+        N -->|no: notification| X[no response]
+        N -->|yes| M{_meta has version and capabilities?}
+        M -->|no| IP[error -32602]
+        M -->|yes| V{version supported?}
+        V -->|no| UV[error -32022 with supported list]
+        V -->|yes| D{method known?}
+        D -->|no| MN[error -32601]
+        D -->|tools/call| T{tool known, params well-formed?}
+        T -->|no| TP[protocol error -32602]
+        T -->|yes| A{arguments valid, tool succeeds?}
+        A -->|no| TE[result with isError true]
+        A -->|yes| OK[result, resultType complete, serverInfo in _meta]
+        PE & IR & IP & UV & MN & TP & TE & OK --> W[one JSON line to stdout]
+      ```
+
+      Notice where each failure ends: everything above the tool call is a JSON-RPC `error`; only failures **inside**
+      the tool's execution become a `result` with `isError` - and those are the ones the model reads.
+
+  - id: code-tools
+    kind: code
+    concepts: [mcp-server-tools]
+    title: "server_tools.py: list and call"
+    body: |
+      The core of the reference solution (validator, tool definitions and docstrings omitted - see
+      `practice/ai/solutions/mcp/server_tools.py`):
+
+      ```python
+      def list_tools(self, params=None):
+          params = params or {}
+          offset = decode_cursor(params["cursor"]) if "cursor" in params else 0
+          names = sorted(self.tools)
+          if offset > len(names):
+              raise ProtocolError(INVALID_PARAMS, "Invalid cursor")
+          page = names[offset : offset + self.page_size]
+          result = {"resultType": "complete", "tools": [self.tools[n].definition() for n in page]}
+          if offset + self.page_size < len(names):
+              result["nextCursor"] = encode_cursor(offset + self.page_size)
+          result["ttlMs"] = self.ttl_ms
+          result["cacheScope"] = "public"
+          return result
+
+      def call_tool(self, params):
+          if not isinstance(params, dict) or not isinstance(params.get("name"), str):
+              raise ProtocolError(INVALID_PARAMS, "tools/call needs params.name (a string)")
+          name = params["name"]
+          arguments = params.get("arguments", {})
+          if not isinstance(arguments, dict):
+              raise ProtocolError(INVALID_PARAMS, "tools/call params.arguments must be an object")
+          tool = self.tools.get(name)
+          if tool is None:
+              raise ProtocolError(INVALID_PARAMS, f"Unknown tool: {name}")
+
+          problems = validate(tool.input_schema, arguments)
+          if problems:
+              return _error_result(f"Invalid arguments for {name}: " + "; ".join(problems))
+          try:
+              value = tool.handler(**arguments)
+          except ToolError as exc:
+              return _error_result(str(exc))
+          except Exception as exc:
+              self.crashes.append(f"{name}: {type(exc).__name__}: {exc}")
+              print(f"tool {name} crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
+              return _error_result(f"Tool {name} failed with an internal error")
+
+          if tool.output_schema is not None:
+              problems = validate(tool.output_schema, value, "structuredContent")
+              if problems:
+                  self.crashes.append(f"{name}: output does not match outputSchema: " + "; ".join(problems))
+                  raise ProtocolError(INTERNAL_ERROR, f"Tool {name} returned output that does not match its outputSchema")
+              text = json.dumps(value, sort_keys=True)
+              return {"resultType": "complete", "content": [{"type": "text", "text": text}],
+                      "structuredContent": value, "isError": False}
+          text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+          return {"resultType": "complete", "content": [{"type": "text", "text": text}], "isError": False}
+      ```
+
+      A tool definition as `tools/list` shows it (from `sandpay_tools`):
+
+      ```json
+      {
+        "name": "refund_payment",
+        "title": "Refund a payment",
+        "description": "Refund part or all of a captured SandPay payment. Moves money and cannot be undone; amount_minor is in minor units (cents).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "payment_id": {"type": "string", "pattern": "^pay_[0-9]{4,8}$", "description": "SandPay payment id, e.g. pay_1042."},
+            "amount_minor": {"type": "integer", "minimum": 1, "description": "Amount in minor units."}
+          },
+          "required": ["payment_id", "amount_minor"],
+          "additionalProperties": false
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false}
+      }
+      ```
+
+      `destructiveHint: false` - a refund is an additive update to the ledger; `idempotentHint: false` - calling it
+      twice refunds twice. The spec recommends `{"type": "object", "additionalProperties": false}` for a tool with
+      no parameters.
+
+  - id: official-sdk
+    kind: code
+    concepts: [mcp-server-tools, mcp-server-resources-prompts]
+    title: The same ideas in the official Python SDK (from the docs, not run here)
+    collapsed: true
+    body: |
+      The [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) v2 implements 2026-07-28 and serves
+      older clients too. Its README's server, quoted as published (`FastMCP` from v1 is `MCPServer` in v2):
+
+      ```python
+      from mcp.server import MCPServer
+
+      mcp = MCPServer("Demo")
+
+
+      @mcp.tool()
+      def add(a: int, b: int) -> int:
+          """Add two numbers."""
+          return a + b
+
+
+      @mcp.resource("greeting://{name}")
+      def greeting(name: str) -> str:
+          """Greet someone by name."""
+          return f"Hello, {name}!"
+      ```
+
+      What the decorators do for you, mapped to this lesson's code:
+
+      | You wrote by hand | The SDK, per its docs |
+      | --- | --- |
+      | `inputSchema` dicts and `validate` | the schema comes from type hints ("`a: int, b: int` _is_ the schema"); bad arguments are rejected "before calling you, as the same kind of `is_error=True` tool error" |
+      | `raise ToolError(...)` -> `isError` result | `raise ToolError(...)` from `mcp.server.mcpserver.exceptions` - "the call returns `is_error=True` with your message in `content`" |
+      | `raise ProtocolError(...)` -> JSON-RPC error | `raise MCPError(code, message, data)` - "the call itself fails with a JSON-RPC error" |
+      | generic message for crashes | any other exception -> "`is_error=True` with only `Error executing tool <name>`", traceback logged at `ERROR` |
+      | `not_found(uri)` | `ResourceNotFoundError` -> "`-32602` with the requested URI in `data`" |
+      | prompt templates | `@mcp.prompt()` on a function returning the text; parameters without defaults are required |
+
+      The SDK's docs give one rule for choosing: "**could a smarter model have avoided this?** Yes -> `ToolError`.
+      No -> `MCPError`." They also warn: "Never `return` an error message from a tool. A returned string has
+      `is_error=False`".
+
+      **Testing in memory.** The SDK's `Client` connects to the server object itself, with no subprocess - from the
+      Testing page:
+
+      ```python
+      @pytest.fixture
+      async def client():
+          async with Client(mcp, raise_exceptions=True) as c:
+              yield c
+
+
+      @pytest.mark.anyio
+      async def test_call_add_tool(client: Client):
+          result = await client.call_tool("add", {"a": 1, "b": 2})
+      ```
+
+      **The MCP Inspector** is the interactive test client. Per its README, one package provides a web UI, a CLI
+      and a TUI:
+
+      ```bash
+      npx @modelcontextprotocol/inspector         # web UI (default)
+      npx @modelcontextprotocol/inspector --cli   # CLI
+      ```
+
+      and the Python SDK's README opens a server in it with `uv run mcp dev server.py` (the `mcp[cli]` extra).
+      Point it at `python solutions/mcp/server_stdio.py` to see your hand-written server through someone else's
+      client - check the Inspector's docs for the current flags.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [mcp-server-stateless-stdio]
+    title: "server_stdio.py: the envelope, line by line"
+    body: |
+      ```python
+      def handle(message):
+          if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or not isinstance(message.get("method"), str):
+              rid = message.get("id") if isinstance(message, dict) else None
+              if isinstance(rid, bool) or not isinstance(rid, (str, int)):
+                  rid = None
+              return error_response(rid, INVALID_REQUEST, "Invalid Request")
+          if "id" not in message:
+              return None
+          rid = message["id"]
+          if isinstance(rid, bool) or not isinstance(rid, (str, int)):
+              return error_response(None, INVALID_REQUEST, "Invalid Request: id must be a string or an integer")
+          params = message.get("params", {})
+          if not isinstance(params, dict):
+              return error_response(rid, INVALID_PARAMS, "params must be an object")
+          method = message["method"]
+          if method == "initialize":
+              ...  # -32602 naming the supported versions
+          try:
+              check_meta(params)
+              if method not in METHODS:
+                  raise RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")
+              result = METHODS[method](params)
+          except RpcError as exc:
+              return error_response(rid, exc.code, exc.message, exc.data)
+          except Exception as exc:
+              print(f"internal error in {method}: {type(exc).__name__}: {exc}", file=sys.stderr)
+              return error_response(rid, INTERNAL_ERROR, "Internal error")
+          return {"jsonrpc": "2.0", "id": rid,
+                  "result": {"resultType": "complete", **result, "_meta": {SERVER_INFO_KEY: SERVER_INFO}}}
+      ```
+
+      - **The first `if`** - JSON-RPC's "Invalid Request". The id is echoed only when it is usable; JSON-RPC lets an
+        error carry a null id when the request's id cannot be read.
+      - **`isinstance(rid, bool)`** - in Python `True` is an `int`, but JSON `true` is not a valid id. MCP also
+        forbids `null`.
+      - **`"id" not in message`** - a notification. The receiver "MUST NOT send a response" - not even an error for
+        an unknown method. This check comes before any validation that would produce an error.
+      - **`initialize` before `check_meta`** - a legacy client sends no `_meta`; without this branch it would get a
+        generic "missing `_meta`" error instead of the versions it needs to show the user.
+      - **`check_meta` on every request** - statelessness: no result of an earlier request is trusted.
+      - **`except Exception`** - the client gets `-32603` and nothing else; the detail goes to stderr, which the
+        spec reserves for logs.
+      - **The success line** - `resultType` is required on every result; `serverInfo` in `_meta` lets the client
+        log who answered without a handshake.
+
+      And the loop that makes it a stdio server:
+
+      ```python
+      def serve(inp, out, err):
+          written = 0
+          for line in inp:
+              if not line.strip():
+                  continue
+              try:
+                  message = json.loads(line)
+              except json.JSONDecodeError:
+                  response = error_response(None, PARSE_ERROR, "Parse error")
+                  print("parse error", file=err)
+              else:
+                  response = handle(message)
+                  ...  # one log line per message to err
+              if response is not None:
+                  out.write(json.dumps(response, separators=(",", ":")) + "\n")
+                  out.flush()
+                  written += 1
+          return written
+      ```
+
+      - **`for line in inp`** ends at end of file, so the server exits when the client closes stdin - the spec's
+        "primary graceful-shutdown signal".
+      - **`json.dumps(..., separators=...)`** - compact, one line. `indent=2` would break the framing.
+      - **`out.flush()`** - without it, the response can sit in a buffer while the client waits for it.
+
+  - id: steps
+    kind: steps
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: Building a server, step by step
+    body: |
+      1. **List what the server exposes and who controls each item.** Model decides -> tool; application decides ->
+         resource; person decides -> prompt. Write one sentence per tool saying what it does and what it must never
+         do.
+      2. **Write the schemas.** Every tool: an object `inputSchema` with `required`, formats (`pattern`), ranges and
+         `additionalProperties: false`; an `outputSchema` when the result is data. Add annotations honestly.
+      3. **Write descriptions for the model** - when to use the tool, units (minor units), side effects ("moves
+         money and cannot be undone"). The model sees nothing else.
+      4. **Implement the handlers with the two error paths.** Validation and business failures -> `isError` results
+         with a sentence the model can act on; unknown names and malformed requests -> protocol errors; crashes ->
+         a generic message plus a log line.
+      5. **Implement lists** with deterministic order, cursors and cache hints (`public` unless the content depends
+         on the caller).
+      6. **Implement resources and prompts**, validating every URI and argument; `-32602` with the URI for a
+         missing resource.
+      7. **Wrap it in the envelope**: per-request `_meta` checks, `server/discover`, `resultType`, `serverInfo`,
+         a helpful error for `initialize`.
+      8. **Pick the transport.** stdio for a local server the host starts; Streamable HTTP for a remote one (and then
+         authorization - see [MCP security and authorization](#/lesson/mcp-security-and-authorization)).
+      9. **Test at three levels**: functions directly; the envelope in memory (`handle`, `serve` with `StringIO`);
+         the process over real pipes. Then look at it through a second client such as the Inspector.
+
+  - id: example
+    kind: example
+    concepts: [mcp-server-tools, mcp-server-resources-prompts]
+    title: "Example: reviewing SandPay's ledger server before release"
+    body: |
+      A tester gets the ledger server two days before it is added to the support assistant. What they check, and the
+      evidence for each:
+
+      | Check | How | Evidence |
+      | --- | --- | --- |
+      | the model cannot refund more than was captured | `tools/call refund_payment` with 9000 on an 8400 payment | `isError: true` with the refundable amount; ledger unchanged |
+      | a refund on an authorised (uncaptured) payment is refused | `pay_1043`, amount 100 | `isError` "only captured payments can be refunded" |
+      | a hallucinated tool name does not reach any handler | `tools/call delete_ledger` | JSON-RPC `-32602 Unknown tool: delete_ledger`; handler spies empty |
+      | bad arguments never reach the ledger | `payment_id: "1042"`, `amount_minor: 0`, an extra field | one `isError` listing all three problems; spy empty |
+      | crashes do not leak internals | force a `KeyError` with SQL text in it | client sees "failed with an internal error"; the SQL appears only in the server log |
+      | `structuredContent` matches the `outputSchema` | validate every `get_payment` result | no schema errors over all ledger rows |
+      | the tool list is stable | call `tools/list` twice, and after a restart | byte-identical pages; same cursors |
+      | merchant payouts are not cached for everyone | read `sandpay://merchants/m_204/payouts` | `cacheScope: "private"` |
+      | path tricks do not escape | read `sandpay://docs/..%2F..%2Fetc%2Fpasswd` | `-32602 Resource not found` with that URI |
+      | stdout is clean | run over stdio with logging turned up | every stdout line parses as JSON-RPC |
+
+      One finding from such a review: the first version of `refund_payment` returned the string "Error - refund too
+      large" as a *successful* result. The model then told the merchant the refund had been issued. Fix - raise a
+      tool error so the result carries `isError: true` - and add a test that asserts the flag, not just the text.
+
+  - id: tests
+    kind: tests
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: Testing an MCP server
+    body: |
+      **Positive cases**
+
+      | Case | Expected | Evidence |
+      | --- | --- | --- |
+      | walk `tools/list` with `nextCursor` until it is absent | every tool exactly once, sorted; last page without `nextCursor` | list of names per page |
+      | `get_payment pay_1042` | `isError: false`; `structuredContent` matches `outputSchema`; text block parses to the same JSON | result JSON |
+      | `prompts/get summarise_payouts` with only `merchant_id` | one user message; optional argument filled with its default | rendered text |
+      | `subscriptions/listen` then a new payout | acknowledgement first; then one `resources/updated` with the listen id | captured notifications |
+      | `server/discover` | `supportedVersions`, `capabilities`, `serverInfo`, `ttlMs`, `cacheScope` | result JSON |
+
+      **Negative cases**
+
+      | Case | Expected | Evidence |
+      | --- | --- | --- |
+      | unknown tool / prompt / resource | `-32602`; resource error has `data.uri` | error JSON |
+      | invalid cursor | `-32602 Invalid cursor` | error JSON |
+      | missing `_meta`, version or capabilities | `-32602` | error JSON |
+      | protocol version `1900-01-01` | `-32022` with `supported` and `requested` | error JSON |
+      | legacy `initialize` | an error naming the supported versions | error message |
+      | notification, even with an unknown method | no output at all | stdout line count |
+      | a line that is not JSON | `-32700` with `id: null`; the server keeps reading | next response still arrives |
+      | stdin closed | exit status 0 | process return code |
+      | a filter for a notification type the server does not support | omitted from the acknowledgement; never sent | ack JSON; notification log |
+
+      **Over a real process** (from `test_server_stdio.py`):
+
+      ```python
+      proc = subprocess.run(
+          [sys.executable, server_stdio.__file__],
+          input="\n".join(lines) + "\n",
+          capture_output=True,
+          text=True,
+          timeout=10,
+      )
+      assert proc.returncode == 0
+      responses = [json.loads(line) for line in proc.stdout.splitlines()]  # every stdout line is a JSON-RPC message
+      ```
+
+      `capture_output` keeps stdout and stderr apart, so the test proves both that logs went to stderr and that
+      stdout holds only messages. `timeout` turns a server that never exits into a failed test, not a hung build.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | returning an error *string* from a tool | the model reports success ("refund issued") | return `isError: true` (raise `ToolError` in the SDK) |
+      | protocol error for a fixable input problem | the agent stops instead of retrying with a corrected argument | input validation and business rules are tool execution errors |
+      | `print()` for debugging in a stdio server | client reports a parse error or hangs | log to stderr |
+      | `json.dumps(..., indent=2)` on stdio | the client reads half a message | compact JSON, one line |
+      | answering notifications | client sees a response to an id it never sent | return nothing for messages without `id` |
+      | empty `contents` for a missing resource | the model treats an empty document as the answer | `-32602` with `data.uri` |
+      | trusting a template match | `m_999` or `../` reaches the data layer | validate each variable; then look the item up |
+      | remembering capabilities from the first request | works in one client, fails in another or behind a load balancer | read `_meta` on every request |
+      | unordered `tools/list` (iterating a set) | client caches miss; prompt cache misses | sort |
+      | `cacheScope: "public"` on per-merchant data | a shared gateway serves one merchant's payouts to another | `private`, plus access control |
+      | leaking exception text | stack traces or SQL in the chat | generic message to the client; details in the log |
+
+      **Debugging method.** Reproduce with the smallest transcript: write the failing request as one line of JSON
+      and pipe it to the server (`python server.py < one.jsonl`). Read stdout and stderr separately. Then check, in
+      order: is every stdout line valid JSON? Does the response id match? Is it an `error` or a `result`, and did
+      the spec intend that path? Is the `_meta` complete? Only then look inside the tool.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [mcp-server-tools, mcp-server-stateless-stdio]
+    title: Trade-offs and alternatives
+    body: |
+      - **Fine-grained vs coarse tools.** Many narrow tools (`get_payment`, `refund_payment`) are easy to validate,
+        authorise and test, but fill the model's context with definitions; one broad tool (`ledger_query`) is short
+        but hard to secure. Prefer narrow tools for anything that changes state.
+      - **Statelessness.** No session means any replica can answer any request and a crashed stdio process loses
+        nothing but in-flight requests. The cost: state that must span calls needs explicit handles. The Tools page
+        suggests "returning an explicit handle from a creation tool and accepting that handle as an argument on
+        subsequent calls", validating the caller's authorization against the handle every time.
+      - **Supporting both eras.** Per the Python SDK's v2 notes, most clients today still speak 2025-era revisions. A modern-only server is
+        simpler; a dual-era server (which the Python SDK v2 provides) reaches everyone. Hand-written servers should
+        at least answer `initialize` with the supported versions.
+      - **Cache hints vs notifications.** `ttlMs` alone works for any client and needs no open stream;
+        `subscriptions/listen` gives immediate invalidation but holds a stream open. The spec allows both together.
+      - **Hand-written vs SDK.** Hand-written code shows every message and has no dependency, but you own every edge
+        case the spec lists. The SDK validates traffic against the schema, handles transports and both eras, and
+        receives fixes when the spec changes.
+      - **stdio vs Streamable HTTP.** stdio is local, single-client and uses the environment for credentials ("SHOULD
+        NOT" use the HTTP authorization spec); Streamable HTTP serves remote clients and brings OAuth-based
+        authorization, headers and deployment concerns.
+
+  - id: summary
+    kind: summary
+    concepts: [mcp-server-tools, mcp-server-resources-prompts, mcp-server-stateless-stdio]
+    title: Quick reference
+    body: |
+      - **Tools**: `tools/list` (sorted, cursor-paginated, `ttlMs` + `cacheScope`) and `tools/call`. Names 1-128 of
+        `A-Za-z0-9_-.`. Object `inputSchema`; optional `outputSchema` -> `structuredContent` (plus the JSON in a text
+        block). Annotations are untrusted hints.
+      - **Errors**: unknown tool, malformed request, server error -> JSON-RPC error (`-32602`, `-32603`). Bad input,
+        API failure, business rule -> result with `isError: true` and an actionable message. Crashes -> generic
+        message; details to the log.
+      - **Resources**: `resources/list`, `resources/templates/list` (RFC 6570), `resources/read`. Missing ->
+        `-32602` with `data.uri` (older revisions: `-32002`); never empty `contents`. Validate URIs. `private` for
+        per-user data.
+      - **Prompts**: `prompts/list`, `prompts/get`; string arguments; missing required -> `-32602`.
+      - **Notifications**: only on a `subscriptions/listen` stream, only the requested types, acknowledgement first,
+        `io.modelcontextprotocol/subscriptionId` on each.
+      - **Envelope (2026-07-28)**: no `initialize`; `_meta` on every request with `protocolVersion` and
+        `clientCapabilities`; `-32602` if missing, `-32022` with `supported` if unknown; `resultType` on every result;
+        `serverInfo` in result `_meta`; `server/discover` is mandatory.
+      - **stdio**: one compact JSON-RPC message per line; stdout only for messages; logs to stderr; no response to
+        notifications; `-32700` for unparseable lines; exit when stdin closes.
+      - **SDK (Python v2)**: `MCPServer` (was `FastMCP`), `@mcp.tool()`, `@mcp.resource(uri)`, `@mcp.prompt()`,
+        `ToolError` vs `MCPError`, `Client(mcp)` for in-memory tests; Inspector for interactive checks.
+
+exercises:
+  - id: refund-too-large
+    type: mcq
+    concept: mcp-server-tools
+    skill: application
+    title: The refund is larger than the payment
+    prompt: |
+      The model calls `refund_payment` with `{"payment_id": "pay_1042", "amount_minor": 9000}`. The payment was
+      8400 EUR minor units. What should the server send back?
+    options:
+      - id: is-error
+        text: A result with `isError` true and a message stating the refundable amount
+        feedback: Correct - a business rule failed during execution; the model can read the message and retry with a valid amount.
+      - id: invalid-params
+        text: A JSON-RPC error -32602 Invalid params
+        feedback: Protocol errors are for unknown tools and malformed requests; the request is well-formed, and the model would get nothing to correct itself with.
+      - id: success-text
+        text: A normal result whose text says the refund failed
+        feedback: Without `isError` the client and the model treat it as success - the classic way an agent tells a merchant a refund went through.
+      - id: clamp
+        text: Refund the maximum 8400 and say so
+        feedback: Never do something different from what was asked with money; the caller asked for 9000, not 8400.
+    correct: [is-error]
+    hints:
+      - Is the request itself malformed, or did the tool's work fail?
+      - Who should read the explanation - the host or the model?
+    solution: |
+      Tool execution error. The spec lists "Business logic errors" under tool execution errors, reported "in tool
+      results with `isError: true`", and says clients SHOULD pass them to the model "to enable self-correction".
+
+  - id: unknown-tool
+    type: mcq
+    concept: mcp-server-tools
+    skill: recall
+    title: A tool that does not exist
+    prompt: |
+      A client sends `tools/call` with `"name": "delete_ledger"`. The server has no such tool. Per the 2026-07-28
+      Tools page, what is the response?
+    options:
+      - id: protocol
+        text: A JSON-RPC error, for example code -32602 with the message "Unknown tool - delete_ledger"
+        feedback: Correct - "Unknown tool" is the spec's first example of a protocol error.
+      - id: is-error
+        text: A result with `isError` true
+        feedback: That path is for failures during execution. An unknown tool never executes; the spec lists it under protocol errors.
+      - id: method-not-found
+        text: JSON-RPC -32601 Method not found
+        feedback: The method `tools/call` exists; only the tool name is wrong. The spec's example uses -32602.
+      - id: empty
+        text: A result with empty `content`
+        feedback: An empty success hides the problem from everyone.
+    correct: [protocol]
+    hints:
+      - The method is known. What part of the request is wrong?
+    solution: |
+      Protocol error, `-32602`, as in the spec's example `"message": "Unknown tool: invalid_tool_name"`. The host
+      sees it; a model is "less likely" to recover from it.
+
+  - id: output-schema
+    type: mcq
+    concept: mcp-server-tools
+    skill: analysis
+    title: Output that breaks the schema
+    prompt: |
+      `get_payment` declares an `outputSchema` with `amount_minor` as an integer. After a ledger migration it returns
+      `"amount_minor": "8400"` (a string). What should the server do, and why?
+    options:
+      - id: server-error
+        text: Treat it as a server bug - return a protocol error (for example -32603), log the mismatch, and fix the tool
+        feedback: Correct - "Servers MUST provide structured results that conform to this schema"; a better model cannot fix the server's output.
+      - id: is-error
+        text: Return `isError` true so the model can retry
+        feedback: Retrying calls the same broken code; the model cannot fix server output.
+      - id: send-anyway
+        text: Send it - clients SHOULD validate, so it is their problem
+        feedback: The server's MUST comes first; clients that validate will reject it, and those that do not will compute with a string.
+      - id: drop-schema
+        text: Remove the outputSchema so nothing is checked
+        feedback: That hides the regression and removes the contract clients rely on.
+    correct: [server-error]
+    hints:
+      - Who broke the contract - the model or the server?
+      - Use the SDK docs' test - could a smarter model have avoided this?
+    solution: |
+      The output schema is the server's promise. Breaking it is a server error; the reference raises `-32603` and
+      records the mismatch. A test that validates every tool result against its schema catches this before release.
+
+  - id: empty-cursor
+    type: mcq
+    concept: mcp-server-tools
+    skill: application
+    title: A cursor that is an empty string
+    prompt: |
+      A client's `tools/list` loop stops when `nextCursor` is falsy. A server returns `"nextCursor": ""`. What does
+      the Pagination page say?
+    options:
+      - id: continue
+        text: An empty string is a valid cursor - the client must send it back; only an absent (null) cursor ends the list
+        feedback: Correct - "an empty string is a valid cursor and thus MUST NOT be treated as the end of results".
+      - id: stop
+        text: Empty means no more pages
+        feedback: That is the bug in the client - it decides on the cursor's value, which the spec forbids.
+      - id: parse
+        text: Decode the cursor to find the page number
+        feedback: Clients "MUST treat cursors as opaque tokens" and must not parse them.
+      - id: page-size
+        text: Assume pages of 50 and compute the next offset
+        feedback: Clients "MUST NOT assume a fixed page size".
+    correct: [continue]
+    hints:
+      - What is the only decision a client may make from a cursor's value?
+    solution: |
+      Clients may only test whether a non-null cursor was provided. Fix the loop with `while cursor is not None`,
+      and add a test with a server that returns `""` as a middle cursor.
+
+  - id: missing-resource
+    type: mcq
+    concept: mcp-server-resources-prompts
+    skill: application
+    title: A merchant that does not exist
+    prompt: |
+      A host reads `sandpay://merchants/m_999/payouts`. The URI matches the template, but there is no merchant
+      `m_999`. What does a 2026-07-28 server return?
+    options:
+      - id: invalid-params
+        text: JSON-RPC error -32602 with the URI in `data`
+        feedback: Correct - "servers MUST return a JSON-RPC error with code -32602 (Invalid Params)"; the URI in data tells the client which read failed.
+      - id: empty
+        text: 'A result with `"contents": []`'
+        feedback: Forbidden - "Servers MUST NOT return an empty contents array for a non-existent resource" because it is ambiguous.
+      - id: legacy
+        text: JSON-RPC error -32002
+        feedback: That was the code in 2025-11-25 and earlier; 2026-07-28 servers "MUST NOT emit" it (clients should still accept it from older servers).
+      - id: is-error
+        text: A result with `isError` true
+        feedback: '`isError` belongs to tool results. "Resources have only the protocol path", as the Python SDK docs put it.'
+    correct: [invalid-params]
+    hints:
+      - A template match proves only that the URI has the right shape.
+    solution: |
+      `-32602`, message such as "Resource not found", `data: {"uri": ...}`. Clients should also accept `-32002` from
+      older servers.
+
+  - id: which-primitive
+    type: mcq
+    concept: mcp-server-resources-prompts
+    skill: application
+    title: Tool, resource or prompt?
+    prompt: |
+      SandPay's agents want a "Draft a chargeback reply" entry in the assistant's slash-command menu. The agent picks
+      it, types a dispute id, and the assistant starts from a prepared instruction. Which primitive fits?
+    options:
+      - id: prompt
+        text: A prompt with a required `dispute_id` argument
+        feedback: Correct - user-controlled, chosen from a menu, with arguments the person fills in.
+      - id: tool
+        text: A tool `draft_chargeback_reply`
+        feedback: Tools are model-controlled - the model decides when to call them. Here the person decides.
+      - id: resource
+        text: A resource template `sandpay://disputes/{id}/reply`
+        feedback: Resources are application-controlled context. The dispute data could be a resource the prompt links to, but the menu entry is a prompt.
+      - id: notification
+        text: A list_changed notification
+        feedback: Notifications only say that a list changed.
+    correct: [prompt]
+    hints:
+      - Who decides when it is used - the model, the application, or the person?
+    solution: |
+      Prompts are user-controlled ("Interactive templates invoked by user choice", for example slash commands).
+      The prompt can include a `resource_link` or embedded resource for the dispute file.
+
+  - id: unrequested-notification
+    type: mcq
+    concept: mcp-server-resources-prompts
+    skill: analysis
+    title: Notifications nobody asked for
+    prompt: |
+      A client opens `subscriptions/listen` with `{"promptsListChanged": true}`. Later the server's tool list
+      changes. The server sends `notifications/tools/list_changed` on that stream "to be helpful". What is wrong?
+    options:
+      - id: not-requested
+        text: The server must not send notification types the client did not request
+        feedback: Correct - "The server MUST NOT send notification types the client has not explicitly requested."
+      - id: missing-ack
+        text: Nothing - list_changed notifications are always allowed
+        feedback: In 2026-07-28 notifications flow only on streams that asked for that type.
+      - id: needs-id
+        text: Notifications need an id so the client can answer
+        feedback: Notifications have no id and are never answered; they carry the subscription id in _meta.
+      - id: wrong-method
+        text: It should send the full new tool list instead
+        feedback: A notification only signals the change; the client calls tools/list itself.
+    correct: [not-requested]
+    hints:
+      - What did the filter contain?
+    solution: |
+      Honour the filter exactly and echo the honoured subset in the acknowledgement. The client opens another
+      listen (or re-opens this one) with `toolsListChanged: true` if it wants tool changes.
+
+  - id: remembered-caps
+    type: mcq
+    concept: mcp-server-stateless-stdio
+    skill: analysis
+    title: The server that remembers
+    prompt: |
+      A stdio server stores `clientCapabilities` from the first request on the connection and uses them for every
+      later request, to save parsing. Under 2026-07-28, what is the problem?
+    options:
+      - id: must-not
+        text: Servers must not rely on prior requests for capabilities - each request declares its own, and they may differ
+        feedback: Correct - "Servers MUST NOT rely on prior requests over the same connection to establish context (e.g., capabilities...)".
+      - id: fine-stdio
+        text: Fine on stdio because there is only one client per process
+        feedback: The spec says a connection "is not a conversation or session" - clients may interleave unrelated requests on one stdio process.
+      - id: fine-if-same
+        text: Fine as long as the client never changes its capabilities
+        feedback: The rule is not conditional; per-request capabilities are how the protocol works now.
+      - id: perf
+        text: The only problem is memory use
+        feedback: The problem is correctness - a request that declared fewer capabilities would be treated as having more.
+    correct: [must-not]
+    hints:
+      - What did 2026-07-28 remove from the start of a connection?
+    solution: |
+      Statelessness means every request is complete: read `_meta` each time. If a request needs a capability it did
+      not declare, return `-32021` MissingRequiredClientCapability.
+
+  - id: old-version
+    type: mcq
+    concept: mcp-server-stateless-stdio
+    skill: application
+    title: A request at an older version
+    prompt: |
+      A modern-only server (supports `2026-07-28`) receives `tools/list` whose `_meta` says
+      `"io.modelcontextprotocol/protocolVersion": "2025-11-25"`. What is the correct response?
+    options:
+      - id: unsupported
+        text: Error -32022 with `data.supported` listing 2026-07-28 and `data.requested` 2025-11-25
+        feedback: Correct - UnsupportedProtocolVersionError; the client can retry with a supported version.
+      - id: serve-anyway
+        text: Serve it - the methods are the same
+        feedback: The server must reject versions it does not implement; semantics differ between revisions.
+      - id: invalid-params
+        text: -32602 because the version is wrong
+        feedback: -32602 is for a missing required field. An unsupported version has its own code with the supported list.
+      - id: silent
+        text: Ignore the request
+        feedback: The client would wait for a timeout and learn nothing.
+    correct: [unsupported]
+    hints:
+      - Which error gives the client enough to fix the problem itself?
+    solution: |
+      `-32022` "Unsupported protocol version" with `{"supported": [...], "requested": ...}`. The client "SHOULD
+      select a mutually supported version from the supported list and retry".
+
+  - id: stdout-logging
+    type: mcq
+    concept: mcp-server-stateless-stdio
+    skill: recall
+    title: Where do the logs go?
+    prompt: A stdio MCP server wants to log every request it handles. Where may it write the log lines?
+    options:
+      - id: stderr
+        text: To stderr (or a file)
+        feedback: Correct - "The server MAY write UTF-8 strings to stderr for any logging purposes".
+      - id: stdout
+        text: To stdout, prefixed with "LOG"
+        feedback: The server "MUST NOT write anything to its stdout that is not a valid MCP message".
+      - id: notifications
+        text: As notifications/message on stdout for every request
+        feedback: In 2026-07-28 servers "MUST NOT emit notifications/message for requests that did not include" a logLevel, and MCP logging is deprecated.
+      - id: nowhere
+        text: Nowhere - stdio servers cannot log
+        feedback: stderr exists for exactly this.
+    correct: [stderr]
+    hints:
+      - Which stream is reserved for protocol messages?
+    solution: |
+      stderr. The client "MAY capture, forward, or ignore" it and "SHOULD NOT assume stderr output indicates error
+      conditions".
+
+  - id: build-order
+    type: order
+    concept: mcp-server-stateless-stdio
+    skill: application
+    title: One stdio line through the server
+    prompt: Put the steps the reference server takes for one input line in order.
+    items:
+      - id: parse
+        text: Parse the line as JSON (or answer -32700 with a null id)
+      - id: envelope
+        text: Check jsonrpc and method (or answer -32600)
+      - id: notification
+        text: If there is no id, stop - notifications get no response
+      - id: meta
+        text: Check _meta for the protocol version and client capabilities (or -32602 / -32022)
+      - id: dispatch
+        text: Find the method and run it (unknown method -32601; RpcError becomes its error)
+      - id: wrap
+        text: Add resultType and serverInfo to the result
+      - id: write
+        text: Write the response as one compact JSON line to stdout and flush
+    hints:
+      - Nothing can be checked before the line is JSON.
+      - Why must the notification check come before the _meta check?
+    solution: |
+      Parse, envelope, notification, metadata, dispatch, wrap, write. The notification check comes before every
+      check that could produce an error, because a notification must never be answered - not even with an error.
+
+  - id: stdio-debug
+    type: debug
+    concept: mcp-server-stateless-stdio
+    skill: analysis
+    title: The client hangs, then reports a parse error
+    prompt: |
+      A client talking to this stdio server hangs after the first notification and sometimes reports "unexpected
+      token". Click **every** line that breaks the stdio transport.
+    language: python
+    code: |
+      def serve(inp, out):
+          for line in inp:
+              message = json.loads(line)
+              print(f"handling {message.get('method')}")
+              response = handle(message)
+              out.write(json.dumps(response, indent=2) + "\n")
+              out.flush()
+    correctLines: [3, 4, 6]
+    lineNotes:
+      - line: 2
+        note: Reading line by line and ending at end of input is right - it is how the server exits when the client closes stdin.
+      - line: 7
+        note: Flushing after each response is right; without it the client could wait for buffered output.
+      - line: 5
+        note: Calling the dispatcher is fine; the problem is what is written when it returns None for a notification.
+    hints:
+      - Where does `print` write when the server's stdout is the protocol channel?
+      - What does `json.dumps(None)` produce, and what does `indent=2` do to one message?
+      - What happens to the loop when one line is not valid JSON?
+    solution: |
+      **Line 3** - one bad line raises `JSONDecodeError` and kills the server; answer `-32700` with a null id and keep
+      reading. **Line 4** - `print` writes to stdout, which "MUST NOT" carry anything but MCP messages; log to
+      stderr. **Line 6** - `indent=2` puts newlines inside a message, which breaks newline framing, and for a
+      notification `handle` returns `None`, so the server writes `null`; write compact JSON and only when there is
+      a response.
+    followUp: |
+      Write the subprocess test that would have caught all three, using one notification and one non-JSON line.
+
+  - id: why-is-error
+    type: short
+    concept: mcp-server-tools
+    skill: analysis
+    title: Why are validation errors not protocol errors?
+    prompt: |
+      JSON-RPC has an "Invalid params" error (-32602). Yet the MCP spec lists "Input validation errors (e.g., date
+      in wrong format, value out of range)" as tool execution errors with `isError: true`. Explain why, and name the
+      one input problem that *is* a protocol error.
+    modelAnswer: |
+      Because of who can fix it. The model chose the arguments; an `isError` result goes back into the model's
+      context, where a message such as "amount_minor: less than 1" lets it correct the call and retry. A protocol
+      error goes to the client and usually never reaches the model, so the agent stops. Requests that are not a
+      valid `CallToolRequest` at all - no tool name, `arguments` that is not an object - and an unknown tool name
+      are protocol errors: the request itself is broken.
+    rubric:
+      - Says the model chose the arguments and can correct them if it sees the message
+      - Says protocol errors usually go to the host, not the model
+      - Names malformed requests or unknown tools as protocol errors
+    hints:
+      - Ask the SDK docs' question - could a smarter model have avoided this?
+    solution: |
+      Validation failures are feedback for the model; malformed requests and unknown tools are protocol errors.
+
+  - id: server-testdesign
+    type: testdesign
+    concept: mcp-server-resources-prompts
+    skill: application
+    title: Test plan for the ledger server's resources and prompts
+    prompt: |
+      Design test cases for SandPay's ledger server: resources (`sandpay://docs/{name}`, the payouts template),
+      the `summarise_payouts` prompt and `subscriptions/listen`. For each give preconditions, steps, the expected
+      result and the evidence you would keep.
+    modelAnswer: |
+      Preconditions for all: the demo server with two docs and merchant `m_204` with two payouts; no subscriptions.
+
+      1. **List** - `resources/list`. Expected - two doc URIs sorted, `text/markdown`, `cacheScope` public, `ttlMs` >= 0.
+         Evidence - result JSON.
+      2. **Template** - `resources/templates/list`. Expected - `sandpay://merchants/{merchant_id}/payouts`. Evidence - JSON.
+      3. **Read payouts** - read `m_204`. Expected - one content, `application/json`, newest first, `private`.
+         Evidence - parsed contents.
+      4. **Unknown merchant** - read `m_999`. Expected - `-32602`, `data.uri` equals the URI, no contents. Evidence - error.
+      5. **Traversal and bad ids** - `sandpay://docs/..%2F..%2Fetc%2Fpasswd`, `m_204;drop`, `file:///etc/passwd`.
+         Expected - `-32602` not found for each; no file read. Evidence - errors; file-access spy empty.
+      6. **Prompt** - `prompts/get` with `merchant_id` only. Expected - one user message, default tone. Evidence - text.
+      7. **Missing argument** - only `tone`. Expected - `-32602`, `data.missing = ["merchant_id"]`. Evidence - error.
+      8. **Non-string argument** - `merchant_id: 204`. Expected - `-32602`. Evidence - error.
+      9. **Listen filter** - ask for tools, prompts and two URIs (one unknown). Expected - acknowledgement first,
+         listing prompts and the known URI only. Evidence - ack JSON.
+      10. **Delivery** - two listeners (prompts; payouts URI), add a prompt, record a payout. Expected - one
+          `prompts/list_changed` to the first, one `resources/updated` to the second, each with its own
+          subscriptionId, no id field. Evidence - captured notifications.
+      11. **Cancel** - cancel a listener, change prompts. Expected - nothing sent to it. Evidence - empty list.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence
+      - Covers the not-found code with data.uri and the ban on empty contents
+      - Covers URI validation, including traversal attempts
+      - Covers required and non-string prompt arguments
+      - Covers subscription filtering, acknowledgement and subscriptionId correlation
+    hints:
+      - Every error rule in the spec is a negative test.
+      - How do you prove a notification was not sent?
+    solution: |
+      Test each spec rule positively and negatively, and keep the JSON as evidence - errors with their data, the
+      acknowledgement and every notification sent.
+
+  - id: server-interview
+    type: interview
+    concept: mcp-server-tools
+    skill: analysis
+    title: "Interview: you are building an MCP server for payments"
+    prompt: |
+      "We want our payments API available to AI assistants through MCP. Walk me through how you would build and
+      test the server."
+    modelAnswer: |
+      I'd start by deciding the primitives: read-only lookups and a small number of state-changing tools for the
+      model, reference documents and per-merchant data as resources, and user-initiated tasks as prompts. Every
+      tool gets a strict object input schema - patterns for ids, integer minor units with minimums,
+      `additionalProperties: false` - an output schema for data results, honest annotations and a description that
+      states units and side effects.
+
+      The handlers separate the two error paths: anything the model can fix - validation, business rules, upstream
+      failures - comes back as a result with `isError` and a clear sentence; unknown tools and malformed requests
+      are JSON-RPC errors; crashes return a generic message and log details. Money-moving tools enforce limits
+      in the server, and the host should ask a human before calling them; annotations are only hints.
+
+      On the protocol side, for the 2026-07-28 revision: per-request `_meta` validation, `server/discover`,
+      `resultType` on every result, deterministic paginated lists with cache hints - private for merchant data -
+      and change notifications only on `subscriptions/listen`. I'd use the official SDK for production, which also
+      serves older clients, and run it over stdio locally or Streamable HTTP with OAuth for remote use.
+
+      Testing has three levels: handlers directly, the protocol in memory with the SDK's client or a hand-written
+      dispatcher, and the real process over its transport, checking every stdout line is a message. Plus negative
+      tests for every error rule, a schema check of every structured result, and the Inspector for exploratory
+      testing.
+    rubric:
+      - Chooses tools, resources and prompts by who controls them
+      - Describes strict input schemas, output schemas and descriptions with units and side effects
+      - Separates isError tool results from protocol errors, and hides crash details
+      - Mentions server-side limits and human approval for money-moving tools; annotations untrusted
+      - Mentions the stateless envelope or discover, pagination, cache scope and notifications
+      - Describes testing at several levels, including the real transport
+    followUps:
+      - How would you keep a refund from being issued twice if the client retries?
+      - What changes if the same server must also serve clients that still send initialize?
+      - Which of these checks can a host enforce, and which must the server enforce?
+    hints:
+      - Structure it - primitives, schemas, errors, protocol, transport, testing.
+    solution: |
+      Primitives by control, strict schemas, the two error paths, the stateless envelope, the right transport, and
+      tests at every level.
+
+  - id: server-tools-code
+    type: coding
+    concept: mcp-server-tools
+    skill: application
+    title: Tools - definitions, pages and the two error paths
+    prompt: |
+      In `server_tools.py`, implement `encode_cursor` / `decode_cursor` (opaque, invalid -> `-32602`),
+      `ToolServer.add_tool` (spec name rules, no duplicates, object input schema), `list_tools` (sorted by name,
+      `page_size` per page, `nextCursor` only when more remain, `resultType`, `ttlMs`, `cacheScope: "public"`) and
+      `call_tool` (protocol errors for malformed params and unknown tools; `isError` results for invalid arguments,
+      `ToolError` and crashes; `structuredContent` checked against `outputSchema` with a text copy). The validator
+      and SandPay's tools are given.
+    project: ai
+    files:
+      - exercises/mcp/server_tools.py
+    test: tests/mcp/test_server_tools.py
+    command: .venv/bin/python -m pytest tests/mcp/test_server_tools.py
+    hints:
+      - "The cursor only needs to round-trip through your own server; base64 of a prefix and an offset is enough."
+      - Validate arguments before calling the handler; a handler must never see invalid input.
+      - "Order inside call_tool: params shape, unknown tool, validation, handler, output schema."
+    modelAnswer: |
+      ```python
+      def decode_cursor(cursor):
+          if not isinstance(cursor, str):
+              raise ProtocolError(INVALID_PARAMS, "Invalid cursor")
+          try:
+              text = base64.urlsafe_b64decode(cursor.encode()).decode()
+          except (binascii.Error, UnicodeDecodeError, ValueError):
+              raise ProtocolError(INVALID_PARAMS, "Invalid cursor") from None
+          prefix, _, number = text.partition(":")
+          if prefix != "tools" or not number.isdigit():
+              raise ProtocolError(INVALID_PARAMS, "Invalid cursor")
+          return int(number)
+      ```
+
+      `list_tools` and `call_tool` are in the code section above. The crash branch records the exception for the
+      operator and returns only "Tool <name> failed with an internal error"; an output that breaks the
+      `outputSchema` is the server's fault, so it raises `-32603` instead of an `isError` result.
+    rubric:
+      - Every test in test_server_tools.py passes
+      - The handler never runs with invalid arguments
+      - No exception text reaches the client
+      - Tool order does not depend on registration order
+    solution: |
+      See the model answer and `solutions/mcp/server_tools.py`. The tests walk the cursor, check both error paths,
+      a crash with SQL in the message, and a broken output schema.
+    followUp: |
+      Add a `requires_scope` field to `Tool` and filter `tools/list` by the scopes on the request - the spec allows the
+      list to vary by authorization. How do you keep it cacheable, and which `cacheScope` does it need?
+
+  - id: server-resources-code
+    type: coding
+    concept: mcp-server-resources-prompts
+    skill: application
+    title: Resources, templates, prompts and subscriptions
+    prompt: |
+      In `server_resources.py`, implement `match_template` (level-1 RFC 6570, literals matched exactly),
+      `ResourceServer.read` (docs and payouts, validated, `-32602` with `data.uri` when missing, private payouts),
+      `get_prompt` (string arguments, required check with `data.missing`, defaults), `listen` (acknowledge only the
+      honoured subset), `add_prompt` and `record_payout` (notifications only to matching subscriptions, each with its
+      `io.modelcontextprotocol/subscriptionId`).
+    project: ai
+    files:
+      - exercises/mcp/server_resources.py
+    test: tests/mcp/test_server_resources.py
+    command: .venv/bin/python -m pytest tests/mcp/test_server_resources.py
+    hints:
+      - Build a regex from the template with `re.escape` on the literal parts and `[^/]+` for each variable.
+      - A template match is only the shape; check the id format and that the item exists.
+      - "listen: a URI is worth watching only if read() would succeed for it."
+    modelAnswer: |
+      ```python
+      def match_template(template, uri):
+          pattern, names = "", []
+          for literal, name in re.findall(r"([^{]*)(?:\{([A-Za-z0-9_]+)\})?", template):
+              pattern += re.escape(literal)
+              if name:
+                  names.append(name)
+                  pattern += f"(?P<{name}>[^/]+)"
+          m = re.fullmatch(pattern, uri)
+          return {n: m.group(n) for n in names} if m else None
+      ```
+
+      `read` matches the docs template, then the payouts template; each variable is checked against a strict
+      pattern (`^[a-z0-9-]{1,40}$`, `^m_[0-9]{3}$`) and looked up before anything is returned. `listen` stores the
+      honoured filter under the request id; `add_prompt` and `record_payout` build notifications from it.
+    rubric:
+      - Every test in test_server_resources.py passes
+      - Missing resources raise -32602 with the URI; contents are never empty
+      - Notifications go only to subscriptions that asked for that type or URI
+      - Per-merchant data is private
+    solution: |
+      See the model answer and `solutions/mcp/server_resources.py`. The tests cover near-miss URIs, traversal, prompt
+      errors, filters, delivery and cancellation.
+    followUp: |
+      Add `resources/list` pagination with the same cursor scheme as tools. Each page is cached separately - what
+      must stay the same across all pages of one list?
+
+  - id: server-stdio-code
+    type: coding
+    concept: mcp-server-stateless-stdio
+    skill: application
+    title: The stateless envelope and a stdio server
+    prompt: |
+      In `server_stdio.py`, implement `check_meta`, `handle` (follow the numbered rules in its docstring) and
+      `serve` (newline-delimited JSON-RPC, compact output, flush, `-32700` for bad lines, logs to stderr, exit at end
+      of input). The tests run it in memory and then as a real subprocess with `sys.executable`.
+    project: ai
+    files:
+      - exercises/mcp/server_stdio.py
+    test: tests/mcp/test_server_stdio.py
+    command: .venv/bin/python -m pytest tests/mcp/test_server_stdio.py
+    hints:
+      - "In Python, True is an int - check for bool before checking for int."
+      - The notification check must come before anything that can return an error.
+      - Use separators=(",", ":") and never indent.
+    modelAnswer: |
+      ```python
+      def check_meta(params):
+          meta = params.get("_meta")
+          if not isinstance(meta, dict):
+              raise RpcError(INVALID_PARAMS, "Missing params._meta (2026-07-28 requests carry their protocol metadata)")
+          version = meta.get(PV)
+          if not isinstance(version, str):
+              raise RpcError(INVALID_PARAMS, f"Missing required _meta field {PV}")
+          if not isinstance(meta.get(CAPS), dict):
+              raise RpcError(INVALID_PARAMS, f"Missing required _meta field {CAPS}")
+          if version not in SUPPORTED_VERSIONS:
+              raise RpcError(UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
+                             {"supported": SUPPORTED_VERSIONS, "requested": version})
+      ```
+
+      `handle` and `serve` are in the line-by-line section.
+    rubric:
+      - Every test in test_server_stdio.py passes
+      - Notifications produce no output at all
+      - stdout carries only compact JSON-RPC lines; logs go to stderr
+      - No exception detail reaches the client
+    solution: |
+      See the model answer and `solutions/mcp/server_stdio.py`. Run it by hand too -
+      `.venv/bin/python solutions/mcp/server_stdio.py < requests.jsonl` - and read stdout and stderr separately.
+    followUp: |
+      Make the server dual-era: answer `initialize` with a 2025-11-25 handshake and serve that client on the
+      same process. Which parts of `handle` must branch on the era, and how would you test both on one pipe?
+
+placement:
+  - id: place-error-path
+    type: mcq
+    concept: mcp-server-tools
+    skill: analysis
+    title: Which error path?
+    prompt: |
+      A `get_exchange_rate` tool calls an upstream FX service that times out. The model could simply try again a
+      little later or use yesterday's rate tool instead. What should the MCP server return?
+    options:
+      - id: is-error
+        text: A tool result with `isError` true saying the FX service timed out
+        feedback: Correct - an API failure during execution is a tool execution error the model can act on.
+      - id: internal
+        text: JSON-RPC -32603 Internal error
+        feedback: Protocol errors are for problems with the request or the server itself; this is a failed execution the model could work around.
+      - id: success
+        text: A normal result with the text "service unavailable"
+        feedback: Without isError the model may treat the text as the rate.
+      - id: hang
+        text: Keep waiting until the upstream answers
+        feedback: Tools should time out; the spec tells clients to implement timeouts for tool calls too.
+    correct: [is-error]
+    solution: |
+      The spec lists "API failures" as tool execution errors, returned with `isError: true` so the model can
+      self-correct. Protocol errors are for unknown tools, malformed requests and server errors.
+
+  - id: place-resource
+    type: mcq
+    concept: mcp-server-resources-prompts
+    skill: application
+    title: Reading a resource that is not there
+    prompt: |
+      Under MCP 2026-07-28, a client reads `sandpay://docs/chargebacks` and the server has no such document. Which
+      response follows the specification?
+    options:
+      - id: right
+        text: JSON-RPC error -32602 with the URI in `data`
+        feedback: Correct.
+      - id: empty
+        text: A result with an empty `contents` array
+        feedback: Explicitly forbidden - it is ambiguous with an existing but empty resource.
+      - id: old-code
+        text: JSON-RPC error -32002 Resource not found
+        feedback: The code of 2025-11-25 and earlier; 2026-07-28 servers must not emit it.
+      - id: html
+        text: A text content saying "404 not found"
+        feedback: That is a successful read of a document that says 404 - the model will quote it.
+    correct: [right]
+    solution: |
+      `-32602` (Invalid Params) with `data.uri`; never empty contents. Clients should still accept `-32002` from
+      older servers.
+
+  - id: place-stdio
+    type: debug
+    concept: mcp-server-stateless-stdio
+    skill: analysis
+    title: A 2026-07-28 stdio server
+    prompt: Click every line that breaks the 2026-07-28 specification.
+    language: python
+    code: |
+      CAPS = {}
+      def handle(msg):
+          if msg["method"] == "initialize":
+              CAPS.update(msg["params"]["capabilities"])
+              return {"jsonrpc": "2.0", "id": msg["id"], "result": {}}
+          result = METHODS[msg["method"]](msg.get("params", {}), CAPS)
+          return {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+      for line in sys.stdin:
+          sys.stdout.write(json.dumps(handle(json.loads(line))) + "\n")
+          sys.stdout.flush()
+    correctLines: [4, 6, 7]
+    lineNotes:
+      - line: 10
+        note: Flushing after every response is correct.
+      - line: 8
+        note: Reading stdin line by line is the stdio framing.
+    solution: |
+      **Line 4** stores capabilities from an earlier request; 2026-07-28 servers must read them from each request's
+      `_meta`. **Line 6** uses those stored capabilities and never checks `_meta` (version, capabilities). **Line 7**
+      returns a result without the required `resultType`. (Line 9 also answers notifications and crashes on bad JSON -
+      worth fixing, though not what this question asks.)
+
+recall:
+  - id: recall-error-paths
+    concept: mcp-server-tools
+    prompt: Which tool failures are protocol errors, and which are tool execution errors?
+    answer: Protocol errors (JSON-RPC error, e.g. -32602) - unknown tool, malformed request, server errors. Tool execution errors (result with isError true) - input validation, API failures, business rules. The second kind goes back to the model so it can self-correct.
+  - id: recall-structured
+    concept: mcp-server-tools
+    prompt: What must a server do when a tool has an outputSchema?
+    answer: Return structuredContent that conforms to it (MUST), and for backwards compatibility also put the serialised JSON in a text content block (SHOULD). Clients SHOULD validate it.
+  - id: recall-list
+    concept: mcp-server-tools
+    prompt: What does a complete tools/list result contain in 2026-07-28?
+    answer: resultType "complete", the tools in a deterministic order, nextCursor only if more pages remain (an opaque string), ttlMs (>= 0) and cacheScope ("public" or "private").
+  - id: recall-resource-missing
+    concept: mcp-server-resources-prompts
+    prompt: How does a 2026-07-28 server report a missing resource?
+    answer: JSON-RPC error -32602 (Invalid Params), ideally with the URI in data. Never an empty contents array. Older revisions used -32002, which clients should still accept.
+  - id: recall-primitives
+    concept: mcp-server-resources-prompts
+    prompt: Who controls tools, resources and prompts?
+    answer: Tools are model-controlled, resources application-controlled, prompts user-controlled (for example slash commands).
+  - id: recall-listen
+    concept: mcp-server-resources-prompts
+    prompt: What are the rules for change notifications in 2026-07-28?
+    answer: Only on a subscriptions/listen stream; only the types the client requested; first message notifications/subscriptions/acknowledged with the honoured subset; every notification carries io.modelcontextprotocol/subscriptionId (the listen request's id) in _meta.
+  - id: recall-meta
+    concept: mcp-server-stateless-stdio
+    prompt: What must every 2026-07-28 request carry, and what happens if it is wrong?
+    answer: In params._meta, io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities (clientInfo optional). Missing -> -32602; unsupported version -> -32022 with data.supported and data.requested.
+  - id: recall-stdio
+    concept: mcp-server-stateless-stdio
+    prompt: What are the stdio transport's rules for a server?
+    answer: Read JSON-RPC from stdin, write to stdout, one message per line with no embedded newlines; nothing on stdout that is not an MCP message; logs to stderr; no JSON-RPC requests on stdout; exit promptly when stdin closes.
+
+next:
+  - building-mcp-clients
+  - mcp-security-and-authorization
+  - mcp-multi-agent-architectures

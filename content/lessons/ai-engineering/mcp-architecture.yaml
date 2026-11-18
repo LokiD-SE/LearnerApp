@@ -1,0 +1,1480 @@
+id: mcp-architecture
+title: MCP architecture - hosts, clients and servers
+subject: ai-engineering
+module: model-context-protocol
+level: intermediate
+status: published
+estimatedMinutes: 120
+summary: How the Model Context Protocol connects an AI application to tools and data - the host that owns the conversation and the user's consent, one client per server, and servers that expose tools, resources and prompts. Covers the two layers (JSON-RPC 2.0 data layer, stdio or Streamable HTTP transport), the stateless per-request metadata and server/discover of protocol version 2026-07-28, who controls each primitive, how a server asks the user for input with multi round-trip requests, and opt-in notifications. Every message shown was produced by a small plain-Python host and fake SandPay servers from the practice project.
+tags:
+  [
+    MCP,
+    Model Context Protocol,
+    MCP architecture,
+    host,
+    client,
+    server,
+    JSON-RPC 2.0,
+    data layer,
+    transport layer,
+    stdio,
+    Streamable HTTP,
+    server/discover,
+    capabilities,
+    _meta,
+    stateless,
+    tools,
+    resources,
+    prompts,
+    elicitation,
+    sampling,
+    roots,
+    multi round-trip requests,
+    MRTR,
+    InputRequiredResult,
+    resultType,
+    notifications,
+    subscriptions/listen,
+    LLM,
+    agents,
+  ]
+
+environment: |
+  - **Specification:** the Model Context Protocol specification, **revision 2026-07-28** (the latest dated
+    revision on 18 November 2026), read from the specification repository
+    [modelcontextprotocol/modelcontextprotocol](https://github.com/modelcontextprotocol/modelcontextprotocol)
+    (`docs/specification/2026-07-28/`) and published at
+    [modelcontextprotocol.io/specification/2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28).
+    Pages used: [Overview](https://modelcontextprotocol.io/specification/2026-07-28),
+    [Architecture](https://modelcontextprotocol.io/specification/2026-07-28/architecture),
+    [Base protocol](https://modelcontextprotocol.io/specification/2026-07-28/basic) (messages, error codes,
+    statelessness, `_meta`), [Message patterns](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns),
+    [Multi round-trip requests](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr),
+    [Transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports),
+    [Versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+    [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover), the server pages for
+    [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools),
+    [resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources) and
+    [prompts](https://modelcontextprotocol.io/specification/2026-07-28/server/prompts), the client page for
+    [elicitation](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation), the
+    [deprecated features registry](https://modelcontextprotocol.io/specification/2026-07-28/deprecated) and the
+    [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog) (key changes since
+    2025-11-25). Also the guide [Architecture
+    overview](https://modelcontextprotocol.io/docs/learn/architecture) (2026-07-28 docs). Quotations are from
+    those pages, as documented on 18 November 2026.
+  - **Version matters.** Revision 2026-07-28 made MCP stateless: it removed the `initialize` handshake and
+    protocol-level sessions, added `server/discover`, per-request `_meta`, `resultType` and multi round-trip
+    requests, and deprecated sampling, roots and logging. Many hosts, servers and SDKs still speak 2025-11-25
+    or earlier ("legacy" in the spec's words). Where this lesson says "the spec", it means 2026-07-28; the
+    lifecycle of earlier revisions is in [The MCP lifecycle, JSON-RPC and
+    transports](#/lesson/mcp-lifecycle-and-transports).
+  - **JSON-RPC:** [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification) (sections 4, 4.1, 5,
+    5.1). MCP's removal of batching is in the [2025-06-18
+    changelog](https://modelcontextprotocol.io/specification/2025-06-18/changelog).
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`, standard library only, pytest for the exercises. **No MCP
+    SDK is used** - the host, clients and servers are about 200 lines of plain Python written for this lesson, so
+    every field on the wire is visible. They follow the spec's data layer but skip transports, pagination,
+    subscriptions and caching rules: they are teaching code, not a conformant implementation. Every message
+    shown was printed by `practice/ai/solutions/mcp/arch_host.py`, `arch_mrtr.py` and `arch_messages.py`
+    against the fake servers in `practice/ai/support/mcp_arch_fixture.py`, run on Linux on 18 November 2026.
+    The official SDKs and the MCP Inspector are named only; the SDK snippet in the guide is quoted as pseudo-code,
+    as the guide labels it.
+  - **Synthetic data:** SandPay is a fictional payments company. The servers `sandpay-payments` and
+    `sandpay-docs`, payment `pay_7001`, merchant `m-204` ("Lumen Books") and refund `rf_7001` were invented for
+    this lesson. The fixture's `requestState` is plain base64 - fine for a demo, **not** acceptable in production
+    (see the mistakes section).
+  - **Not repeated here:** how a model asks for a tool and how the application runs it -
+    [Tool use and function calling](#/lesson/tool-use-and-function-calling); the agent loop around it -
+    [Agent loops and workflow patterns](#/lesson/agent-loops-and-workflow-patterns).
+
+prerequisites:
+  - tool-use-and-function-calling
+  - agent-loops-and-workflow-patterns
+  - http-request-response-anatomy
+
+concepts:
+  - id: mcp-arch-participants
+    name: Participants - host, clients and servers
+    summary: An MCP host is the AI application; it creates one MCP client per server, and each client talks to exactly one server. The host owns the conversation, the model and the user's consent and decides what each server sees; servers expose focused capabilities, cannot read the whole conversation and cannot see into other servers. A server is a program, local (usually stdio, one client) or remote (usually Streamable HTTP, many clients).
+  - id: mcp-arch-layers-messages
+    name: Layers and messages - JSON-RPC data layer, stateless requests, transports
+    summary: The data layer is JSON-RPC 2.0 - requests (id, never null in MCP), results or errors with the same id, and notifications without an id that are never answered; MCP adds a required resultType ("complete" or "input_required") and has no batches. In revision 2026-07-28 every request carries its protocol version and client capabilities in _meta, the server keeps no session, and server/discover returns supported versions and server capabilities. Clients send requests and notifications; servers send responses and notifications. The transport layer (stdio, Streamable HTTP) frames and delivers the same messages and carries authorization on HTTP.
+  - id: mcp-arch-primitives
+    name: Primitives - tools, resources, prompts and elicitation
+    summary: Servers offer tools (model-controlled functions), resources (application-controlled data addressed by URI) and prompts (user-controlled templates), each with a */list method and tools/call, resources/read or prompts/get. A server may use a primitive only if it declared the capability. Clients offer elicitation - the server asks the user for input by answering tools/call, resources/read or prompts/get with an InputRequiredResult, and the client retries the original request with a new id, inputResponses and the exact requestState. Sampling and roots still exist but are deprecated in 2026-07-28. Change notifications are opt-in through subscriptions/listen.
+
+objectives:
+  - Name the three MCP participants and explain why a host creates one client per server and keeps the conversation to itself.
+  - Classify a JSON-RPC 2.0 message as a request, notification, result or error and reject one that breaks the MCP rules.
+  - Explain what every MCP 2026-07-28 request carries in _meta, what server/discover returns and why a server must not rely on earlier requests.
+  - Decide whether a capability belongs in a tool, a resource or a prompt from who should control it.
+  - Trace a multi round-trip request in which a server asks the user to approve a refund through elicitation.
+  - Write a minimal host that discovers servers, merges and namespaces their tools, asks for consent and routes calls.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [mcp-arch-participants, mcp-arch-primitives]
+    title: The idea in plain language
+    body: |
+      Think of a hospital's front desk. Patients talk only to the receptionist. Behind the desk there is one
+      phone line to each department - radiology, the lab, the pharmacy - and the receptionist decides what to ask
+      each one and what to pass on. The lab never hears the patient's whole story, and radiology never listens in
+      on the pharmacy's line.
+
+      MCP gives AI applications the same shape:
+
+      - The **host** is the receptionist: the AI application (an IDE, a chat app, SandPay's support console). It
+        holds the conversation, talks to the model and asks the user before anything risky happens.
+      - Each **client** is one phone line. The host creates one client for each server it connects to.
+      - Each **server** is a department: a program that offers something useful - tools to run, data to read,
+        ready-made prompts.
+
+      Before MCP every AI application wired up each data source its own way, so *N* applications and *M* systems
+      meant up to *N x M* integrations. With one protocol, SandPay writes one payments server and every
+      MCP-capable host can use it; a host adds MCP once and can use every server. The specification itself says
+      it takes "some inspiration from the Language Server Protocol", which did the same for programming-language
+      support in editors.
+
+      The rest of this lesson makes the picture precise: what flows on each line (JSON-RPC messages), what a
+      department can offer (tools, resources, prompts), and how a department asks the patient a question without
+      a phone line of its own (elicitation through multi round-trip requests).
+
+  - id: what
+    kind: what
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages, mcp-arch-primitives]
+    title: Terms you need
+    body: |
+      | Term | Meaning (MCP spec 2026-07-28 unless noted) |
+      | --- | --- |
+      | **Host** | "LLM applications that initiate connections". It "creates and manages multiple client instances", "enforces security policies and consent requirements" and "coordinates AI/LLM integration". |
+      | **Client** | "Connectors within the host application". Each "communicates with exactly one server" and "attaches protocol version and capabilities to every request". |
+      | **Server** | "Services that provide context and capabilities" - "can be local processes or remote services". |
+      | **Local / remote server** | Informal names from the guide: a server launched by the host over **stdio** "typically serve[s] a single MCP client"; a server over **Streamable HTTP** "will typically serve many MCP clients". |
+      | **Data layer** | The JSON-RPC 2.0 protocol: discovery, server and client features, notifications. |
+      | **Transport layer** | How messages are framed and delivered - stdio or Streamable HTTP - plus authorization on HTTP. |
+      | **Request / result / error / notification** | JSON-RPC 2.0 message kinds. A notification has no `id` and is never answered. |
+      | **`resultType`** | Required in every MCP result: `"complete"` or `"input_required"`. Absent means `"complete"` (earlier servers). |
+      | **`_meta`** | Metadata on a message. Every request carries `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` (required) and should carry `io.modelcontextprotocol/clientInfo`. |
+      | **Capabilities** | What each side supports. Clients send theirs on every request; servers return theirs from `server/discover`. |
+      | **`server/discover`** | A request every server MUST implement; returns `supportedVersions`, `capabilities`, optional `instructions`, and `serverInfo` in `_meta`. |
+      | **Tools** | Server primitive, **model-controlled**: "Functions exposed to the LLM to take actions". Methods `tools/list`, `tools/call`. |
+      | **Resources** | Server primitive, **application-controlled**: "Contextual data attached and managed by the client", addressed by URI. Methods `resources/list`, `resources/read`, `resources/templates/list`. |
+      | **Prompts** | Server primitive, **user-controlled**: "Interactive templates invoked by user choice", such as slash commands. Methods `prompts/list`, `prompts/get`. |
+      | **Elicitation** | Client feature: "Server-initiated requests for additional information from users" (`elicitation/create`), in form or URL mode. |
+      | **Sampling, roots** | Client features (ask the client's model for a completion; list the user's directories). **Deprecated** in 2026-07-28. |
+      | **Multi round-trip request (MRTR)** | The server answers with an `InputRequiredResult`; the client gathers the input and retries the original request. |
+      | **`subscriptions/listen`** | A long-lived request whose reply is a stream of opted-in change notifications. |
+
+  - id: why
+    kind: why
+    concepts: [mcp-arch-participants, mcp-arch-primitives]
+    title: Why a protocol, and why this split
+    body: |
+      In [Tool use and function calling](#/lesson/tool-use-and-function-calling) the application defined its own
+      tools in code. That works for one application and a few tools. It stops working when:
+
+      - **Many applications need the same systems.** SandPay's support console, an engineer's IDE and a
+        merchant-facing chat all want "look up a payment". Without a standard, each writes its own adapter.
+      - **Systems belong to different teams.** The payments team should own the payments integration and ship
+        fixes once, not ask every AI application to update.
+      - **Context is more than functions.** A refund policy document is not an action; a "summarise this dispute"
+        template is chosen by a person, not the model. Function calling has one primitive; MCP has three, split by
+        **who decides** when they are used.
+
+      The participant split is about trust. The specification's design principles say servers "should not be
+      able to read the whole conversation, nor 'see into' other servers": "Full conversation history stays with
+      the host", "Cross-server interactions are controlled by the host" and the "Host process enforces security
+      boundaries". The host is the only party the user trusts with everything, so consent lives there - "Hosts
+      must obtain explicit user consent before invoking any tool".
+
+      A second principle explains the protocol's shape: "Servers should be extremely easy to build" - "Host
+      applications handle complex orchestration responsibilities", "Servers focus on specific, well-defined
+      capabilities". Revision 2026-07-28 pushed this further by making MCP stateless, so a remote server can sit
+      behind an ordinary load balancer: "all the information needed to process a request is contained in the
+      request itself".
+
+  - id: layers
+    kind: internals
+    concepts: [mcp-arch-layers-messages]
+    title: Two layers, four kinds of message
+    body: |
+      MCP "consists of two layers" (architecture guide):
+
+      - the **data layer** - "the JSON-RPC based protocol for client-server communication, including capability
+        and version discovery, and core primitives, such as tools, resources, prompts and notifications";
+      - the **transport layer** - "connection establishment, message framing, and authorization". The two standard
+        transports are **stdio** ("newline-delimited messages over the standard streams of a client-launched
+        subprocess") and **Streamable HTTP** ("each message is an HTTP POST to a single MCP endpoint; replies
+        arrive as a JSON object or a request-scoped SSE stream").
+
+      "Protocol semantics are identical on every transport" - the same JSON objects travel over a pipe or over
+      HTTPS. This lesson stays in the data layer; the next lesson covers transports.
+
+      **The four message kinds** come from JSON-RPC 2.0, with MCP's extra rules:
+
+      | Kind | Has | JSON-RPC 2.0 says | MCP adds |
+      | --- | --- | --- | --- |
+      | Request | `jsonrpc`, `id`, `method`, optional `params` | id is "a String, Number, or NULL"; null is discouraged | id "MUST NOT be `null`"; must be a string or integer; must not repeat an id still waiting for a response; params is an object |
+      | Notification | `jsonrpc`, `method`, optional `params`, **no `id`** | "The Server MUST NOT reply to a Notification" | "The receiver MUST NOT send a response" - either side can send one |
+      | Result | `jsonrpc`, `id`, `result` | same id as the request | `result` MUST include `resultType` |
+      | Error | `jsonrpc`, `id`, `error` {`code`, `message`, `data`?} | `code` "MUST be an integer"; id is null if it could not be read | MCP codes `-32020` to `-32099` are reserved for the spec |
+
+      A response has **either** `result` **or** `error` - JSON-RPC 2.0: "both members MUST NOT be included".
+      JSON-RPC also allows batches (an array of messages); MCP removed batch support in revision 2025-06-18.
+
+      **Directions (2026-07-28).** "Every interaction begins with the client": the client sends requests and
+      notifications; the server answers each request with a result or error, "optionally preceded by
+      notifications scoped to that request". "Servers MUST NOT initiate JSON-RPC requests, and clients do not
+      send JSON-RPC responses." Earlier revisions let servers send requests (for sampling, roots, elicitation);
+      that is exactly what multi round-trip requests replaced.
+
+      **Error codes you will meet:**
+
+      | Code | Meaning |
+      | --- | --- |
+      | `-32700`, `-32600` to `-32603` | JSON-RPC: parse error, invalid request, method not found, invalid params, internal error |
+      | `-32602` | also MCP's "resource not found" (earlier revisions used `-32002`; clients should still accept it) and a request missing a required `_meta` field |
+      | `-32020` | `HeaderMismatch` (Streamable HTTP headers disagree with the body) |
+      | `-32021` | `MissingRequiredClientCapability`, with `data.requiredCapabilities` |
+      | `-32022` | `UnsupportedProtocolVersion`, with `data.supported` and `data.requested` |
+
+  - id: stateless
+    kind: internals
+    concepts: [mcp-arch-layers-messages, mcp-arch-participants]
+    title: Stateless requests and server/discover
+    body: |
+      Revision 2026-07-28's changelog lists as a major change: "Make MCP stateless: remove the
+      `initialize`/`notifications/initialized` handshake. Every request now carries its protocol version and client
+      capabilities in `_meta`". The base protocol page spells out what that means for a server:
+
+      - "Servers MUST NOT rely on prior requests over the same connection to establish context (e.g.,
+        capabilities, protocol version, client identity)."
+      - "State that needs to span multiple requests (e.g., long-running tasks, application-level handles) MUST be
+        referenced by an explicit identifier the client passes on each request."
+      - "an open connection, such as a STDIO process, is not a conversation or session".
+
+      A request missing `protocolVersion` or `clientCapabilities` "is malformed; the server MUST reject it with
+      JSON-RPC error code `-32602` (Invalid params)". Our fake server does exactly that:
+
+      ```json
+      {"jsonrpc": "2.0", "id": 9, "error": {"code": -32602, "message": "Missing required _meta fields"}}
+      ```
+
+      **Discovery.** `server/discover` lets a client learn "a server's supported protocol versions, capabilities,
+      and identity before sending any other requests. Servers MUST implement it." Calling it is optional - "a
+      client may invoke any RPC inline and handle `UnsupportedProtocolVersionError`" - but it is the easy way to
+      learn what a server offers in one round trip. Here is the request our host sent to the payments server and
+      the server's reply (the reply was produced by sending the same params again with id `x-1`):
+
+      ```json
+      {
+        "jsonrpc": "2.0",
+        "id": "payments-1",
+        "method": "server/discover",
+        "params": {
+          "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "sandpay-host", "version": "1.0.0"},
+            "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}
+          }
+        }
+      }
+      ```
+
+      ```json
+      {
+        "jsonrpc": "2.0",
+        "id": "x-1",
+        "result": {
+          "resultType": "complete",
+          "supportedVersions": ["2026-07-28"],
+          "capabilities": {"tools": {}, "resources": {}},
+          "ttlMs": 60000,
+          "cacheScope": "public",
+          "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "sandpay-payments", "version": "1.0.0"}}
+        }
+      }
+      ```
+
+      Notice: the client declares `elicitation` (it can ask the user questions for the server); the server
+      declares `tools` and `resources` but not `prompts`, so the host must never send it `prompts/list`. `ttlMs`
+      and `cacheScope` are the caching fields 2026-07-28 requires on discover and list results. `clientInfo` and
+      `serverInfo` "are self-reported by the sender and are not verified by the protocol" - log them, never base a
+      security decision on them.
+
+      **Version mismatch.** If a server does not support the requested version it "MUST respond with an
+      `UnsupportedProtocolVersionError` listing the versions it does support". Connecting our host to a fake
+      server that speaks only 2025-11-25 printed:
+
+      ```plaintext
+      -32022 Unsupported protocol version {'supported': ['2025-11-25'], 'requested': '2026-07-28'}
+      ```
+
+      A dual-era client would retry with a mutually supported version - or, for a legacy server, fall back to the
+      old `initialize` handshake as the versioning page describes.
+
+  - id: primitives
+    kind: internals
+    concepts: [mcp-arch-primitives]
+    title: The primitives - who controls what
+    body: |
+      The server overview gives one table that decides most design questions:
+
+      | Primitive | Control | Description | Example |
+      | --- | --- | --- | --- |
+      | Prompts | User-controlled | "Interactive templates invoked by user choice" | "Slash commands, menu options" |
+      | Resources | Application-controlled | "Contextual data attached and managed by the client" | "File contents, git history" |
+      | Tools | Model-controlled | "Functions exposed to the LLM to take actions" | "API POST requests, file writing" |
+
+      "Control" means **who decides when it is used**:
+
+      - **Tools** - the model picks them during the conversation. The spec still says "there SHOULD always be a
+        human in the loop with the ability to deny tool invocations". Methods: `tools/list`, `tools/call`. A tool
+        has a `name`, `description` and `inputSchema` (JSON Schema, 2020-12 by default); a result has `content`
+        (text, image, audio, resource links, embedded resources), optional `structuredContent` and `isError`.
+      - **Resources** - the application decides, for example a picker where the user attaches a file, or automatic
+        inclusion. Each has a URI (`https://`, `file://`, `git://` or a custom scheme such as
+        `sandpay://merchants/m-204/profile`). Methods: `resources/list`, `resources/read`,
+        `resources/templates/list`.
+      - **Prompts** - the user picks them, typically as slash commands; "This refers to who decides when the
+        prompt is used, not who authors its content." Methods: `prompts/list`, `prompts/get`.
+
+      A server "MUST declare" each capability it supports (`"tools": {}`, `"resources": {"subscribe": true,
+      "listChanged": true}`, `"prompts": {"listChanged": true}`); `listChanged` and `subscribe` are optional
+      flags for notifications. List results "MUST NOT vary per-connection or as a side effect of other requests on
+      the connection" but "MAY vary by the authorization presented on the request".
+
+      **Client features.** The client can offer **elicitation**: the server asks the user for information during
+      a `tools/call`, `resources/read` or `prompts/get`. Form mode collects structured data against a schema;
+      **URL mode** sends the user to a web page. "Servers MUST NOT use form mode elicitation to request sensitive
+      information such as passwords, API keys, access tokens, or payment credentials." **Sampling** (the server
+      asks the client's model for a completion) and **roots** (the client lists directories the server may use)
+      still work but are deprecated in 2026-07-28; the registry's migration paths are "Integrate directly with LLM
+      provider APIs" and "Pass directories or files via tool parameters, resource URIs, or server configuration".
+
+      **Notifications.** Change notifications are opt-in. The client sends `subscriptions/listen` naming what it
+      wants (`toolsListChanged`, `promptsListChanged`, `resourcesListChanged`, `resourceSubscriptions`); the server
+      acknowledges with `notifications/subscriptions/acknowledged` and then sends, for example,
+      `notifications/tools/list_changed`, each tagged with `io.modelcontextprotocol/subscriptionId`. Notifications
+      about one request - `notifications/progress`, for example - flow with that request's response instead.
+
+  - id: mrtr
+    kind: internals
+    concepts: [mcp-arch-primitives, mcp-arch-layers-messages]
+    title: How a server asks the user - multi round-trip requests
+    body: |
+      In 2026-07-28 a server cannot send a request, so how does it ask the user "Approve this refund?" The answer
+      is the **multi round-trip request** pattern: "Servers return an `InputRequiredResult` (`resultType:
+      "input_required"`) whose `inputRequests` field carries the requests for the additional information".
+      The client gathers the answers and retries.
+
+      Our host asked the payments server to call `refund_payment`. The first reply was:
+
+      ```json
+      {
+        "resultType": "input_required",
+        "inputRequests": {
+          "confirm": {
+            "method": "elicitation/create",
+            "params": {
+              "mode": "form",
+              "message": "sandpay-payments wants to run refund_payment with {\"amount_minor\": 1200, \"payment_id\": \"pay_7001\"}. Approve?",
+              "requestedSchema": {
+                "type": "object",
+                "properties": {"approve": {"type": "boolean"}},
+                "required": ["approve"]
+              }
+            }
+          }
+        },
+        "requestState": "eyJhcmdzIjogeyJhbW91bnRfbWlub3IiOiAxMjAwLCAicGF5bWVudF9pZCI6ICJwYXlfNzAwMSJ9LCAidG9vbCI6ICJyZWZ1bmRfcGF5bWVudCJ9"
+      }
+      ```
+
+      The host showed the message to the user, who accepted. The client then sent a **new** request (`payments-5`
+      after `payments-4`) with the original params plus the answers and the state, untouched:
+
+      ```json
+      {
+        "name": "refund_payment",
+        "arguments": {"payment_id": "pay_7001", "amount_minor": 1200},
+        "inputResponses": {"confirm": {"action": "accept", "content": {"approve": true}}},
+        "requestState": "eyJhcmdzIjogeyJhbW91bnRfbWlub3IiOiAxMjAwLCAicGF5bWVudF9pZCI6ICJwYXlfNzAwMSJ9LCAidG9vbCI6ICJyZWZ1bmRfcGF5bWVudCJ9"
+      }
+      ```
+
+      and got `"resultType": "complete"` with `{"amount_minor": 1200, "refund_id": "rf_7001", "status":
+      "pending"}`.
+
+      The rules that make this work (MRTR page, client and server requirements):
+
+      - "The JSON-RPC `id` MUST be different between the initial request and the retry, as they are independent
+        requests."
+      - If the result has `requestState`, "the client MUST echo back the exact value"; clients "MUST NOT inspect,
+        parse, modify" it; without one, the retry "MUST NOT include one".
+      - "Servers MUST NOT send an `inputRequests` that the client has not declared support for in its
+        capabilities." Our fake server answers a client without `elicitation` with error `-32021` and
+        `{"requiredCapabilities": {"elicitation": {}}}`.
+      - Only `prompts/get`, `resources/read` and `tools/call` may return `InputRequiredResult`.
+      - "Servers MUST NOT assume that clients will fulfill the `inputRequests` or retry". The user may decline;
+        elicitation answers have three actions - `accept`, `decline`, `cancel`.
+      - The server "MUST treat `requestState` as an attacker-controlled input" and, if it influences
+        authorization or business logic, "MUST protect its integrity (e.g. HMAC or AEAD)".
+
+      Because everything the server needs is in the retry, any server instance behind a load balancer can finish
+      the request - the reason the pattern exists: no "shared storage layer across server instances" and no
+      "stateful load balancing".
+
+  - id: when
+    kind: when
+    concepts: [mcp-arch-participants, mcp-arch-primitives]
+    title: When MCP fits - and when it does not
+    body: |
+      | Situation | Usually best |
+      | --- | --- |
+      | one application, a handful of functions it owns | plain tool use in code - MCP adds a process or a network hop for nothing |
+      | the same system used from several AI applications (IDE, chat, support console) | an MCP server, written once by the team that owns the system |
+      | a vendor or another team owns the integration | their MCP server, connected by your host - but review it like any third-party code |
+      | data the user or application should choose (documents, records) | resources, not a "read_document" tool the model calls at will |
+      | repeatable task templates the user starts | prompts |
+      | a server needs the user's confirmation or a missing field | elicitation through a multi round-trip request |
+      | a server wants an LLM completion | deprecated sampling - call a provider API from the server instead |
+      | anything involving secrets or payment credentials from the user | URL-mode elicitation, never a form |
+
+      MCP does **not** replace: the agent loop (the host still runs it), authorization inside your systems (the
+      server still checks what the caller may do), or evaluation (a server can expose a misleading tool
+      description; the host must still decide what to trust). MCP "focuses solely on the protocol for context
+      exchange - it does not dictate how AI applications use LLMs or manage the provided context" (architecture
+      guide).
+
+  - id: visual
+    kind: visual
+    concepts: [mcp-arch-participants]
+    title: One host, one client per server
+    body: |
+      The SandPay support console as an MCP host. Notice that each client has exactly one server, that the
+      conversation and the model stay inside the host, and that the two servers never talk to each other.
+
+      ```mermaid
+      graph LR
+        subgraph Host["Host: SandPay support console"]
+          M[Model and conversation]
+          U[Consent UI]
+          C1[Client 1]
+          C2[Client 2]
+          M --- C1
+          M --- C2
+          U --- C1
+          U --- C2
+        end
+        C1 -->|"stdio (local)"| S1["Server: sandpay-docs<br/>tools, resources, prompts"]
+        C2 -->|"Streamable HTTP (remote)"| S2["Server: sandpay-payments<br/>tools, resources"]
+        S2 --- L[(Payments ledger)]
+        S1 --- D[(Docs)]
+      ```
+
+  - id: visual-mrtr
+    kind: visual
+    concepts: [mcp-arch-primitives]
+    title: A refund that needs approval
+    body: |
+      The multi round-trip request from the previous section. The first request ends with an interim result; the
+      retry is a separate request with a new id.
+
+      ```mermaid
+      sequenceDiagram
+        participant User
+        participant Host as Host and client
+        participant Server as sandpay-payments
+        Host->>Server: tools/call refund_payment (id payments-4)
+        Server-->>Host: resultType input_required, elicitation/create, requestState
+        Host->>User: Approve refund of 1200 on pay_7001?
+        User-->>Host: accept, approve true
+        Host->>Server: tools/call refund_payment (id payments-5) + inputResponses + same requestState
+        Server-->>Host: resultType complete, refund rf_7001 pending
+      ```
+
+  - id: code
+    kind: code
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages]
+    title: A host in about 60 lines, and what it printed
+    body: |
+      The core of `practice/ai/solutions/mcp/arch_host.py` (the exercise you will write; `McpError` and constants
+      are omitted here). Servers are in-process objects with `handle(message) -> reply`, standing in for a
+      transport:
+
+      ```python
+      class Client:
+          """Talks to exactly one server and attaches the per-request _meta to every request."""
+
+          def __init__(self, server, client_info, capabilities, id_prefix):
+              self.server, self.client_info, self.capabilities = server, client_info, capabilities
+              self._prefix, self._next = id_prefix, 0
+              self.server_capabilities = None
+
+          def new_id(self):
+              self._next += 1
+              return f"{self._prefix}-{self._next}"
+
+          def request(self, method, params=None):
+              body = dict(params or {})
+              body["_meta"] = {
+                  META + "protocolVersion": PROTOCOL_VERSION,
+                  META + "clientInfo": self.client_info,
+                  META + "clientCapabilities": self.capabilities,
+              }
+              msg_id = self.new_id()
+              reply = self.server.handle({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": body})
+              if reply is None or reply.get("id") != msg_id:
+                  raise McpError(-32603, "response does not match the request id")
+              if "error" in reply:
+                  e = reply["error"]
+                  raise McpError(e["code"], e["message"], e.get("data"))
+              return reply["result"]
+
+          def discover(self):
+              result = self.request("server/discover")
+              self.server_capabilities = result["capabilities"]
+              return result
+
+
+      class Host:
+          """Owns the clients, merges their tools for the model and routes the model's calls."""
+
+          def __init__(self, approve, capabilities=None):
+              self.approve = approve  # (server name, tool name, arguments) -> user said yes?
+              self.capabilities = capabilities if capabilities is not None else {}
+              self.clients = {}
+
+          def connect(self, name, server):
+              if SEPARATOR in name:
+                  raise ValueError(f"server name must not contain {SEPARATOR!r}")
+              if name in self.clients:
+                  raise ValueError(f"already connected: {name}")
+              client = Client(server, {"name": "sandpay-host", "version": "1.0.0"}, self.capabilities, name)
+              client.discover()
+              self.clients[name] = client
+              return client
+
+          def all_tools(self):
+              tools = []
+              for name, client in self.clients.items():
+                  if "tools" not in (client.server_capabilities or {}):
+                      continue  # never ask a server for a primitive it did not declare
+                  for tool in client.request("tools/list")["tools"]:
+                      tools.append({**tool, "name": f"{name}{SEPARATOR}{tool['name']}"})
+              return tools
+
+          def call_tool(self, qualified_name, arguments):
+              server_name, sep, tool_name = qualified_name.partition(SEPARATOR)
+              if not sep or server_name not in self.clients:
+                  raise KeyError(f"no server for tool {qualified_name!r}")
+              if not self.approve(server_name, tool_name, arguments):
+                  return {"resultType": "complete", "content": [{"type": "text", "text": "User denied the tool call."}], "isError": True}
+              return self.clients[server_name].request("tools/call", {"name": tool_name, "arguments": arguments})
+      ```
+
+      Connecting it to the two SandPay servers and calling one tool printed (from the demo script, abridged to the
+      lines discussed):
+
+      ```plaintext
+      payments {'tools': {}, 'resources': {}}
+      docs {'tools': {}, 'resources': {}, 'prompts': {}}
+      ['payments__get_payment', 'payments__refund_payment', 'docs__search_docs']
+      server saw: "get_payment" ['_meta', 'arguments', 'name']
+      docs requests: ['server/discover', 'tools/list']
+      ```
+
+      and the `tools/call` result:
+
+      ```json
+      {
+        "resultType": "complete",
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"amount_minor\": 4200, \"currency\": \"EUR\", \"id\": \"pay_7001\", \"merchant\": \"m-204\", \"status\": \"settled\"}"
+          }
+        ],
+        "isError": false,
+        "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "sandpay-payments", "version": "1.0.0"}}
+      }
+      ```
+
+      The payments server received only `name`, `arguments` and `_meta` - not the conversation, not the other
+      server's tools - and the docs server saw nothing of the payment lookup.
+
+      For comparison, the architecture guide shows the same idea with the official Python SDK, labelled by the
+      guide as pseudo-code (quoted, not run here):
+
+      ```python
+      # Pseudo-code using MCP Python SDK patterns
+      available_tools = []
+      for client in app.mcp_clients():
+          tools_response = await client.list_tools()
+          available_tools.extend(tools_response.tools)
+      conversation.register_available_tools(available_tools)
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages]
+    title: Why the host is written that way
+    body: |
+      - **`body = dict(params or {})`** - copy before adding `_meta`, so a caller's dict is never changed. The MRTR
+        retry depends on this: it must resend the *original* params.
+      - **`_meta` on every request** - the protocol is stateless; a server "MUST NOT rely on prior requests" for
+        the version or capabilities. Sending them once and assuming the server remembers is a 2025-era habit.
+      - **`msg_id = self.new_id()`** - each request gets a fresh id; "The request ID MUST NOT match the ID of any
+        other request the sender has issued and not yet received a response for". The prefix (`payments-3`) makes
+        logs readable.
+      - **`reply.get("id") != msg_id`** - a response belongs to exactly one request. A mismatch is a bug in the
+        transport or the server; failing loudly beats attaching the wrong result to a model's tool call.
+      - **`raise McpError(code, message, data)`** - protocol errors (unknown tool, bad params, version) are
+        exceptions for the host; a *tool* that failed returns a normal result with `isError: true`, which the host
+        passes to the model.
+      - **`client.discover()` before `self.clients[name] = client`** - a server that cannot speak our version
+        never becomes a half-connected entry.
+      - **`if "tools" not in client.server_capabilities: continue`** - "Both parties must respect declared
+        capabilities"; a resources-only server is never sent `tools/list`.
+      - **`f"{name}{SEPARATOR}{tool['name']}"`** - two servers can both have a tool called `search`. The spec does
+        not prescribe a namespacing scheme; prefixing with the host's own server name is one common choice. The
+        connect check forbids the separator inside server names so the split is unambiguous.
+      - **`self.approve(...)` before `request("tools/call")`** - consent is the host's job: "Hosts must obtain
+        explicit user consent before invoking any tool". A denied call never reaches the server, so the server
+        cannot act on it.
+      - **`{"name": tool_name, ...}`** - the server gets its own tool name back, without the host's prefix.
+
+  - id: steps
+    kind: steps
+    concepts: [mcp-arch-participants, mcp-arch-primitives]
+    title: Reviewing a new MCP server before you connect it
+    body: |
+      1. **Find out what it is.** Local (the host launches a process; it runs with the user's permissions) or
+         remote (an HTTPS endpoint; who operates it, and how does it authenticate you)?
+      2. **Discover it.** Send `server/discover` (or connect with the MCP Inspector, the project's development
+         tool). Record `supportedVersions`, `capabilities` and `serverInfo` - and remember `serverInfo` is
+         self-reported.
+      3. **List each declared primitive.** `tools/list`, `resources/list`, `prompts/list` - only those declared.
+      4. **Classify every tool by impact.** Read-only, writes data, moves money, deletes. Tool descriptions and
+         annotations "should be considered untrusted, unless obtained from a trusted server".
+      5. **Decide the consent rule per tool** in the host: auto-allow read-only lookups, confirm anything that
+         changes state, block what this host never needs.
+      6. **Check what the server can ask for.** If you declare `elicitation`, the server may ask the user
+         questions; make sure the host shows which server is asking and offers decline and cancel.
+      7. **Check names.** Do any tool names collide with other servers' tools? How will the host namespace them?
+      8. **Test the edges** - version mismatch, unknown tool, a failing tool, a declined elicitation - with
+         recorded messages as evidence.
+
+  - id: example
+    kind: example
+    concepts: [mcp-arch-participants, mcp-arch-primitives]
+    title: "Example: SandPay's support console adds two servers"
+    body: |
+      SandPay's support console (the host) connects to `sandpay-docs` (local, maintained by the docs team) and
+      `sandpay-payments` (remote, maintained by the payments team). The QA engineer reviews the design:
+
+      | Question | Finding | Evidence |
+      | --- | --- | --- |
+      | Is there one client per server? | Yes - two clients, ids prefixed `docs-` and `payments-` | host log of request ids |
+      | Does every request carry `_meta`? | Yes - version `2026-07-28`, capabilities `{"elicitation": {}}`, client info | recorded requests on both servers |
+      | Are undeclared primitives requested? | No - `prompts/list` goes only to `sandpay-docs` | payments server's received methods |
+      | Is the policy document a tool? | It was a `read_policy` tool; changed to the resource `sandpay://docs/refund-policy`, attached by the console when an agent opens a refund case | server diff |
+      | Is "summarise dispute" chosen by the model? | No - it is the prompt `summarise_dispute`, shown as a slash command | `prompts/list` result |
+      | Does a refund need approval? | Yes - `refund_payment` returns `input_required` with a form elicitation; the console also confirms every non-read-only tool | MRTR transcript above |
+      | What does the payments server see? | Only `name`, `arguments`, `_meta` | recorded `tools/call` params |
+      | What if the payments team ships 2026-07-28 support late? | The host receives `-32022` with `supported`; it must surface that rather than retry forever | version test |
+
+      The design is accepted with one change request: the payments server's `requestState` must be HMAC-protected
+      and bound to the agent's identity and a short expiry before release, because it controls a money-moving
+      action.
+
+  - id: tests
+    kind: tests
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages, mcp-arch-primitives]
+    title: Testing a host and its servers
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Discovery first | connect to a server | first message is `server/discover` with all `_meta` fields | server's received log |
+      | 2 | `_meta` everywhere | list tools, call a tool | every request has `protocolVersion` and `clientCapabilities` | received log |
+      | 3 | Unique ids | make several requests | no repeated id per client | ids in the log |
+      | 4 | Capability gating | connect a resources-only server, list tools | that server receives only `server/discover` | its received log |
+      | 5 | Namespacing | two servers with the same tool name | both tools visible, distinct names; calls reach the right server | merged list, both logs |
+      | 6 | Isolation | call a tool on server A | server B receives nothing; A receives only `name`, `arguments`, `_meta` | both logs |
+      | 7 | Consent denied | user denies a tool | `isError` result to the model; the server receives no `tools/call` | server log unchanged |
+      | 8 | Version mismatch | server supports only `2025-11-25` | `-32022` with `supported`; server not added to the host | exception data, host's client list |
+      | 9 | Missing `_meta` (server test) | send `tools/list` without `_meta` | `-32602` | response |
+      | 10 | MRTR accept | refund, user accepts | second request has a new id, `inputResponses`, identical `requestState`; result complete | both requests and the result |
+      | 11 | MRTR decline | user declines | result tells the model nothing was done; no refund in the ledger | result, ledger fixture |
+      | 12 | Missing capability | client without `elicitation` calls the refund tool | `-32021` with `requiredCapabilities` | error data |
+
+      Use fake servers that record what they receive (like `FakeServer.received` in the practice project): the
+      most important architectural properties - isolation, consent, gating - are about messages that must **not**
+      be sent, and only a recording proves an absence.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages, mcp-arch-primitives]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Treating a stdio connection as a session.** Caching the client's capabilities from the first request
+        and serving later requests without `_meta`. In 2026-07-28 that is a spec violation; reject with `-32602`.
+      - **Reusing the request id on an MRTR retry.** The retry is an independent request and needs a new id.
+      - **Editing or dropping `requestState`.** Clients must echo it exactly - not trimmed, not re-encoded, not
+        sent as `""` when there was none.
+      - **Unprotected `requestState` on the server.** Our fixture uses plain base64 so you can read it; a real
+        server whose state controls a refund must use HMAC or AEAD and bind it to the principal, an expiry and the
+        request - otherwise a client can edit the amount.
+      - **One client for several servers**, or passing one server's results to another directly. The host is the
+        only place results meet.
+      - **Sending undeclared requests** - `prompts/list` to a server without `prompts`, or an elicitation to a
+        client that did not declare it.
+      - **Everything as a tool.** A document the user chooses is a resource; a template the user starts is a
+        prompt. Making them tools hands the choice to the model.
+      - **Trusting `serverInfo` or tool annotations** for security decisions. Both are self-reported.
+      - **Form elicitation for secrets.** Passwords, API keys, tokens and payment credentials need URL mode.
+      - **Building new features on sampling or roots** in 2026-07-28 - they are deprecated with a removal date no
+        earlier than 2027-07-28.
+      - **Answering a notification** or expecting an answer to one.
+
+      **Debugging method:** capture the raw messages on both sides (most hosts and the MCP Inspector can show
+      them), then check in order: (1) is each message valid JSON-RPC - right kind, `jsonrpc: "2.0"`, id rules;
+      (2) does every request have the required `_meta`; (3) is the version supported - look for `-32022`; (4) was
+      the capability declared by the side that needs it; (5) for `input_required`, compare the first request and
+      the retry field by field.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages]
+    title: Trade-offs and alternatives
+    body: |
+      - **Reuse versus control.** A third-party server saves work but brings its own tool descriptions, data
+        handling and update schedule into your host. Pin versions and review changes like any dependency.
+      - **Stateless (2026-07-28) versus session-based (2025-11-25 and earlier).** Stateless requests are larger
+        (metadata on each one) but any server instance can answer any request, and a restart loses nothing. State
+        that must persist becomes explicit handles or `requestState`, which then needs integrity protection.
+      - **Local versus remote servers.** Local (stdio) servers are simple and need no network auth, but run with
+        the user's permissions on the user's machine; remote (Streamable HTTP) servers centralise updates and
+        access control but need OAuth-based authorization and network security.
+      - **Many small servers versus one large one.** Small servers isolate failures and permissions; every one adds
+        a client, a process or connection and tool descriptions in the model's context.
+      - **Version churn.** The spec changes in dated revisions and has a deprecation policy with a twelve-month
+        minimum window. Hosts that serve users today often need to be dual-era.
+      - **Alternatives.** In-process tool use (one application, simplest), a plain REST/OpenAPI integration (no AI
+        features, mature tooling), or vendor-specific plugin systems. MCP pays off when several AI applications
+        need the same integrations.
+
+  - id: summary
+    kind: summary
+    concepts: [mcp-arch-participants, mcp-arch-layers-messages, mcp-arch-primitives]
+    title: Quick reference
+    body: |
+      - **Host** = AI application: conversation, model, consent. **Client** = one per server. **Server** = focused
+        capabilities; cannot read the conversation or other servers.
+      - **Data layer** = JSON-RPC 2.0; **transport layer** = stdio or Streamable HTTP (+ auth on HTTP).
+      - Request (id, not null) - result or error (same id, never both) - notification (no id, never answered). No
+        batches. Results carry `resultType`; absent means `complete`.
+      - 2026-07-28: **stateless**; every request has `_meta` protocolVersion + clientCapabilities (+ clientInfo);
+        `server/discover` returns versions, capabilities, serverInfo. Errors `-32602`, `-32021`, `-32022`.
+      - Clients send requests and notifications; servers send responses and notifications.
+      - **Tools** model-controlled, **resources** application-controlled, **prompts** user-controlled. Declare
+        before use.
+      - **Elicitation** via MRTR: `input_required` - user answers - retry with a new id, `inputResponses`, exact
+        `requestState`. Sampling and roots are deprecated.
+      - Change notifications are opt-in via `subscriptions/listen`.
+
+exercises:
+  - id: clients-per-server
+    type: mcq
+    concept: mcp-arch-participants
+    skill: application
+    title: How many clients?
+    prompt: |
+      SandPay's support console connects to three MCP servers - docs (stdio), payments (remote) and disputes
+      (remote, the same company as payments). How many MCP clients does the console create?
+    options:
+      - id: three
+        text: Three - one per server
+        feedback: Correct. "Each client is created by the host and communicates with exactly one server", whatever the transport or operator.
+      - id: one
+        text: One client that talks to all three servers
+        feedback: A client has a 1:1 relationship with a server; one client for several servers would mix their messages and break isolation.
+      - id: two
+        text: Two - one for local servers and one for remote servers
+        feedback: Transport does not decide the count. The two remote servers are separate servers, so separate clients.
+      - id: zero
+        text: None - the model talks to the servers directly
+        feedback: The model never talks to servers. The host runs the model and routes its tool calls through clients.
+    correct: [three]
+    hints:
+      - Read the spec's sentence about what a client communicates with.
+    solution: |
+      Three. One client per server is what keeps each connection's messages and security boundary separate.
+
+  - id: who-sees-conversation
+    type: mcq
+    concept: mcp-arch-participants
+    skill: analysis
+    title: The server wants the whole chat
+    prompt: |
+      A vendor's MCP server asks the host to send the full conversation with every `tools/call` "so it can give
+      better answers". Under the MCP design principles, what should the host do?
+    options:
+      - id: refuse
+        text: Send only the tool name and arguments the call needs; the conversation stays with the host
+        feedback: Correct. "Servers receive only necessary contextual information"; "Full conversation history stays with the host".
+      - id: comply
+        text: Send it - servers need context to work well
+        feedback: That breaks a core design principle; servers "should not be able to read the whole conversation".
+      - id: comply-if-trusted
+        text: Send it if the server's serverInfo shows a trusted vendor name
+        feedback: serverInfo is self-reported and "not verified by the protocol"; it must not drive security decisions.
+      - id: other-servers
+        text: Send it, but remove the other servers' tool results first
+        feedback: Still far more than the call needs. The host decides what each server sees - the default is the minimum.
+    correct: [refuse]
+    hints:
+      - Which participant does the user trust with everything?
+    solution: |
+      The host keeps the conversation. A server gets the arguments for the operation it performs, and any extra
+      context only as an explicit, consented part of those arguments.
+
+  - id: pick-primitive
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: application
+    title: Tool, resource or prompt?
+    prompt: |
+      SandPay's docs server will offer the refund policy document so a support agent can attach it to a case
+      before asking the model a question. Which primitive fits best?
+    options:
+      - id: resource
+        text: A resource, such as sandpay://docs/refund-policy
+        feedback: Correct. Resources are application-controlled context "attached and managed by the client"; the agent or console chooses it.
+      - id: tool
+        text: A tool read_refund_policy
+        feedback: Tools are model-controlled; that hands the decision to the model, and the agent cannot attach it deliberately.
+      - id: prompt
+        text: A prompt refund_policy
+        feedback: Prompts are templates the user starts, such as slash commands - not documents to attach as context.
+      - id: elicitation
+        text: An elicitation that asks the user to paste the policy
+        feedback: Elicitation asks the user for information the server lacks; the server already has the document.
+    correct: [resource]
+    hints:
+      - Who decides when the document is used - the model, the application or the user?
+    solution: |
+      A resource. The spec's control column - model, application, user - decides most primitive choices.
+
+  - id: slash-command
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: application
+    title: A template the agent starts
+    prompt: |
+      Support agents want to type `/summarise-dispute D-77` and get a fixed, reviewed instruction sent to the
+      model. Which primitive and method?
+    options:
+      - id: prompt-get
+        text: A prompt, fetched with prompts/get
+        feedback: Correct. Prompts are "user-controlled" templates, typically exposed "as slash commands".
+      - id: tool-call
+        text: A tool, run with tools/call
+        feedback: A tool would be chosen by the model, not started by the agent; and it runs code rather than returning messages.
+      - id: resource-read
+        text: A resource, read with resources/read
+        feedback: Resources are data to attach, not templates with arguments that produce messages.
+      - id: sampling
+        text: Sampling - the server asks the client's model to summarise
+        feedback: Sampling is deprecated in 2026-07-28 and is the server asking for a completion, not a user-started template.
+    correct: [prompt-get]
+    hints:
+      - The user is the one deciding when it runs.
+    solution: |
+      A prompt: listed with prompts/list, filled with arguments and returned as messages by prompts/get.
+
+  - id: classify-null-id
+    type: mcq
+    concept: mcp-arch-layers-messages
+    skill: analysis
+    title: Is this a valid MCP message?
+    prompt: |
+      A client sends:
+
+      ```json
+      {"jsonrpc": "2.0", "id": null, "method": "tools/list", "params": {}}
+      ```
+
+      What is it under MCP?
+    options:
+      - id: invalid
+        text: Invalid - MCP request ids must not be null
+        feedback: Correct. JSON-RPC 2.0 allows (but discourages) a null id; MCP says the ID "MUST NOT be null".
+      - id: notification
+        text: A notification, because the id is null
+        feedback: A notification has no id member at all. A null id is still an id - and MCP forbids it.
+      - id: request
+        text: A valid request with id null
+        feedback: Valid in plain JSON-RPC 2.0, but MCP narrows the rule.
+      - id: error
+        text: An error response, because errors use a null id
+        feedback: Error responses use a null id only when the request id could not be read - and this message has method, not error.
+    correct: [invalid]
+    hints:
+      - Compare JSON-RPC 2.0's rule for ids with the MCP base protocol's.
+    solution: |
+      Invalid. Also notice the empty params are missing the required _meta - a server would answer -32602.
+    followUp: |
+      What would `{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}` be, and
+      what must the receiver send back? (A notification; nothing.)
+
+  - id: stateless-cache
+    type: mcq
+    concept: mcp-arch-layers-messages
+    skill: analysis
+    title: The server remembered the first request
+    prompt: |
+      A stdio server stores the protocol version and client capabilities from the first request on its stdin and
+      then accepts later requests without `_meta`. Tests pass with one client. What is wrong under revision
+      2026-07-28?
+    options:
+      - id: violates
+        text: Servers must not rely on prior requests for context; each request must carry _meta and one without it must get -32602
+        feedback: Correct. "Servers MUST NOT rely on prior requests over the same connection to establish context"; a missing required field means -32602.
+      - id: fine-stdio
+        text: Nothing - stdio has one client, so connection state is safe
+        feedback: The spec says "an open connection, such as a STDIO process, is not a conversation or session"; clients may interleave unrelated requests.
+      - id: initialize
+        text: It should require an initialize request first
+        feedback: initialize was removed in 2026-07-28; it is the legacy handshake.
+      - id: discover-required
+        text: Clients must call server/discover first, and the server should cache that
+        feedback: Discover is optional for clients and does not create a session.
+    correct: [violates]
+    hints:
+      - What does the spec say an open stdio process is not?
+    solution: |
+      Stateless means every request stands alone. Connection state is not context.
+
+  - id: absent-result-type
+    type: mcq
+    concept: mcp-arch-layers-messages
+    skill: application
+    title: No resultType
+    prompt: |
+      A client speaking 2026-07-28 talks to an older server and receives
+      `{"jsonrpc": "2.0", "id": 3, "result": {"tools": []}}`. How should it treat the result?
+    options:
+      - id: complete
+        text: As complete - an absent resultType means "complete"
+        feedback: Correct. "clients MUST treat an absent resultType as complete" for backward compatibility.
+      - id: invalid
+        text: As invalid - resultType is required
+        feedback: It is required from current servers, but the spec carves out absence for earlier ones. An unrecognised value is invalid; an absent one is not.
+      - id: input-required
+        text: As input_required, and retry
+        feedback: Nothing asks for input; retrying would repeat the call.
+      - id: error
+        text: As an error, because there is no content
+        feedback: An empty tool list is a normal result.
+    correct: [complete]
+    hints:
+      - The base protocol page has a backward-compatibility rule for this field.
+    solution: |
+      Complete. Unknown values are invalid; missing ones mean complete.
+
+  - id: server-needs-approval
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: application
+    title: The server needs the user's approval
+    prompt: |
+      In 2026-07-28, the payments server is handling `tools/call` for `refund_payment` and needs the user to
+      confirm. The client declared `elicitation`. What does the server do?
+    options:
+      - id: input-required
+        text: Answer the tools/call with resultType input_required, an elicitation/create in inputRequests and optional requestState
+        feedback: Correct. That is the multi round-trip request pattern; the client asks the user and retries.
+      - id: send-request
+        text: Send its own elicitation/create request to the client and wait for the response
+        feedback: That is the pre-2026-07-28 pattern. Now "Servers MUST NOT initiate JSON-RPC requests".
+      - id: error
+        text: Return a JSON-RPC error asking the client to confirm and call again
+        feedback: An error tells the client the call failed; the structured way to ask for input is InputRequiredResult.
+      - id: notification
+        text: Send a notification asking for confirmation
+        feedback: Notifications get no response, so the server could never receive the answer.
+    correct: [input-required]
+    hints:
+      - Which side may start a request in 2026-07-28?
+    solution: |
+      An InputRequiredResult with inputRequests. The retry carries inputResponses and the same requestState.
+
+  - id: capability-gating
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: analysis
+    title: A prompts/list error
+    prompt: |
+      The host sends `prompts/list` to `sandpay-payments` and gets `-32601 Method not found`. Discovery returned
+      `"capabilities": {"tools": {}, "resources": {}}`. Where is the bug?
+    options:
+      - id: host
+        text: In the host - it should only send prompts/list to servers that declared prompts
+        feedback: Correct. Capabilities tell each side what not to attempt; "Both parties must respect declared capabilities".
+      - id: server
+        text: In the server - every server must implement prompts/list
+        feedback: Only servers that declare the prompts capability must answer it.
+      - id: version
+        text: A version mismatch - the server should have returned -32022
+        feedback: The version was accepted (discovery succeeded). This is about an undeclared feature.
+      - id: transport
+        text: The transport dropped the prompts capability
+        feedback: Transports do not change message content; the server simply did not declare it.
+    correct: [host]
+    hints:
+      - Look at what the server declared.
+    solution: |
+      The host. Gate every primitive request on the discovered capabilities.
+
+  - id: sensitive-elicitation
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: analysis
+    title: Asking for an API key
+    prompt: |
+      A server needs the merchant's API key for a third-party shipping service. Its developer plans a form-mode
+      elicitation with a password field. What does the spec say?
+    options:
+      - id: url-mode
+        text: Not allowed - sensitive information such as API keys must go through URL mode
+        feedback: Correct. "Servers MUST NOT use form mode elicitation to request sensitive information such as passwords, API keys, access tokens, or payment credentials"; they "MUST use URL mode".
+      - id: ok-masked
+        text: Allowed if the field is masked in the UI
+        feedback: Masking does not change where the secret goes - through the client. The spec forbids form mode for secrets.
+      - id: tool-arg
+        text: Make the API key a tool argument so the model fills it in
+        feedback: Worse - the secret would pass through the model and the conversation.
+      - id: sampling
+        text: Use sampling to ask the model for the key
+        feedback: The model does not have the key, and sampling is deprecated.
+    correct: [url-mode]
+    hints:
+      - Elicitation has two modes. Which one keeps the secret away from the client?
+    solution: |
+      URL mode. The user completes the sensitive step in a browser; the credential never transits the MCP client.
+
+  - id: tool-call-order
+    type: order
+    concept: mcp-arch-participants
+    skill: application
+    title: A tool call through MCP, end to end
+    prompt: |
+      Put the steps in order for the first tool call the support console makes through a newly connected server.
+    items:
+      - id: create-client
+        text: The host creates a client for the server
+      - id: discover
+        text: The client sends server/discover with protocolVersion and clientCapabilities in _meta
+      - id: list
+        text: Because tools was declared, the client sends tools/list
+      - id: offer
+        text: The host gives the namespaced tool definitions to the model with the conversation
+      - id: choose
+        text: The model asks for a tool call
+      - id: consent
+        text: The host asks the user to approve the call
+      - id: call
+        text: The client sends tools/call with the server's tool name, the arguments and _meta
+      - id: result
+        text: The host adds the result to the conversation and calls the model again
+    hints:
+      - The model can only choose from tools it has been given.
+      - Consent happens before anything reaches the server.
+    solution: |
+      Client, discover, list (gated by capability), offer to the model, model chooses, user consents, call, result
+      back into the conversation. Discovery is optional in the spec but the usual way to learn capabilities.
+
+  - id: mrtr-debug
+    type: debug
+    concept: mcp-arch-primitives
+    skill: analysis
+    title: A retry the server rejects
+    prompt: |
+      This client helper sometimes gets "requestState does not match" and sometimes a duplicate-id error from a
+      strict server. Click **every** line that breaks the multi round-trip rules.
+    language: python
+    code: |
+      def refund_with_approval(client, payment_id, amount_minor, ask_user):
+          params = {"name": "refund_payment",
+                    "arguments": {"payment_id": payment_id, "amount_minor": amount_minor}}
+          msg_id = client.new_id()
+          result = client.send(msg_id, "tools/call", params)
+          if result.get("resultType", "complete") == "input_required":
+              answers = {key: ask_user(req["params"])
+                         for key, req in result.get("inputRequests", {}).items()}
+              params["inputResponses"] = answers
+              params["requestState"] = result.get("requestState", "").strip()
+              result = client.send(msg_id, "tools/call", params)
+          return result
+    correctLines: [10, 11]
+    lineNotes:
+      - line: 6
+        note: Correct - an absent resultType means complete.
+      - line: 9
+        note: Adding inputResponses to the original params is what the retry needs.
+    hints:
+      - Two rules govern the retry - one about the id, one about the state.
+      - What happens on line 10 when the server sent no requestState?
+    solution: |
+      Line 10 changes the state (strip) and sends "" when there was none - the client must echo the exact value
+      and omit it when absent. Line 11 reuses msg_id; the retry is an independent request and needs a new id.
+
+  - id: why-stateless
+    type: short
+    concept: mcp-arch-layers-messages
+    skill: analysis
+    title: Why remove the handshake?
+    prompt: |
+      SandPay runs its payments MCP server as six instances behind a load balancer. Explain why revision
+      2026-07-28's stateless design (per-request _meta, no initialize, MRTR) makes this easier than the earlier
+      session-based design, and name one new responsibility it gives the server.
+    modelAnswer: |
+      With a session, the instance that handled `initialize` held the negotiated version and capabilities, so later
+      requests had to reach that instance (sticky load balancing) or the state had to be shared. Server-initiated
+      requests (elicitation, sampling) also had to come back to the instance waiting for them. In 2026-07-28 each
+      request carries its version and capabilities in `_meta`, and an MRTR retry carries the user's answers and the
+      server's `requestState`, so any instance can handle any request and a restart loses nothing. The new
+      responsibility: state the server hands to the client - `requestState` or explicit handles - is
+      attacker-controlled input, so the server must integrity-protect it (HMAC or AEAD) and bind it to the
+      principal, an expiry and the original request when it affects authorization or business logic.
+    rubric:
+      - Explains that session state tied requests to one instance (sticky routing or shared storage).
+      - Says per-request _meta and MRTR retries make each request self-contained.
+      - Names integrity protection of requestState (or explicit handles) as the new duty.
+      - Mentions binding state to principal, expiry or request, or replay.
+    hints:
+      - Where did the negotiated version live before 2026-07-28?
+    solution: |
+      Self-contained requests let any instance serve any request; the price is protecting state that round-trips
+      through the client.
+
+  - id: host-test-design
+    type: testdesign
+    concept: mcp-arch-participants
+    skill: application
+    title: Test plan for the support console's MCP layer
+    prompt: |
+      Design test cases for the support console's MCP host, connected to `sandpay-docs` and `sandpay-payments`.
+      For each case give preconditions, steps, the expected result and the evidence you would keep. Cover
+      isolation, consent, capabilities, versions and the refund approval flow.
+    modelAnswer: |
+      Preconditions for all: two recording fake servers (payments declares tools and resources; docs declares
+      tools, resources and prompts), the host configured with capabilities `{"elicitation": {}}`.
+
+      1. **Discovery and _meta** - connect both. Expected: first message to each is server/discover; every request
+         carries protocolVersion 2026-07-28 and clientCapabilities. Evidence: recorded requests.
+      2. **Capability gating** - open the prompt menu. Expected: prompts/list only to docs. Evidence: payments log
+         has no prompts/list.
+      3. **Name collision** - both servers expose `search`. Expected: two distinct names; each call reaches its
+         server. Evidence: merged list, logs.
+      4. **Isolation** - call payments get_payment. Expected: docs receives nothing; payments receives only name,
+         arguments, _meta. Evidence: both logs.
+      5. **Consent denied** - deny refund_payment. Expected: isError result to the model, no tools/call on the
+         server. Evidence: server log unchanged, transcript.
+      6. **Refund approved (MRTR)** - approve. Expected: first call returns input_required; retry has a new id,
+         inputResponses and the identical requestState; result complete. Evidence: both requests and the result.
+      7. **Refund declined** - decline the elicitation. Expected: no refund created; the model is told nothing was
+         done. Evidence: ledger fixture, result.
+      8. **Version mismatch** - payments supports only 2025-11-25. Expected: -32022 with supported list surfaced;
+         server not marked connected. Evidence: error data, host state.
+      9. **Tampered state (server test)** - change one character of requestState on the retry. Expected: rejected.
+         Evidence: error response; no refund.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Includes isolation and consent-denied cases that prove a message was NOT sent.
+      - Includes capability gating and a version mismatch.
+      - Covers the MRTR flow including a new id and an unchanged requestState, and a decline.
+      - Uses recording fake servers rather than production systems.
+    hints:
+      - Several of the most important properties are about messages that must never be sent. How do you prove an absence?
+    solution: |
+      One case per architectural promise - discovery, gating, namespacing, isolation, consent, version, MRTR -
+      each proved from recorded messages.
+
+  - id: interview-mcp
+    type: interview
+    concept: mcp-arch-participants
+    skill: analysis
+    title: "Interview: explain MCP"
+    prompt: |
+      "We already use function calling. What is MCP, how is it structured, and why would we use it?"
+    modelAnswer: |
+      MCP is an open protocol for connecting AI applications to tools and data. It has three participants: the host
+      - the AI application, which owns the conversation, the model and the user's consent; one client per server
+      inside the host; and servers, which expose capabilities. Messages are JSON-RPC 2.0 over stdio for local
+      servers or Streamable HTTP for remote ones. Servers offer three primitives split by who controls them:
+      tools (model), resources (application) and prompts (user); clients can offer elicitation so a server can ask
+      the user for input. In the current revision, 2026-07-28, the protocol is stateless - every request carries
+      its version and capabilities in _meta, server/discover returns the server's capabilities, and a server that
+      needs input answers with input_required and the client retries.
+
+      Function calling is still what happens inside the host: the host lists MCP tools, gives them to the model
+      and runs the calls through the right client. MCP standardises the other side, so one payments server works
+      in every MCP host, and the team that owns payments owns the integration. I would use it when several AI
+      applications need the same systems, and keep plain in-process tools for a single app with a few functions.
+      Security stays the host's job: consent before tool calls, treating descriptions and results as untrusted,
+      and never giving a server the whole conversation.
+    rubric:
+      - Names host, client (one per server) and server, and what the host owns.
+      - Mentions JSON-RPC and the two transports.
+      - Distinguishes tools, resources and prompts by who controls them.
+      - Relates MCP to function calling (the host still does tool use) and says when not to use it.
+      - Mentions consent and untrusted servers, or the stateless 2026-07-28 design.
+    followUps:
+      - How does a server ask the user for confirmation in the current revision?
+      - Two servers expose a tool with the same name. What does your host do?
+      - What changed between 2025-11-25 and 2026-07-28 that matters for a load-balanced server?
+    hints:
+      - Structure - participants, messages and transports, primitives, then why and when.
+    solution: |
+      Participants, layers, primitives by control, then the relationship to function calling and the security
+      duties of the host.
+
+  - id: arch-messages-code
+    type: coding
+    concept: mcp-arch-layers-messages
+    skill: application
+    title: Classify JSON-RPC messages for MCP
+    prompt: |
+      In `arch_messages.py`, implement `classify_message` (request, notification, result or error - or
+      `InvalidMessage` with a reason), `result_type` (absent means complete, unknown is invalid) and `may_send`
+      (who may send which kind in 2026-07-28). The docstrings list the rules and the order to check them in.
+    project: ai
+    files:
+      - exercises/mcp/arch_messages.py
+    test: tests/mcp/test_arch_messages.py
+    command: .venv/bin/python -m pytest tests/mcp/test_arch_messages.py
+    modelAnswer: |
+      Check the shape before the meaning: a list is a batch (not supported), then `jsonrpc == "2.0"`. A message
+      with `method` is a request or notification - it must not also have result or error, params must be an
+      object, no id means notification, and an id must be a non-null string or integer (exclude `bool`, which is
+      an `int` in Python). Otherwise a response has exactly one of result or error; a result needs an id; an error
+      needs an integer code and a message and may have a null id.
+
+      ```python
+      def result_type(response):
+          if classify_message(response) != "result":
+              raise InvalidMessage("not a result response")
+          value = response["result"].get("resultType", "complete")
+          if value not in KNOWN_RESULT_TYPES:
+              raise InvalidMessage(f"unknown resultType {value!r}")
+          return value
+      ```
+
+      `may_send` is a table: client - request, notification; server - result, error, notification.
+    rubric:
+      - Every test in tests/mcp/test_arch_messages.py passes.
+      - Booleans are rejected as ids and codes even though Python treats them as integers.
+      - The null-id error response is accepted while a null-id request is rejected.
+      - You can say which rules come from JSON-RPC 2.0 and which MCP adds.
+    hints:
+      - In Python, isinstance(True, int) is True.
+      - An error response may have a null id; a request may not.
+    solution: |
+      JSON-RPC 2.0 gives the four kinds; MCP adds non-null ids, object params, no batches and resultType.
+
+  - id: arch-host-code
+    type: coding
+    concept: mcp-arch-participants
+    skill: application
+    title: Build a minimal MCP host
+    prompt: |
+      In `arch_host.py`, implement `controller`, `Client.request`, `Client.discover`, `Host.connect`,
+      `Host.all_tools` and `Host.call_tool`. The tests connect your host to two fake SandPay servers that record
+      every message they receive, so they check what was sent - and what was not.
+    project: ai
+    files:
+      - exercises/mcp/arch_host.py
+    test: tests/mcp/test_arch_host.py
+    command: .venv/bin/python -m pytest tests/mcp/test_arch_host.py
+    modelAnswer: |
+      The reference solution is the code in the section "A host in about 60 lines". The key decisions: copy params
+      and add `_meta` on every request; new id per request; check the reply's id; raise protocol errors; discover
+      before storing a client; send `tools/list` only to servers that declared `tools`; namespace tools with the
+      server name; ask for consent before `tools/call`, and on denial return an `isError` result without touching
+      the server.
+    rubric:
+      - Every test in tests/mcp/test_arch_host.py passes.
+      - The server receives only name, arguments and _meta on a tool call.
+      - A failed discover leaves no client behind.
+      - You can explain why consent is checked in the host rather than the server.
+    hints:
+      - Read FakeServer.handle in support/mcp_arch_fixture.py to see exactly what the server checks.
+      - str.partition splits once and tells you whether the separator was found.
+    solution: |
+      One client per server, _meta on every request, capability gating, namespacing, consent before calls.
+
+  - id: arch-mrtr-code
+    type: coding
+    concept: mcp-arch-primitives
+    skill: application
+    title: Finish a request that needs the user's input
+    prompt: |
+      In `arch_mrtr.py`, implement `answer_input_requests` and `call_with_input`: send the request, and while the
+      result is `input_required`, ask the user through `ask_user`, then retry the original request with
+      `inputResponses` and the exact `requestState`. Stop after `max_rounds` requests.
+    project: ai
+    files:
+      - exercises/mcp/arch_mrtr.py
+    test: tests/mcp/test_arch_mrtr.py
+    command: .venv/bin/python -m pytest tests/mcp/test_arch_mrtr.py
+    modelAnswer: |
+      ```python
+      def call_with_input(client, method, params, ask_user, max_rounds=3):
+          current = dict(params)
+          for _ in range(max_rounds):
+              result = client.request(method, current)
+              kind = result.get("resultType", "complete")
+              if kind == "complete":
+                  return result
+              if kind != "input_required":
+                  raise ValueError(f"unknown resultType {kind!r}")
+              retry = dict(params)  # the original params, not the previous retry's
+              if "inputRequests" in result:
+                  retry["inputResponses"] = answer_input_requests(result["inputRequests"], client.capabilities, ask_user)
+              if "requestState" in result:
+                  retry["requestState"] = result["requestState"]
+              current = retry
+          raise InputLoopError(f"{method} still needs input after {max_rounds} rounds")
+      ```
+
+      The client creates a new id for every `request`, so the retry is automatically an independent request.
+      Building each retry from the original params means old answers and old state never leak into the next
+      round; refusing input requests for undeclared capabilities mirrors the server's duty not to send them.
+    rubric:
+      - Every test in tests/mcp/test_arch_mrtr.py passes.
+      - Each retry starts from the original params and carries only the latest requestState.
+      - A declined elicitation is returned as a result, not raised.
+      - You can explain why the retry needs a new JSON-RPC id.
+    hints:
+      - A result may contain requestState without inputRequests - then retry with the state only.
+      - Copy the caller's params; the tests check they are unchanged.
+    solution: |
+      Loop - request, check resultType, answer, rebuild from the original params plus answers and exact state -
+      with a round limit.
+
+placement:
+  - id: place-host-role
+    type: mcq
+    concept: mcp-arch-participants
+    skill: analysis
+    title: Where does consent live?
+    prompt: |
+      A remote MCP server exposes `delete_merchant`. Which participant must make sure the user approves before it
+      runs?
+    options:
+      - id: host
+        text: The host
+        feedback: Correct. The host "enforces security policies and consent requirements" and must get consent before invoking any tool.
+      - id: client
+        text: The client, because it sends tools/call
+        feedback: The client is a connector inside the host; the consent decision and UI belong to the host.
+      - id: server
+        text: The server, through its tool description
+        feedback: A description is not consent, and tool descriptions are untrusted. The server may add its own checks, but the host must ask.
+      - id: model
+        text: The model, which decides whether to call it
+        feedback: The model choosing a tool is exactly what needs a human check.
+    correct: [host]
+    hints:
+      - Which participant talks to the user?
+    solution: |
+      The host. Servers may add elicitation or their own authorization, but consent is the host's duty.
+
+  - id: place-message-kind
+    type: mcq
+    concept: mcp-arch-layers-messages
+    skill: application
+    title: What must the receiver send back?
+    prompt: |
+      A server receives `{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "c-7"}}`.
+      What does it send in reply?
+    options:
+      - id: nothing
+        text: Nothing - it is a notification
+        feedback: Correct. No id means a notification, and "The receiver MUST NOT send a response".
+      - id: result
+        text: A result with resultType complete
+        feedback: A result needs the id of a request; there is none.
+      - id: error
+        text: An error -32600, because the id is missing
+        feedback: A missing id is what makes it a notification, not an invalid request.
+      - id: ack
+        text: A notifications/acknowledged message
+        feedback: There is no generic acknowledgement; notifications are not confirmable.
+    correct: [nothing]
+    hints:
+      - Look for the id member.
+    solution: |
+      Nothing. Notifications are one-way in both JSON-RPC 2.0 and MCP.
+
+  - id: place-mrtr
+    type: mcq
+    concept: mcp-arch-primitives
+    skill: analysis
+    title: The retry after input_required
+    prompt: |
+      Request `p-4` (tools/call) returned `resultType: "input_required"` with an elicitation and
+      `requestState: "s.abc"`. The user accepted. What does the client send?
+    options:
+      - id: new-request
+        text: A new tools/call with a new id, the original params, inputResponses and requestState "s.abc" unchanged
+        feedback: Correct - a new id, the exact state, and the answers keyed like the inputRequests.
+      - id: response
+        text: A JSON-RPC response with id p-4 containing the user's answer
+        feedback: Clients do not send JSON-RPC responses in 2026-07-28; the answer travels on a retry.
+      - id: same-id
+        text: The same request again with id p-4 plus inputResponses
+        feedback: The id "MUST be different between the initial request and the retry".
+      - id: decoded
+        text: A new tools/call whose requestState is decoded and checked by the client first
+        feedback: Clients "MUST NOT inspect, parse, modify" requestState.
+    correct: [new-request]
+    hints:
+      - Who may send responses in 2026-07-28?
+    solution: |
+      A new request: original params + inputResponses + the exact requestState, new id.
+
+recall:
+  - id: recall-participants
+    concept: mcp-arch-participants
+    prompt: Name the three MCP participants and one job of each.
+    answer: Host - the AI application; owns the conversation, the model and consent. Client - one per server, attaches version and capabilities to every request. Server - exposes tools, resources and prompts; cannot see the conversation or other servers.
+  - id: recall-layers
+    concept: mcp-arch-layers-messages
+    prompt: What are MCP's two layers?
+    answer: The data layer (JSON-RPC 2.0 messages - discovery, primitives, notifications) and the transport layer (stdio or Streamable HTTP - framing, delivery, authorization on HTTP).
+  - id: recall-message-kinds
+    concept: mcp-arch-layers-messages
+    prompt: How do you tell the four JSON-RPC message kinds apart?
+    answer: method + id = request; method without id = notification (never answered); id + result = result; id + error = error. Never result and error together. MCP request ids are not null.
+  - id: recall-meta
+    concept: mcp-arch-layers-messages
+    prompt: What must every MCP 2026-07-28 request carry, and what if it does not?
+    answer: In params._meta - io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities (clientInfo is recommended). Missing a required field - error -32602 (400 on HTTP).
+  - id: recall-control
+    concept: mcp-arch-primitives
+    prompt: Who controls tools, resources and prompts?
+    answer: Tools - the model. Resources - the application. Prompts - the user.
+  - id: recall-mrtr
+    concept: mcp-arch-primitives
+    prompt: How does a 2026-07-28 server ask the user for input?
+    answer: It answers tools/call, resources/read or prompts/get with resultType input_required and inputRequests (for example elicitation/create) and optional requestState; the client asks the user and retries with a new id, inputResponses and the exact requestState.
+
+next:
+  - mcp-lifecycle-and-transports
+  - building-mcp-servers
+  - building-mcp-clients

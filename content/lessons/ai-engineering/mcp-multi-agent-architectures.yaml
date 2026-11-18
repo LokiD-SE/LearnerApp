@@ -1,0 +1,1514 @@
+id: mcp-multi-agent-architectures
+title: Multi-server and multi-agent MCP architectures
+subject: ai-engineering
+module: model-context-protocol
+level: advanced
+status: published
+estimatedMinutes: 135
+summary: Run one AI application against many MCP servers at once - one client per server, a single tool list for the model with namespaced names, calls routed back to the right server, partial results when one server is down, progress and cancellation tracked per request across servers, and agents placed behind MCP servers. Built from the MCP specification revision 2026-07-28 (the stateless revision) in plain Python; every output shown was printed by the code shown, against in-process fake servers.
+tags:
+  [
+    MCP,
+    Model Context Protocol,
+    multi-server,
+    MCP host,
+    MCP client,
+    tool aggregation,
+    namespacing,
+    tool name collision,
+    routing,
+    fan-out,
+    partial results,
+    failure isolation,
+    circuit breaker,
+    timeouts,
+    progress notifications,
+    progressToken,
+    cancellation,
+    notifications/cancelled,
+    Streamable HTTP,
+    stdio,
+    remote server,
+    local server,
+    progressive discovery,
+    subagents,
+    multi-agent,
+    stateless protocol,
+    JSON-RPC,
+    agents,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`, standard library only (`concurrent.futures`, `dataclasses`,
+    `re`); pytest for the exercises. Every output in this lesson was printed by the code shown, run on Linux on
+    18 November 2026, using the reference solutions in `practice/ai/solutions/mcp/multi_aggregator.py`,
+    `multi_router.py` and `multi_progress.py`.
+  - **No MCP SDK, no network, no model.** Following the course decision, MCP is implemented by hand from the
+    specification. A "client" in the code is a Python callable that takes one JSON-RPC request dict and returns one
+    response dict; the "servers" are in-process fakes. The JSON-RPC and MCP message shapes follow the
+    specification; transport framing (stdio lines, HTTP POST and SSE) is taught in [The MCP lifecycle, JSON-RPC
+    and transports](#/lesson/mcp-lifecycle-and-transports) and not repeated here.
+  - **Standard:** [Model Context Protocol specification, revision
+    2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) - the revision marked **Current** on the
+    [versioning page](https://modelcontextprotocol.io/specification/versioning) as documented on 18 November 2026.
+    Sections used: [Architecture](https://modelcontextprotocol.io/specification/2026-07-28/architecture),
+    [Base protocol overview](https://modelcontextprotocol.io/specification/2026-07-28/basic) (Statelessness,
+    `_meta`, error codes), [Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) (Tool
+    Names, Error Handling, Security Considerations),
+    [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover),
+    [Progress](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress),
+    [Cancellation](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation),
+    [Transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports),
+    [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) and [Streamable
+    HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http), and the
+    [Key Changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog) page. Quotations are from
+    those pages. Earlier revisions (2025-11-25 and before) had an `initialize` handshake and protocol sessions;
+    2026-07-28 removed both - check which revision your SDK and servers speak.
+  - **Guides on modelcontextprotocol.io (documentation, not normative spec), as documented on 18 November 2026:**
+    [Architecture overview](https://modelcontextprotocol.io/docs/2026-07-28/learn/architecture) (local and remote
+    servers), [Client Best Practices](https://modelcontextprotocol.io/docs/2026-07-28/develop/clients/client-best-practices)
+    (progressive discovery, prompt caching, programmatic tool calling) and [Security Best
+    Practices](https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices) (token
+    passthrough).
+  - **Patterns, not specification:** the `server__tool` prefix format, fan-out with partial results, the circuit
+    breaker, the idle/maximum timeout split and "an agent behind an MCP server" are host design patterns. The spec
+    asks for a disambiguation strategy and timeouts; it does not prescribe these designs. They are labelled where
+    they appear.
+  - **Multi-agent background:** the cost and coordination evidence (Anthropic's multi-agent research article,
+    the MAST study) is covered in [Multi-agent systems with CrewAI](#/lesson/multi-agent-systems-crewai) and only
+    referred to here.
+  - **Synthetic data:** SandPay is a fictional payments company. Server ids `ledger`, `support`, `kb` and `fx`,
+    payout `po_1039`, merchant `m-204` and all amounts were invented for this lesson.
+
+prerequisites:
+  - mcp-architecture
+  - building-mcp-clients
+  - tool-use-and-function-calling
+  - multi-agent-systems-crewai
+
+concepts:
+  - id: mcp-multi-host-topology
+    name: One host, many clients, many servers - local, remote and agents behind servers
+    summary: The host is the only component that sees the whole conversation; it creates one client per server, and each client talks to exactly one server. Local servers (stdio, launched by the host) typically serve one client; remote servers (Streamable HTTP) typically serve many. Servers never see each other or the full conversation - cross-server work is orchestrated by the host. An agent can sit behind a server as one tool that runs its own loop with its own model key (a pattern); since 2026-07-28 MCP is stateless, so state that spans calls travels as explicit handles in tool arguments.
+  - id: mcp-multi-tool-aggregation
+    name: Aggregating tools from several servers - namespacing, collisions and routing
+    summary: Tool names are unique only within one server, so a host that merges tool lists must disambiguate - the spec suggests prefixing with a server identifier and says not to rely on serverInfo names. Prefix every tool with a host-chosen server id (stable names, stable prompt cache) rather than only colliding ones (names change when a server connects). Keep a reverse map from exposed name to (server, original name), send the original name in tools/call, list tools in a deterministic order, skip a bad definition with a warning, and switch to progressive discovery when definitions take a noticeable share of the context window.
+  - id: mcp-multi-resilience
+    name: Failure isolation, progress and cancellation across servers
+    summary: One slow or dead server must not stall or crash the turn - send to servers in parallel with a timeout each, return partial results with one error per failed server, report a failed call to the model as an isError tool result, and skip a server after repeated failures (a circuit breaker pattern). Progress tokens must be unique across all active requests, progress must increase, and notifications for unknown, foreign or completed tokens are ignored. Cancelling is transport-specific - notifications/cancelled on stdio, closing the response stream on Streamable HTTP - and a maximum timeout is enforced even while progress keeps arriving.
+
+objectives:
+  - Draw the host-client-server topology for an assistant that uses local and remote MCP servers, and explain what each component can and cannot see.
+  - Build one tool list from several servers with namespaced names, route a model's call back to the right server and explain why prefixing every tool beats prefixing only collisions.
+  - Write a fan-out that returns partial results when servers fail or hang, and turn every routing failure into an isError tool result.
+  - Track progress notifications from several servers, reject invalid ones, and decide how to cancel and when to time out a request on each transport.
+  - Decide when to put an agent behind an MCP server, and design tests that prove one failing server cannot break the others.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: The idea in plain language
+    body: |
+      SandPay's merchant-support assistant answers questions like "Why is payout po_1039 late?". To answer, it needs
+      the **ledger** (payouts and balances), the **support** desk (open tickets), the **knowledge base** (help
+      articles) and an **FX** service (exchange rates). Each of these is a separate MCP server, owned by a separate
+      team, some on the same laptop and some on the internet.
+
+      Think of the assistant as a **switchboard operator** in an old telephone exchange:
+
+      - the operator (the **host**) is the only person who hears the whole conversation with the caller;
+      - each department has its own line (one **client** per **server**) - the ledger team never hears what the
+        support team said, unless the operator repeats it;
+      - the operator keeps a directory of who can do what (the **aggregated tool list**). Two departments both
+        offer a "search" - so the directory says "ledger search" and "support search", never just "search";
+      - if the knowledge-base line is dead, the operator still answers with what the other departments said and
+        tells the caller which part is missing (**partial results**) - one dead line never takes down the switchboard;
+      - for slow jobs the operator watches each line's "still working - 60% done" messages (**progress**), and can
+        hang up a line that has gone silent for too long (**cancellation**, **timeouts**).
+
+      MCP defines the lines and the messages on them. The switchboard - the directory, the routing, the "what if a
+      line is dead" rules - is the host's job, and that is what this lesson builds and tests.
+
+  - id: what
+    kind: what
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Terms you need
+    body: |
+      | Term | Meaning | Source |
+      | --- | --- | --- |
+      | **Host** | the AI application; "Creates and manages multiple client instances", "Coordinates AI/LLM integration", "Manages context aggregation across clients" | spec, Architecture |
+      | **Client** | created by the host; "Communicates with exactly one server" and "Attaches protocol version and capabilities to every request" | spec, Architecture |
+      | **Server** | a program offering tools, resources and prompts; servers "Can be local processes or remote services" | spec, Architecture |
+      | **Local server** | runs on the user's machine over the stdio transport; local stdio servers "typically serve a single MCP client" | docs, Architecture overview |
+      | **Remote server** | runs elsewhere over Streamable HTTP; remote servers "will typically serve many MCP clients" | docs, Architecture overview |
+      | **Stateless protocol** | "every request is self-contained and carries its own protocol version and capabilities" (revision 2026-07-28) | spec, Architecture |
+      | **`_meta` per-request fields** | `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` (both required on client requests), `io.modelcontextprotocol/clientInfo` (optional) | spec, Base protocol |
+      | **Tool aggregation** | merging the `tools/list` results of several servers into one list for the model | host design |
+      | **Namespacing** | making names unique across servers - the spec suggests "prefixing tool names with a server identifier" | spec, Tools |
+      | **Exposed name** | the name the model sees, e.g. `ledger__search`; the host maps it back to server `ledger`, tool `search` | this lesson's pattern |
+      | **Fan-out** | sending the same request to several servers in parallel | pattern |
+      | **Partial result** | the answers that arrived plus a named error for each server that did not | pattern |
+      | **Circuit breaker** | skipping a server after N consecutive failures until it is healthy again | pattern (not in MCP) |
+      | **Progress token** | a string or integer the requester puts in `_meta.progressToken`; "MUST be unique across all active requests" | spec, Progress |
+      | **`notifications/progress`** | carries the token, `progress` (which "MUST increase"), optional `total` and `message` | spec, Progress |
+      | **Cancellation** | stdio: send `notifications/cancelled` with the `requestId`; Streamable HTTP: "Closing the SSE response stream is the cancellation signal" | spec, Cancellation |
+      | **Tool execution error** | a normal result with `isError: true` that the model can read and act on | spec, Tools |
+      | **Protocol error** | a JSON-RPC `error` object, e.g. code `-32602` for an unknown tool | spec, Tools |
+
+  - id: why
+    kind: why
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Why one server is never enough - and why many servers need a plan
+    body: |
+      MCP was designed for many servers. The specification's design principles say "Servers should be highly
+      composable": "Each server provides focused functionality in isolation" and "Multiple servers can be combined
+      seamlessly". A useful assistant therefore ends up with several servers - the ledger team's, the support
+      team's, a vendor's remote server - and every one of them adds a way to fail.
+
+      Without a plan, a multi-server host breaks in predictable ways:
+
+      | Without a plan | What goes wrong |
+      | --- | --- |
+      | merge tool lists as they come | two `search` tools - the provider API rejects duplicate names, or the model calls the wrong one |
+      | name tools after `serverInfo.name` | two servers both report `"name": "search-server"`; the spec says that name "SHOULD NOT be relied upon for disambiguation" |
+      | ask servers one after another, no timeout | one hung server stalls the whole answer |
+      | let a client exception propagate | a refused connection to the knowledge base crashes a turn that only needed the ledger |
+      | accept every progress notification | a buggy server moves another server's progress bar, or sends progress after the answer |
+      | load every tool of every server into context | the Client Best Practices guide warns that definitions alone "can consume the majority of the context window" |
+
+      The specification also draws the security line that makes all of this the host's job: servers "should not be
+      able to read the whole conversation, nor 'see into' other servers", "Cross-server interactions are controlled
+      by the host" and the "Host process enforces security boundaries". Composition is free; coordination is yours.
+
+  - id: internals
+    kind: internals
+    concepts: [mcp-multi-host-topology, mcp-multi-resilience]
+    title: What the 2026-07-28 revision changes for multi-server hosts
+    body: |
+      Revision 2026-07-28 made MCP **stateless** (Key Changes, items 1-3 and 9). Four consequences matter when you
+      run many servers:
+
+      1. **No handshake per server.** The `initialize` / `notifications/initialized` handshake is gone. "Every
+         request now carries its protocol version and client capabilities in `_meta`." A host may call
+         `server/discover` (which servers "MUST implement") to learn each server's versions and capabilities up
+         front, or simply send requests and handle an `UnsupportedProtocolVersionError` (code `-32022`).
+      2. **A connection is not a session.** The spec: "Servers MUST NOT rely on prior requests over the same
+         connection to establish context", and "an open connection, such as a STDIO process, is not a conversation
+         or session". The `Mcp-Session-Id` header was removed. Servers that need state across calls use "explicit,
+         server-minted handles passed as ordinary tool arguments". For a host with many conversations this is good
+         news: it can share one client per server between conversations, and route by request, not by connection.
+      3. **Server-to-client requests became results.** Servers no longer send requests such as
+         `elicitation/create` to the client; they return an `InputRequiredResult` (`resultType: "input_required"`)
+         and the client retries the original request with `inputResponses`. Every result carries `resultType`. A
+         router therefore stays strictly request-response per server - easier to reason about when ten servers are
+         in flight.
+      4. **Request-scoped notifications stay with their request.** "Request-scoped notifications such as
+         `notifications/progress` and `notifications/message` continue to flow on the response stream of the
+         request they relate to". Long-lived change notifications (`toolsListChanged` and others) come over a
+         separate `subscriptions/listen` request.
+
+      Two other changes help aggregation directly: servers "SHOULD return tools from `tools/list` in a
+      deterministic order", and list results carry `ttlMs` and `cacheScope` caching hints, so a host can cache each
+      server's tool list instead of asking again every turn.
+
+      **Error codes a router sees.** Tool failures the model can fix arrive as a *result* with `isError: true`.
+      Protocol problems arrive as a JSON-RPC `error`: the spec's example for an unknown tool is code `-32602`
+      ("Unknown tool: invalid_tool_name"). Codes `-32020` to `-32099` are "reserved for the MCP specification";
+      `-32000` to `-32019` remain implementation-defined.
+
+      **Agents behind a server (pattern).** An MCP tool can do anything the server likes - including running its
+      own agent loop with its own model, prompts and tools, then returning a final answer. To the host it is just
+      one tool call (with progress notifications if it is slow). Note what the spec says about the alternative:
+      **Sampling** (the server asking the client's model to generate) is **deprecated** in 2026-07-28, with the
+      suggested migration "integrate directly with LLM provider APIs instead of Sampling". A server-side agent
+      therefore brings its own model access and its own costs.
+
+  - id: when
+    kind: when
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation]
+    title: When to add a server, merge tools, or put an agent behind MCP
+    body: |
+      | Situation | Usually best | Why |
+      | --- | --- | --- |
+      | a capability owned by another team or vendor | a separate server, its own client | ownership, deployment and credentials stay separate |
+      | 2-4 servers, a few dozen tools | load all definitions, namespaced | simple; the guide says that for a small set "loading all tools is fine" |
+      | hundreds of tools | progressive discovery (`search_tools` then load the chosen definitions) | the guide suggests a threshold such as "1%-5%" of the context window |
+      | the same question to several servers (search everywhere) | fan-out with a timeout and partial results | latency is the slowest *healthy* server, not the sum |
+      | steps depend on each other (look up payout, then the ticket for it) | sequential calls in the model loop | fan-out only helps independent work |
+      | a self-contained job with its own tools and lots of reading (reconcile 1,000 payouts) | an agent behind one MCP tool (pattern), with progress | its intermediate data never enters your model's context |
+      | the job needs the whole conversation | keep it in the host | servers receive "only necessary contextual information"; do not ship the conversation to them |
+      | many intermediate results passed between tools | programmatic tool calling in a sandbox (guide) | only the final output returns to the model |
+
+      **What multi-server does not replace:** authorization (each remote server has its own tokens - see [MCP
+      security and authorization](#/lesson/mcp-security-and-authorization)), evaluation of the assistant as a whole,
+      and the judgement in [Multi-agent systems with CrewAI](#/lesson/multi-agent-systems-crewai) about whether
+      more agents help at all. More servers means more tokens of tool definitions, more failure modes and more to
+      test; add one when a real capability needs it.
+
+  - id: visual
+    kind: visual
+    concepts: [mcp-multi-host-topology, mcp-multi-resilience]
+    title: The SandPay host, one turn
+    body: |
+      ```mermaid
+      flowchart LR
+        subgraph Host["SandPay assistant (host)"]
+          M[Model loop] --> R[Router + tool catalog]
+          R --> C1[client: ledger]
+          R --> C2[client: support]
+          R --> C3[client: kb]
+          R --> C4[client: fx]
+        end
+        C1 -- stdio --> S1[ledger server - local]
+        C2 -- Streamable HTTP --> S2[support server - remote]
+        C3 -. connection refused .-> S3[kb server - down]
+        C4 -. "no reply in 0.2 s" .-> S4[fx server - hung]
+        S2 --> A[(reconciliation agent behind a tool)]
+      ```
+
+      What to notice: every arrow from the host goes through its **own** client; the router is the only place that
+      knows all servers. Two lines are broken, and the turn still completes with the ledger and support answers. The
+      agent behind the support server is invisible to the host - it sees one tool and its progress.
+
+      ```mermaid
+      sequenceDiagram
+        participant H as Host router
+        participant L as ledger (stdio)
+        participant S as support (HTTP)
+        H->>L: tools/call (id 17, progressToken ledger-1)
+        H->>S: tools/call (id 4, progressToken support-2)
+        L-->>H: notifications/progress ledger-1 200/1000
+        S-->>H: notifications/progress support-2 1/4
+        Note over H: user presses Stop
+        H->>L: notifications/cancelled requestId 17
+        H--xS: close the SSE response stream (that is the cancel)
+      ```
+
+      What to notice: the **same** user action becomes two different transport actions.
+
+  - id: aggregation-code
+    kind: code
+    concepts: [mcp-multi-tool-aggregation]
+    title: "Aggregating tools: namespaced names and a reverse map"
+    body: |
+      The heart of `multi_aggregator.py` (the practice exercise; the full file has the validation helpers):
+
+      ```python
+      SEPARATOR = "__"
+      MAX_NAME = 128  # the spec's SHOULD: 1 to 128 characters
+      TOOL_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")  # the spec's SHOULD character set
+      SERVER_ID = re.compile(r"^[a-z0-9][a-z0-9\-]{0,31}$")  # host-chosen: no "_", so "__" splits unambiguously
+
+      def namespaced(server_id, tool_name):
+          if not SERVER_ID.match(server_id):
+              raise ValueError(f"invalid server id {server_id!r}: ...")
+          name = f"{server_id}{SEPARATOR}{tool_name}"
+          if len(name) > MAX_NAME:
+              raise ValueError(f"namespaced name is {len(name)} characters; the limit is {MAX_NAME}")
+          if not TOOL_NAME.match(name):
+              raise ValueError(f"namespaced name {name!r} has characters outside A-Z a-z 0-9 _ - .")
+          return name
+
+      class ToolCatalog:            # a dataclass in the file: mode, warnings, _servers
+          def _exposed_name(self, server_id, name, counts):
+              if self.mode == "always" or counts[name] > 1:
+                  return namespaced(server_id, name)
+              return name
+
+          def exposed(self):
+              counts = self._counts()
+              out = []
+              for server_id, tools in self._servers.items():     # registration order
+                  for tool in tools:                              # each server's own order
+                      out.append({
+                          "name": self._exposed_name(server_id, tool["name"], counts),
+                          "description": f"[{server_id}] {tool.get('description', '')}".rstrip(),
+                          "inputSchema": tool.get("inputSchema", {"type": "object"}),
+                      })
+              return out
+
+          def resolve(self, exposed_name):
+              counts = self._counts()
+              for server_id, tools in self._servers.items():
+                  for tool in tools:
+                      if self._exposed_name(server_id, tool["name"], counts) == exposed_name:
+                          return server_id, tool["name"]
+              raise KeyError(exposed_name)
+      ```
+
+      Fed with the `tools/list` results of the two servers that answered (the support server also sent a broken
+      tool named `create ticket`, with a space), in both modes:
+
+      ```plaintext
+      == exposed names, mode=always ==
+        ledger__search           [ledger] Search ledger entries by payout or merchant id.
+        ledger__get_payout       [ledger] Fetch one payout by id.
+        support__search          [support] Search support tickets.
+        support__create_ticket   [support] Open a support ticket.
+        warnings: ["support: skipped tool 'create ticket' - invalid name"]
+      == exposed names, mode=collision ==
+        ledger__search           [ledger] Search ledger entries by payout or merchant id.
+        get_payout               [ledger] Fetch one payout by id.
+        support__search          [support] Search support tickets.
+        create_ticket            [support] Open a support ticket.
+        warnings: ["support: skipped tool 'create ticket' - invalid name"]
+      ```
+
+      In `collision` mode only `search` is prefixed. That looks tidier - until a third server that also has
+      `get_payout` connects and the model's familiar `get_payout` silently becomes `ledger__get_payout` (the
+      exercise's tests prove it). In `always` mode a tool's name depends only on its own server.
+
+  - id: router-code
+    kind: code
+    concepts: [mcp-multi-resilience, mcp-multi-host-topology]
+    title: "Fan-out with partial results, and routing one call"
+    body: |
+      From `multi_router.py`. A client is any callable `send(request) -> response`; it may raise or hang.
+
+      ```python
+      PROTOCOL_VERSION = "2026-07-28"
+      _ids = itertools.count(1)
+
+      def make_request(method, params=None):
+          body = dict(params or {})
+          meta = dict(body.get("_meta", {}))
+          meta["io.modelcontextprotocol/protocolVersion"] = PROTOCOL_VERSION
+          meta.setdefault("io.modelcontextprotocol/clientCapabilities", {})
+          body["_meta"] = meta
+          return {"jsonrpc": "2.0", "id": next(_ids), "method": method, "params": body}
+
+      def fan_out(clients, method, params=None, timeout=1.0, health=None):
+          results, errors, live = {}, {}, {}
+          for server_id, send in clients.items():
+              if health is not None and health.is_down(server_id):
+                  errors[server_id] = f"skipped: down after {health.failures[server_id]} failures"
+              else:
+                  live[server_id] = send
+          if live:
+              pool = ThreadPoolExecutor(max_workers=len(live))
+              try:
+                  pending = {}
+                  for server_id, send in live.items():
+                      request = make_request(method, params)          # a fresh id per server
+                      pending[server_id] = (request, pool.submit(send, request))
+                  for server_id, (request, future) in pending.items():
+                      try:
+                          results[server_id] = check_response(request, future.result(timeout=timeout))
+                      except FutureTimeout:
+                          errors[server_id] = f"timeout after {timeout}s"
+                      except RuntimeError as err:                    # JSON-RPC error or bad reply
+                          errors[server_id] = str(err)
+                      except Exception as err:                       # the client itself failed
+                          errors[server_id] = f"unavailable: {type(err).__name__}: {err}"
+              finally:
+                  pool.shutdown(wait=False, cancel_futures=True)     # never wait for a hung server
+          if health is not None:
+              for server_id in live:
+                  health.record(server_id, server_id in results)
+          return FanOutResult(results=dict(sorted(results.items())), errors=dict(sorted(errors.items())))
+
+      def route_call(resolve, clients, exposed_name, arguments, timeout=1.0, health=None):
+          try:
+              server_id, tool = resolve(exposed_name)
+          except KeyError:
+              return error_result(f"Unknown tool {exposed_name!r}.")
+          if server_id not in clients:
+              return error_result(f"Server {server_id!r} is not connected.")
+          outcome = fan_out({server_id: clients[server_id]}, "tools/call",
+                            {"name": tool, "arguments": arguments}, timeout, health)
+          if server_id in outcome.results:
+              return outcome.results[server_id]
+          return error_result(f"Server {server_id!r} could not run {tool!r}: {outcome.errors[server_id]}")
+      ```
+
+      The request every client sends, and a `tools/list` fan-out to four servers - `kb` refuses connections and
+      `fx` never answers:
+
+      ```plaintext
+      == request the router sends ==
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {
+          "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+          }
+        }
+      }
+      == fan_out tools/list (timeout 0.2s) ==
+      ok    ledger ['search', 'get_payout']
+      ok    support ['search', 'create_ticket', 'create ticket']
+      error fx timeout after 0.2s
+      error kb unavailable: ConnectionRefusedError: [Errno 111] Connection refused
+      ```
+
+      Routing three calls the model might make (catalog in `always` mode with `ledger`, `support` and `kb`):
+
+      ```plaintext
+      == route_call ==
+      {"resultType": "complete", "content": [{"type": "text", "text": "{\"payout_id\": \"po_1039\", \"merchant\": \"m-204\", \"amount_minor\": 128450, \"currency\": \"EUR\", \"status\": \"paid\"}"}], "isError": false}
+      {"resultType": "complete", "content": [{"type": "text", "text": "Server 'kb' could not run 'search': unavailable: ConnectionRefusedError: [Errno 111] Connection refused"}], "isError": true}
+      {"resultType": "complete", "content": [{"type": "text", "text": "Unknown tool 'search'."}], "isError": true}
+      ```
+
+      And the circuit breaker (`ServerHealth(threshold=3)`), four rounds against `ledger` and the dead `kb`:
+
+      ```plaintext
+      round 1: results=['ledger'] errors={'kb': 'unavailable: ConnectionRefusedError: [Errno 111] Connection refused'}
+      round 2: results=['ledger'] errors={'kb': 'unavailable: ConnectionRefusedError: [Errno 111] Connection refused'}
+      round 3: results=['ledger'] errors={'kb': 'unavailable: ConnectionRefusedError: [Errno 111] Connection refused'}
+      round 4: results=['ledger'] errors={'kb': 'skipped: down after 3 failures'}
+      ```
+
+  - id: progress-code
+    kind: code
+    concepts: [mcp-multi-resilience]
+    title: "Progress, cancellation and timeouts across servers"
+    collapsed: true
+    body: |
+      From `multi_progress.py`. Tokens are made unique across *all* servers by including the server id; the
+      tracker refuses anything the Progress page forbids.
+
+      ```python
+      def on_notification(self, server_id, params):
+          token = params.get("progressToken")
+          op = self.ops.get(token) if isinstance(token, (str, int)) else None
+          if op is None:
+              self.ignored.append(f"{server_id}: unknown token {token!r}"); return False
+          if op.server_id != server_id:
+              self.ignored.append(f"{server_id}: token {token!r} belongs to {op.server_id}"); return False
+          if not op.active:
+              self.ignored.append(f"{server_id}: token {token!r} already completed"); return False
+          progress = params.get("progress")
+          if not isinstance(progress, (int, float)) or isinstance(progress, bool):
+              self.ignored.append(f"{server_id}: token {token!r} has no numeric progress"); return False
+          if op.progress is not None and progress <= op.progress:
+              self.ignored.append(f"{server_id}: token {token!r} progress {progress} does not increase on {op.progress}")
+              return False
+          op.progress = progress
+          total = params.get("total")
+          op.total = total if isinstance(total, (int, float)) and not isinstance(total, bool) else None
+          op.message = str(params.get("message", ""))
+          return True
+
+      def cancellation_for(transport, request_id, reason):
+          if transport == "stdio":
+              return {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                      "params": {"requestId": request_id, "reason": reason}}
+          if transport == "http":
+              return {"action": "close_stream", "requestId": request_id}
+          raise ValueError(f"unknown transport {transport!r}")
+
+      def timed_out(started, last_progress, now, idle, maximum):
+          if now - started >= maximum:
+              return "max"
+          since = last_progress if last_progress is not None else started
+          if now - since >= idle:
+              return "idle"
+          return None
+      ```
+
+      (In the file each `self.ignored.append(...)` and `return False` are on separate lines.) Three requests in
+      flight - ledger (stdio, request 17), support (HTTP, request 4) and kb (request 9) - and six notifications:
+
+      ```plaintext
+      tokens: ledger-1 support-2 kb-3
+      ledger   {"progressToken": "ledger-1", "progress": 200, "total": 1000, "message -> accepted
+      support  {"progressToken": "support-2", "progress": 1, "total": 4, "message": " -> accepted
+      kb       {"progressToken": "kb-3", "progress": 12, "message": "12 articles inde -> accepted
+      ledger   {"progressToken": "ledger-1", "progress": 150, "total": 1000}          -> ignored
+      support  {"progressToken": "ledger-1", "progress": 600, "total": 1000}          -> ignored
+      ledger   {"progressToken": "ledger-1", "progress": 600, "total": 1000, "message -> accepted
+      overall: (0.425, 1)
+      after support completes: (0.6, 1)
+      ignored: ["ledger: token 'ledger-1' progress 150 does not increase on 200", "support: token 'ledger-1' belongs to ledger"]
+      == cancellation ==
+      {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 17, "reason": "user pressed Stop"}}
+      {"action": "close_stream", "requestId": 4}
+      == timeouts (idle 10s, max 60s) ==
+      started=0 last_progress=None now=9 -> None
+      started=0 last_progress=None now=10 -> idle
+      started=0 last_progress=28 now=35 -> None
+      started=0 last_progress=58 now=60 -> max
+      ```
+
+      `overall` is the mean fraction of the operations that report a `total` - (0.6 + 0.25) / 2 = 0.425 - plus a
+      count of operations without one (kb). The last timeout line is the spec's rule in action: progress at 58 s
+      would reset an idle timer, but "implementations SHOULD always enforce a maximum timeout, regardless of
+      progress notifications".
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Why the important lines are written that way
+    body: |
+      **`SERVER_ID = re.compile(r"^[a-z0-9][a-z0-9\-]{0,31}$")`** - the host chooses the id in its own
+      configuration, so it is unique by construction. Forbidding `_` in it means the first `__` in an exposed name
+      always separates server from tool, even for a tool called `export__v2`. Using `serverInfo.name` instead would
+      break the spec's advice that it "SHOULD NOT be relied upon for disambiguation".
+
+      **`if len(name) > MAX_NAME`** - the spec says tool names "SHOULD be between 1 and 128 characters". A prefix
+      can push a valid 125-character name over the limit; checking here turns that into a warning at connect time
+      rather than a provider API error in the middle of a conversation.
+
+      **`self.warnings.append(...); continue`** - one server's malformed tool must not stop the others. The spec
+      takes the same stance on bad `x-mcp-header` definitions: "a single malformed tool definition does not prevent
+      other valid tools from being used".
+
+      **`for server_id, tools in self._servers.items()`** - a deterministic order (registration order, then each
+      server's order). The spec asks servers for a deterministic `tools/list` "to enable client-side caching and
+      improve LLM prompt cache hit rates"; a host that re-sorts or shuffles the merged list throws that away.
+
+      **`request = make_request(method, params)` inside the loop** - each server gets its own request id. Ids only
+      need to be unique per sender and connection, but a fresh one per server keeps logs and cancellations
+      unambiguous ("request 17 on ledger").
+
+      **`future.result(timeout=timeout)`** - without a timeout the loop waits forever for the first hung server. The
+      Cancellation page: implementations "SHOULD establish timeouts for all sent requests".
+
+      **`except Exception as err`** - deliberately broad, *per server*. Whatever the client raises - a refused
+      connection, a broken pipe from a crashed stdio process, a TLS error - it becomes that server's error string and
+      the loop continues.
+
+      **`pool.shutdown(wait=False, cancel_futures=True)`** - Python cannot kill a running thread; the hung call keeps
+      its thread until it returns. Not waiting keeps the turn fast; a real client should also cancel the request on
+      the wire (next lines) and bound its own I/O.
+
+      **`return error_result(...)` in `route_call`** - the model asked for a tool, so it gets a tool result: `isError:
+      true` with a sentence it can act on ("Server 'kb' could not run 'search'..."). The Tools page: clients "SHOULD
+      provide tool execution errors to language models to enable self-correction".
+
+      **`if op.server_id != server_id`** - progress tokens are unique across the host, so a notification from
+      `support` carrying `ledger-1` is a bug or an attack; the spec says notifications "MUST only reference tokens
+      that ... Were provided in an active request". Accepting it would let one server move another's progress.
+
+      **`if now - started >= maximum: return "max"`** - checked first, so steady progress can never keep a request
+      alive forever.
+
+  - id: steps
+    kind: steps
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Adding a server to a multi-server host, step by step
+    body: |
+      1. **Give it a host-side id** (`kb`), its transport (stdio command or Streamable HTTP URL) and its credentials
+         in the host's configuration - never derive the id from what the server says about itself.
+      2. **Create one client for it.** Optionally call `server/discover` to check `supportedVersions` includes the
+         revision your client speaks and read its `capabilities`.
+      3. **Fetch `tools/list`** (follow `nextCursor` pages), cache it for `ttlMs`, and register it in the catalog.
+         Read the warnings: skipped tools and over-long names show up here, not in production.
+      4. **Decide what the model sees:** all namespaced definitions, or - past your context threshold - a
+         `search_tools` meta-tool and on-demand definitions. Add new definitions at the end of the list so earlier
+         tools keep their position in the prompt cache.
+      5. **Set its timeouts:** an idle timeout reset by progress, and a hard maximum. Slow servers (an agent behind a
+         tool) need a larger maximum and should send progress.
+      6. **Wire failure handling:** fan-outs return partial results; routed calls return `isError` results; the
+         circuit breaker skips it after repeated failures and a periodic check (for example `server/discover`) closes
+         the breaker again.
+      7. **Wire cancellation** for its transport: `notifications/cancelled` on stdio, closing the response stream on
+         HTTP - and ignore any response that arrives after you cancelled ("The client SHOULD ignore any response to
+         the cancelled request that arrives afterward").
+      8. **Test it in isolation and in the crowd:** the server alone, then the host with this server dead, hung and
+         returning junk while the others are healthy.
+
+  - id: example
+    kind: example
+    concepts: [mcp-multi-host-topology, mcp-multi-resilience]
+    title: "Example: the reconciliation agent behind the support server"
+    body: |
+      The support team wants the assistant to answer "Which of merchant m-204's payouts this month don't match the
+      bank file?". That is 1,000 payouts, a bank file, and several lookups per mismatch - far too much to pass
+      through the assistant's own context.
+
+      **Design (pattern).** The support server exposes one tool, `reconcile_payouts(merchant_id, month)`. Inside, the
+      server runs its *own* agent loop with its own model key and its own internal tools, and returns a short report
+      (say, "3 mismatches: ..."). It sends `notifications/progress` ("reconciling payouts 600/1000") on the response
+      stream of the `tools/call` request. To the host it is one tool among many: `support__reconcile_payouts`.
+
+      **What the tester checks:**
+
+      - **Isolation of context.** The tool's arguments carry only the merchant id and month - not the conversation.
+        The spec's principle: servers "receive only necessary contextual information"; "Full conversation history
+        stays with the host".
+      - **No hidden state across calls.** If the agent needs to continue later, it returns an explicit handle
+        (for example `run_id`) that the host passes back as an argument - the stateless revision forbids relying
+        on the connection.
+      - **Progress and timeouts.** Progress increases; it stops after the result; the host's maximum timeout (say
+        10 minutes for this tool, 30 seconds for others) cancels a run that never finishes, even while progress
+        trickles in. After a cancel, the server stops work and does not answer the request.
+      - **Failure isolation.** With the support server down, "What is the balance of m-204?" still works from the
+        ledger, and the reconciliation question gets an `isError` result the model turns into "the reconciliation
+        service is unavailable right now".
+      - **Untrusted output.** The agent's report is tool output - data, not instructions - and it is untrusted
+        input if the host passes it to another server. The Client Best Practices guide: "Tool results from one
+        server are untrusted input to another."
+      - **Credentials.** The support server calls the ledger API with *its own* credentials. Forwarding the token
+        the host gave the support server would be token passthrough, which the Security Best Practices forbid: "MCP
+        servers MUST NOT accept any tokens that were not explicitly issued for the MCP server."
+      - **Cost.** Every call runs a whole agent loop on the server's model account - log and budget it like any
+        multi-agent system.
+
+  - id: tests
+    kind: tests
+    concepts: [mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Test cases for a multi-server host
+    body: |
+      All with in-process fake servers (callables), so every case is deterministic and offline. Evidence is the
+      router's return value, the requests each fake recorded, and the timings.
+
+      | # | Case | Setup | Expected | Evidence |
+      | - | ---- | ----- | -------- | -------- |
+      | 1 | Collision | `ledger` and `support` both list `search` | exposed `ledger__search`, `support__search`; no bare `search` | `exposed()` names |
+      | 2 | Routing | model calls `support__search` | the support fake receives `tools/call` with `name: "search"`; ledger fake receives nothing | the fakes' request logs |
+      | 3 | Stable names | add a third server | names of existing tools unchanged | `exposed()` before/after |
+      | 4 | Bad definition | a tool named `create ticket` | skipped, one warning, other tools present | `warnings`, names |
+      | 5 | Dead server | `kb` raises `ConnectionRefusedError` | partial results; `kb` error string; no exception | `FanOutResult` |
+      | 6 | Hung server | `fx` blocks on an event | fan-out returns in about the timeout; `fx` "timeout" | measured duration; event released in teardown |
+      | 7 | Protocol error | server returns `error` `-32602` | error string carries the code and message | `errors[...]` |
+      | 8 | Wrong id | server answers with another id | treated as a bad response, not as a result | `errors[...]` |
+      | 9 | Routed failure | call to a dead server's tool | result with `isError: true` naming the server | the result |
+      | 10 | Circuit breaker | 3 consecutive failures | 4th call skipped without calling the fake; success resets | fake call count |
+      | 11 | Foreign progress | `support` sends `ledger-1` | ignored, reason logged; ledger progress unchanged | `ignored`, `ops` |
+      | 12 | Late progress | notification after completion | ignored | `ignored` |
+      | 13 | Cancel on stdio | user stops | exactly one `notifications/cancelled` with the request id, no `id` field | the written message |
+      | 14 | Cancel on HTTP | user stops | stream closed; no message sent | the transport fake's log |
+      | 15 | Maximum timeout | progress every 2 s for 2 minutes, max 60 s | cancelled at 60 s | `timed_out` result, fake log |
+
+      Negative cases (5-15) are most of the table on purpose: with N servers, the interesting behaviour is what
+      happens when some of them misbehave.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | Prefix with `serverInfo.name` | two servers named "mcp-server" collide again | prefix with a host-chosen id |
+      | Prefix only on collision | the model calls a tool name that vanished when a server connected; cache misses | prefix every tool |
+      | Send the exposed name to the server | server answers `-32602` "Unknown tool: ledger__search" | resolve back to the original name |
+      | Sequential calls without timeouts | one slow server makes every answer slow | parallel fan-out, timeout per server |
+      | One `try` around the whole loop | one exception loses every result | `try` per server |
+      | Raise from `route_call` | the agent loop crashes on a down server | return an `isError` result |
+      | Same progress token on two servers | progress bars jump between operations | token unique across all active requests |
+      | Reset the timeout on every progress, forever | a looping server runs for hours | hard maximum timeout |
+      | Send `notifications/cancelled` over HTTP and keep the stream open | work continues | closing the stream is the cancel |
+      | Treat a stdio process as a session | state leaks between conversations | explicit handles in tool arguments (2026-07-28) |
+      | Pass the user's token from one server to the next | confused deputy, token passthrough | each server uses its own credentials |
+      | Load every tool of every server | context fills before the user's question | progressive discovery past a threshold |
+
+      **Debugging method for "the assistant gave a wrong or partial answer":**
+
+      1. **Which servers were asked?** Log every routed call as `server_id`, original tool name, request id,
+         duration and outcome. Most multi-server bugs are routing bugs.
+      2. **What did each return?** Look at `errors` before `results`: a `timeout` or `skipped` explains a missing
+         part; an `isError` result explains a model apology.
+      3. **What did the model see?** Print the exposed tool list for that turn. A tool missing (skipped definition,
+         breaker open, discovery not loaded) explains "I can't do that".
+      4. **Reproduce with fakes.** Replace each server by a scripted fake that returns what the logs show, and
+         rerun - if the bug persists, it is in the host.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Trade-offs and alternatives
+    body: |
+      - **Prefix always vs on collision vs rename map.** Always-prefix is stable and simple but makes names longer
+        (use up part of the 128 characters) and less natural to the model; a hand-written rename map for a few
+        well-known servers reads better but needs maintenance. On-collision is the least stable.
+      - **Static list vs progressive discovery.** A static list is easy to test and cache; discovery saves context
+        and can improve tool choice with many tools, at the cost of extra model steps and a search component that can
+        miss the right tool.
+      - **Fan-out vs sequential.** Fan-out cuts latency for independent requests but spends work on every server
+        even when one would do, and makes ordering and rate limits harder.
+      - **Circuit breaker vs always try.** A breaker spares a dead server and the user's time, but can hide a
+        recovered server until the next health check; keep the threshold and the check interval small.
+      - **Agent behind a server vs in the host.** Behind a server: its intermediate data, model costs and tools stay
+        with the team that owns it, and the host stays simple. In the host: one trace, one budget, one model loop to
+        test - and the host can share context the server would otherwise ask for.
+      - **Many small servers vs one gateway server.** A gateway (one server that fronts many APIs) gives the host one
+        client, one credential and one tool list, but becomes a single point of failure and a place where every
+        team's changes meet. Many servers isolate failures and ownership but multiply configuration.
+      - **Programmatic tool calling** (guide) instead of many direct calls: far fewer tokens through the model, but
+        you must run a sandbox and apply the same per-call authorization to calls the script makes.
+
+  - id: summary
+    kind: summary
+    concepts: [mcp-multi-host-topology, mcp-multi-tool-aggregation, mcp-multi-resilience]
+    title: Quick reference
+    body: |
+      - **Topology:** one host, one client per server; only the host sees the conversation; servers never see each
+        other. Local = stdio, typically one client; remote = Streamable HTTP, typically many clients.
+      - **2026-07-28 is stateless:** no `initialize`; every request carries `io.modelcontextprotocol/protocolVersion`
+        and `io.modelcontextprotocol/clientCapabilities` in `_meta`; `server/discover` is optional for clients; state
+        across calls travels as explicit handles.
+      - **Aggregate:** prefix every tool with a host-chosen id (`ledger__search`), check the 128-character limit,
+        skip bad definitions with a warning, keep a deterministic order, resolve back to the original name.
+      - **Fan out:** parallel, a timeout per server, `try` per server, partial results with named errors.
+      - **Route:** failures become `isError: true` results the model can read; unknown tool is a protocol error
+        (`-32602`) at the server, an `isError` result from the host.
+      - **Breaker (pattern):** skip after N consecutive failures; a success resets.
+      - **Progress:** token in `_meta.progressToken`, unique across all active requests; `progress` must increase;
+        ignore unknown, foreign and completed tokens.
+      - **Cancel:** stdio - `notifications/cancelled` with `requestId`; HTTP - close the response stream. Ignore late
+        responses.
+      - **Timeouts:** idle (may reset on progress) and a hard maximum (always).
+      - **Agents behind servers (pattern):** one tool, its own model and credentials, progress for long runs, output
+        treated as untrusted.
+
+exercises:
+  - id: count-clients
+    type: mcq
+    concept: mcp-multi-host-topology
+    skill: application
+    title: How many clients?
+    prompt: |
+      SandPay's assistant uses a local ledger server (stdio), a local file server (stdio) and SandPay's remote
+      support server (Streamable HTTP). The support server is also used by 40 other employees' assistants. How many
+      MCP **clients** does one employee's assistant create, and how many clients does the support server talk to?
+    options:
+      - id: three-many
+        text: Three clients in the assistant; the support server talks to about 41 clients.
+        feedback: Correct - one client per server in each host ("Each client ... communicates with exactly one server"), and a remote server typically serves many clients, one from each host.
+      - id: one-three
+        text: One client in the assistant that talks to all three servers; the support server talks to one client.
+        feedback: That is the host's job description, not a client's. A client "Communicates with exactly one server"; the host creates several.
+      - id: two-one
+        text: Two clients - one per transport (stdio and HTTP) - and the support server talks to one.
+        feedback: Clients are per server, not per transport. Two stdio servers need two clients, each launching its own process.
+      - id: three-one
+        text: Three clients; the support server talks to one client because MCP connections are exclusive.
+        feedback: Local stdio servers typically serve one client, but remote Streamable HTTP servers "will typically serve many MCP clients".
+    correct: [three-many]
+    hints:
+      - Read the Architecture page's sentence about clients and servers - which side has the "exactly one"?
+    solution: |
+      Three clients (1:1 with servers) inside the host; the remote support server serves one client from every host
+      that uses it. Local stdio servers are launched per host, so each typically has one client.
+
+  - id: prefix-source
+    type: mcq
+    concept: mcp-multi-tool-aggregation
+    skill: analysis
+    title: Where should the prefix come from?
+    prompt: |
+      A developer namespaces tools with the `name` each server reports in `_meta.io.modelcontextprotocol/serverInfo`.
+      In staging it works. In production two vendor servers both report `"name": "mcp-server"` and the assistant
+      calls the wrong vendor's `search`. What should the prefix have been?
+    options:
+      - id: host-id
+        text: An id the host assigns to each configured server, unique by construction.
+        feedback: Correct - the spec says serverInfo's name "is not guaranteed to be unique across servers and SHOULD NOT be relied upon for disambiguation".
+      - id: server-name-version
+        text: serverInfo name plus version, which is unique enough.
+        feedback: Two copies of the same server (two tenants, two regions) report the same name and version. Uniqueness has to come from the host's own configuration.
+      - id: url
+        text: The server's URL, used as the prefix as-is.
+        feedback: A URL is unique, but it contains characters (`:`, `/`) outside the spec's tool-name set and stdio servers have no URL. Map it to a short id instead.
+      - id: random
+        text: A random UUID generated each time the host starts.
+        feedback: Unique, but names change on every restart - the model's prompt cache and any saved transcripts or evals that mention tool names break.
+    correct: [host-id]
+    hints:
+      - Who can guarantee uniqueness - the servers, or the host's configuration?
+      - The Tools page has a note about serverInfo names in multi-server clients.
+    solution: |
+      Use a short, stable, host-assigned server id. It is unique because the host's configuration says so, valid
+      in tool names, and stable across restarts.
+
+  - id: collision-mode
+    type: mcq
+    concept: mcp-multi-tool-aggregation
+    skill: analysis
+    title: The tool that renamed itself
+    prompt: |
+      The host prefixes tool names only when two servers collide. Yesterday the model called `get_payout` all day.
+      Today a new `reports` server, which also has `get_payout`, was connected. Evals show the model calling
+      `get_payout` and getting `isError: true` with "Unknown tool 'get_payout'." What happened, and what is the fix?
+    options:
+      - id: renamed
+        text: The collision renamed the ledger's tool to `ledger__get_payout`; prefix every tool always so names never depend on other servers.
+        feedback: Correct - in collision mode adding a server changes existing names; always-prefixing makes each name depend only on its own server, and keeps the tools array stable for prompt caching.
+      - id: server-bug
+        text: The ledger server stopped exposing get_payout; ask the ledger team to restore it.
+        feedback: The ledger server did not change. The host's exposed name changed because a second server offers the same tool name.
+      - id: first-wins
+        text: Fix it by letting the first server keep the bare name and prefixing only the newcomer.
+        feedback: Better for the ledger, but the order of connection now decides names - restart in another order and they swap. Names should not depend on other servers at all.
+      - id: model-cache
+        text: The model cached yesterday's tool list; clear the provider's prompt cache.
+        feedback: The model reads the tools in each request. The request today lists `ledger__get_payout` and the model still used the old name from its examples or instructions.
+    correct: [renamed]
+    hints:
+      - Compare the exposed names before and after the new server connected.
+    solution: |
+      Collision-only prefixing makes a tool's name depend on which other servers are connected. Prefix every tool
+      with its server id; update prompts and evals that mention bare names.
+    followUp: |
+      Your provider caches the prompt prefix, including the tools array. Where should the new server's tools go in
+      the array, and why? (Hint - the Client Best Practices guide's prompt-caching advice.)
+
+  - id: partial-answer
+    type: mcq
+    concept: mcp-multi-resilience
+    skill: application
+    title: The knowledge base is down
+    prompt: |
+      A merchant asks "Why is payout po_1039 late, and what does your help centre say about late payouts?". The
+      ledger answers in 300 ms; the `kb` server refuses connections. What should the model receive for its
+      `kb__search` call?
+    options:
+      - id: iserror-result
+        text: 'A tool result with isError: true saying the kb server is unavailable - and the ledger answer as normal.'
+        feedback: Correct - the failure is isolated to its server and reported in a form the model can read, so it can answer the payout part and say the help-centre part is unavailable.
+      - id: raise
+        text: Nothing - the host raises an exception so the user sees "Something went wrong".
+        feedback: That throws away the ledger answer the user needs. One dead server should not cancel the whole turn.
+      - id: empty
+        text: An empty successful result, so the model just says it found no articles.
+        feedback: That is a lie the model will repeat ("no articles found"). An error result says what really happened.
+      - id: retry-forever
+        text: Keep retrying kb until it answers, then send both results together.
+        feedback: The user waits indefinitely on a server that is refusing connections. Bound retries and timeouts; return a partial answer.
+    correct: [iserror-result]
+    hints:
+      - What can the model do with an error it can read, versus an exception it never sees?
+    solution: |
+      Partial results plus an `isError` tool result for the failed server. The Tools page: clients "SHOULD provide
+      tool execution errors to language models to enable self-correction".
+
+  - id: foreign-token
+    type: mcq
+    concept: mcp-multi-resilience
+    skill: analysis
+    title: A progress notification from the wrong server
+    prompt: |
+      The host gave token `ledger-1` to the ledger request and `support-2` to the support request. The support
+      server sends `notifications/progress` with `progressToken: "ledger-1"`, `progress: 600`, `total: 1000`. What
+      should the host do?
+    options:
+      - id: ignore
+        text: Ignore it and log why; the ledger operation's progress stays as it was.
+        feedback: Correct - notifications must only reference tokens provided in an active request to that peer; a token issued to another server is invalid from this one.
+      - id: accept
+        text: Accept it - tokens are unique, so the token alone says which operation it is.
+        feedback: Uniqueness tells you which operation the token names, not whether this server may report on it. Accepting lets one server move another's progress.
+      - id: cancel-support
+        text: Cancel every request to the support server immediately.
+        feedback: Too drastic for one bad notification; the spec says invalid notifications SHOULD be ignored. Log it and alert if it repeats.
+      - id: forward-ledger
+        text: Forward the notification to the ledger server so it can correct its own progress.
+        feedback: Servers never see each other's messages - the host keeps them isolated.
+    correct: [ignore]
+    hints:
+      - Who issued `ledger-1`, and to whom?
+    solution: |
+      Ignore and log. Track which server each token was issued to; accept a notification only from that server,
+      only while the request is active, and only if `progress` increased.
+
+  - id: cancel-transport
+    type: mcq
+    concept: mcp-multi-resilience
+    skill: application
+    title: The user presses Stop
+    prompt: |
+      Two calls are in flight - request 17 to the ledger server over stdio and request 4 to the support server over
+      Streamable HTTP (its reply is an SSE stream). The user presses Stop. What does the host do on each?
+    options:
+      - id: right
+        text: 'stdio - write notifications/cancelled with requestId 17; HTTP - close the response stream of request 4.'
+        feedback: Correct - the Cancellation page lists exactly these two transport-specific signals.
+      - id: both-notify
+        text: Send notifications/cancelled to both servers.
+        feedback: On Streamable HTTP, closing the SSE response stream is the cancellation signal; the server MUST treat the disconnect as cancellation and "No notifications/cancelled message is required or expected".
+      - id: kill
+        text: Kill the stdio process and send DELETE to the HTTP endpoint.
+        feedback: Killing the process cancels every request on it, including other conversations' requests (a stdio process is not a session). There is no per-request DELETE in the 2026-07-28 HTTP transport.
+      - id: wait
+        text: Nothing on the wire - just ignore the responses when they arrive.
+        feedback: Ignoring late responses is right, but without a cancel the servers keep working (and spending) on results nobody wants.
+    correct: [right]
+    hints:
+      - Which transport has a per-request stream you can close?
+    solution: |
+      stdio has no per-request stream, so the client must send `notifications/cancelled` with the request id;
+      Streamable HTTP has one response stream per request, and closing it is the cancel. In both cases ignore any
+      response that arrives afterwards.
+
+  - id: max-timeout
+    type: mcq
+    concept: mcp-multi-resilience
+    skill: analysis
+    title: Progress forever
+    prompt: |
+      A server's tool sends progress every 2 seconds - `1, 2, 3, ...` with no `total` - and has been running for 40
+      minutes on a request that usually takes 30 seconds. The host resets its timeout on every progress
+      notification. What is wrong with the host?
+    options:
+      - id: no-max
+        text: It has no maximum timeout; progress may reset an idle timer, but a hard maximum should always apply.
+        feedback: Correct - the spec says implementations "SHOULD always enforce a maximum timeout, regardless of progress notifications".
+      - id: no-reset
+        text: It should never reset the timeout on progress.
+        feedback: The spec explicitly allows it - implementations "MAY choose to reset the timeout clock" on progress, because progress implies real work. Resetting is fine; missing a ceiling is the bug.
+      - id: total
+        text: Progress without a total is invalid, so the host should have rejected every notification.
+        feedback: total is optional ("Omit the total value if unknown"). The progress values increase, so they are valid.
+      - id: server-only
+        text: Nothing - it is the server's job to finish; the host should wait.
+        feedback: The host owns the user's time and the turn's budget. A looping server must be cut off by the host.
+    correct: [no-max]
+    hints:
+      - The Cancellation page has two rules about timeouts and progress - one MAY and one SHOULD.
+    solution: |
+      Keep two timers: an idle timeout that progress may reset, and a maximum that nothing resets. When either fires,
+      cancel the request (transport-specific) and return an error result.
+
+  - id: agent-behind-server
+    type: mcq
+    concept: mcp-multi-host-topology
+    skill: analysis
+    title: The agent that wants the whole conversation
+    prompt: |
+      The support team's server hosts a reconciliation agent. They propose that the host send the **entire chat
+      history** as an argument on every call "so the agent has full context". What is the best response?
+    options:
+      - id: minimal
+        text: Send only what the task needs (merchant id, month, maybe a short task statement); the conversation stays with the host.
+        feedback: Correct - a design principle of the spec is that servers "should not be able to read the whole conversation"; they "receive only necessary contextual information".
+      - id: send-all
+        text: Agree - more context always gives a better agent.
+        feedback: It leaks every other server's results and the user's data to one server, and costs tokens. The host decides what each server needs.
+      - id: sampling
+        text: Use Sampling so the agent can use the host's model and see the conversation.
+        feedback: Sampling is deprecated in 2026-07-28 (migrate by integrating "directly with LLM provider APIs"), and it never gave servers the host's conversation either.
+      - id: session
+        text: Keep a session on the stdio connection so the agent remembers the conversation.
+        feedback: The stateless revision says a connection "is not a conversation or session". Use explicit handles if the agent needs its own state across calls.
+    correct: [minimal]
+    hints:
+      - Read design principle 3 on the Architecture page.
+    solution: |
+      Treat the server-side agent as any other tool: pass minimal, explicit arguments; it brings its own model;
+      state across calls is an explicit handle; its output is untrusted data.
+
+  - id: stateless-handle
+    type: mcq
+    concept: mcp-multi-host-topology
+    skill: application
+    title: Continuing a long reconciliation
+    prompt: |
+      Under revision 2026-07-28, the reconciliation tool needs to let the model ask follow-up questions about the
+      same run ("show mismatch 2 in detail"). How should the server keep track of which run the follow-up is about?
+    options:
+      - id: handle
+        text: Return a run id in the first result; the follow-up tool takes that run id as an ordinary argument.
+        feedback: Correct - state that spans requests "MUST be referenced by an explicit identifier the client passes on each request"; the changelog calls these "server-minted handles passed as ordinary tool arguments".
+      - id: session-header
+        text: Store it under the Mcp-Session-Id header.
+        feedback: Revision 2026-07-28 removed protocol-level sessions and the Mcp-Session-Id header.
+      - id: same-connection
+        text: Remember the last run per stdio connection.
+        feedback: 'The spec says "Servers MUST NOT rely on prior requests over the same connection" - and one connection may carry requests from many conversations.'
+      - id: clientinfo
+        text: Key it by the clientInfo name in _meta.
+        feedback: clientInfo identifies the client software ("Client name and version"), not a run or a conversation; many users share it.
+    correct: [handle]
+    hints:
+      - The Statelessness section says how state that spans requests must be referenced.
+    solution: |
+      Explicit, server-minted handles in tool arguments. They survive reconnects, load balancers and shared clients,
+      and make each request self-contained.
+
+  - id: discovery-threshold
+    type: mcq
+    concept: mcp-multi-tool-aggregation
+    skill: application
+    title: Six servers, 240 tools
+    prompt: |
+      After connecting six servers the assistant has 240 tool definitions, about 30,000 tokens, in a 200,000-token
+      context window. Answers have become slower and tool choice worse. Which change does the Client Best Practices
+      guide point to?
+    options:
+      - id: progressive
+        text: Progressive discovery - a search_tools meta-tool, then load only the chosen tools' full definitions.
+        feedback: Correct - definitions are 15% of the window, well past the "1%-5%" example threshold the guide suggests for switching.
+      - id: shorter-names
+        text: Remove the server prefixes to save tokens.
+        feedback: Prefixes are a small part of the definitions and keep names unambiguous; removing them brings collisions back.
+      - id: drop-servers
+        text: Disconnect four servers permanently.
+        feedback: That removes capabilities users need. The guide's dynamic server management connects servers when needed rather than never.
+      - id: bigger-model
+        text: Switch to a model with a larger context window.
+        feedback: More room does not fix scanning hundreds of irrelevant tools; the guide notes that focusing on a few relevant tools can improve selection accuracy.
+    correct: [progressive]
+    hints:
+      - Work out what share of the window the definitions take.
+    solution: |
+      30,000 / 200,000 = 15% of the window on tool definitions. Switch to progressive discovery (catalog, inspect,
+      execute) and keep definitions cached host-side.
+
+  - id: route-order
+    type: order
+    concept: mcp-multi-tool-aggregation
+    skill: application
+    title: From the model's call to the model's next turn
+    prompt: |
+      The model calls `support__search` with `{"query": "po_1039"}`. Put the host's steps in order.
+    items:
+      - id: resolve
+        text: Resolve `support__search` in the catalog to server `support`, tool `search`
+      - id: breaker
+        text: Check the support server is connected and its circuit breaker is closed
+      - id: build
+        text: 'Build a tools/call request with name "search", the arguments and the per-request _meta fields'
+      - id: send
+        text: Send it through the support client with a timeout (and a progress token if it may be slow)
+      - id: check
+        text: Check the reply is JSON-RPC 2.0 with the same id, then take its result or turn the error into an isError result
+      - id: health
+        text: Record success or failure for the breaker
+      - id: append
+        text: Add the tool result to the conversation for the model's next request
+    hints:
+      - You cannot build the request before you know the original tool name.
+      - Health is recorded once you know the outcome.
+    solution: |
+      Resolve, check availability, build (with the original name), send with a timeout, validate the reply,
+      record health, hand the result to the model. Every failure along the way becomes an `isError` result rather
+      than an exception.
+
+  - id: fanout-debug
+    type: debug
+    concept: mcp-multi-resilience
+    skill: analysis
+    title: The fan-out that one server can break
+    prompt: |
+      This fan-out is meant to return partial results when some servers fail or hang. Click **every** line that lets
+      one bad server break or stall the whole fan-out, or mix up results.
+    language: python
+    code: |
+      def fan_out(clients, method, params, timeout=1.0):
+          results, errors = {}, {}
+          request = make_request(method, params)
+          pool = ThreadPoolExecutor(max_workers=len(clients))
+          futures = {sid: pool.submit(send, request) for sid, send in clients.items()}
+          try:
+              for sid, future in futures.items():
+                  reply = future.result()
+                  if reply["id"] != request["id"]:
+                      errors[sid] = "bad response"
+                      continue
+                  results[sid] = reply["result"]
+          except Exception as err:
+              errors["all"] = str(err)
+          pool.shutdown(wait=True)
+          return results, errors
+    correctLines: [6, 8, 12, 15]
+    lineNotes:
+      - line: 3
+        note: One request object shared by all servers is untidy (same id everywhere makes logs ambiguous), but it does not by itself let a server break the fan-out.
+      - line: 9
+        note: Checking the id is right - it catches replies to other requests.
+    hints:
+      - What happens to the loop when one future raises?
+      - What happens when one server never answers?
+      - What if a server replies with a JSON-RPC error instead of a result?
+    solution: |
+      Line 6: the `try` wraps the whole loop, so the first exception discards every later server - put the `try`
+      inside the loop, per server. Line 8: `result()` without a timeout waits forever for a hung server. Line 12:
+      a JSON-RPC `error` reply has no `"result"`, so `KeyError` - check for `error` first. Line 15: `wait=True`
+      waits for the hung server's thread anyway - use `wait=False`.
+
+  - id: why-always-prefix
+    type: short
+    concept: mcp-multi-tool-aggregation
+    skill: analysis
+    title: Defend always-prefixing in a design review
+    prompt: |
+      A colleague says: "Prefixing every tool is ugly - `ledger__get_payout` instead of `get_payout`. Only prefix
+      when names collide." Give three concrete reasons to prefix every tool, and one cost of doing so.
+    modelAnswer: |
+      1. **Stability.** With collision-only prefixing a tool's name depends on which *other* servers are connected;
+         connecting a server that also has `get_payout` renames the ledger's tool and breaks prompts, examples, evals
+         and transcripts that use the old name.
+      2. **Prompt caching.** The tools array is part of the cached prefix; names that change when servers come and
+         go change the prefix and cause cache misses.
+      3. **Routing and audit.** The exposed name says which server will run the call, which helps the model, the
+         logs and anyone approving a sensitive action ("support__create_ticket").
+      Cost: longer names (closer to the spec's 128-character SHOULD limit) and less natural names for the model;
+      mitigate with short server ids and descriptions that start with the server.
+    rubric:
+      - Explains that names change when another server connects (instability).
+      - Mentions prompt caching or other saved artefacts that depend on names.
+      - Mentions routing, transparency or audit.
+      - Names a real cost (length limit, readability).
+    hints:
+      - What happens to the name of an existing tool when a new server with the same tool name connects?
+    solution: |
+      Always-prefixing makes each name depend only on its own server - stable for prompts, evals and caches, and
+      clear for routing and audit - at the cost of longer names.
+
+  - id: host-testdesign
+    type: testdesign
+    concept: mcp-multi-resilience
+    skill: application
+    title: Prove one server cannot break the others
+    prompt: |
+      Design the tests for SandPay's multi-server host (ledger over stdio, support over HTTP, kb, fx) that prove one
+      misbehaving server cannot break, stall or confuse the others. For each case give preconditions, steps, the
+      expected result and the evidence you would collect.
+    modelAnswer: |
+      Preconditions for all: in-process fake servers that record requests; ledger and support healthy unless stated;
+      timeout 0.2 s; breaker threshold 3.
+
+      1. **Dead server** - kb raises `ConnectionRefusedError`. Fan out `tools/list`. Expected - results for the
+         others, `kb` error "unavailable: ...", no exception. Evidence - the `FanOutResult`.
+      2. **Hung server** - fx blocks on an event. Expected - fan-out returns in about 0.2 s with fx "timeout".
+         Evidence - measured duration; release the event in teardown.
+      3. **Protocol error** - kb returns error `-32602`. Expected - error string with code and message. Evidence -
+         `errors["kb"]`.
+      4. **Wrong id** - fx replies with another id. Expected - "bad response", not a result. Evidence - errors.
+      5. **Routed call to a dead server** - model calls `kb__search`. Expected - `isError: true` result naming kb;
+         ledger and support fakes receive nothing. Evidence - result, request logs.
+      6. **Collision** - ledger and support both have `search`. Expected - `support__search` reaches support with
+         `name: "search"`. Evidence - support's request log.
+      7. **Breaker** - kb fails 3 times. Expected - 4th fan-out does not call kb ("skipped"); a recorded success
+         re-enables it. Evidence - kb's call count.
+      8. **Foreign progress** - support sends ledger's token. Expected - ignored, logged, ledger progress unchanged.
+         Evidence - `ignored`, `ops`.
+      9. **Cancel** - Stop with one stdio and one HTTP call in flight. Expected - one `notifications/cancelled` to
+         ledger with its request id; the HTTP stream closed and no message sent to support; late responses ignored.
+         Evidence - transport fakes' logs.
+      10. **Max timeout** - a server sends progress every 2 s forever. Expected - cancelled at the maximum.
+          Evidence - `timed_out` result and the cancel in the log.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Covers dead, hung, erroring and wrong-id servers.
+      - Checks routing reaches only the owning server with the original name.
+      - Covers progress validation and transport-specific cancellation.
+      - Uses fakes and measured timings rather than real servers.
+    hints:
+      - List every way a server can misbehave - then add one test per way, all with the other servers healthy.
+      - How do you prove a server received nothing?
+    solution: |
+      One case per failure mode (dead, hung, error, wrong id, foreign progress, never-ending), each run with the other
+      servers healthy, proved with fake servers' request logs, the fan-out result and measured timings.
+
+  - id: interview-multi-server
+    type: interview
+    concept: mcp-multi-host-topology
+    skill: analysis
+    title: "Interview: design a multi-server MCP assistant"
+    prompt: |
+      "Our support assistant must use our ledger service, our ticketing system, a vendor's remote MCP server and a
+      knowledge base. Walk me through the architecture with MCP, and tell me what happens when one of them is down."
+    modelAnswer: |
+      The assistant is the MCP **host**: it runs the model loop and creates one **client** per server - two local
+      stdio servers we launch, and remote ones over Streamable HTTP with their own OAuth tokens. Only the host sees
+      the conversation; each server gets just the arguments of its calls, and servers never talk to each other
+      directly.
+
+      On the current revision (2026-07-28) the protocol is stateless: every request carries the protocol version and
+      client capabilities in `_meta`, I can call `server/discover` to check versions, and anything that spans calls
+      is an explicit handle in tool arguments.
+
+      I merge the tool lists into one catalog, prefixing every tool with a host-chosen id - `ledger__get_payout`,
+      `tickets__search` - because tool names are only unique per server and serverInfo names are not reliable. A
+      reverse map routes each call to the right client with the original name. Past a few percent of the context
+      window I switch to progressive discovery.
+
+      For failures: independent calls fan out in parallel with a timeout each; a dead or hung server yields a
+      partial result and an `isError` tool result the model can explain; a circuit breaker skips a server that keeps
+      failing. Long calls send progress with host-unique tokens; Stop sends `notifications/cancelled` on stdio or
+      closes the stream on HTTP, and a hard maximum timeout applies even with progress. Tool output from one server
+      is untrusted input to another, and each server uses its own credentials - no token passthrough.
+
+      I test it with fake servers: dead, hung, erroring, colliding names, foreign progress, cancellation - each with
+      the other servers healthy.
+    rubric:
+      - Host, one client per server, local vs remote transports.
+      - Host-only conversation and server isolation.
+      - Namespacing with host-chosen ids and routing back to original names.
+      - Parallel calls, timeouts, partial results and isError results for failures.
+      - Progress, cancellation per transport and a maximum timeout.
+      - Security - untrusted cross-server data, own credentials per server.
+    followUps:
+      - How would you put a long-running reconciliation agent behind one of these servers?
+      - What changes if there are 400 tools?
+      - How do you know a recovered server is healthy again?
+      - What did the 2026-07-28 revision change compared with the initialize handshake?
+    hints:
+      - Structure it as topology, aggregation, failure handling, security, testing.
+    solution: |
+      One host, one client per server, namespaced and routed tools, isolated failures with partial results,
+      progress and cancellation per transport, untrusted cross-server data, and tests with fake servers.
+
+  - id: multi-aggregator-code
+    type: coding
+    concept: mcp-multi-tool-aggregation
+    skill: application
+    title: Build the tool catalog
+    prompt: |
+      In `multi_aggregator.py`, implement `namespaced` (validate the server id, join with `__`, enforce the
+      128-character limit and the character set), and `ToolCatalog.add_server`, `_exposed_name`, `exposed` and
+      `resolve` - in both modes, `"always"` and `"collision"`. Bad and duplicate tools are skipped with a warning; a
+      duplicate server id is a `ValueError`.
+    project: ai
+    files:
+      - exercises/mcp/multi_aggregator.py
+    test: tests/mcp/test_multi_aggregator.py
+    command: .venv/bin/python -m pytest tests/mcp/test_multi_aggregator.py
+    hints:
+      - "Validate the server id with namespaced(server_id, 'x') at the start of add_server."
+      - "Count how many servers offer each name before deciding exposed names - collision mode needs the counts."
+      - "resolve can reuse _exposed_name: compute every exposed name and compare."
+    modelAnswer: |
+      ```python
+      def add_server(self, server_id, tools):
+          namespaced(server_id, "x")  # validates the id
+          if server_id in self._servers:
+              raise ValueError(f"server id {server_id!r} is already registered")
+          accepted, seen = [], set()
+          for tool in tools:
+              name = tool.get("name", "")
+              if not isinstance(name, str) or not TOOL_NAME.match(name):
+                  self.warnings.append(f"{server_id}: skipped tool {name!r} - invalid name")
+                  continue
+              if name in seen:
+                  self.warnings.append(f"{server_id}: skipped duplicate tool {name!r}")
+                  continue
+              try:
+                  namespaced(server_id, name)
+              except ValueError as err:
+                  self.warnings.append(f"{server_id}: skipped tool {name!r} - {err}")
+                  continue
+              seen.add(name)
+              accepted.append(tool)
+          self._servers[server_id] = accepted
+          return len(accepted)
+      ```
+
+      Validation happens once, at connect time, so a bad tool is a warning in the logs rather than a provider API
+      error mid-conversation. `exposed` and `resolve` share `_exposed_name`, so the name the model sees and the name
+      routing accepts can never disagree.
+    rubric:
+      - Every test in tests/mcp/test_multi_aggregator.py passes.
+      - The server id comes from the host's configuration and is validated, never from serverInfo.
+      - One bad tool never prevents the server's other tools from being registered.
+      - exposed and resolve share one naming rule.
+    solution: |
+      Validate at registration, warn and skip instead of failing, and compute exposed names in one function used by
+      both the tool list and the router.
+
+  - id: multi-router-code
+    type: coding
+    concept: mcp-multi-resilience
+    skill: application
+    title: Fan out with partial results
+    prompt: |
+      In `multi_router.py`, implement `check_response`, `ServerHealth.record` and `is_down`, `fan_out` (parallel,
+      a timeout per server, partial results, the exact error strings in the docstring, health recorded) and
+      `route_call` (resolve, send the original tool name, turn every failure into an `isError` result). The tests
+      use in-process fake servers, one of which hangs until the test ends.
+    project: ai
+    files:
+      - exercises/mcp/multi_router.py
+    test: tests/mcp/test_multi_router.py
+    command: .venv/bin/python -m pytest tests/mcp/test_multi_router.py
+    hints:
+      - "Submit every request before you wait for any result - otherwise the calls are sequential."
+      - "Put the try/except around each future.result(timeout=...), not around the loop."
+      - "Shut the pool down with wait=False, or the hung server's thread keeps you waiting."
+      - "route_call can reuse fan_out with a single client."
+    modelAnswer: |
+      ```python
+      for server_id, send in live.items():
+          request = make_request(method, params)
+          pending[server_id] = (request, pool.submit(send, request))
+      for server_id, (request, future) in pending.items():
+          try:
+              results[server_id] = check_response(request, future.result(timeout=timeout))
+          except FutureTimeout:
+              errors[server_id] = f"timeout after {timeout}s"
+          except RuntimeError as err:
+              errors[server_id] = str(err)
+          except Exception as err:
+              errors[server_id] = f"unavailable: {type(err).__name__}: {err}"
+      ```
+
+      All requests are in flight before the first wait, so the total time is about the slowest healthy server or the
+      timeout. Each server's failure is caught and named separately; `route_call` reuses this with one client and
+      converts an error into `{"resultType": "complete", "content": [...], "isError": True}`.
+    rubric:
+      - Every test in tests/mcp/test_multi_router.py passes.
+      - Requests to different servers run in parallel, each with its own id and timeout.
+      - No server's failure (exception, timeout, error reply, wrong id) affects the others' results.
+      - route_call never raises and sends the original, not the namespaced, tool name.
+    solution: |
+      Submit all, then wait per server with a timeout and a per-server try; return results and named errors; route
+      single calls through the same code and convert failures into isError results.
+
+  - id: multi-progress-code
+    type: coding
+    concept: mcp-multi-resilience
+    skill: application
+    title: Track progress, cancel and time out
+    prompt: |
+      In `multi_progress.py`, implement `ProgressTracker.on_notification` (accept only valid notifications from the
+      server that owns the token, while active, with increasing progress) and `overall`, plus `cancellation_for`
+      (stdio and HTTP) and `timed_out` (idle and maximum).
+    project: ai
+    files:
+      - exercises/mcp/multi_progress.py
+    test: tests/mcp/test_multi_progress.py
+    command: .venv/bin/python -m pytest tests/mcp/test_multi_progress.py
+    hints:
+      - "Check the reasons to ignore in order: unknown token, wrong server, completed, no numeric progress, not increasing."
+      - "bool is a subclass of int in Python - True must not count as progress."
+      - "timed_out: check the maximum first, so progress can never extend it."
+    modelAnswer: |
+      ```python
+      def timed_out(started, last_progress, now, idle, maximum):
+          if now - started >= maximum:
+              return "max"
+          since = last_progress if last_progress is not None else started
+          if now - since >= idle:
+              return "idle"
+          return None
+      ```
+
+      `on_notification` mirrors the Progress page's rules one by one, and logs each refusal so a misbehaving server
+      shows up in the logs. `cancellation_for("stdio", ...)` returns a notification - no `id`, because
+      notifications get no response - and `"http"` returns a close-the-stream action, because on Streamable HTTP
+      that is the signal.
+    rubric:
+      - Every test in tests/mcp/test_multi_progress.py passes.
+      - Notifications are checked against the token's owner, its state and increasing progress.
+      - The cancel action depends on the transport.
+      - The maximum timeout applies whatever the progress.
+    solution: |
+      Validate each notification against who owns the token and whether it is still active; cancel the way the
+      transport defines; keep a maximum timeout that progress cannot extend.
+
+placement:
+  - id: place-topology
+    type: mcq
+    concept: mcp-multi-host-topology
+    skill: analysis
+    title: Who coordinates the ledger and the tickets?
+    prompt: |
+      To answer one question, data from the ledger server must be used in a call to the ticketing server. Under MCP,
+      how does that data get there?
+    options:
+      - id: host
+        text: The host reads the ledger result and includes what is needed in its call to the ticketing server.
+        feedback: Correct - "Cross-server interactions are controlled by the host"; servers do not see into each other.
+      - id: direct
+        text: The ledger server calls the ticketing server's MCP endpoint directly using the host's client.
+        feedback: Servers do not use the host's clients or see each other; the host enforces the boundary. (A server may call other APIs itself, with its own credentials - but that is outside this host's MCP traffic.)
+      - id: shared-session
+        text: Both servers read it from the shared MCP session.
+        feedback: There is no shared session - each client talks to one server, and 2026-07-28 removed protocol sessions altogether.
+      - id: one-client
+        text: Use one client connected to both servers so they share context.
+        feedback: A client communicates with exactly one server.
+    correct: [host]
+    hints:
+      - Which component is allowed to see both servers' data?
+    solution: |
+      Only the host sees both results; it decides what to pass on, treating the first server's output as untrusted
+      data.
+
+  - id: place-collision
+    type: order
+    concept: mcp-multi-tool-aggregation
+    skill: application
+    title: Merging two tool lists
+    prompt: |
+      Put the steps for merging the `tools/list` results of servers `ledger` and `support` (both have `search`) into
+      one list for the model in order.
+    items:
+      - id: config-ids
+        text: Take each server's id from the host configuration
+      - id: fetch
+        text: Fetch each server's tools/list (with its own client)
+      - id: validate
+        text: Validate each tool's name and skip bad ones with a warning
+      - id: prefix
+        text: Prefix every name with its server id and check the length limit
+      - id: map
+        text: Record exposed name to (server, original name) for routing
+      - id: send
+        text: Send the merged list, in a deterministic order, with the model request
+    hints:
+      - The ids exist before any server is contacted.
+    solution: |
+      Ids from configuration, fetch, validate, prefix, map for routing, then send in a stable order. Routing needs
+      the map before the model can call anything.
+
+  - id: place-cancel
+    type: mcq
+    concept: mcp-multi-resilience
+    skill: application
+    title: Cancel on Streamable HTTP
+    prompt: |
+      A `tools/call` to a remote Streamable HTTP server is answering with an SSE stream of progress notifications.
+      The host's maximum timeout fires. What does the host do?
+    options:
+      - id: close
+        text: Close that request's SSE response stream and ignore anything that arrives for it afterwards.
+        feedback: Correct - on Streamable HTTP "Closing the SSE response stream is the cancellation signal".
+      - id: notify
+        text: POST a notifications/cancelled message and keep reading the stream until the server stops.
+        feedback: On Streamable HTTP no notifications/cancelled message "is required or expected" - closing the stream is the cancel.
+      - id: wait-progress
+        text: Nothing, as long as progress notifications keep arriving.
+        feedback: The maximum timeout applies "regardless of progress notifications".
+      - id: kill-all
+        text: Disconnect every request to that server.
+        feedback: Cancel the one request that timed out; other requests to the same server are unaffected.
+    correct: [close]
+    hints:
+      - Each Streamable HTTP request has its own response stream.
+    solution: |
+      Close that request's response stream (the HTTP cancel), ignore late messages for it, and give the model an
+      isError result explaining the timeout.
+
+recall:
+  - id: recall-topology
+    concept: mcp-multi-host-topology
+    prompt: How do host, clients and servers relate in an assistant that uses four MCP servers?
+    answer: One host creates four clients, one per server; each client communicates with exactly one server. Only the host sees the whole conversation and controls cross-server interactions.
+  - id: recall-local-remote
+    concept: mcp-multi-host-topology
+    prompt: What is the difference between a local and a remote MCP server?
+    answer: A local server runs on the user's machine as a subprocess over stdio and typically serves one client; a remote server runs elsewhere over Streamable HTTP and typically serves many clients.
+  - id: recall-stateless
+    concept: mcp-multi-host-topology
+    prompt: In revision 2026-07-28, how does a server keep state across requests?
+    answer: Through explicit, server-minted handles passed as ordinary tool arguments - never through the connection, a session or an initialize handshake, which were removed. Every request carries its version and capabilities in _meta.
+  - id: recall-namespace
+    concept: mcp-multi-tool-aggregation
+    prompt: How should a host disambiguate tool names from several servers?
+    answer: Prefix every tool with a host-chosen server id (not serverInfo's name), keep names within 128 characters and the allowed characters, and map exposed names back to (server, original name) for routing.
+  - id: recall-partial
+    concept: mcp-multi-resilience
+    prompt: What should a fan-out return when one of four servers is down?
+    answer: The three results plus a named error for the failed server; a routed call to it becomes a tool result with isError true, so the model can explain the gap.
+  - id: recall-progress
+    concept: mcp-multi-resilience
+    prompt: Name three progress notifications a host should ignore.
+    answer: One with an unknown token, one carrying a token issued to a different server (or a completed request), and one whose progress does not increase.
+  - id: recall-cancel
+    concept: mcp-multi-resilience
+    prompt: How do you cancel a request on stdio and on Streamable HTTP, and what about timeouts?
+    answer: stdio - send notifications/cancelled with the requestId; HTTP - close the request's SSE response stream. Use an idle timeout that progress may reset plus a maximum timeout that always applies.
+
+next:
+  - mcp-security-and-authorization
+  - deploying-and-operating-ai-apps
+  - ai-capstone-support-agent
