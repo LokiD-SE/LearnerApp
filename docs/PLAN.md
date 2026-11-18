@@ -215,23 +215,20 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
 - [x] `practice/fullstack`: TypeScript, React 19 (Testing Library, jsdom), Express 5 (supertest) and PostgreSQL
       (PGlite, no server); exercise tests tagged `@exercise`; `npm run verify` in CI via `practice/verify.sh fullstack`.
       54 exercises.
-- [ ] Track J lessons, in batches of 4-6. Batch 1 done: python-numpy-pandas, ml-maths-essentials,
-      linear-regression-gradient-descent, logistic-regression-classification, model-evaluation-and-overfitting,
-      scikit-learn-pipelines (6 of 36). Next: decision-trees-and-ensembles, unsupervised-learning, then the deep
-      learning module (needs PyTorch CPU in practice/ai). Sources: the Model Context Protocol specification
+- [x] Track J lessons - all 36 published (2026-11-14 to 2026-11-18), in six batches: machine learning
+      foundations, deep learning (PyTorch CPU), generative AI engineering, AI agents (plain-Python graph and crew
+      harnesses; LangGraph and CrewAI quoted from their docs, not installed), the Model Context Protocol (revision
+      2026-07-28, implemented by hand in plain Python - no SDK, by the owner's choice; SDK and Inspector quoted
+      from the docs), and production AI + capstone + mock interview. Sources: the MCP specification
       (modelcontextprotocol.io), Anthropic and OpenAI API docs, LangGraph and CrewAI docs, scikit-learn, NumPy,
-      pandas and PyTorch docs, _Deep Learning_ (Goodfellow, Bengio, Courville), _Attention Is All You Need_,
-      Stanford CS229 notes, OWASP Top 10 for LLM applications, NIST AI RMF. The courses the owner named
-      (IBM Generative AI Engineering, DeepLearning.AI Machine Learning / Deep Learning specialisations, AI Agents
-      in LangGraph, MCP with Anthropic, Coursera AI Agent Architecture with MCP) shape the outline only; lessons
-      cite primary sources.
-- [ ] `practice/ai`: a Python project (NumPy, scikit-learn, PyTorch CPU, the MCP Python SDK) with pytest
-      exercises; agent exercises run against a scripted fake model so they pass offline and free; real API calls
-      are optional and illustrative. Started: Python 3.12 venv (`.venv`, pinned `requirements.txt`: NumPy 2.5.4,
-      pandas 3.1.1, scikit-learn 1.9.1, pytest 9.2.0), `AI_TARGET=solutions` switches the import path,
-      `scripts/verify.py` via `practice/verify.sh ai` in CI; 13 exercises so far.
-- [ ] Interview question bank entries for both tracks. Track I done (20 questions in
-      `content/interviews/questions/fullstack.yaml`); Track J to do.
+      pandas and PyTorch docs, OpenTelemetry GenAI conventions, OWASP Top 10 for LLM applications 2025 and for
+      agentic applications. The courses the owner named shape the outline only; lessons cite primary sources.
+- [x] `practice/ai`: Python 3.12 venv (pinned `requirements.txt`: NumPy, pandas, scikit-learn, pytest, PyTorch
+      CPU); LLM and agent exercises run against `support/llm_fake.py` (ScriptedLLM) and toy embeddings, offline
+      and free; `AI_TARGET=solutions` switches the import path; `scripts/verify.py` via `practice/verify.sh ai`
+      in CI. 96 exercises (ml_foundations, deep_learning, genai, agents, mcp, production).
+- [x] Interview question bank entries for both tracks: 20 Track I questions (`fullstack.yaml`) and 21 Track J
+      questions (`ai-engineering.yaml`), with the `ai-engineering` competency.
 
 ## Next increments
 

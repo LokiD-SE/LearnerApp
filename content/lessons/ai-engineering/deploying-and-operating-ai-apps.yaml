@@ -1,0 +1,1602 @@
+id: deploying-and-operating-ai-apps
+title: Deploying and operating AI applications
+subject: ai-engineering
+module: ai-production-capstone
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Run an LLM feature like any other production service, with the extra failure modes a model brings. Retry rate limits and overloads with capped exponential backoff and full jitter, honour Retry-After, stop at a deadline, and fall back to another model only when the first is unavailable - never for a bad request or a spend cap you would hit again. Price every request from its token usage, use provider prompt caching and an application response cache where they are safe, and put per-request, per-user and daily limits in front of the model (OWASP LLM10 Unbounded Consumption). Trace every model call with the OpenTelemetry GenAI attribute names, watch percentiles and time to first chunk instead of averages, and block a release when a golden-set case regresses. Every number shown was produced by the code shown, against an offline scripted model.
+tags:
+  [
+    LLMOps,
+    production,
+    reliability,
+    retries,
+    exponential backoff,
+    jitter,
+    Retry-After,
+    '429',
+    '529',
+    rate limits,
+    spend cap,
+    timeouts,
+    deadlines,
+    fallback,
+    model routing,
+    cost,
+    token usage,
+    prompt caching,
+    response cache,
+    budget,
+    OWASP LLM10,
+    unbounded consumption,
+    denial of wallet,
+    observability,
+    tracing,
+    OpenTelemetry,
+    GenAI semantic conventions,
+    spans,
+    time to first chunk,
+    TTFT,
+    latency,
+    percentiles,
+    p95,
+    SLO,
+    golden set,
+    regression gate,
+    release,
+    LLM,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`; pytest for the exercises. Every output in this lesson was
+    printed by the code shown - the reference solutions in `practice/ai/solutions/production/ops_resilience.py`,
+    `ops_cost.py` and `ops_telemetry.py` - run on Linux on 18 November 2026. Random draws use
+    `random.Random(7)`, and clocks and sleeps are injected, so the numbers are the same on any machine.
+  - **No real model, no network, no key.** The "LLM" is `ScriptedLLM` from `practice/ai/support/llm_fake.py`:
+    it replays scripted replies or raises the scripted error (`RateLimitError(retry_after=...)`,
+    `OverloadedError`, `BadRequestError`), and counts tokens with a toy tokenizer. `SpendCapError` is defined in
+    the exercise to model the documented spend-cap 429. Latencies in the examples are injected clock values,
+    not measurements of any provider.
+  - **Synthetic data:** SandPay is a fictional payments company. Merchants `m-204` and `m-311`, payout `po_204`,
+    refund 4821, the golden-set case ids and every dollar amount in the examples were invented for this
+    lesson. The "small" and "large" models are placeholders; the small one's prices are the same as the Claude
+    Haiku 4.5 row of Anthropic's prompt-caching pricing table on 18 November 2026 ($1 / MTok input, $1.25 5-minute
+    cache write, $0.10 cache hit, $5 output) and the large one's ($3 / $15) are illustrative. Prices change;
+    use your provider's pricing page.
+  - **Standards and specifications:** OpenTelemetry [GenAI semantic
+    conventions](https://github.com/open-telemetry/semantic-conventions-genai) - [client
+    inference](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md)
+    (span `gen_ai.client.inference`, span name, attributes, `gen_ai.client.inference.time_to_first_chunk`) and
+    [spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md)
+    (retries inside one span). Their status is **Development**: names and requirement levels may still change.
+    The conventions moved out of the main `semantic-conventions` repository into their own repository; old
+    links point to a "Moved" page. Read on 18 November 2026.
+  - **Security:** OWASP [LLM10:2025 Unbounded
+    Consumption](https://genai.owasp.org/llmrisk/llm102025-unbounded-consumption/) (examples "Variable-Length
+    Input Flood", "Denial of Wallet (DoW)", "Continuous Input Overflow"; mitigations including input validation,
+    rate limiting, resource allocation management, timeouts and throttling, graceful degradation).
+  - **Provider-specific, as documented on 18 November 2026 (not run here - no API key is used):** Anthropic
+    [Errors](https://platform.claude.com/docs/en/api/errors) (429 `rate_limit_error`, 500 `api_error`, 504
+    `timeout_error`, 529 `overloaded_error`; the SDK retries "twice by default, honoring the `retry-after`
+    header"), [Rate limits](https://platform.claude.com/docs/en/api/rate-limits) (token bucket; RPM, ITPM, OTPM;
+    the spend-cap 429 "has no `retry-after` header"; "Wait at least the number of seconds in the `retry-after`
+    header") and [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+    (multipliers, 5-minute default lifetime, minimum cacheable length). OpenAI [Prompt
+    caching](https://developers.openai.com/api/docs/guides/prompt-caching) (minimum cacheable prefix of 1,024
+    tokens on GPT-5.6 and later, `cached_tokens`) and [Latency
+    optimization](https://developers.openai.com/api/docs/guides/latency-optimization) (seven principles). These
+    details change; check the pages before you rely on one.
+  - **Engineering references:** Marc Brooker, [Exponential Backoff And
+    Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/), AWS Architecture Blog,
+    4 March 2015 (names "Full Jitter", "Equal Jitter" and "Decorrelated Jitter"; the post's formulas are images,
+    so this lesson describes them in words). Google, [Site Reliability Engineering, chapter 4 - Service Level
+    Objectives](https://sre.google/sre-book/service-level-objectives/) (percentiles over averages, SLIs and SLOs).
+  - **Not repeated here:** HTTP observability, RED metrics and trace context for web services -
+    [Observability for web apps](#/lesson/observability-for-web-apps); building a golden set and grading
+    answers - [LLM evaluation and guardrails](#/lesson/llm-evaluation-and-guardrails); idempotency for
+    operations that move money - [Idempotency keys](#/lesson/idempotency-keys).
+
+prerequisites:
+  - llm-apis-and-structured-output
+  - llm-evaluation-and-guardrails
+  - observability-for-web-apps
+
+concepts:
+  - id: ai-ops-resilience
+    name: Resilient model calls - retries, backoff with jitter, deadlines and fallbacks
+    summary: Classify each failure before reacting. Rate limits (429 with Retry-After) and overloads or transient server errors (500, 503, 529) can succeed later, so retry them with capped exponential backoff and full jitter - a random wait between zero and min(cap, base x 2^attempt) - and never wait less than Retry-After. A bad request (400) fails the same way every time, and a spend-cap 429 (no Retry-After) keeps failing until the cap resets, so neither is retried. Every user request has a deadline; give up when the next wait would cross it. Fall back to another model only when the current one is unavailable, and make sure a fallback reply is still checked like a primary one.
+  - id: ai-ops-cost-control
+    name: Cost control - token pricing, caching and budget limits
+    summary: A request costs uncached input tokens x input price + cache writes and reads at their multipliers + output tokens x output price; compute it in Decimal from the usage the provider returns. Provider prompt caching reuses a stable prefix (tools, system, documents) and can cut the input bill several-fold, but only above a minimum length and only for an identical prefix. An application response cache returns a stored reply for an identical deterministic request; store only complete replies, give entries a TTL and key them on everything that changes the answer. Put limits in front of the model - input size, output cap, a token bucket per user and a daily budget - because OWASP LLM10 Unbounded Consumption includes "Denial of Wallet".
+  - id: ai-ops-observability
+    name: Observability and release gates for LLM features
+    summary: Trace every model call as a span named "{gen_ai.operation.name} {gen_ai.request.model}" with the GenAI attributes - operation, provider, request model and parameters, input and output token usage, finish reasons and error.type on failure - and keep prompt and reply text out unless you have opted in deliberately. Measure time to first chunk for streamed replies and report latency as percentiles, because a mean hides the tail. Before release, run the candidate and the current version on the same golden set and block on any case that regressed, a pass-rate drop, a p95 latency over budget or a cost increase over the limit.
+
+objectives:
+  - Classify LLM API errors as retryable or not, and implement retries with capped exponential backoff, full jitter, Retry-After and a deadline.
+  - Decide when a fallback model is appropriate, implement a fallback chain, and explain what it must not hide.
+  - Calculate the cost of a request with and without prompt caching from its token usage, and estimate the saving at volume.
+  - Implement a safe application response cache (temperature 0, complete replies only, TTL, LRU) and explain what must be in its key.
+  - Implement per-request, per-user and daily limits that mitigate OWASP LLM10 Unbounded Consumption.
+  - Trace model calls with the OpenTelemetry GenAI attributes, compute percentiles and time to first chunk, and write a golden-set release gate.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: The idea in plain language
+    body: |
+      SandPay's merchant-support assistant worked perfectly in the demo. In its first week in production it met
+      the things a demo never shows:
+
+      - On Monday morning, when every merchant checks their payouts, the model provider answered some requests
+        with **429 Too Many Requests** and a few with **529 Overloaded**. The assistant showed "Something went
+        wrong" to one merchant in twelve.
+      - A bug in a retry loop resent one long conversation 40 times in a minute. Nobody noticed until the
+        **invoice** arrived.
+      - A prompt change made answers shorter and cheaper - and quietly stopped citing the refund policy in one
+        case out of forty. The **average** latency looked fine while a few merchants waited nine seconds.
+
+      Think of the model as a busy, metered, slightly unpredictable supplier. You would not phone a supplier
+      once and give up when the line is busy, nor redial the instant it hangs up - you wait, a little longer each
+      time, and stop when the customer can no longer wait. You would keep an eye on the meter, refuse orders that
+      would blow the month's budget, and remember answers to questions you are asked every day. And before you
+      switch to a new supplier contract, you would check the next delivery against the last one.
+
+      Operating an AI application is that discipline, written as code you can test: **resilience** (retries,
+      deadlines, fallbacks), **cost control** (pricing, caching, limits) and **observability** (traces,
+      percentiles, release gates). None of it needs a smarter model - only careful engineering around it.
+
+  - id: what
+    kind: what
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Rate limit** | a cap on how much you may send - Anthropic measures requests per minute (RPM), input tokens per minute (ITPM) and output tokens per minute (OTPM), and answers excess with 429 |
+      | **Retry-After** | a response header with "the number of seconds to wait until you can retry the request" (Anthropic's wording); not every 429 carries it |
+      | **Transient error** | a failure a later identical request can succeed on: rate limits, overloads (Anthropic 529 `overloaded_error`), many 5xx |
+      | **Permanent error** | a failure that repeats for the same request: 400 bad request, 401/403 auth, a spend cap reached |
+      | **Exponential backoff** | wait base x 2^attempt between tries, capped at a maximum |
+      | **Jitter** | randomness added to the wait so many clients do not retry in lock-step; "Full Jitter" waits a random time between 0 and the capped backoff |
+      | **Deadline** | the latest time an answer is still useful to the user; every retry must fit before it |
+      | **Fallback** | sending the request to another model or provider when the first is unavailable |
+      | **Token usage** | the input and output token counts the API returns with each reply - the basis of the bill |
+      | **Prompt caching** | a provider feature that reuses the processed prefix of a prompt; cache writes and reads are priced differently from normal input |
+      | **Response cache** | your own store of whole replies, returned for an identical request without calling the model |
+      | **Unbounded consumption** | OWASP LLM10:2025 - an application "allows users to conduct excessive and uncontrolled inferences", risking denial of service, "economic losses", model theft and degradation |
+      | **Span** | one timed operation in a trace, with attributes; the OpenTelemetry GenAI conventions define one per inference call |
+      | **TTFT / time to first chunk** | time from starting a streamed call to receiving the first piece of the reply; OpenTelemetry calls the metric `gen_ai.client.inference.time_to_first_chunk` |
+      | **Percentile (p50, p95, p99)** | the value below which that share of observations falls; p50 is the median, p99 a plausible worst case |
+      | **SLI / SLO** | a measured indicator (for example request latency) and the target for it (for example p95 under 3 s) |
+      | **Golden set** | fixed inputs with known good answers or checks, run against every candidate release |
+      | **Release gate** | an automated check that blocks a release when the golden-set run is worse than the current version |
+
+  - id: why
+    kind: why
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Why LLM features need their own operations work
+    body: |
+      A web service you write has failure modes you control. A hosted model adds three you do not:
+
+      1. **A shared, rate-limited dependency on the critical path.** Each answer depends on someone else's
+         capacity. Anthropic's errors page warns that "A 529 error can occur when the API experiences high
+         traffic across all users", and its rate-limits page says a "sharp increase in usage can also cause 429
+         errors" even below your limits. An assistant that treats every error as fatal fails at exactly the
+         busiest moment; one that retries badly makes the overload worse.
+      2. **A meter that runs per token.** Cost scales with input and output tokens, so a bug or an attacker can
+         turn into a bill. OWASP lists "Denial of Wallet (DoW)" - "initiating a high volume of operations" to
+         exploit "the cost-per-use model of cloud-based AI services" - as an example of LLM10 Unbounded
+         Consumption.
+      3. **Quality that changes without an error.** A new prompt, model version or retrieval index can make
+         answers worse while every request still returns 200. Only measurement on fixed cases catches that,
+         and only percentiles show the users in the tail.
+
+      The good news: each risk has a well-understood engineering answer that can be unit-tested offline - which
+      is what the three practice exercises do.
+
+  - id: internals-retries
+    kind: internals
+    concepts: [ai-ops-resilience]
+    title: Retries - classify, back off, jitter, stop
+    body: |
+      **1. Classify the error.** Retrying is only worth it when a later identical request can succeed.
+
+      | Response | Retry? | Why |
+      | --- | --- | --- |
+      | 429 with `retry-after` | yes, after at least that many seconds | the bucket refills; Anthropic says to wait "at least" the header's value |
+      | 429 spend cap (no `retry-after`) | **no** | Anthropic: it "keeps failing until access resumes"; retrying, "including the SDK's automatic retries, fails" |
+      | 529 overloaded / 503 | yes, with backoff | temporary capacity problem |
+      | 500 `api_error` | yes, with backoff | Anthropic: "Retry the request with exponential backoff" |
+      | 400 bad request, 401, 403, 413 | **no** | the same request fails the same way; fix the request |
+      | a client-side timeout | it depends | the provider may still be working on it; for anything with side effects, see [Idempotency keys](#/lesson/idempotency-keys) |
+
+      Anthropic tells the spend-cap 429 apart by its body: on the Messages API, `error.details.error_code` is
+      `enforced_spend_limit_reached`. The practice code models it as its own error, `SpendCapError`.
+
+      **2. Back off exponentially, with a cap.** Waiting a fixed second between tries hammers an overloaded
+      service; doubling the wait (0.5 s, 1 s, 2 s, 4 s...) gives it room. A cap (8 s here) keeps one wait from
+      growing absurd.
+
+      **3. Add jitter.** Marc Brooker's AWS post simulated many clients contending for one resource. With plain
+      exponential backoff "there are still clusters of calls" - everyone who failed together retries together.
+      Randomising the wait spreads them out; the post calls the version used here **Full Jitter** - a random wait
+      anywhere between 0 and the capped backoff - and concludes that jittered backoff "should be considered a
+      standard approach for remote clients". The windows and draws with base 0.5 s, cap 8 s and seed 7:
+
+      ```plaintext
+      == 1 backoff windows (base 0.5, cap 8), seed 7
+      attempt 0: window 0..0.5  drew 0.162
+      attempt 1: window 0..1.0  drew 0.151
+      attempt 2: window 0..2.0  drew 1.302
+      attempt 3: window 0..4.0  drew 0.290
+      attempt 4: window 0..8.0  drew 4.287
+      attempt 5: window 0..8.0  drew 2.926
+      ```
+
+      Notice that a draw can be *shorter* than the previous one - that is the point: the window grows, the wait
+      inside it is random.
+
+      **4. Respect the server and the user.** The wait is `max(retry_after, jitter)`: never earlier than the
+      server asked. And every user request has a **deadline**: if the next wait would end after it, stop and
+      tell the user (or fall back) now instead of answering a question nobody is waiting for. OpenTelemetry's
+      GenAI spans convention adds one more rule for tracing: when "the request was retried automatically, the
+      corresponding span SHOULD cover the duration of the logical operation with all retries".
+
+      **5. Count every layer.** Anthropic's SDK already "automatically retries transient failures ... twice by
+      default, honoring the `retry-after` header" (its `max_retries` option changes that). If your code also
+      retries 3 times, one user request can become 3 x 3 = 9 calls. Retry in one layer, or set the SDK's
+      `max_retries` to 0 when you own the loop.
+
+  - id: internals-fallback
+    kind: internals
+    concepts: [ai-ops-resilience]
+    title: Fallbacks and timeouts
+    body: |
+      A **fallback** sends the request to another model (a smaller one, another region, another provider) when
+      the first is unavailable. It is useful when:
+
+      - retries on the primary are used up, or its deadline share is spent, on a **transient** error;
+      - the primary has hit a **spend cap** or quota that the fallback does not share.
+
+      It is wrong when the request itself is bad: a 400 from the primary means the fallback will most likely
+      reject the same messages, and silently trying three providers only delays the error and hides the bug.
+      The practice `FallbackChain` therefore re-raises a `BadRequestError` at once.
+
+      A fallback model is a **different model**. It may follow the prompt less well, use a different tokenizer
+      (different costs), lack a tool or have a smaller context window. So:
+
+      - run the fallback against the golden set too - it is part of the release;
+      - log which model served each reply (the trace's `gen_ai.request.model` and `gen_ai.response.model` show it);
+      - keep the same output checks (schema validation, guardrails) on the fallback's replies.
+
+      **Timeouts.** Every call needs one, or one hung connection holds a worker forever. For long generations
+      Anthropic recommends streaming ("For long-running Messages API requests, use the streaming Messages API"),
+      which also lets you show text as it arrives; your overall request deadline still applies on top.
+
+  - id: internals-cost
+    kind: internals
+    concepts: [ai-ops-cost-control]
+    title: What a request costs, and how caching changes it
+    body: |
+      **The formula.** With prices per million tokens (MTok):
+
+      ```plaintext
+      cost = uncached_input x input_price
+           + cache_write   x input_price x write_multiplier
+           + cache_read    x input_price x read_multiplier
+           + output        x output_price
+      ```
+
+      Anthropic documents the multipliers: "Cache write tokens with a 5-minute TTL are 1.25 times the base input
+      tokens price", 1-hour writes are 2 times, and "Cache read tokens are 0.1 times the base input tokens price"
+      (with per-model exceptions in its table). OpenAI and others price caching differently - read your
+      provider's page. Use `Decimal` for money, as for any amount SandPay bills.
+
+      **A worked example.** The SandPay assistant sends a 6,000-token prefix (instructions, tool definitions,
+      the refund and payout policy) plus a 200-token question, and gets about 350 tokens back. The code prints:
+
+      ```plaintext
+      == 5 cost
+      small: no cache $0.00795  first (cache write) $0.00945  later (cache read) $0.00255  10,000 requests $79.50 vs $25.51
+      large: no cache $0.02385  first (cache write) $0.02835  later (cache read) $0.00765  10,000 requests $238.50 vs $76.52
+      ```
+
+      The first request pays *more* (the write costs 1.25x); every later request that reuses the prefix pays
+      0.1x for it. The 10,000-request column assumes one write and 9,999 reads - in reality the cache expires
+      (Anthropic's default lifetime is 5 minutes, "refreshed for no additional cost each time the cached content
+      is used"), so quiet periods cost extra writes. Check the reported usage fields (`cache_read_input_tokens` /
+      `cache_creation_input_tokens` on Anthropic, `cached_tokens` on OpenAI) to see what really happened.
+
+      **What breaks provider caching.** The cache matches a **prefix**: on Anthropic "`tools`, `system`, and
+      `messages` (in that order)". Anything that changes early in the prompt - a timestamp in the system prompt,
+      a reordered tool list - makes every request a miss. And below a minimum length nothing is cached at all:
+      "Shorter prompts cannot be cached, even if marked with `cache_control`" (the minimum is 4,096 tokens for
+      Claude Haiku 4.5 and 1,024 for several other models; OpenAI's minimum is 1,024 tokens on GPT-5.6 and later).
+
+      **An application response cache** is different: it stores whole replies and skips the model entirely for
+      an identical request - useful for FAQ-style questions. It is only safe when:
+
+      - the request is **deterministic** (temperature 0) - a sampled reply is meant to vary;
+      - the reply is **complete** (`stop_reason` `end_turn`) - never replay a cut-off or tool-use turn;
+      - the key covers **everything** that changes the answer (model, system prompt, messages, parameters,
+        tools) - the practice code hashes the canonical JSON of the request with SHA-256;
+      - entries **expire** (TTL) - policy changes, and old answers must stop being served;
+      - the answer is **not personal** - never cache across users a reply that depends on one merchant's data.
+
+      ```plaintext
+      == 6 response cache
+      MISS How long do refunds take?
+      MISS When do payouts run?
+      HIT  How long do refunds take?
+      HIT  How long do refunds take?
+      HIT  When do payouts run?
+      hits 3 misses 2 hit rate 60% model calls 2
+      ```
+
+  - id: internals-limits
+    kind: internals
+    concepts: [ai-ops-cost-control]
+    title: Limits in front of the model - OWASP LLM10
+    body: |
+      OWASP LLM10:2025 describes three ways consumption goes unbounded that matter for SandPay: a
+      "Variable-Length Input Flood", "Denial of Wallet (DoW)" and "Continuous Input Overflow" (inputs "that exceed
+      the LLM's context window"). Its mitigations include "Input Validation" ("inputs do not exceed reasonable
+      size limits"), "Rate Limiting" ("rate limiting and user quotas"), "Resource Allocation Management",
+      "Timeouts and Throttling" and "Graceful Degradation".
+
+      The practice `BudgetGuard` turns those into checks that run **before** each call, in order:
+
+      1. **input size** - refuse inputs over a token limit (`input_too_large`);
+      2. **output cap** - refuse a `max_tokens` above the allowed maximum (`max_tokens_too_high`);
+      3. **per-user rate** - a token bucket per merchant: `burst` requests at once, refilled at a steady rate
+         (`rate_limited`) - the same algorithm Anthropic says its API uses, "continuously replenished up to your
+         maximum limit";
+      4. **daily budget** - refuse when spent + estimated cost would exceed it (`daily_budget`).
+
+      ```plaintext
+      == 7 budget guard
+      t=0s m-204 in=500 max=300: allowed
+      t=0s m-204 in=500 max=300: allowed
+      t=0s m-204 in=500 max=300: allowed
+      t=0s m-204 in=500 max=300: refused (rate_limited)
+      t=0s m-311 in=120000 max=300: refused (input_too_large)
+      t=0s m-311 in=500 max=4096: refused (max_tokens_too_high)
+      t=0s m-311 in=500 max=300: allowed
+      t=5s m-204: allowed (bucket refilled 1)
+      spent 19.996 + estimated 0.03 > 20.00: refused (daily_budget)
+      ```
+
+      Merchant `m-311` was not affected by `m-204`'s burst - each user has its own bucket. A refused request
+      does not use up a token, and the real cost is recorded *after* the call from the reply's usage.
+      Your provider's limits are a last line of defence for *their* capacity; these are yours, for *your* bill
+      and *your* users.
+
+  - id: internals-observability
+    kind: internals
+    concepts: [ai-ops-observability]
+    title: Traces, percentiles and time to first chunk
+    body: |
+      **One span per model call.** The OpenTelemetry GenAI conventions (status: Development) define the span
+      `gen_ai.client.inference`, "a logical client call to Generative AI model or service". Its "**Span name**
+      SHOULD be `{gen_ai.operation.name} {gen_ai.request.model}`". `gen_ai.operation.name` (for example `chat`)
+      and `gen_ai.provider.name` (for example `anthropic`, `openai`) are Required; the request model is
+      Conditionally Required "If available"; token usage, finish reasons and request parameters are
+      Recommended; `error.type` is Conditionally Required "If the operation ended in an error". Message content
+      (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`) is **Opt-In** - it can hold
+      personal data, so the practice tracer never records it.
+
+      ```plaintext
+      == 8 span
+      span 'chat model-small' 1.84s status=UNSET
+        gen_ai.operation.name = 'chat'
+        gen_ai.provider.name = 'anthropic'
+        gen_ai.request.model = 'model-small'
+        gen_ai.request.max_tokens = 200
+        gen_ai.request.temperature = 0
+        gen_ai.usage.input_tokens = 12
+        gen_ai.usage.output_tokens = 9
+        gen_ai.response.finish_reasons = ['end_turn']
+      span 'chat model-small' 1.84s status=ERROR
+        gen_ai.operation.name = 'chat'
+        gen_ai.provider.name = 'anthropic'
+        gen_ai.request.model = 'model-small'
+        gen_ai.request.max_tokens = 200
+        error.type = 'OverloadedError'
+      ```
+
+      Two details from the conventions: `gen_ai.usage.input_tokens` "SHOULD include cached tokens", and
+      `error.type` "SHOULD match the error code returned by the Generative AI provider or the client library, the
+      canonical name of exception that occurred, or another low-cardinality error identifier". The practice code
+      uses the exception class name. (Finish reasons here are the fake's stop reasons; real instrumentation
+      records the provider's values.)
+
+      **Time to first chunk.** For a streamed reply, users feel the wait until text appears, not the total. The
+      conventions say to measure "from the start of the logical inference operation, before authentication and
+      the first attempt, to when the first chunk is fully received" - including "failed attempts, and retry
+      backoff". The practice helper returns both:
+
+      ```plaintext
+      == 9 ttfc
+      ttfc 0.62s total 0.91s text 'Payout po_204 is scheduled.'
+      ```
+
+      **Percentiles, not averages.** Google's SRE book: "Most metrics are better thought of as distributions
+      rather than averages", and "a high-order percentile, such as the 99th or 99.9th, shows you a plausible
+      worst-case value, while using the 50th percentile (also known as the median) emphasizes the typical case."
+      Twenty latencies from a morning, with three slow ones (nearest-rank percentiles):
+
+      ```plaintext
+      == 10 percentiles
+      mean 1.86 p50 1.1 p90 2.4 p95 6.8 p99 9.6
+      ```
+
+      The mean (1.86 s) describes nobody: most merchants waited about a second, and one in twenty waited almost
+      seven. An SLO such as "p95 under 3 s" catches that; "average under 2 s" passes.
+
+  - id: when
+    kind: when
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: When to use what
+    body: |
+      | Situation | Use | Do not |
+      | --- | --- | --- |
+      | 429 with `retry-after`, 529, 500 | retry with backoff, full jitter and a deadline | retry immediately in a tight loop |
+      | spend-cap 429, 400, 401/403 | fail fast, alert, maybe fall back (spend cap only) | retry - it cannot succeed |
+      | primary unavailable after retries | fallback model, tested on the golden set | fall back on a bad request |
+      | a long, stable prefix reused across requests | provider prompt caching | put timestamps or per-user data before the breakpoint |
+      | the same deterministic question asked often | application response cache with TTL | cache sampled, cut-off, tool-use or per-user replies |
+      | any user-facing endpoint | input and output caps, per-user token bucket, daily budget | rely only on the provider's limits |
+      | every model call | a span with GenAI attributes, no content by default | log full prompts with personal data |
+      | latency targets | percentiles and time to first chunk | the mean |
+      | every prompt, model or index change | golden-set release gate | ship on "it looked fine in the demo" |
+
+      **What this does not replace.** A release gate catches regressions on cases you have; it does not prove
+      the feature is good - for that see [LLM evaluation and guardrails](#/lesson/llm-evaluation-and-guardrails).
+      Retries do not make a non-idempotent tool call safe to repeat. And a budget guard limits damage; it does
+      not find the bug that caused it.
+
+  - id: visual
+    kind: visual
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: One request through the production path
+    body: |
+      ```mermaid
+      flowchart TD
+        U["Merchant question"] --> G{"Budget guard"}
+        G -- "refused" --> R1["Polite limit message + metric"]
+        G -- "allowed" --> C{"Response cache"}
+        C -- "hit" --> OUT["Reply to merchant"]
+        C -- "miss" --> S["Span: chat model-large"]
+        S --> P["Primary model"]
+        P -- "429 / 529 / 500" --> B["Backoff with full jitter, at least Retry-After"]
+        B -- "fits the deadline" --> P
+        B -- "past the deadline" --> F["Fallback: model-small"]
+        P -- "400 or spend cap" --> E["Fail fast + alert"]
+        P -- "reply" --> V["Output checks"]
+        F --> V
+        V --> M["Record cost and usage"]
+        M --> OUT
+      ```
+
+      Notice where each control sits: limits **before** any spend, the cache **before** the model, retries and
+      fallback **inside** one traced operation, and the cost recorded **after**, from real usage.
+
+  - id: code-resilience
+    kind: code
+    concepts: [ai-ops-resilience]
+    title: Retries and fallback in code
+    body: |
+      The core of `ops_resilience.py` (the practice reference solution; docstrings shortened):
+
+      ```python
+      def backoff_delay(attempt: int, base: float, cap: float, rng: random.Random) -> float:
+          if attempt < 0:
+              raise ValueError("attempt must be >= 0")
+          return rng.uniform(0, min(cap, base * 2**attempt))
+
+
+      def call_with_retries(fn, *, max_attempts=3, base=0.5, cap=8.0, deadline=None, clock, sleep, rng):
+          attempts = []
+          for number in range(1, max_attempts + 1):
+              try:
+                  value = fn()
+              except Exception as error:
+                  if not is_retryable(error):
+                      raise
+                  if number == max_attempts:
+                      attempts.append(Attempt(number, type(error).__name__, 0.0))
+                      raise
+                  wait = max(float(getattr(error, "retry_after", 0.0) or 0.0), backoff_delay(number - 1, base, cap, rng))
+                  if deadline is not None and clock() + wait > deadline:
+                      attempts.append(Attempt(number, type(error).__name__, 0.0))
+                      raise RetryBudgetExceeded(error, number) from error
+                  attempts.append(Attempt(number, type(error).__name__, wait))
+                  sleep(wait)
+                  continue
+              attempts.append(Attempt(number, None, 0.0))
+              return RetryResult(value, attempts)
+      ```
+
+      Run against a script of "overloaded, rate limited (retry after 4 s), success":
+
+      ```plaintext
+      == 2 retries
+      attempt 1: OverloadedError  waited 0.162s
+      attempt 2: RateLimitError  waited 4.000s
+      attempt 3: ok  waited 0.000s
+      reply: Your payout po_204 is scheduled for Friday. | elapsed 4.162
+      == 3 deadline
+      RetryBudgetExceeded: gave up after 1 attempt(s): rate limited, retry after 30s
+      ```
+
+      And the fallback chain, first with an overloaded primary, then with a bad request:
+
+      ```plaintext
+      == 4 fallback
+      served by: small | tried: [('large', 'OverloadedError'), ('small', 'ok')] | reply: Refund 4821 was sent on 3 November.
+      BadRequestError: max_tokens must be at least 1 - no fallback
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [ai-ops-resilience]
+    title: The retry loop - line by line
+    body: |
+      - `if not is_retryable(error): raise` - classification comes **first**. A 400 or a spend cap leaves the
+        loop on the first attempt, unchanged, so the caller sees the real error and nothing is wasted.
+      - `if number == max_attempts: ... raise` - the last error is re-raised **as itself**, not wrapped in a
+        generic "failed" - the caller (or the fallback chain) still needs to know it was an overload.
+      - `max(retry_after, backoff_delay(number - 1, ...))` - the server's request is a floor; jitter is still
+        added below it so a crowd of clients that all got "retry after 4" do not return in the same instant
+        once their waits differ. (A stricter design adds the jitter on top of `retry_after`; both respect it.)
+      - `backoff_delay(number - 1, ...)` - attempt numbers are 1-based for people and 0-based for the formula,
+        so the first wait comes from the 0..0.5 s window.
+      - `if deadline is not None and clock() + wait > deadline` - decide **before** sleeping. Sleeping 30 s and
+        then discovering the user left 20 s ago wastes a worker and still fails.
+      - `raise RetryBudgetExceeded(error, number) from error` - a distinct error lets the fallback chain treat
+        "ran out of time" as "unavailable", and `from error` keeps the original in the traceback.
+      - `clock`, `sleep` and `rng` are parameters - the tests replace them, so a test of a 30-second backoff
+        runs in microseconds and gives the same draws every time.
+
+  - id: code-cost
+    kind: code
+    concepts: [ai-ops-cost-control]
+    title: Cost, response cache and budget guard in code
+    collapsed: true
+    body: |
+      From `ops_cost.py` (reference solution, docstrings shortened):
+
+      ```python
+      MILLION = Decimal(1_000_000)
+
+
+      def request_cost(price, *, input_tokens, output_tokens, cache_write_tokens=0, cache_read_tokens=0):
+          counts = (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+          if any(c < 0 for c in counts):
+              raise ValueError("token counts must be >= 0")
+          base_in = price.input_per_mtok / MILLION
+          return (
+              input_tokens * base_in
+              + cache_write_tokens * base_in * price.cache_write_multiplier
+              + cache_read_tokens * base_in * price.cache_read_multiplier
+              + output_tokens * price.output_per_mtok / MILLION
+          )
+
+
+      def request_key(request):
+          canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+          return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+      class ResponseCache:
+          def get_or_call(self, request, call):
+              if not self.cacheable(request):            # temperature must be 0
+                  return call(request), False
+              key = request_key(request)
+              now = self.clock()
+              entry = self._entries.get(key)
+              if entry is not None:
+                  stored_at, reply = entry
+                  if now - stored_at < self.ttl:
+                      self._entries.move_to_end(key)     # most recently used
+                      self.hits += 1
+                      return reply, True
+                  del self._entries[key]                 # expired
+              self.misses += 1
+              reply = call(request)
+              if getattr(reply, "stop_reason", None) == "end_turn":
+                  self._entries[key] = (now, reply)
+                  self._entries.move_to_end(key)
+                  while len(self._entries) > self.max_entries:
+                      self._entries.popitem(last=False)  # evict least recently used
+              return reply, False
+
+
+      class BudgetGuard:
+          def check(self, user, *, input_tokens, max_tokens, estimated_cost):
+              if input_tokens > self.max_input_tokens:
+                  raise BudgetExceeded("input_too_large")
+              if max_tokens > self.max_output_tokens:
+                  raise BudgetExceeded("max_tokens_too_high")
+              now = self.clock()
+              tokens, last = self._buckets.get(user, (float(self.burst), now))
+              tokens = min(float(self.burst), tokens + (now - last) * self.refill_per_second)
+              if tokens < 1:
+                  self._buckets[user] = (tokens, now)
+                  raise BudgetExceeded("rate_limited")
+              self._roll_day()
+              if self.spent + estimated_cost > self.daily_budget:
+                  self._buckets[user] = (tokens, now)
+                  raise BudgetExceeded("daily_budget")
+              self._buckets[user] = (tokens - 1, now)
+      ```
+
+  - id: code-telemetry
+    kind: code
+    concepts: [ai-ops-observability]
+    title: Spans, percentiles and the release gate in code
+    collapsed: true
+    body: |
+      From `ops_telemetry.py` (reference solution, docstrings shortened). No OpenTelemetry SDK is installed; the
+      tiny `Tracer` only records spans so the tests can inspect them. In a real service you would create the
+      same span and attributes with the OpenTelemetry API.
+
+      ```python
+      def traced_chat(tracer, llm, *, provider, model, **request):
+          attributes = {
+              "gen_ai.operation.name": "chat",
+              "gen_ai.provider.name": provider,
+              "gen_ai.request.model": model,
+          }
+          if "max_tokens" in request:
+              attributes["gen_ai.request.max_tokens"] = request["max_tokens"]
+          if "temperature" in request:
+              attributes["gen_ai.request.temperature"] = request["temperature"]
+          span = tracer.start(f"chat {model}", attributes)
+          try:
+              reply = llm.create(**request)
+          except Exception as error:
+              span.status = "ERROR"
+              span.attributes["error.type"] = type(error).__name__
+              tracer.end(span)
+              raise
+          span.attributes["gen_ai.usage.input_tokens"] = reply.input_tokens
+          span.attributes["gen_ai.usage.output_tokens"] = reply.output_tokens
+          span.attributes["gen_ai.response.finish_reasons"] = [reply.stop_reason]
+          tracer.end(span)
+          return reply
+
+
+      def percentile(values, p):
+          if not values:
+              raise ValueError("no values")
+          if not 0 < p <= 100:
+              raise ValueError("p must be in (0, 100]")
+          ordered = sorted(values)
+          rank = math.ceil(p / 100 * len(ordered))
+          return ordered[rank - 1]
+
+
+      def release_gate(baseline, candidate, *, max_pass_rate_drop, p95_budget, max_cost_increase):
+          if set(baseline.passed) != set(candidate.passed):
+              raise ValueError("baseline and candidate cover different cases")
+          reasons = []
+          base_rate = sum(baseline.passed.values()) / len(baseline.passed)
+          cand_rate = sum(candidate.passed.values()) / len(candidate.passed)
+          if base_rate - cand_rate > max_pass_rate_drop:
+              reasons.append(f"pass rate {base_rate:.3f} -> {cand_rate:.3f}")
+          regressed = sorted(cid for cid, ok in baseline.passed.items() if ok and not candidate.passed[cid])
+          if regressed:
+              reasons.append("regressed: " + ", ".join(regressed))
+          p95 = percentile(candidate.latencies, 95)
+          if p95 > p95_budget:
+              reasons.append(f"p95 latency {p95:.2f} > {p95_budget:.2f}")
+          if baseline.cost > 0 and (candidate.cost - baseline.cost) / baseline.cost > max_cost_increase:
+              reasons.append(f"cost +{(candidate.cost - baseline.cost) / baseline.cost:.0%}")
+          return reasons
+      ```
+
+      Three candidates against a 40-case baseline (baseline fails g17; gate: pass-rate drop 0.02, p95 3 s,
+      cost +20%):
+
+      ```plaintext
+      == 11 release gate
+      ['regressed: g05']
+      []
+      ['pass rate 0.975 -> 0.925', 'regressed: g05, g23', 'p95 latency 3.60 > 3.00', 'cost +33%']
+      ```
+
+      The first candidate has the **same** pass rate as the baseline (39 of 40) - it fixed g17 and broke g05.
+      A rate-only gate would ship it; the per-case check blocks it.
+
+  - id: steps
+    kind: steps
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Taking an LLM feature to production, step by step
+    body: |
+      1. **Write down the budget.** Latency SLO (for example p95 time to first chunk under 1.5 s, p95 total
+         under 6 s), cost per request and per day, and the error rate you accept.
+      2. **Classify errors** for your provider from its errors page, and decide retry, fail fast or fall back
+         for each. Turn off duplicate retry layers (SDK `max_retries` or your own loop - not both).
+      3. **Set timeouts and a deadline** per user request; stream long replies.
+      4. **Add limits before the model:** input size, `max_tokens` cap, per-user token bucket, daily budget,
+         with a polite message and a metric when one triggers.
+      5. **Structure prompts for caching:** stable content first (tools, system, policies), variable content
+         last; check the cache usage fields after deploying.
+      6. **Add a response cache** only for deterministic, non-personal, complete replies, with a TTL you can
+         defend after a policy change.
+      7. **Instrument:** one span per model call with the GenAI attributes, cost from usage, time to first
+         chunk; no prompt text by default.
+      8. **Build the golden set and the gate:** run the current release and the candidate, block on per-case
+         regressions, pass-rate drop, p95 and cost. Include the fallback model.
+      9. **Watch in production:** dashboards of percentiles, error types, fallback rate, cache hit rate and
+         spend; alerts on the SLO and the budget; sample live answers for review.
+      10. **Rehearse failure:** script 429s, 529s and a spend cap in a test environment and check the user sees
+          a sensible message and the alerts fire.
+
+  - id: example
+    kind: example
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: "Example: the Monday-morning incident review"
+    body: |
+      After the first busy Monday, the SandPay team reviewed the assistant's traces and invoice. What a tester
+      checked and found:
+
+      | Evidence | Finding | Fix |
+      | --- | --- | --- |
+      | spans with `error.type = rate_limit_error`, all within the same second, then again 1.0 s later | a fixed 1-second retry, no jitter: clients retried in waves | full jitter, at least `retry-after` |
+      | 3 SDK attempts inside each of 3 application attempts for one request id | two retry layers - 9 calls per question | SDK `max_retries=0`; one loop with a deadline |
+      | one conversation id with 40 spans in a minute and a 410,000-token day | a client stuck resending after a UI bug | per-user token bucket and daily budget; alert on spend |
+      | `cache_read_input_tokens` always 0 | the system prompt starts with "Today is {date} {time}" | move the timestamp after the cached prefix |
+      | p50 1.1 s, p95 6.8 s, mean 1.86 s on the dashboard | the mean hid the tail | SLO on p95 and on time to first chunk |
+      | a prompt change that passed review | golden case g05 (refund policy citation) regressed | per-case release gate in CI |
+
+      Each fix got a regression test with the scripted model: a script of `[OverloadedError, RateLimitError(4),
+      "ok"]` must sleep at least 4 s on the second wait; a stuck client must be refused after `burst` requests; a
+      candidate that breaks one golden case must not ship.
+
+  - id: tests
+    kind: tests
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Testing the operations code
+    body: |
+      | # | Case | Setup | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | transient error recovers | script `[Overloaded, Overloaded, "ok"]`, fake sleep | reply returned, 2 sleeps, 3 calls | attempt log, sleep list |
+      | 2 | Retry-After respected | `RateLimitError(retry_after=5)` then "ok", base 0.1, cap 1 | first sleep >= 5 s | sleep list |
+      | 3 | bad request fails fast | `BadRequestError` | raised after 1 call, no sleep | call count |
+      | 4 | spend cap fails fast | `SpendCapError` | raised after 1 call | call count |
+      | 5 | deadline | retry-after 30 s, deadline 10 s | `RetryBudgetExceeded`, no sleep | exception, sleep list |
+      | 6 | fallback on overload | primary always overloaded, secondary OK | reply from secondary, `tried` lists both | result.model, primary call count |
+      | 7 | no fallback on 400 | primary 400 | 400 raised, secondary never called | secondary.calls empty |
+      | 8 | cost formula | 6,200 in / 350 out at $1/$5 | $0.00795 | Decimal equality |
+      | 9 | cache safety | temperature 0.7; cut-off reply | never served from cache | `from_cache` False, model call count |
+      | 10 | cache TTL and LRU | fake clock past TTL; 3 keys in a size-2 cache | miss after TTL; least recent evicted | hit flags |
+      | 11 | per-user bucket | 3 quick requests, burst 2 | third refused, other user allowed | reason `rate_limited` |
+      | 12 | span on failure | scripted overload | span ended, status ERROR, `error.type`, no usage | span attributes |
+      | 13 | no content in spans | prompt with an email address | address absent from attributes | repr of attributes |
+      | 14 | release gate | one case regressed at equal pass rate | blocked with the case id | returned reasons |
+
+      All of these are in the practice tests. Two things a unit test cannot prove: that your provider's real
+      errors map to these classes (check with a contract test against the real API in a test environment), and
+      that the golden set represents real traffic (review it against sampled production questions).
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Common mistakes and a debugging method
+    body: |
+      **Mistakes**
+
+      - **Retrying everything.** A 400 or a spend cap is retried until the user gives up. Classify first.
+      - **No jitter, or retrying immediately.** Synchronised clients turn one overload into repeated spikes.
+      - **Ignoring `retry-after`.** Retrying sooner than asked just collects more 429s.
+      - **Retry layers multiplied.** SDK retries x application retries x gateway retries.
+      - **No deadline.** Retries continue long after the user closed the chat.
+      - **Fallback hides a bug.** Falling back on 400s turns a schema bug into slow, inconsistent answers.
+      - **Untested fallback model.** It is in production, but not in the golden set.
+      - **Caching sampled, cut-off or personal replies.** One merchant's payout answer shown to another.
+      - **Prompt caching silently off.** A timestamp or per-user text early in the prompt; a prefix below the
+        minimum length (no error is returned).
+      - **Money in floats.** Rounding drift in cost reports; use `Decimal`.
+      - **Limits only at the provider.** Your bill has no per-user cap.
+      - **Logging full prompts.** Personal data in the tracing backend; GenAI content attributes are opt-in for a
+        reason.
+      - **Averages on the dashboard.** The tail stays invisible.
+      - **A pass-rate-only gate.** One fixed case hides one broken case.
+
+      **A debugging method for "the assistant is slow / expensive / failing"**
+
+      1. **Scope it with metrics:** which percentile, which model, which error types, since when (a deploy, a
+         traffic change, a provider incident?).
+      2. **Pick one slow or failed request and read its spans:** how many inference spans, which `error.type`,
+         how long each wait was, which model finally served it.
+      3. **Count calls per request** - more than expected means a retry or agent loop problem.
+      4. **Check usage fields** - input tokens far above normal means context growth; zero cache reads means the
+         prefix changed.
+      5. **Reproduce with the scripted model** and write the failing test before changing the code.
+      6. **Verify the fix** on the golden set and on the metric that showed the problem.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Trade-offs and alternatives
+    body: |
+      - **More retries vs latency.** Each retry raises the success rate and the tail latency. The deadline
+        decides; for interactive use, a fast honest "please try again" can beat a 20-second success.
+      - **Full Jitter vs other variants.** Brooker's simulation found "Equal Jitter" the loser, and the choice
+        between "Decorrelated Jitter" and "Full Jitter" "less clear": Full Jitter "uses less work, but slightly
+        more time". Any jitter is far better than none.
+      - **Fallback model vs consistency.** Higher availability, but answers from a different model; some teams
+        prefer to queue the request or degrade to a non-LLM answer (OWASP's "Graceful Degradation"; OpenAI's
+        latency guide also says "Don't default to an LLM").
+      - **Cache TTL.** Longer means more hits and staler answers. Short TTLs plus explicit invalidation when a
+        policy document changes are safer.
+      - **Prompt caching and context editing.** Every rewrite of early context (summaries, cleared tool results)
+        changes the prefix and costs a new cache write - see [Agent memory and context
+        management](#/lesson/agent-memory-and-context).
+      - **Tracing content.** Recording prompts makes debugging easy and privacy hard. Prefer ids, token counts
+        and sampled, redacted content with access controls.
+      - **Gate strictness.** Blocking on any regressed case can block good releases on a flaky judge; keep the
+        golden checks deterministic where you can, and re-run the one case before overriding a gate.
+      - **Buy vs build.** API gateways and LLM-observability products provide retries, caching, budgets and
+        tracing. They still need your error classification, budgets and golden set - and the same tests.
+
+  - id: summary
+    kind: summary
+    concepts: [ai-ops-resilience, ai-ops-cost-control, ai-ops-observability]
+    title: Quick reference
+    body: |
+      - Retry 429 (with `retry-after`), 529, 503, 500; never 400, auth errors or a spend-cap 429.
+      - Wait `max(retry_after, uniform(0, min(cap, base x 2^attempt)))`; stop before the deadline; one retry layer.
+      - Fall back only when the primary is unavailable; test the fallback on the golden set; trace which model answered.
+      - Cost = uncached input x price + cache writes and reads x multipliers + output x price; Decimal, from usage.
+      - Prompt caching: stable prefix first, above the minimum length; check cache usage fields.
+      - Response cache: temperature 0, complete replies, full request in the key, TTL, never per-user data.
+      - Limits before the model: input size, output cap, per-user token bucket, daily budget (OWASP LLM10).
+      - Span `"{operation} {model}"` with `gen_ai.*` attributes and `error.type`; no content unless opted in.
+      - Report p50/p95/p99 and time to first chunk, not the mean.
+      - Release gate: per-case regressions, pass rate, p95 and cost against the current version.
+
+exercises:
+  - id: retry-which-errors
+    type: mcq
+    concept: ai-ops-resilience
+    skill: application
+    title: Which errors should the loop retry?
+    prompt: |
+      The SandPay assistant calls Anthropic's Messages API. Which responses should the application's retry loop
+      retry (with backoff)? Select all that apply.
+    options:
+      - id: rate-retry-after
+        text: 429 rate_limit_error with a retry-after header
+        feedback: Correct - wait at least retry-after seconds, then retry.
+      - id: overloaded
+        text: 529 overloaded_error
+        feedback: Correct - a temporary capacity problem; retry with backoff and jitter.
+      - id: api-error
+        text: 500 api_error
+        feedback: Correct - the errors page says to retry with exponential backoff.
+      - id: bad-request
+        text: 400 invalid_request_error
+        feedback: The same request will fail the same way; fix the request instead.
+      - id: spend-cap
+        text: 429 with error_code enforced_spend_limit_reached and no retry-after
+        feedback: A spend cap keeps failing until it resets; retrying only adds load and delay.
+    correct: [rate-retry-after, overloaded, api-error]
+    hints:
+      - Ask of each one - can the identical request succeed a few seconds later?
+      - Two different responses share the status 429. What tells them apart?
+    solution: |
+      Retry what can succeed later: rate limits with retry-after, 529 and 500. A 400 needs a code fix, and the
+      spend-cap 429 has no retry-after and "keeps failing until access resumes". Tell the two 429s apart by the
+      header and by `error.details.error_code`.
+
+  - id: jitter-why
+    type: mcq
+    concept: ai-ops-resilience
+    skill: analysis
+    title: Retries in waves
+    prompt: |
+      Traces show that after a provider overload, 200 assistant workers all failed at 09:00:00.0, retried at
+      09:00:01.0, failed again, and retried at 09:00:03.0. The code uses exponential backoff (1 s, 2 s, 4 s) with
+      a cap. What is the most effective change?
+    options:
+      - id: jitter
+        text: Make each wait a random time between 0 and the capped backoff (full jitter)
+        feedback: Correct - the workers stop retrying in lock-step, so the provider sees a steady trickle instead of spikes.
+      - id: longer
+        text: Double the base delay to 2 s
+        feedback: The waves just move later; all 200 workers still retry at the same instant.
+      - id: more-retries
+        text: Allow 10 retries instead of 3
+        feedback: More synchronised retries mean more spikes and a longer tail.
+      - id: fixed
+        text: Use a fixed 1-second delay
+        feedback: That removes the growth that gives the provider time to recover, and keeps the lock-step.
+    correct: [jitter]
+    hints:
+      - What do all 200 workers have in common at the moment they retry?
+      - Brooker's post says exponential backoff alone still leaves "clusters of calls".
+    solution: |
+      Synchronised failures plus deterministic backoff give synchronised retries. Randomising the wait inside
+      the growing window spreads the load; the AWS post concludes jittered backoff "should be considered a
+      standard approach for remote clients".
+
+  - id: deadline-retry
+    type: mcq
+    concept: ai-ops-resilience
+    skill: application
+    title: Retry-after longer than the user will wait
+    prompt: |
+      A chat request has a 10-second deadline. At t = 2 s the provider answers 429 with `retry-after: 30`. What
+      should the code do?
+    options:
+      - id: give-up
+        text: Stop now - fall back or tell the user - because the wait would end after the deadline
+        feedback: Correct - decide before sleeping; a reply at t = 32 s helps nobody.
+      - id: sleep-30
+        text: Sleep 30 s, then retry
+        feedback: The user's deadline passed at 10 s; the worker is blocked for nothing.
+      - id: retry-now
+        text: Retry immediately with a different request id
+        feedback: The rate limit is per organisation, not per request; an early retry collects another 429.
+      - id: sleep-8
+        text: Sleep 8 s (the time left), then retry
+        feedback: That retries earlier than the server asked; the docs say to wait at least retry-after.
+    correct: [give-up]
+    hints:
+      - Which two limits apply to the wait - the server's and whose?
+    solution: |
+      The wait must be at least retry-after and must end before the deadline. Here both cannot hold, so give up
+      at once (RetryBudgetExceeded) and fall back or answer "busy, please try again".
+
+  - id: fallback-when
+    type: mcq
+    concept: ai-ops-resilience
+    skill: analysis
+    title: When should the chain fall back?
+    prompt: |
+      `FallbackChain([("large", primary), ("small", secondary)])`. For which primary outcomes should it try the
+      secondary model? Select all that apply.
+    options:
+      - id: overload-exhausted
+        text: 529 overloaded on every allowed attempt
+        feedback: Correct - the primary is unavailable; the secondary may have capacity.
+      - id: spend-cap
+        text: A spend-cap 429 on the primary's account
+        feedback: Correct - retries cannot help, and a model on another account or provider is not capped.
+      - id: deadline
+        text: The retry budget ran out before the deadline
+        feedback: Correct - treat "out of time on this model" as unavailable, if time remains for one more call.
+      - id: bad-request
+        text: 400 because the messages list is empty
+        feedback: The secondary will reject the same empty list; falling back only hides the bug.
+    correct: [overload-exhausted, spend-cap, deadline]
+    hints:
+      - Would the secondary model see a different request, or the same one?
+    solution: |
+      Fall back when the primary is unavailable (transient errors exhausted, spend cap, time budget). Never for
+      a request error - it repeats on every model and must surface as a bug.
+
+  - id: cost-calc
+    type: mcq
+    concept: ai-ops-cost-control
+    skill: application
+    title: The price of the second request
+    prompt: |
+      Prices: input $1 / MTok, output $5 / MTok, cache writes 1.25x input, cache reads 0.1x input. A request
+      reads a 6,000-token cached prefix, sends 200 uncached input tokens and receives 350 output tokens. What
+      does it cost?
+    options:
+      - id: right
+        text: $0.00255
+        feedback: "Correct - 200 x $0.000001 + 6,000 x $0.0000001 + 350 x $0.000005 = $0.0002 + $0.0006 + $0.00175."
+      - id: no-cache
+        text: $0.00795
+        feedback: That prices all 6,200 input tokens at the full rate - the cost without caching.
+      - id: write
+        text: $0.00945
+        feedback: That is the first request, which writes the cache at 1.25x.
+      - id: output-free
+        text: $0.0008
+        feedback: Output tokens are billed too - and at five times the input price here.
+    correct: [right]
+    hints:
+      - Split the input into the cached and uncached parts.
+      - Cache reads cost 0.1 x $1 per million tokens.
+    solution: |
+      $0.0002 (uncached input) + $0.0006 (cache read) + $0.00175 (output) = $0.00255, against $0.00795 with no
+      cache. Output now dominates the bill, so a shorter max_tokens is the next lever.
+
+  - id: cache-miss-mcq
+    type: mcq
+    concept: ai-ops-cost-control
+    skill: analysis
+    title: Prompt caching never hits
+    prompt: |
+      After enabling prompt caching, the usage field `cache_read_input_tokens` is 0 on every request, and every
+      request reports a cache write. The system prompt starts with `"Current time: 2026-11-18T09:14:07Z. You
+      are SandPay merchant support..."` followed by 6,000 tokens of policy. What is the most likely cause?
+    options:
+      - id: timestamp
+        text: The timestamp at the start changes on every request, so the cached prefix never matches
+        feedback: Correct - caching matches an identical prefix; put stable content first and the time after it.
+      - id: too-short
+        text: The prompt is below the minimum cacheable length
+        feedback: Then nothing would be written either - here every request writes. 6,000 tokens is above the documented minimums.
+      - id: temperature
+        text: Temperature is above 0
+        feedback: Sampling settings do not decide prefix matching.
+      - id: ttl
+        text: The 5-minute lifetime is too short for this traffic
+        feedback: Possible at night, but at busy times requests seconds apart would still hit if the prefix were identical.
+    correct: [timestamp]
+    hints:
+      - Compare the first characters of two consecutive requests.
+    solution: |
+      The prefix differs from the first token, so each request writes a new entry (paying 1.25x) and none reads.
+      Move variable content after the stable part, or after the cache breakpoint, and re-check the usage fields.
+
+  - id: response-cache-safe
+    type: mcq
+    concept: ai-ops-cost-control
+    skill: analysis
+    title: Which replies may the response cache store?
+    prompt: |
+      SandPay's application response cache is shared by all merchants. Which replies is it safe to store?
+      Select all that apply.
+    options:
+      - id: faq
+        text: A temperature-0, end_turn reply to "How long do standard refunds take?" with the general policy
+        feedback: Correct - deterministic, complete, the same for everyone; give it a TTL.
+      - id: personal
+        text: A temperature-0 reply to "When is my next payout?" that contains merchant m-204's payout date
+        feedback: The answer depends on one merchant's data; serving it to another merchant would leak it.
+      - id: cut-off
+        text: A temperature-0 reply that stopped with max_tokens
+        feedback: It is incomplete; replaying it would give every later user a cut-off answer.
+      - id: sampled
+        text: A temperature-0.8 reply to the FAQ question
+        feedback: Sampled replies are meant to vary; caching freezes one sample and changes the product's behaviour.
+    correct: [faq]
+    hints:
+      - Three tests - deterministic, complete, not personal.
+    solution: |
+      Only the general FAQ reply passes all three tests. If an answer depends on the user, the user (or tenant)
+      must be part of the key - or the reply must not be cached at all.
+
+  - id: llm10-mcq
+    type: mcq
+    concept: ai-ops-cost-control
+    skill: application
+    title: The 410,000-token day
+    prompt: |
+      One merchant's browser, stuck in a UI bug, resent its conversation every 1.5 s for six hours, and the
+      provider's organisation limits never triggered. Which control would have stopped it with the least
+      effect on other merchants?
+    options:
+      - id: bucket
+        text: A per-merchant token bucket plus a daily budget checked before each model call
+        feedback: Correct - the stuck client is refused after its burst, and everyone else keeps their own allowance.
+      - id: org-limit
+        text: Ask the provider to lower the organisation's rate limit
+        feedback: That limits every merchant together; the stuck client still uses the shared allowance first.
+      - id: max-tokens
+        text: Lower max_tokens for all requests
+        feedback: Each request gets cheaper, but the number of requests is still unbounded.
+      - id: cache
+        text: A response cache
+        feedback: Conversations change each turn; and caching treats the symptom, not the unbounded calls.
+    correct: [bucket]
+    hints:
+      - OWASP LLM10 mitigations include "Rate Limiting" with "user quotas".
+    solution: |
+      Per-user limits stop one client without hurting others, and a daily budget caps the worst case. Alert when
+      either triggers, so the UI bug is found the same day.
+
+  - id: span-attributes-mcq
+    type: mcq
+    concept: ai-ops-observability
+    skill: application
+    title: What belongs on the span?
+    prompt: |
+      You instrument the assistant's model calls following the OpenTelemetry GenAI client-inference conventions.
+      Which should you record on every span by default? Select all that apply.
+    options:
+      - id: op-model
+        text: gen_ai.operation.name, gen_ai.provider.name and gen_ai.request.model
+        feedback: Correct - operation and provider are Required; the request model is Conditionally Required when available.
+      - id: usage
+        text: gen_ai.usage.input_tokens and gen_ai.usage.output_tokens
+        feedback: Correct - Recommended, and the basis of cost per request.
+      - id: error-type
+        text: error.type when the call fails
+        feedback: Correct - Conditionally Required if the operation ended in an error.
+      - id: messages
+        text: gen_ai.input.messages with the merchant's full question
+        feedback: Message content is Opt-In; it can contain personal data. Record it only deliberately, redacted and access-controlled.
+    correct: [op-model, usage, error-type]
+    hints:
+      - Look at the requirement levels - Required, Conditionally Required, Recommended, Opt-In.
+    solution: |
+      Record identity, parameters, usage, finish reasons and errors by default; keep content off unless you have
+      a privacy-reviewed reason. The span name is "chat model-small" - operation, then model.
+
+  - id: percentile-mcq
+    type: mcq
+    concept: ai-ops-observability
+    skill: analysis
+    title: The dashboard says 1.9 s
+    prompt: |
+      The latency panel shows "mean 1.86 s" for a morning. The SLO is "95% of replies within 3 s". Twenty
+      measured latencies (seconds) - 17 between 0.8 and 1.4, then 2.4, 6.8, 9.6. Is the SLO met?
+    options:
+      - id: no
+        text: No - p95 (nearest rank) is 6.8 s
+        feedback: Correct - the 19th of 20 sorted values is 6.8 s, so more than 5% of replies took over 3 s.
+      - id: yes-mean
+        text: Yes - the mean is under 3 s
+        feedback: The SLO is about a percentile; the mean hides the slow tail.
+      - id: yes-median
+        text: Yes - the median is about 1.1 s
+        feedback: The median describes the typical case, not the 95th percentile.
+      - id: unknown
+        text: It cannot be decided from 20 values
+        feedback: A small sample is noisy, but for this morning's data the p95 is clearly above 3 s.
+    correct: [no]
+    hints:
+      - Sort the values. Which position is the 95th percentile of 20 values?
+    solution: |
+      ceil(0.95 x 20) = 19, and the 19th value is 6.8 s. Two of twenty replies (10%) were over 3 s, so a 95%
+      target is missed while the mean looks healthy.
+
+  - id: gate-regressed
+    type: mcq
+    concept: ai-ops-observability
+    skill: analysis
+    title: Same pass rate, different cases
+    prompt: |
+      Baseline: 39 of 40 golden cases pass (g17 fails). Candidate prompt: 39 of 40 pass (g05 fails). p95 and cost
+      are within budget. g05 checks that a refund answer cites the refund policy. Ship?
+    options:
+      - id: block
+        text: No - g05 regressed; investigate before shipping
+        feedback: Correct - a fixed case does not cancel a broken one; per-case comparison catches what the rate hides.
+      - id: ship-rate
+        text: Yes - the pass rate did not change
+        feedback: The rate is equal because one improvement and one regression cancel out.
+      - id: ship-tolerance
+        text: Yes - one case is within a 2% tolerance
+        feedback: Tolerances are for noise in the rate; a deterministic case that flips from pass to fail is a signal.
+      - id: rerun-baseline
+        text: Re-run the baseline until g05 fails there too
+        feedback: That is searching for a result; if g05 is flaky, fix the check, do not hide the regression.
+    correct: [block]
+    hints:
+      - Compare case by case, not only the totals.
+    solution: |
+      Block, read g05's candidate output, and fix the prompt or confirm the check is flaky. The practice gate
+      reports "regressed - g05" even when the rate is unchanged.
+
+  - id: incident-order
+    type: order
+    concept: ai-ops-observability
+    skill: application
+    title: Investigating "the assistant is slow"
+    prompt: |
+      Merchants report the assistant is slow since this morning. Put the investigation steps in order.
+    items:
+      - id: scope
+        text: Scope with metrics - which percentile, model and error types changed, and since when
+      - id: correlate
+        text: Correlate with changes - deploys, traffic, provider status
+      - id: spans
+        text: Read the spans of a few slow requests - number of calls, error.type, waits, serving model
+      - id: usage
+        text: Check token usage and cache usage fields of those calls
+      - id: reproduce
+        text: Reproduce the cause with the scripted model and write a failing test
+      - id: fix-verify
+        text: Fix, run the golden-set gate, and confirm the percentile recovered in production
+    hints:
+      - Measure the size of the problem before looking at single requests.
+      - Change nothing until a test reproduces the cause.
+    solution: |
+      Metrics tell you what and when; changes suggest why; spans and usage show how; a failing test proves the
+      cause; the gate and the production metric confirm the fix.
+
+  - id: retry-debug
+    type: debug
+    concept: ai-ops-resilience
+    skill: analysis
+    title: A retry loop that makes outages worse
+    prompt: |
+      Click **every** line that is a defect in this retry helper for an LLM API.
+    language: python
+    code: |
+      def call_llm(client, request, max_attempts=5):
+          for attempt in range(max_attempts):
+              try:
+                  return client.create(**request)
+              except LLMError as error:
+                  if attempt == max_attempts - 1:
+                      raise
+                  delay = 0.5 * 2**attempt
+                  time.sleep(delay)
+    correctLines: [5, 8]
+    lineNotes:
+      - line: 6
+        note: Re-raising the last error on the final attempt is correct.
+      - line: 4
+        note: Returning the reply on success is correct.
+      - line: 9
+        note: Sleeping is right in production code; injecting `sleep` would make it testable, but it is not the defect.
+    hints:
+      - Which errors does line 5 catch - and should all of them be retried?
+      - What do 200 workers that failed together do with this delay?
+    solution: |
+      Line 5 retries every LLMError, including 400 bad requests and the spend cap - classify with
+      `is_retryable` and re-raise the rest. Line 8 is deterministic: no jitter, no cap and no `retry_after`
+      floor - use `max(retry_after, uniform(0, min(cap, base * 2**attempt)))`. A deadline check is missing too.
+
+  - id: cache-key-short
+    type: short
+    concept: ai-ops-cost-control
+    skill: analysis
+    title: A stale answer after a policy change
+    prompt: |
+      SandPay shortened standard refunds from "5-10" to "3-5 business days" and updated the policy text in the
+      system prompt at 10:00. At 14:00 merchants still received "5-10 business days" from the application
+      response cache, whose key is a hash of the user's question only and whose TTL is 7 days. Explain the
+      cause and how to fix the cache design.
+    modelAnswer: |
+      The key left out part of what determines the answer: the system prompt (and the model and parameters).
+      After the policy change the request was different but hashed to the same key, so old replies were served
+      for up to 7 days. Fix: key on the whole canonical request - model, system prompt (or a version id of the
+      policy), messages, max_tokens, temperature and tools - so any change makes a new key; shorten the TTL to
+      what the business can tolerate; and add explicit invalidation (or a cache namespace bump) when policy
+      documents change. Then purge the stale entries now, and add a test that changing the system prompt
+      produces a miss.
+    rubric:
+      - Identifies that the key omits the system prompt / policy (and other request fields).
+      - Proposes keying on the whole canonical request or a policy version.
+      - Addresses TTL length and explicit invalidation on policy change.
+      - Mentions purging current stale entries and a regression test.
+    hints:
+      - What changed at 10:00, and is it part of the key?
+    solution: |
+      Everything that changes the answer belongs in the key; policy changes also need invalidation, not just a
+      TTL.
+
+  - id: ops-testdesign
+    type: testdesign
+    concept: ai-ops-resilience
+    skill: application
+    title: Test plan for the assistant's resilience layer
+    prompt: |
+      Design test cases for SandPay's model-call layer: retries with backoff and Retry-After, a 10-second
+      deadline, fallback from model-large to model-small, and the per-merchant budget guard. For each case give
+      preconditions, steps, the expected result and the evidence you would collect. Use a scripted model and an
+      injected clock - no real API.
+    modelAnswer: |
+      Preconditions for all: `ScriptedLLM` for each model, a fake clock and a recording `sleep`, `random.Random(7)`.
+
+      1. **Transient recovery** - script `[Overloaded, Overloaded, "ok"]`. Expected - reply returned; 2 sleeps,
+         each within its window (0..0.5 s, 0..1 s). Evidence - attempt log, sleep list.
+      2. **Retry-After floor** - `[RateLimit(retry_after=4), "ok"]`. Expected - first sleep >= 4 s. Evidence - sleep list.
+      3. **No retry on 400** - `[BadRequest]`. Expected - raised after one call, no sleep, no fallback call.
+         Evidence - both models' call counts.
+      4. **Spend cap** - primary `[SpendCap]`. Expected - one primary call, then the secondary answers. Evidence
+         - `tried` list.
+      5. **Deadline** - `[RateLimit(retry_after=30)]`, deadline 10 s. Expected - gives up without sleeping, then
+         falls back. Evidence - sleep list empty, `RetryBudgetExceeded` in `tried`.
+      6. **All models down** - both always overloaded. Expected - the last model's error reaches the caller and
+         the user sees "busy, try again". Evidence - exception type, user message.
+      7. **Fallback reply is checked** - secondary returns invalid JSON. Expected - the same schema check fails
+         it. Evidence - validation error logged with model name.
+      8. **Per-merchant bucket** - burst 3: four calls at t = 0 for m-204, one for m-311. Expected - fourth m-204
+         refused (`rate_limited`), m-311 allowed; at t = 5 s with refill 0.2/s m-204 is allowed again. Evidence -
+         reasons, model call count.
+      9. **Daily budget** - record spend near the limit. Expected - refused with `daily_budget`, allowed again
+         after midnight UTC. Evidence - reasons with the fake clock.
+      10. **Trace** - every case above produces spans with `error.type` on failures and the serving model.
+          Evidence - span list.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Covers transient recovery, Retry-After, no retry on 400 and the spend cap.
+      - Covers the deadline and fallback, including all models down and checks on fallback replies.
+      - Covers per-user rate limiting without affecting another user, and the daily budget.
+      - Uses a scripted model, injected clock and seeded random - no real API or real sleeping.
+    hints:
+      - Every branch in the classification table is a test.
+      - How do you prove the second model was never called?
+    solution: |
+      One case per outcome - recover, wait at least Retry-After, fail fast, give up at the deadline, fall back,
+      limit per user - each proved with call counts, the sleep list and spans.
+
+  - id: ops-interview
+    type: interview
+    concept: ai-ops-observability
+    skill: analysis
+    title: "Interview: how do you run an LLM feature in production?"
+    prompt: |
+      "You are taking our LLM-based support assistant from prototype to production. What do you put in place
+      for reliability, cost and quality, and how would you know it is working?"
+    modelAnswer: |
+      Reliability: I classify provider errors - rate limits, overloads and 5xx are retried with capped
+      exponential backoff and full jitter, never sooner than Retry-After, within a per-request deadline and in
+      one layer only (the SDK's own retries count); 400s, auth errors and spend caps fail fast. Calls have
+      timeouts, long answers stream, and a tested fallback model takes over when the primary is unavailable -
+      never for bad requests.
+
+      Cost: I price each request from its usage in Decimal, structure prompts so the stable prefix is cached by
+      the provider and verify it with the cache usage fields, cache whole replies only for deterministic,
+      non-personal FAQ-type requests with a TTL, and put input/output caps, a per-user token bucket and a daily
+      budget in front of the model - OWASP LLM10, denial of wallet.
+
+      Quality and visibility: one span per model call with the OpenTelemetry GenAI attributes - operation,
+      provider, model, token usage, finish reasons, error type, no prompt content by default; dashboards of p50,
+      p95 and p99 latency and time to first chunk, error types, fallback rate, cache hit rate and spend, with
+      SLO and budget alerts. Every prompt, model or index change goes through a golden-set gate against the
+      current version that blocks on per-case regressions, pass-rate drop, p95 and cost. All of this is unit
+      tested with a scripted model and an injected clock.
+    rubric:
+      - Distinguishes retryable from non-retryable errors, with backoff, jitter, Retry-After and a deadline.
+      - Explains fallback and its limits (not for bad requests; tested; traced).
+      - Covers cost - usage-based pricing, provider prompt caching, a safe response cache, per-user and daily limits.
+      - Covers observability - GenAI spans without content, percentiles and time to first chunk, alerts.
+      - Describes a golden-set release gate with per-case regressions, and offline tests with a scripted model.
+    followUps:
+      - Your SDK retries twice by default and your gateway retries three times. What happens during an outage?
+      - How would you detect that prompt caching silently stopped working?
+      - The fallback model costs less but fails 3 golden cases. Do you keep it?
+    hints:
+      - Structure the answer in three parts - reliability, cost, quality - and end with how you measure each.
+    solution: |
+      Retries with jitter and deadlines, safe fallbacks, priced and capped usage, GenAI traces with percentiles,
+      and a per-case golden-set gate - all tested offline.
+
+  - id: ops-resilience-code
+    type: coding
+    concept: ai-ops-resilience
+    skill: application
+    title: Retries, deadline and fallback
+    prompt: |
+      In `ops_resilience.py`, implement `is_retryable`, `backoff_delay` (full jitter), `call_with_retries`
+      (classify, wait at least `retry_after`, stop before the deadline, re-raise the last error) and
+      `FallbackChain.create` (fall back only when a model is unavailable). Clock, sleep and random are injected.
+    project: ai
+    files:
+      - exercises/production/ops_resilience.py
+    test: tests/production/test_ops_resilience.py
+    command: .venv/bin/python -m pytest tests/production/test_ops_resilience.py
+    hints:
+      - "is_retryable: only LLMError subclasses whose retryable attribute is true."
+      - "Check the deadline before calling sleep, and record each attempt with its wait."
+      - "FallbackChain: catch RetryBudgetExceeded and SpendCapError and move on; re-raise non-retryable errors at once."
+    modelAnswer: |
+      ```python
+      def is_retryable(error):
+          return isinstance(error, LLMError) and bool(getattr(error, "retryable", False))
+
+
+      def backoff_delay(attempt, base, cap, rng):
+          if attempt < 0:
+              raise ValueError("attempt must be >= 0")
+          return rng.uniform(0, min(cap, base * 2**attempt))
+      ```
+
+      `call_with_retries` is shown in the lesson. `FallbackChain.create` loops over the models, calls
+      `call_with_retries`, records `(name, outcome)` in `tried`, continues on `RetryBudgetExceeded`,
+      `SpendCapError` and exhausted retryable errors, re-raises any other error immediately and raises the last
+      error when every model is unavailable.
+    rubric:
+      - Every test in tests/production/test_ops_resilience.py passes.
+      - A bad request is neither retried nor sent to the fallback model.
+      - The wait is never shorter than retry_after and never crosses the deadline.
+      - The last error is re-raised unchanged, not wrapped in a generic exception.
+    solution: |
+      Classify first, then wait max(retry_after, full jitter) within the deadline, and fall back only for
+      unavailability.
+
+  - id: ops-cost-code
+    type: coding
+    concept: ai-ops-cost-control
+    skill: application
+    title: Cost, response cache and budget guard
+    prompt: |
+      In `ops_cost.py`, implement `request_cost` (Decimal, cache multipliers), `ResponseCache.get_or_call`
+      (temperature 0 only, complete replies only, TTL, least-recently-used eviction, hit and miss counts) and
+      `BudgetGuard.check` (input size, output cap, per-user token bucket, daily budget - in that order).
+    project: ai
+    files:
+      - exercises/production/ops_cost.py
+    test: tests/production/test_ops_cost.py
+    command: .venv/bin/python -m pytest tests/production/test_ops_cost.py
+    hints:
+      - "request_cost: divide prices by Decimal(1_000_000); multiply cache tokens by the base input price times their multiplier."
+      - "get_or_call: an expired entry is removed and counted as a miss; only end_turn replies are stored."
+      - "check: refill the bucket from the time since its last update, capped at burst; a refused request must not use a token."
+    modelAnswer: |
+      ```python
+      def request_cost(price, *, input_tokens, output_tokens, cache_write_tokens=0, cache_read_tokens=0):
+          if any(c < 0 for c in (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)):
+              raise ValueError("token counts must be >= 0")
+          base_in = price.input_per_mtok / MILLION
+          return (
+              input_tokens * base_in
+              + cache_write_tokens * base_in * price.cache_write_multiplier
+              + cache_read_tokens * base_in * price.cache_read_multiplier
+              + output_tokens * price.output_per_mtok / MILLION
+          )
+      ```
+
+      `get_or_call` and `check` are shown in full in the lesson's code section.
+    rubric:
+      - Every test in tests/production/test_ops_cost.py passes.
+      - Money is Decimal throughout; no float arithmetic on prices.
+      - The cache never stores sampled or incomplete replies, and the key covers the whole request.
+      - Limits are checked before the call, per user, and a refusal has a clear reason.
+    solution: |
+      Price from usage in Decimal; cache only deterministic complete replies with a TTL; refuse before spending.
+
+  - id: ops-telemetry-code
+    type: coding
+    concept: ai-ops-observability
+    skill: application
+    title: GenAI spans, percentiles and a release gate
+    prompt: |
+      In `ops_telemetry.py`, implement `traced_chat` (span name and GenAI attributes, error.type on failure, no
+      content), `time_to_first_chunk`, `percentile` (nearest rank) and `release_gate` (pass-rate drop, per-case
+      regressions, p95 budget, cost increase).
+    project: ai
+    files:
+      - exercises/production/ops_telemetry.py
+    test: tests/production/test_ops_telemetry.py
+    command: .venv/bin/python -m pytest tests/production/test_ops_telemetry.py
+    hints:
+      - "traced_chat: end the span in both the success and the error path, and re-raise the original exception."
+      - "percentile: rank = ceil(p / 100 * n), then take the rank-th smallest value."
+      - "release_gate: check the reasons in the documented order so messages are stable."
+    modelAnswer: |
+      ```python
+      def time_to_first_chunk(start, chunks, clock):
+          first = None
+          parts = []
+          for chunk in chunks:
+              if chunk and first is None:
+                  first = clock() - start
+              parts.append(chunk)
+          return first, clock() - start, "".join(parts)
+      ```
+
+      `traced_chat`, `percentile` and `release_gate` are shown in the lesson's code section.
+    rubric:
+      - Every test in tests/production/test_ops_telemetry.py passes.
+      - Spans follow the documented name and attribute names, and never contain prompt or reply text.
+      - Failed calls still produce an ended span with error.type, and the exception reaches the caller.
+      - The gate blocks on a single regressed case even when the pass rate is unchanged.
+    solution: |
+      Name and attribute spans per the GenAI conventions without content, report percentiles, and compare
+      releases case by case.
+
+placement:
+  - id: place-retry
+    type: mcq
+    concept: ai-ops-resilience
+    skill: application
+    title: Two kinds of 429
+    prompt: |
+      Your retry loop receives HTTP 429 from the model API with no `retry-after` header and
+      `error.details.error_code: enforced_spend_limit_reached`. What should it do?
+    options:
+      - id: fail-fast
+        text: Stop retrying, alert, and fall back to a model not under that spend cap if one exists
+        feedback: Correct - the spend cap keeps failing until access resumes.
+      - id: backoff
+        text: Retry with exponential backoff and jitter like any 429
+        feedback: This 429 is a spend cap, not a rate limit; retries cannot succeed.
+      - id: wait-minute
+        text: Wait 60 seconds, then retry
+        feedback: The cap resets at the next billing period, not in a minute.
+      - id: smaller
+        text: Retry with a smaller max_tokens
+        feedback: The request size is not the problem; the account has reached its spend limit.
+    correct: [fail-fast]
+    solution: |
+      Not every 429 is a rate limit. Check for retry-after and the error code: a spend cap must fail fast and
+      alert; only a model on another account can still answer.
+
+  - id: place-cost
+    type: mcq
+    concept: ai-ops-cost-control
+    skill: application
+    title: Is the reply safe to cache?
+    prompt: |
+      A shared response cache sees a temperature-0 reply to "What is my current balance?" for merchant m-311,
+      with stop_reason end_turn. Should it be stored under a key made from the request?
+    options:
+      - id: no-personal
+        text: No - the answer is personal; do not cache it (or include the merchant in the key and keep the TTL very short)
+        feedback: Correct - a shared cache keyed on the question alone would show m-311's balance to others.
+      - id: yes
+        text: Yes - it is deterministic and complete
+        feedback: Deterministic and complete are necessary, not sufficient; the reply contains one merchant's data.
+      - id: yes-long
+        text: Yes, with a 7-day TTL to maximise hits
+        feedback: Balances change constantly and the data is personal - the worst case for caching.
+      - id: only-temp
+        text: Only if temperature is set to 0.7
+        feedback: Sampled replies should not be cached at all.
+    correct: [no-personal]
+    solution: |
+      Cache only deterministic, complete and non-personal replies. Balances should come from the source of
+      truth (a tool call), not a cache.
+
+  - id: place-p95
+    type: mcq
+    concept: ai-ops-observability
+    skill: analysis
+    title: Which number for the SLO?
+    prompt: |
+      Ten reply latencies in seconds - 0.9, 1.0, 1.0, 1.1, 1.1, 1.2, 1.2, 1.3, 1.4, 8.0. Your SLO is "90% of
+      replies within 2 s". Using nearest-rank percentiles, is it met?
+    options:
+      - id: met
+        text: Yes - p90 is 1.4 s
+        feedback: Correct - ceil(0.9 x 10) = 9, and the 9th value is 1.4 s.
+      - id: not-met-mean
+        text: No - the mean is 1.82 s, too close to 2 s
+        feedback: The SLO is a percentile; the mean is not what it measures.
+      - id: not-met-max
+        text: No - one reply took 8 s
+        feedback: The SLO allows 10% of replies to be slower; one of ten is exactly that share.
+      - id: met-median
+        text: Yes - the median is 1.15 s
+        feedback: The median does not answer a 90th-percentile target.
+    correct: [met]
+    solution: |
+      Sort, take rank ceil(p x n). p90 of these ten values is 1.4 s, so the target is met - but the 8 s reply
+      is worth a look in its trace.
+
+recall:
+  - id: recall-retryable
+    concept: ai-ops-resilience
+    prompt: Which LLM API errors do you retry, and which not?
+    answer: Retry rate limits with retry-after, overloads (529/503) and transient 5xx. Do not retry 400, 401/403, 413 or a spend-cap 429 (no retry-after) - they fail the same way again.
+  - id: recall-wait
+    concept: ai-ops-resilience
+    prompt: Write the wait before a retry.
+    answer: max(retry_after, uniform(0, min(cap, base x 2^attempt))) - full jitter inside a capped exponential window, never shorter than retry-after, and only if it ends before the request's deadline.
+  - id: recall-fallback
+    concept: ai-ops-resilience
+    prompt: When do you fall back to another model, and what must you do about it?
+    answer: Only when the primary is unavailable - transient errors exhausted, time budget spent, spend cap. Never for a bad request. Test the fallback on the golden set, keep output checks, and record which model answered.
+  - id: recall-cost
+    concept: ai-ops-cost-control
+    prompt: How do you compute a request's cost with prompt caching?
+    answer: uncached input x input price + cache writes x input price x write multiplier + cache reads x input price x read multiplier + output x output price, in Decimal, from the usage the API returns.
+  - id: recall-response-cache
+    concept: ai-ops-cost-control
+    prompt: What makes an application response cache safe?
+    answer: Temperature 0, complete (end_turn) replies only, a key over the whole canonical request, a TTL plus invalidation on policy change, and never personal answers in a shared cache.
+  - id: recall-llm10
+    concept: ai-ops-cost-control
+    prompt: Which limits mitigate OWASP LLM10 Unbounded Consumption in front of a model?
+    answer: An input size limit, an output (max_tokens) cap, per-user rate limits such as a token bucket, and a daily budget - checked before the call, with alerts - plus timeouts and graceful degradation.
+  - id: recall-span
+    concept: ai-ops-observability
+    prompt: What does a GenAI inference span look like?
+    answer: Name "{gen_ai.operation.name} {gen_ai.request.model}" (e.g. "chat model-small"); attributes for operation, provider, request model and parameters, input and output token usage, finish reasons, and error.type on failure; message content only if opted in.
+  - id: recall-gate
+    concept: ai-ops-observability
+    prompt: What does a golden-set release gate compare?
+    answer: The candidate against the current version on the same cases - per-case regressions, pass-rate drop, p95 latency against its budget and cost increase - and blocks the release on any of them.
+
+next:
+  - ai-capstone-support-agent
+  - ai-engineer-mock-interview
