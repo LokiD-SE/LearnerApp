@@ -1,0 +1,1513 @@
+id: agent-loops-and-workflow-patterns
+title: Agent loops and workflow patterns
+subject: ai-engineering
+module: ai-agents
+level: intermediate
+status: published
+estimatedMinutes: 135
+summary: Decide between a workflow - your code fixes the path and the model fills in each step - and an agent, where the model chooses its next tool call in a loop. Build the five workflow patterns from Anthropic's "Building effective agents" (prompt chaining with gates, routing with a fallback, parallel sectioning and voting, orchestrator-workers with a validated plan, evaluator-optimizer with a code evaluator), then the ReAct-style agent loop with the guards it needs to be safe and testable - a step limit, a token budget, no-progress detection, tool errors returned to the model, and a trace of every step that a tester can assert on. Every output comes from code run offline against a scripted fake model.
+tags:
+  [
+    AI agents,
+    agentic systems,
+    workflows,
+    agent loop,
+    ReAct,
+    prompt chaining,
+    routing,
+    parallelisation,
+    sectioning,
+    voting,
+    self-consistency,
+    orchestrator-workers,
+    evaluator-optimizer,
+    Reflexion,
+    stop conditions,
+    max steps,
+    token budget,
+    no-progress detection,
+    error recovery,
+    is_error,
+    tracing,
+    spans,
+    excessive agency,
+    unbounded consumption,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv` with pytest; NumPy 2.5.4 only for the voting simulation. The
+    lesson's own code is standard-library Python (`concurrent.futures` for parallel calls). Every output shown was
+    printed by the code shown, run on Linux on 14 November 2026 with `OMP_NUM_THREADS=2`.
+  - **No real model is called, no API key, no network.** The "model" is `ScriptedLLM` from
+    `practice/ai/support/llm_fake.py`, an offline stand-in with the shape of a messages API. It replays replies
+    **you script**: a string is a final answer (`stop_reason` `end_turn`), `{"tool": name, "input": {...}}` is a
+    tool-use request (`stop_reason` `tool_use`, the call in `reply.tool_calls` with ids `call_1`, `call_2`...),
+    and an exception is raised by the call. A script can also be a function of the request, which is how this
+    lesson simulates a model that is stuck or keeps guessing. Its token counts come from a toy tokenizer (words
+    and punctuation marks), so the token numbers show growth, not real costs. So:
+    - Every trace, status and token count below is real output of the lesson's loop driving **scripted**
+      replies. They show what the loop does with a stuck or failing model; they do not show how often a real model
+      gets stuck.
+    - Tool timings come from an injected fake clock that advances 0.12 s per reading, so they read 120.0 ms. The
+      parallel-calls timing used a fake model that sleeps 0.2 s per call and was measured with `time.perf_counter`.
+    - The voting accuracies come from a seeded NumPy simulation of a classifier that is right 70% of the time
+      (seed 7), not from a real model.
+  - **Message shapes.** Tool calls and results use this project's shapes, modelled on Anthropic's documented
+    `tool_use` / `tool_result` blocks (with `is_error`). The full round trip, tool definitions and OpenAI's
+    equivalent items are taught in [Tool use and function calling](#/lesson/tool-use-and-function-calling); this
+    lesson only uses them.
+  - **Sources, read on 14 November 2026:**
+    - Erik Schluntz and Barry Zhang (Anthropic), [Building effective
+      agents](https://www.anthropic.com/engineering/building-effective-agents) (published 19 December 2024; a
+      provider's engineering article, and it now carries a note that "much of the tooling landscape described in
+      this post has changed since December 2024"). The definitions of workflows and agents, the five workflow
+      patterns with their "when to use" guidance, the agent description and the three principles are quoted from
+      it.
+    - Shunyu Yao et al., [ReAct - Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
+      (ICLR 2023): interleaved reasoning traces and actions; the "repetitive" failure mode (section 3.3, Table 2);
+      the step limits of 7 and 5 and the back-off to self-consistency when "the majority answer among n CoT-SC
+      samples occurs less than n/2 times".
+    - Xuezhi Wang et al., [Self-Consistency Improves Chain of Thought Reasoning in Language
+      Models](https://arxiv.org/abs/2203.11171) (2022): sample several reasoning paths and select "the most
+      consistent answer" - the research form of voting.
+    - Noah Shinn et al., [Reflexion - Language Agents with Verbal Reinforcement Learning](https://arxiv.org/abs/2303.11366)
+      (2023): agents that "verbally reflect on task feedback signals" and keep the reflections in an episodic memory
+      buffer - a research relative of evaluator-optimizer.
+    - OWASP Gen AI Security Project, [LLM06:2025 Excessive Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/)
+      (excessive functionality, permissions and autonomy; "Require user approval"; rate limiting to limit damage)
+      and [LLM10:2025 Unbounded Consumption](https://genai.owasp.org/llmrisk/llm102025-unbounded-consumption/)
+      (Denial of Wallet; "Timeouts and Throttling").
+  - **Provider documentation (provider-specific, as documented on 14 November 2026; it changes):**
+    - Anthropic, [How tool use works](https://platform.claude.com/docs/en/agents-and-tools/tool-use/how-tool-use-works)
+      (the agentic loop "keyed on `stop_reason`", the stop reasons that exit it, `pause_turn` for server tools) and
+      [Handle tool calls](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls) (`is_error`,
+      instructive error messages).
+    - OpenAI Agents SDK (Python), [Running agents](https://openai.github.io/openai-agents-python/running_agents/)
+      (the runner loop, `max_turns`, `MaxTurnsExceeded`, `error_handlers`) and
+      [Tracing](https://openai.github.io/openai-agents-python/tracing/) (traces, spans and what is traced by
+      default). Quoted only; the SDK is not installed or run here.
+  - **SandPay** is a fictional payments company. Merchants (`m_12`, `m_40`), payouts (`po_1042`), refunds (`rf_7`),
+    payments (`pay_88`) and amounts are invented.
+  - **Builds on:** [Tool use and function calling](#/lesson/tool-use-and-function-calling) (the tool round trip,
+    tool definitions, safe execution), [LLM APIs, streaming and structured output](#/lesson/llm-apis-and-structured-output)
+    (stop reasons, retries, validating JSON) and [Evaluating LLM applications and
+    guardrails](#/lesson/llm-evaluation-and-guardrails) (golden sets, judges, tool allow-lists).
+
+prerequisites:
+  - tool-use-and-function-calling
+  - llm-apis-and-structured-output
+
+concepts:
+  - id: workflows-vs-agents
+    name: Workflows versus agents, and when not to build an agent
+    summary: An agentic system is a workflow when the code decides the path and each model call fills in one step, and an agent when the model decides its own next action - which tool to call, and when it is finished - in a loop. Workflows are predictable, cheap and easy to test; agents handle open-ended tasks whose number of steps cannot be known in advance, at the price of latency, cost and compounding errors. Start with the simplest thing that works (often one well-prompted call with retrieval), and add steps or autonomy only when an evaluation shows it helps.
+  - id: llm-workflow-patterns
+    name: The five workflow patterns
+    summary: Prompt chaining runs fixed steps in order, each on the previous output, with code gates between them. Routing classifies the input and hands it to a specialised prompt, with a fallback for labels it does not know. Parallelisation runs independent sections at the same time, or the same prompt several times and takes a strict majority (voting only helps when the samples' mistakes are independent). Orchestrator-workers lets a model decide the subtasks, which code validates and caps before workers run. Evaluator-optimizer revises a draft using an evaluator's feedback until it passes or a round limit is hit - and the evaluator should be code wherever the criteria are checkable.
+  - id: agent-loop-stop-conditions
+    name: The agent loop, stop conditions and error recovery
+    summary: An agent is a model calling tools in a loop - call the model, run the tools it asked for, send the results back, repeat until it answers. ReAct interleaves the model's reasoning with these actions. The loop needs guards that the model does not control - a maximum number of steps, a token or cost budget checked before running more tools, detection of no progress (the same call with the same input again), and a limit on consecutive failing steps - while single tool errors go back to the model as error results so it can correct itself.
+  - id: agent-tracing-and-testing
+    name: Tracing every step to test an agent
+    summary: An agent's final answer hides the path it took, so record a trace - one event per model call (stop reason, tokens, tool calls) and per tool run (input, error flag, output, duration), and a final stop event with the status. Tests then assert on the trace and on the messages sent, with a scripted model making every failure path happen on demand - wrong ids, stuck repetition, failing tools, model errors, budget exhaustion. Traces hold user data, so they need the same care as logs.
+
+objectives:
+  - Classify a design as a workflow or an agent, and argue for the simplest option that meets a stated task with cost, latency and testability in mind.
+  - Implement prompt chaining with gates, routing with a fallback, and parallel sectioning and voting, and say what each pattern costs in model calls.
+  - Explain why majority voting improves accuracy only when the samples' errors are independent, using a simulation.
+  - Implement orchestrator-workers with a plan that code validates and caps, and evaluator-optimizer with a code evaluator and a round limit.
+  - Write a ReAct-style agent loop with a step limit, a token budget, no-progress detection and a consecutive-error limit, returning tool errors to the model.
+  - Record a trace of every model call and tool run, and write tests that assert on statuses, traces and the messages sent to the model.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [workflows-vs-agents, agent-loop-stop-conditions]
+    title: The idea in plain language
+    body: |
+      SandPay's support team gets two kinds of payout questions from merchants.
+
+      - **"Translate this payout notice into French and check that every amount is still there."** The steps are
+        always the same: translate, then check. You could write them on a sticky note.
+      - **"Why is payout po_1042 lower than my sales?"** The answer might be fees, a refund, a chargeback, a reserve,
+        a currency conversion - or two of those. Which records to look at depends on what the last record showed.
+        Nobody can write the steps down in advance.
+
+      The first is a **workflow**: a recipe your code follows, with the model doing one well-defined step at a time.
+      The second needs an **agent**: you hand the model some tools (look up a payout, list refunds, list fees) and
+      let it decide what to look at next, again and again, until it can answer.
+
+      An agent is like a new support analyst with access to the back office. Useful - but you would not let them
+      work all night on one ticket, call the same report fifty times, or keep retrying a lookup that keeps failing.
+      You would give them **limits** and ask them to **write down what they did**, so a supervisor can check the
+      work. The agent loop in this lesson does exactly that: the model chooses the actions, while your code sets
+      the limits and keeps the record. A tester's job is to prove the limits hold and to read the record.
+
+  - id: what
+    kind: what
+    concepts: [workflows-vs-agents, llm-workflow-patterns]
+    title: Workflows, agents and the words around them
+    body: |
+      Anthropic's [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+      (December 2024) calls all of these **agentic systems** and draws one architectural line:
+
+      > **Workflows** are systems where LLMs and tools are orchestrated through predefined code paths.
+      > **Agents**, on the other hand, are systems where LLMs dynamically direct their own processes and tool usage,
+      > maintaining control over how they accomplish tasks.
+
+      | Term | Meaning in this lesson |
+      | ---- | ---------------------- |
+      | **Augmented LLM** | one model call with retrieval, tools or memory available - the building block of everything else |
+      | **Workflow** | your code decides which calls happen and in what order; the model fills in each step |
+      | **Agent** | the model decides the next action (a tool call, or "I am finished") in a loop, using each tool result as feedback |
+      | **Step** | one model call in the agent loop, plus the tools it asked for |
+      | **Stop condition** | a rule outside the model that ends the loop - an answer, or a limit |
+      | **Trace** | the ordered record of every model call, tool run and stop, kept for debugging and tests |
+
+      The article names five workflow patterns. One line each:
+
+      | Pattern | What happens | Model calls |
+      | ------- | ------------ | ----------- |
+      | Prompt chaining | fixed steps in order, each on the previous output, with code **gates** in between | one per step |
+      | Routing | classify the input, send it to the prompt (or model, or tool set) for that class | 1 + 1 |
+      | Parallelisation | **sectioning**: independent subtasks at once; **voting**: the same task several times | n (at the same time) |
+      | Orchestrator-workers | a model splits the task into subtasks it chooses, workers do them, a model combines | 1 + n + 1 |
+      | Evaluator-optimizer | a model drafts, an evaluator critiques, the model revises - in a loop | 2 per round |
+
+      The first three have a path fixed in code. Orchestrator-workers and evaluator-optimizer let the model decide
+      *some* of the path (which subtasks, how many rounds), but inside limits your code sets. An agent goes further:
+      the model decides every step.
+
+  - id: why
+    kind: why
+    concepts: [workflows-vs-agents]
+    title: Why not make everything an agent?
+    body: |
+      Because autonomy costs. The article's advice is blunt: "we recommend finding the simplest solution possible,
+      and only increasing complexity when needed. This might mean not building agentic systems at all." It adds that
+      "agentic systems often trade latency and cost for better task performance", and that for many applications
+      "optimizing single LLM calls with retrieval and in-context examples is usually enough".
+
+      For a tester, the differences are concrete:
+
+      | | One call | Workflow | Agent |
+      | - | -------- | -------- | ----- |
+      | Number of model calls | 1 | known in advance | unknown - bounded only by your limits |
+      | Cost and latency | lowest | predictable | variable; grows with steps, and each step re-sends the history |
+      | Where a bug can be | the prompt | one step, found by its position | anywhere in a path that differs from run to run |
+      | How to test | golden set | golden set per step + end to end | golden set **plus** trace assertions and limit tests |
+      | Failure style | wrong answer | a gate fails, visibly | loops, repeats, wrong tool, compounding errors |
+
+      The article's guidance on agents: they suit "open-ended problems where it's difficult or impossible to predict
+      the required number of steps, and where you can't hardcode a fixed path", and "the autonomous nature of agents
+      means higher costs, and the potential for compounding errors. We recommend extensive testing in sandboxed
+      environments, along with the appropriate guardrails."
+
+      OWASP lists the security side as [LLM06:2025 Excessive
+      Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/) - "excessive functionality; excessive
+      permissions; excessive autonomy" - and the cost side as [LLM10:2025 Unbounded
+      Consumption](https://genai.owasp.org/llmrisk/llm102025-unbounded-consumption/), including "Denial of Wallet". An
+      agent loop without limits is a direct route to both.
+
+  - id: when
+    kind: when
+    concepts: [workflows-vs-agents, llm-workflow-patterns]
+    title: Choosing - one call, which workflow, or an agent
+    body: |
+      Ask these questions in order and stop at the first "yes":
+
+      1. **Can one well-prompted call do it** (with retrieval and examples if needed)? Then do that. Measure it first.
+      2. **Are the steps fixed and known?** Prompt chaining. Put a code gate after any step whose output you can check.
+      3. **Are there distinct kinds of input that need different handling?** Routing - if the classification itself
+         can be done accurately ("either by an LLM or a more traditional classification model", in the article's
+         words). Always route unknowns to a fallback.
+      4. **Are there independent parts, or do you want more confidence in one answer?** Parallelisation - sectioning
+         for speed and focus, voting for confidence.
+      5. **Do the subtasks depend on the input, so code cannot list them?** Orchestrator-workers - the article's
+         example is a coding change where "the number of files that need to be changed and the nature of the change in
+         each file likely depend on the task".
+      6. **Are there clear criteria, and does feedback measurably improve drafts?** Evaluator-optimizer. The article's
+         two signs: responses improve "when a human articulates their feedback", and "the LLM can provide such
+         feedback".
+      7. **Is the number of steps unknowable and the path not hard-codable, and do you trust the model's decisions in
+         this environment?** An agent - with the guards in the rest of this lesson.
+
+      Patterns combine. SandPay's support copilot **routes** each message; the "payout question" route runs an
+      **agent**; the agent's final reply goes through a **chain** step that checks every amount against the tool
+      results before it is sent.
+
+      **Frameworks.** The article suggests starting "by using LLM APIs directly: many patterns can be implemented in a
+      few lines of code", and warns that frameworks can "obscure the underlying prompts and responses". This lesson
+      builds every pattern in plain Python; the next lessons map them onto LangGraph and CrewAI.
+
+  - id: visual-patterns
+    kind: visual
+    concepts: [llm-workflow-patterns]
+    title: The five workflow patterns side by side
+    body: |
+      ```mermaid
+      flowchart LR
+        subgraph Chain["Prompt chaining"]
+          c1[Call 1] --> g{Gate} -->|pass| c2[Call 2] --> c3[Call 3]
+          g -->|fail| cx[Stop]
+        end
+        subgraph Route["Routing"]
+          r0[Classify] --> ra[Refund prompt]
+          r0 --> rb[Payout prompt]
+          r0 --> rh[Fallback - human]
+        end
+        subgraph Par["Parallelisation"]
+          p0[Input] --> pa[Section A] & pb[Section B] & pc[Section C] --> pz[Aggregate in code]
+        end
+        subgraph Orch["Orchestrator-workers"]
+          o0[Orchestrator plans] --> ov{Plan valid?} --> ow1[Worker] & ow2[Worker] --> os[Synthesiser]
+        end
+        subgraph Eval["Evaluator-optimizer"]
+          e1[Generator] --> e2{Evaluator} -->|problems| e1
+          e2 -->|pass or round limit| e3[Result]
+        end
+      ```
+
+      Notice the diamonds: every pattern has a decision made **by code** - a gate, a fallback, an aggregation, a
+      plan check, a round limit. That is what keeps a workflow predictable.
+
+  - id: chain-route-code
+    kind: code
+    concepts: [llm-workflow-patterns]
+    title: Prompt chaining and routing in code
+    body: |
+      From `practice/ai/solutions/agents/workflow_patterns.py`. `ask` sends one user message and returns the text.
+
+      ```python
+      def chain(client, prompts, text, gate=None):
+          outputs, current = [], text
+          for i, template in enumerate(prompts):
+              current = ask(client, template.format(input=current))
+              if gate is not None and not gate(i, current):
+                  raise GateError(i, current)          # later steps are never called
+              outputs.append(current)
+          return outputs
+
+
+      def classify(client, text, labels):
+          prompt = (
+              f"Classify the message into exactly one of: {', '.join(labels)}. Reply with the label only.\n"
+              f"<message>\n{text}\n</message>"
+          )
+          label = ask(client, prompt, max_tokens=10).strip().rstrip(".").strip().lower()
+          return label if label in labels else None
+
+
+      def route(client, text, handlers, fallback="human"):
+          label = classify(client, text, list(handlers))
+          if label is None:
+              return fallback, None                    # unknown label: no second call
+          return label, ask(client, handlers[label].format(input=text))
+      ```
+
+      Run against the scripted model (the extraction gate checks that step 0 found a payout id):
+
+      ```python
+      gate = lambda i, out: i != 0 or "payout_id=po_" in out
+      llm = ScriptedLLM(["payout_id=po_1042; refund=rf_7; amount=80.00", "Dear merchant, payout po_1042 ..."])
+      print(chain(llm, ["Extract the ids from: {input}", "Write a reply using: {input}"], "email...", gate=gate))
+      llm = ScriptedLLM(["I could not find any ids."])
+      # same chain again, inside try/except GateError
+      ```
+
+      ```plaintext
+      ['payout_id=po_1042; refund=rf_7; amount=80.00', 'Dear merchant, payout po_1042 ...']
+      GateError step 0 'I could not find any ids.' | calls made: 1
+      ```
+
+      And routing, where the classifier answers `Payout` for the first message and `chargeback` (not a route) for the
+      second:
+
+      ```plaintext
+      'When does my payout arrive?' -> ('payout', 'Payouts arrive two business days after capture.') | calls: 2
+      'A customer disputed pay_88' -> ('human', None) | calls: 1
+      ```
+
+      Two details matter for testing. The gate stopped the chain **before** a reply was drafted from no data - one
+      call, not two. And the classifier's reply is normalised (`Payout` became `payout`) and then checked against the
+      known labels: free text from a model is never used as a dictionary key or a function name without that check.
+
+  - id: parallel-code
+    kind: code
+    concepts: [llm-workflow-patterns]
+    title: Parallelisation - sectioning and voting
+    body: |
+      **Sectioning** runs independent prompts at the same time. The article's example is a guardrail: "one model
+      instance processes user queries while another screens them for inappropriate content", which "tends to perform
+      better than having the same LLM call handle both".
+
+      ```python
+      def thread_map(fn, items):
+          items = list(items)
+          if not items:
+              return []
+          with ThreadPoolExecutor(max_workers=len(items)) as pool:
+              return list(pool.map(fn, items))          # results in input order
+
+
+      def parallel_sections(client, text, prompts, map_fn=thread_map):
+          names = list(prompts)
+          outputs = map_fn(lambda name: ask(client, prompts[name].format(input=text)), names)
+          return dict(zip(names, outputs))
+      ```
+
+      Three sections (answer, injection screen, card-number check) against a fake model that sleeps 0.2 s per call:
+
+      ```plaintext
+      one by one  3 calls in 0.60 s
+      thread_map  3 calls in 0.20 s
+      ```
+
+      The wall-clock time is the slowest section, not the sum - but the **cost is still three calls**. `map_fn` is a
+      parameter so tests can pass a sequential map and get a fixed call order.
+
+      **Voting** asks the same question several times at a non-zero temperature and lets the majority decide - the
+      idea behind self-consistency (Wang et al., 2022), which samples several reasoning paths and selects "the most
+      consistent answer".
+
+      ```python
+      def vote(client, prompt, labels, n=5, temperature=1.0, map_fn=thread_map):
+          replies = map_fn(lambda _: ask(client, prompt, max_tokens=10, temperature=temperature), range(n))
+          counts = Counter()
+          for reply in replies:
+              label = reply.strip().rstrip(".").strip().lower()
+              counts[label if label in labels else "invalid"] += 1
+          winner = None
+          for label in labels:
+              if counts[label] * 2 > n:                # strict majority of ALL n samples
+                  winner = label
+          return {"label": winner, "votes": dict(counts), "n": n}
+      ```
+
+      ```plaintext
+      {'label': 'fraud', 'votes': {'fraud': 3, 'ok': 1, 'invalid': 1}, 'n': 5}
+      {'label': None, 'votes': {'fraud': 2, 'ok': 2, 'invalid': 1}, 'n': 5}
+      ```
+
+      No strict majority means **no decision** - the case goes to a person. ReAct's authors use the same rule in the
+      other direction: they fall back from voting to acting "when the majority answer among n CoT-SC samples occurs
+      less than n/2 times".
+
+  - id: voting-internals
+    kind: internals
+    concepts: [llm-workflow-patterns]
+    title: When voting helps - and when it only multiplies the bill
+    body: |
+      Voting is the "ask five reviewers" idea. It works if the reviewers make **different** mistakes. A seeded
+      simulation: 2,000 synthetic SandPay payments, a fraud classifier that is right 70% of the time.
+
+      ```python
+      rng = np.random.default_rng(7)
+      N, p = 2000, 0.7
+      truth = rng.integers(0, 2, N)
+      single = np.where(rng.random((N, 1)) < p, truth[:, None], 1 - truth[:, None])
+      indep = np.where(rng.random((N, 5)) < p, truth[:, None], 1 - truth[:, None])
+      hard = rng.random(N) < 0.3          # 30% hard cases: every sample wrong; the rest: every sample right
+      corr = np.where((~hard)[:, None] & (rng.random((N, 5)) < 1.0), truth[:, None], 1 - truth[:, None])
+      # acc(votes) = share of cases where the strict majority equals the truth
+      ```
+
+      ```plaintext
+      one call                       accuracy 0.690
+      majority of 5, independent     accuracy 0.844
+      majority of 5, shared mistakes accuracy 0.708  (single-sample accuracy 0.708)
+      ```
+
+      With independent errors, five votes lifted 0.69 to 0.84 (theory for p = 0.7 and five voters gives about 0.837).
+      When the samples fail on the **same** hard cases, five votes give exactly the single-call accuracy - at five
+      times the cost. Samples from one model with one prompt tend to share blind spots, so measure the gain on your
+      golden set before paying for it; varying the prompt or the model makes errors less correlated. The article's
+      voting examples use "several different prompts" for exactly this reason.
+
+  - id: orchestrator-evaluator-code
+    kind: code
+    concepts: [llm-workflow-patterns]
+    title: Orchestrator-workers and evaluator-optimizer
+    body: |
+      From `practice/ai/solutions/agents/orchestrator_evaluator.py`. The orchestrator replies with JSON; **code**
+      validates it before any worker runs.
+
+      ```python
+      def plan_subtasks(client, task, max_subtasks=5):
+          text = ask(client, f"<task>\n{task}\n</task>\nSplit the task into at most {max_subtasks} ... JSON only", max_tokens=500)
+          start, end = text.find("{"), text.rfind("}")
+          if start == -1 or end < start:
+              raise PlanError("no JSON object in the plan")
+          data = json.loads(text[start : end + 1])           # JSONDecodeError -> PlanError
+          subtasks = data.get("subtasks")
+          # not a list / empty / more than max_subtasks / bad or repeated id / no instruction -> PlanError
+          return [{"id": s["id"], "instruction": s["instruction"]} for s in subtasks]   # extra keys dropped
+
+
+      def orchestrate(client, task, max_subtasks=5, map_fn=thread_map):
+          plan = plan_subtasks(client, task, max_subtasks)
+          outputs = map_fn(lambda sub: ask(client, f"Overall task: {task}\nYour subtask ({sub['id']}): {sub['instruction']}"), plan)
+          results = {sub["id"]: out for sub, out in zip(plan, outputs)}
+          blocks = "\n".join(f'<result id="{sid}">\n{text}\n</result>' for sid, text in results.items())
+          answer = ask(client, f"<task>\n{task}\n</task>\n{blocks}\nCombine the results into one answer.", max_tokens=600)
+          return {"plan": plan, "results": results, "answer": answer}
+      ```
+
+      A monthly reconciliation for two merchants, then two bad plans:
+
+      ```plaintext
+      plan ids: ['m-12', 'm-40', 'fees'] | model calls: 5
+      answer: 1 of 2 merchants has a difference: m_40 po_1042, explained by refund rf_7.
+      8 subtasks -> PlanError: plan has 8 subtasks, more than 5
+      40 subtasks -> PlanError: plan is not valid JSON: Expecting ',' delimiter: line 1 column 1059 (char 1058)
+      ```
+
+      The 40-subtask plan was not even rejected by the count check: it was **cut off** at `max_tokens=500` and stopped
+      being JSON. Either way no worker ran - a plan of 40 workers is 42 calls, and the cap is what stops a confused
+      orchestrator from fanning out without limit.
+
+      **Evaluator-optimizer** loops a generator and an evaluator. The evaluator is any function from a draft to a
+      list of problems. Where the criteria are checkable, make it code:
+
+      ```python
+      def evaluate_optimize(client, task, evaluate, max_rounds=3):
+          history, prompt = [], task
+          for _ in range(max_rounds):
+              draft = ask(client, prompt, max_tokens=400)
+              problems = evaluate(draft)
+              history.append({"draft": draft, "problems": problems})
+              if not problems:
+                  return {"accepted": True, "draft": draft, "rounds": len(history), "history": history}
+              fixes = "\n".join(f"- {p}" for p in problems)
+              prompt = f"{task}\n<draft>\n{draft}\n</draft>\nFix these problems:\n{fixes}"
+          return {"accepted": False, "draft": history[-1]["draft"], "rounds": len(history), "history": history}
+
+      must = lambda d: [f"missing {f}" for f in ("po_1042", "80.00", "rf_7") if f not in d] + (
+          ["over 40 words"] if len(d.split()) > 40 else [])
+      ```
+
+      ```plaintext
+      round 1: problems=['missing po_1042', 'missing 80.00', 'missing rf_7']
+      round 2: problems=['missing rf_7']
+      round 3: problems=[]
+      accepted: True | rounds: 3
+      ```
+
+      Each round's prompt carries the previous draft **and** the specific problems - without them, round 2 is just a
+      second roll of the dice. Reflexion (Shinn et al., 2023) is the research version: agents "verbally reflect on
+      task feedback signals" and keep those reflections for the next trial. Where code cannot judge (tone,
+      completeness of an explanation), `llm_evaluator` asks a model for `PASS` or `FAIL: ...` lines - and treats a
+      reply with neither as a problem, never a pass (see the judge rules in [Evaluating LLM
+      applications](#/lesson/llm-evaluation-and-guardrails)).
+
+  - id: agent-loop-what
+    kind: internals
+    concepts: [agent-loop-stop-conditions]
+    title: The agent loop and ReAct
+    body: |
+      The article: agents "are typically just LLMs using tools based on environmental feedback in a loop", and "it's
+      crucial for the agents to gain 'ground truth' from the environment at each step (such as tool call results or
+      code execution) to assess its progress". It adds that "it's also common to include stopping conditions (such as a
+      maximum number of iterations) to maintain control".
+
+      **ReAct** (Yao et al., 2022) is the research pattern behind most agent loops: the model generates "reasoning
+      traces and task-specific actions in an interleaved manner" - think, act, observe the result, think again. In the
+      paper the "thought" is an action in language space that "does not affect the external environment"; the
+      actions (`search[entity]`, `lookup[string]`, `finish[answer]` for question answering) do. With today's tool-use
+      APIs the shape is the same: the reply's text is the thought, its tool calls are the actions, the tool results
+      are the observations, and a reply with no tool calls is the finish.
+
+      The provider loop, as documented (provider-specific, 14 November 2026):
+
+      - **Anthropic** describes "a `while` loop keyed on `stop_reason`": while it is `"tool_use"`, run the tools and
+        "send a new request containing the original messages, the assistant's response, and a user message with the
+        `tool_result` blocks". The loop "exits on any other stop reason (`"end_turn"`, `"max_tokens"`,
+        `"stop_sequence"`, or `"refusal"`)". Server-run tools have their own loop with an iteration limit, which returns
+        `stop_reason: "pause_turn"` when it is hit.
+      - **OpenAI Agents SDK**: the runner calls the model; if the output is a final output "the loop ends"; if it
+        requests a handoff it switches agent; if it "produces tool calls, we run those tool calls, append the results,
+        and re-run the loop"; and "if we exceed the `max_turns` passed, we raise a `MaxTurnsExceeded` exception".
+        `error_handlers` can turn `"max_turns"`, `"model_refusal"` and `"invalid_final_output"` into a controlled final
+        output.
+
+      So both providers end the loop when the model stops asking for tools, and the SDK adds a turn cap. Everything
+      else - budget, repetition, failing tools - is yours to add.
+
+  - id: visual-loop
+    kind: visual
+    concepts: [agent-loop-stop-conditions, agent-tracing-and-testing]
+    title: One agent run, with its guards
+    body: |
+      ```mermaid
+      stateDiagram-v2
+        [*] --> CallModel
+        CallModel --> Stop_max_steps: steps == max_steps
+        CallModel --> Stop_model_error: client raised
+        CallModel --> Stop_done: end_turn
+        CallModel --> Stop_stopped: max_tokens / refusal
+        CallModel --> CheckBudget: tool_use
+        CheckBudget --> Stop_budget: tokens > budget
+        CheckBudget --> RunTools
+        RunTools --> Stop_no_progress: same call > max_repeats
+        RunTools --> SendResults: results (errors as is_error)
+        SendResults --> Stop_tool_errors: N failing steps in a row
+        SendResults --> CallModel
+        Stop_done --> [*]
+      ```
+
+      Every arrow out of the loop is decided by **code**, and every one writes a `stop` event to the trace. Only one
+      of them (`done`) carries an answer.
+
+  - id: loop-code
+    kind: code
+    concepts: [agent-loop-stop-conditions, agent-tracing-and-testing]
+    title: The loop, with stop conditions and a trace
+    collapsed: true
+    body: |
+      The core of `run_agent` in `practice/ai/solutions/agents/agent_loop.py` (`trace.append` calls shortened). The
+      client, tools and clock are injected, so tests drive it with a scripted model and a fake clock.
+
+      ```python
+      def run_tool(tools, name, tool_input):
+          if name not in tools:
+              return f"Unknown tool {name!r}. Available tools: {', '.join(sorted(tools))}.", True
+          try:
+              return str(tools[name](**tool_input)), False
+          except Exception as error:                  # any tool failure becomes data for the model
+              return f"{type(error).__name__}: {error}", True
+
+
+      def run_agent(client, task, tools, tool_specs=None, *, system="", max_steps=8, max_total_tokens=4000,
+                    max_repeats=2, max_consecutive_errors=3, max_tokens=512, clock=time.monotonic):
+          messages = [{"role": "user", "content": task}]
+          trace, seen = [], {}
+          steps = input_tokens = output_tokens = failing_steps = 0
+
+          def finish(status, answer=None, error=None):
+              trace.append({"type": "stop", "step": steps, "status": status})
+              return AgentResult(status, answer, steps, input_tokens, output_tokens, trace, messages, error)
+
+          while True:
+              if steps >= max_steps:
+                  return finish("max_steps")
+              steps += 1
+              try:
+                  reply = client.create(messages=messages, system=system, max_tokens=max_tokens,
+                                        tools=list(tool_specs or []))
+              except Exception as error:
+                  ...                                   # trace an "error" event
+                  return finish("model_error", error=f"{type(error).__name__}: {error}")
+              input_tokens += reply.input_tokens
+              output_tokens += reply.output_tokens
+              ...                                       # trace a "model" event: stop reason, tokens, text, tool calls
+              messages.append({"role": "assistant", "content": reply.content})
+              if reply.stop_reason != "tool_use":
+                  return finish("done", reply.text) if reply.stop_reason == "end_turn" else finish("stopped")
+              if input_tokens + output_tokens > max_total_tokens:
+                  return finish("budget")
+
+              results, errors = [], 0
+              for call in reply.tool_calls:
+                  key = call_key(call["name"], call["input"])        # name + JSON with sorted keys
+                  seen[key] = seen.get(key, 0) + 1
+                  if seen[key] > max_repeats:
+                      return finish("no_progress")
+                  start = clock()
+                  content, is_error = run_tool(tools, call["name"], call["input"])
+                  ...                                   # trace a "tool" event with ms = (clock() - start) * 1000
+                  errors += is_error
+                  results.append({"type": "tool_result", "tool_use_id": call["id"],
+                                  "content": content, "is_error": is_error})
+              messages.append({"role": "user", "content": results})
+              failing_steps = failing_steps + 1 if errors == len(reply.tool_calls) else 0
+              if failing_steps >= max_consecutive_errors:
+                  return finish("tool_errors")
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [agent-loop-stop-conditions]
+    title: Why the loop is written this way
+    body: |
+      - **`if steps >= max_steps` before the call.** The limit counts model calls, the thing that costs money. ReAct's
+        authors also capped steps (7 for HotpotQA, 5 for FEVER) "as we find more steps will not improve ReAct
+        performance".
+      - **`messages.append({"role": "assistant", ...})` before anything else.** The tool results refer to the
+        `tool_use` blocks by id, so the model's turn must be in the history - Anthropic's loop sends "the assistant's
+        response" and then the results.
+      - **`end_turn` is the only stop with an answer.** A `max_tokens` or `refusal` stop has no tool calls, so a loop
+        that only checks for `end_turn` would go round again with nothing to send.
+      - **The budget is checked after a tool request, not after an answer.** An answer that crosses the budget is
+        already paid for, so it is kept; what the budget prevents is the *next* round. Each round re-sends the whole
+        history, so input tokens grow every step - see the run below.
+      - **`call_key` sorts the JSON keys.** `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` are the same call. Asking for the
+        same thing again and getting the same result is not progress.
+      - **`run_tool` never raises.** An unknown tool name or a tool exception becomes an `is_error` result with a
+        message that says what went wrong. Anthropic's documentation asks for exactly this: return the error with
+        `"is_error": true` and "write instructive error messages", for example listing what to try next.
+      - **`failing_steps` counts steps where every call failed, and resets on any success.** One wrong guess is
+        normal and recoverable; three steps of nothing but errors means the model cannot recover, and more calls only
+        cost money.
+      - **`model_error` returns a result instead of raising.** Transient errors should already have been retried by
+        the client wrapper from [LLM APIs](#/lesson/llm-apis-and-structured-output); what reaches the loop is final,
+        and the caller still gets the trace of what happened before it.
+
+  - id: loop-run
+    kind: example
+    concepts: [agent-loop-stop-conditions, agent-tracing-and-testing]
+    title: "SandPay: a payout question, a stuck model and a failing tool"
+    body: |
+      The task: "Merchant m_40 asks why payout po_1042 is 116.25 less than their gross sales." Tools: `get_payout`
+      and `list_refunds`. The scripted model first guesses the id format wrong, then corrects itself. `format_trace`
+      prints one line per trace event.
+
+      ```plaintext
+      step 1 model tool_use in=16   out=12  -> get_payout({"payout_id": "PO-1042"})
+      step 1 tool  get_payout   ERROR 120.0 ms  "KeyError: 'no payout PO-1042'"
+      step 2 model tool_use in=25   out=10  -> get_payout({"payout_id": "po_1042"})
+      step 2 tool  get_payout   ok    120.0 ms  "{'gross': '1250.00', 'fees': '36.25', 'refunds': '80.00', 'n"
+      step 3 model tool_use in=66   out=10  -> list_refunds({"payout_id": "po_1042"})
+      step 3 tool  list_refunds ok    120.0 ms  "[{'refund': 'rf_7', 'payment': 'pay_88', 'amount': '80.00'}]"
+      step 4 model end_turn in=95   out=28  -> 'Payout po_1042: gross 1250.00 minus 36.25 fees and an 80.00 refund (rf_7 on pay_88) = 1133.75.'
+      stop: done after 4 model calls
+      status: done | tokens in/out: 202 60
+      tool_result sent after step 1: [{'type': 'tool_result', 'tool_use_id': 'call_1', 'content': "KeyError: 'no payout PO-1042'", 'is_error': True}]
+      ```
+
+      The error went back to the model as data, and it recovered on the next step. Notice `in=` growing: 16, 25, 66,
+      95 - every step re-sends the conversation including the tool outputs.
+
+      Now a **stuck** model that asks for the same refunds list forever, run with three guard settings:
+
+      ```plaintext
+      max_steps=8 only                 status=max_steps   model calls=8  tools run=8  tokens=1020
+      + budget 500 tokens              status=budget      model calls=6  tools run=5  tokens=591
+      + no-progress (max_repeats=2)    status=no_progress model calls=3  tools run=2  tokens=165
+      input tokens per call, max_steps only: [16, 45, 74, 103, 132, 161, 190, 219]
+      ```
+
+      ```plaintext
+      step 1 model tool_use in=16   out=10  -> list_refunds({"payout_id": "po_1042"})
+      step 1 tool  list_refunds ok    120.0 ms  "[{'refund': 'rf_7', 'payment': 'pay_88', 'amount': '80.00'}]"
+      step 2 model tool_use in=45   out=10  -> list_refunds({"payout_id": "po_1042"})
+      step 2 tool  list_refunds ok    120.0 ms  "[{'refund': 'rf_7', 'payment': 'pay_88', 'amount': '80.00'}]"
+      step 3 model tool_use in=74   out=10  -> list_refunds({"payout_id": "po_1042"})
+      stop: no_progress after 3 model calls
+      ```
+
+      The step limit alone let the run spend 1,020 tokens on nothing; repetition detection stopped it at 165. The ReAct
+      paper reports this very failure on HotpotQA: "the model repetitively generates the previous thoughts and actions"
+      and fails to "jump out of the loop". The budget is the backstop for loops that make *different* useless calls,
+      which repetition detection cannot see.
+
+      Finally, a model that keeps inventing ids:
+
+      ```plaintext
+      step 1 model tool_use in=16   out=12  -> get_payout({"payout_id": "PO-1"})
+      step 1 tool  get_payout   ERROR 120.0 ms  "KeyError: 'no payout PO-1'"
+      step 2 model tool_use in=25   out=12  -> get_payout({"payout_id": "PO-3"})
+      step 2 tool  get_payout   ERROR 120.0 ms  "KeyError: 'no payout PO-3'"
+      step 3 model tool_use in=34   out=12  -> get_payout({"payout_id": "PO-5"})
+      step 3 tool  get_payout   ERROR 120.0 ms  "KeyError: 'no payout PO-5'"
+      stop: tool_errors after 3 model calls
+      ```
+
+      Each call was different, so repetition detection did not fire; three failing steps in a row did.
+
+  - id: tracing
+    kind: internals
+    concepts: [agent-tracing-and-testing]
+    title: Traces - what to record and why
+    body: |
+      A final answer cannot tell you whether the agent took four steps or forty, called a refund tool it should not
+      have, or got the right answer by luck. The trace can. The loop above records:
+
+      | Event | Fields | What a test or an investigation reads from it |
+      | ----- | ------ | --------------------------------------------- |
+      | `model` | step, stop reason, input and output tokens, text, tool calls (id, name, input) | which tools were chosen, in what order, with what arguments; token growth per step |
+      | `tool` | step, call id, name, input, `is_error`, output (first 200 characters), duration in ms | failures and recoveries; slow tools; what the model saw |
+      | `error` | step, message | which call failed, after which tools |
+      | `stop` | step, status | why the run ended - always the last event |
+
+      Production frameworks record the same thing as **spans**. The OpenAI Agents SDK documentation (provider-specific,
+      14 November 2026): "Traces represent a single end-to-end operation of a 'workflow'. They're composed of Spans",
+      and spans "represent operations that have a start and end time". By default it wraps agent runs in
+      `agent_span()`, "LLM generations are wrapped in `generation_span()`", "Function tool calls are each wrapped in
+      `function_span()`", and guardrails and handoffs get their own spans. "Tracing is enabled by default", and
+      `trace_include_sensitive_data` defaults to `True` - so model inputs and outputs, which may contain merchant data,
+      end up in traces unless you change that.
+
+      Treat traces like logs with personal data: mask card numbers and e-mail addresses before they are written (the
+      masking from [Evaluating LLM applications](#/lesson/llm-evaluation-and-guardrails)), keep them only as long as
+      you need, and restrict who can read them. OWASP LLM06 lists "log and monitor the activity of LLM extensions" as
+      a way to limit the damage of excessive agency - the trace is that log.
+
+  - id: steps
+    kind: steps
+    concepts: [workflows-vs-agents, agent-loop-stop-conditions, agent-tracing-and-testing]
+    title: Building an agent you can test - step by step
+    body: |
+      1. **Write the task down as a workflow first.** If the steps are fixed, stop: build the workflow.
+      2. **Give the agent the fewest, narrowest tools** (OWASP LLM06: "Minimize extensions", "Avoid open-ended
+         extensions"). Read-only tools first; a tool with side effects gets an approval step.
+      3. **Inject the client, the tools and the clock** so tests can script the model and time.
+      4. **Set the guards:** maximum steps, a token or cost budget, a repetition limit, a consecutive-error limit.
+         Choose values from the longest successful runs on your golden set, plus a margin.
+      5. **Return tool errors to the model** with `is_error` and an instructive message; never let one tool
+         exception crash the run.
+      6. **Record a trace** with a stop event that always says why the run ended.
+      7. **Script every path:** answer in one step, recover from an error, stuck repetition, failing tools, budget,
+         step limit, model error, non-tool stop reasons. Assert on status, answer, trace and the messages sent.
+      8. **Then evaluate with a real model** on a golden set, tracking success rate, steps per task, tokens per task
+         and how often each guard fires - a guard that fires often is a prompt or tool-design bug to fix.
+
+  - id: tests
+    kind: tests
+    concepts: [agent-tracing-and-testing, agent-loop-stop-conditions]
+    title: Test cases for SandPay's payout agent
+    body: |
+      All offline: `ScriptedLLM`, the real tool functions over fixture data, a fake clock.
+
+      | # | Scripted model | Expected | Evidence |
+      | - | -------------- | -------- | -------- |
+      | 1 | tool call, then answer | `done`, 2 model calls, answer returned | status, `steps`, the answer |
+      | 2 | same | second request has roles `user, assistant, user`; the result's `tool_use_id` equals the call's id; `is_error` false | `llm.calls[1].messages` |
+      | 3 | wrong id, right id, answer | `done` in 3 steps; first result `is_error` true with the KeyError message | the tool_result block; trace `is_error` list `[True, False]` |
+      | 4 | the same call three times | `no_progress` after 3 model calls; only 2 tool runs | trace event types, stop event |
+      | 5 | different calls forever | `max_steps` with exactly `max_steps` model calls | `len(llm.calls)` |
+      | 6 | long task, tools forever, small budget | `budget`; the crossing request's tools were not run | tools run = steps - 1 |
+      | 7 | answer that crosses the budget | `done` - a paid-for answer is kept | status and answer |
+      | 8 | three failing steps | `tool_errors`; with one success in between, the count resets | status in both runs |
+      | 9 | `max_tokens` stop | `stopped`, no answer | status, `answer is None` |
+      | 10 | tool call, then the client raises | `model_error`; trace `model, tool, error, stop` | `result.error`, trace types |
+      | 11 | unknown tool name | `is_error` result listing the available tools; the run continues | the tool_result content |
+
+      Negative cases matter most here: the tests prove that the run **stops**, and stops for the right reason,
+      when the model misbehaves. That is impossible to test reliably against a real model, which rarely gets stuck on
+      demand.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [agent-loop-stop-conditions, llm-workflow-patterns, workflows-vs-agents]
+    title: Common mistakes and how to debug them
+    body: |
+      | Mistake | Symptom | Fix |
+      | ------- | ------- | --- |
+      | `while True` with no step limit | a stuck run burns tokens until a timeout or the bill notices | `max_steps` plus a budget (OWASP LLM10 "Timeouts and Throttling") |
+      | Only checking `end_turn` | a `max_tokens` or `refusal` stop loops forever or crashes on an empty tool list | treat every non-tool stop reason as an end; only `end_turn` has an answer |
+      | Not appending the assistant turn | the provider rejects the results, or the model loses its own calls | append `reply.content` before the tool results |
+      | Letting a tool exception escape | one bad id ends the whole conversation with a stack trace | return `is_error` results with instructive messages |
+      | Retrying every failure forever | the model keeps guessing ids | a consecutive-error limit; better tool descriptions and errors |
+      | Trusting the orchestrator's plan | 40 workers, or a subtask with an unexpected `tool` key | validate the plan, cap the count, drop unknown keys |
+      | Evaluator feedback not sent back | evaluator-optimizer rounds don't improve | put the draft and the problems in the next prompt |
+      | Voting with one prompt and one model | 5x cost, no accuracy gain | measure; vary prompts; accept "no majority" as escalation |
+      | Using a model label without checking it | `KeyError`, or a hostile label picks a handler | normalise, check against known labels, fall back |
+      | An agent where a workflow would do | different paths each run, flaky tests, high cost | choose by the questions in "Choosing"; prefer fixed paths |
+
+      **Debugging method.** Read the trace from the stop event backwards. Which guard fired? On the step before, what
+      did the model ask for, and what did the tool return? If the tool output was an error, would *you* know what to
+      do next from that message alone? Most agent bugs are tool-design bugs: an unclear description, a confusing
+      argument, an unhelpful error. The article reports spending "more time optimizing our tools than the overall
+      prompt" for its coding agent.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [workflows-vs-agents, agent-loop-stop-conditions]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **Guards trade completeness for safety.** A strict `max_repeats` stops a legitimate poll ("check the payout
+        status again"); a small budget cuts off hard but valid tasks. Count those as failures in your evaluation and
+        tune with data, not guesses. Some loops exempt known polling tools or require the result to change.
+      - **Repetition detection is exact-match.** It misses near-duplicates (`po_1042` vs `PO_1042`) and loops over two
+        alternating calls with different inputs. The budget and step limit are the backstop.
+      - **Parallel calls save time, not money**, and they can hit rate limits together; cap the pool size.
+      - **A model evaluator inherits model weaknesses** (bias, leniency); a code evaluator only checks what you thought
+        of. Use code for hard rules and a calibrated judge for the rest.
+      - **Workflows need maintenance when inputs change**; agents adapt but are harder to test. Many production systems
+        are mostly workflow with one agentic step.
+      - **Human approval** for high-impact actions (OWASP LLM06 "Require user approval") is a stop condition of a
+        different kind: the loop pauses until a person decides. It is built in
+        [Persistence and human-in-the-loop](#/lesson/langgraph-persistence-and-hitl).
+      - **Frameworks** (LangGraph, CrewAI, the OpenAI Agents SDK, the Claude Agent SDK) give you the loop, tracing and
+        persistence. Know what they do underneath - the article lists "incorrect assumptions about what's under the
+        hood" as "a common source of customer error".
+
+  - id: summary
+    kind: summary
+    concepts: [workflows-vs-agents, llm-workflow-patterns, agent-loop-stop-conditions, agent-tracing-and-testing]
+    title: Quick reference
+    body: |
+      - **Workflow**: code fixes the path. **Agent**: the model picks each next action in a loop. Start simple.
+      - **Chaining** with gates; **routing** with a fallback; **sectioning** for independent parts; **voting** with
+        a strict majority (helps only with independent errors); **orchestrator-workers** with a validated, capped plan;
+        **evaluator-optimizer** with feedback in the next prompt and a round limit.
+      - **Agent loop**: call model -> if tool_use, append the assistant turn, run tools, send `tool_result`s -> repeat.
+        Only `end_turn` is an answer.
+      - **Guards**: max steps, token budget (before running more tools), repetition, consecutive failing steps; tool
+        errors go back as `is_error`.
+      - **Trace** every model call, tool run and stop; test every path with a scripted model; mask data in traces.
+
+exercises:
+  - id: workflow-or-agent
+    type: mcq
+    concept: workflows-vs-agents
+    skill: analysis
+    title: Which of these needs an agent?
+    prompt: |
+      SandPay has four features to build. Which one is the best case for an **agent** (the model chooses its own
+      tool calls in a loop) rather than one call or a workflow?
+    options:
+      - id: notice
+        text: Translate each payout notice into five languages and check that every amount survived.
+        feedback: The steps are fixed - translate, then check each amount in code. That is a prompt chain with a gate (or five parallel sections), not an agent.
+      - id: classify
+        text: Tag each incoming support e-mail as refund, payout or technical.
+        feedback: One classification call (or a small classifier model) does this. An agent adds cost and variance for no benefit.
+      - id: investigate
+        text: Answer "why is my payout lower than my sales?", where the cause may be fees, refunds, chargebacks, reserves or currency conversion, in any combination.
+        feedback: Correct - which records to read next depends on what the last record showed, so the number of steps cannot be known in advance. That is the article's description of when agents fit.
+      - id: summary
+        text: Summarise yesterday's settlement report for the finance team.
+        feedback: The input is fixed and complete; one call with the report in the context does it.
+    correct: [investigate]
+    hints:
+      - For each feature, could you write the steps down before seeing the input?
+      - Agents are for problems where "it's difficult or impossible to predict the required number of steps".
+    solution: |
+      Only the payout investigation has a path that depends on intermediate results. The notice translation is a
+      chain (with a code gate that checks amounts), tagging is one call or routing, and the summary is one call. Even
+      for the investigation, measure a simpler design first - for example a fixed workflow that always fetches the
+      payout, fees and refunds in parallel and asks one call to explain - and choose the agent only if it is
+      measurably better.
+    followUp: |
+      Product asks for the fixed "fetch everything, then explain" workflow for the payout question instead of an agent.
+      What would you measure on a golden set to decide between them?
+
+  - id: pattern-match
+    type: mcq
+    concept: llm-workflow-patterns
+    skill: application
+    title: Pick the pattern
+    prompt: |
+      SandPay's risk team wants each new merchant's website checked for three things - prohibited products, a refund
+      policy, and contact details - and a single report. The three checks are independent, and the team wants the
+      report as fast as possible. Which pattern fits best?
+    options:
+      - id: sectioning
+        text: Parallelisation (sectioning) - three focused prompts at the same time, the results combined in code.
+        feedback: Correct - independent, known subtasks are the case for sectioning; latency is the slowest check, and each prompt focuses on one aspect.
+      - id: chain
+        text: Prompt chaining - check prohibited products, then refund policy, then contact details.
+        feedback: Chaining is for steps where each needs the previous output. These checks don't, so running them one after another only adds latency.
+      - id: orchestrator
+        text: Orchestrator-workers - let a model decide which checks to run.
+        feedback: The checks are known and fixed. Letting a model choose them adds a call and the risk of skipping one.
+      - id: agent
+        text: An agent with a "fetch page" tool that decides what to check.
+        feedback: The task is fully specified; autonomy adds cost, variance and an open-ended tool (OWASP LLM06) for no gain.
+    correct: [sectioning]
+    hints:
+      - Do any of the checks need another check's output?
+      - Who decides the subtasks - code or a model - and do they change per merchant?
+    solution: |
+      Fixed, independent subtasks: sectioning. Code defines the three prompts, runs them concurrently and combines the
+      results. Orchestrator-workers is for subtasks that depend on the input ("you can't predict the subtasks needed").
+
+  - id: workflow-code
+    type: coding
+    concept: llm-workflow-patterns
+    skill: application
+    title: Chain, route, sectioning and voting
+    prompt: |
+      In `workflow_patterns.py`, `ask` and `thread_map` are given. Implement `chain` (raise `GateError(i, output)`
+      when a gate fails, with no further calls), `classify` (exact prompt in the docstring; normalise; unknown label
+      -> None), `route` (fallback without a second call), `parallel_sections` (through `map_fn`, names kept in order)
+      and fix the starting draft of `vote`, which takes a plurality of everything - including invalid replies - and
+      runs at temperature 0 one by one.
+    project: ai
+    files:
+      - exercises/agents/workflow_patterns.py
+    test: tests/agents/test_workflow_patterns.py
+    command: .venv/bin/python -m pytest tests/agents/test_workflow_patterns.py
+    hints:
+      - "chain: keep a `current` variable that starts as `text` and becomes each output."
+      - "classify: reply.strip().rstrip(\".\").strip().lower(), then check membership in labels."
+      - "parallel_sections: names = list(prompts); map_fn(lambda name: ask(...), names); dict(zip(names, outputs))."
+      - "vote: map_fn over range(n) with ask(..., temperature=temperature); count non-labels as \"invalid\"; winner only if count * 2 > n."
+    modelAnswer: |
+      ```python
+      def chain(client, prompts, text, gate=None):
+          outputs, current = [], text
+          for i, template in enumerate(prompts):
+              current = ask(client, template.format(input=current))
+              if gate is not None and not gate(i, current):
+                  raise GateError(i, current)
+              outputs.append(current)
+          return outputs
+
+
+      def route(client, text, handlers, fallback="human"):
+          label = classify(client, text, list(handlers))
+          if label is None:
+              return fallback, None
+          return label, ask(client, handlers[label].format(input=text))
+
+
+      def vote(client, prompt, labels, n=5, temperature=1.0, map_fn=thread_map):
+          replies = map_fn(lambda _: ask(client, prompt, max_tokens=10, temperature=temperature), range(n))
+          counts = Counter()
+          for reply in replies:
+              label = reply.strip().rstrip(".").strip().lower()
+              counts[label if label in labels else "invalid"] += 1
+          winner = next((l for l in labels if counts[l] * 2 > n), None)
+          return {"label": winner, "votes": dict(counts), "n": n}
+      ```
+
+      The strict majority over **all** `n` samples is the point of `vote`: 2-2-1 is not a decision, and invalid
+      replies count against confidence rather than disappearing.
+    solution: |
+      Gate after every step and stop on failure; check model labels against the known set; run sections through the
+      injected map; count votes with invalid replies kept and require more than half of all samples. The reference is
+      `practice/ai/solutions/agents/workflow_patterns.py`.
+    rubric:
+      - Every test in tests/agents/test_workflow_patterns.py passes.
+      - A failed gate makes no further model calls.
+      - Model output is normalised and checked against known labels before it selects a handler.
+      - Voting uses a non-zero temperature and returns no label without a strict majority.
+
+  - id: voting-evidence
+    type: mcq
+    concept: llm-workflow-patterns
+    skill: analysis
+    title: Five votes, same accuracy
+    prompt: |
+      SandPay switched its fraud-flag call from one call to a majority of five calls (same prompt, same model,
+      temperature 1.0). On the 400-case golden set, accuracy went from 81.0% to 81.5%, and cost went up five times.
+      Looking at the failures, almost every case the single call got wrong, all five votes also got wrong. What is
+      the best explanation and next step?
+    options:
+      - id: correlated
+        text: The samples share their mistakes, so the majority repeats them. Try varying the prompts or models (or drop voting), and keep measuring on the golden set.
+        feedback: Correct - voting helps only when errors are independent. In the lesson's simulation, shared mistakes left five votes at exactly the single-sample accuracy.
+      - id: more-votes
+        text: Five votes are too few; use 15.
+        feedback: More votes of the same correlated errors converge on the same wrong answer, at three times the cost again.
+      - id: temperature
+        text: Lower the temperature to 0 so the votes are more accurate.
+        feedback: At temperature 0 the five samples become (nearly) identical - the vote then adds nothing at all.
+      - id: plurality
+        text: Use plurality instead of strict majority.
+        feedback: With two labels, plurality and majority are almost the same; the problem is that the votes agree on the wrong answer.
+    correct: [correlated]
+    hints:
+      - When does asking five people help?
+      - What did the simulation show with "shared mistakes"?
+    solution: |
+      Votes of one model with one prompt are correlated: the hard cases are hard for every sample. The golden-set
+      evidence (failures shared across all votes) confirms it. Diversify the voters (different prompts focusing on
+      different signals, or different models) and measure; if there is still no gain, go back to one call and spend
+      the budget elsewhere.
+
+  - id: orchestrator-code
+    type: coding
+    concept: llm-workflow-patterns
+    skill: application
+    title: A validated orchestrator and an evaluator loop that uses its feedback
+    prompt: |
+      In `orchestrator_evaluator.py`, implement `plan_subtasks` (parse the JSON from the first `{` to the last `}`;
+      reject every bad plan listed in the docstring with `PlanError`; drop extra keys), `orchestrate` (no worker runs
+      on a bad plan; exact worker and synthesiser prompts in the docstring), `llm_evaluator` (PASS, FAIL lines, or
+      "evaluator reply not understood"), and fix the starting draft of `evaluate_optimize`, which regenerates from the
+      bare task every round.
+    project: ai
+    files:
+      - exercises/agents/orchestrator_evaluator.py
+    test: tests/agents/test_orchestrator_evaluator.py
+    command: .venv/bin/python -m pytest tests/agents/test_orchestrator_evaluator.py
+    hints:
+      - Wrap json.loads in try/except json.JSONDecodeError and raise PlanError from it.
+      - Check ids with ID_RE.match and keep a set of seen ids.
+      - "orchestrate: plan first (so a PlanError leaves llm.calls at 1), then map_fn over the plan, then one synthesis call."
+      - "evaluate_optimize: after a failing round, set prompt = task + the draft in <draft> tags + \"Fix these problems:\" and \"- problem\" lines."
+    modelAnswer: |
+      ```python
+      def evaluate_optimize(client, task, evaluate, max_rounds=3):
+          history, prompt = [], task
+          for _ in range(max_rounds):
+              draft = ask(client, prompt, max_tokens=400)
+              problems = evaluate(draft)
+              history.append({"draft": draft, "problems": problems})
+              if not problems:
+                  return {"accepted": True, "draft": draft, "rounds": len(history), "history": history}
+              fixes = "\n".join(f"- {p}" for p in problems)
+              prompt = f"{task}\n<draft>\n{draft}\n</draft>\nFix these problems:\n{fixes}"
+          return {"accepted": False, "draft": history[-1]["draft"], "rounds": len(history), "history": history}
+      ```
+
+      `plan_subtasks` checks, in order: a JSON object exists and parses; `subtasks` is a non-empty list of at most
+      `max_subtasks`; each item is a dict with a non-empty string `instruction` and an `id` matching `ID_RE`; ids are
+      unique. It returns only `id` and `instruction`, so a model cannot smuggle extra keys (such as a `tool`) into
+      the workers.
+    solution: |
+      The plan is untrusted model output: validate and cap it before spending calls on workers. The evaluator's
+      problems must reach the next prompt, or the loop is just resampling. The reference is
+      `practice/ai/solutions/agents/orchestrator_evaluator.py`.
+    rubric:
+      - Every test in tests/agents/test_orchestrator_evaluator.py passes.
+      - No worker call is made when the plan is invalid or too long.
+      - Each revision prompt contains the previous draft and every problem.
+      - An evaluator reply that is neither PASS nor FAIL lines is a problem, never a pass.
+
+  - id: loop-order
+    type: order
+    concept: agent-loop-stop-conditions
+    skill: recall
+    title: One step of the agent loop, in order
+    prompt: |
+      Put one step of the lesson's agent loop in order, from the step-limit check to the next model call.
+    items:
+      - id: limit
+        text: Check the step limit; stop with max_steps if reached
+      - id: call
+        text: Call the model with the messages and tool specs
+      - id: append
+        text: Append the reply as an assistant message
+      - id: stop-reason
+        text: If the stop reason is not tool_use, finish (done for end_turn, else stopped)
+      - id: budget
+        text: Check the token budget before running any tool
+      - id: run
+        text: For each tool call, check repetition, run it, record a tool event
+      - id: results
+        text: Send all results back in one user message of tool_result blocks
+      - id: errors
+        text: Update the consecutive-error count; stop with tool_errors at the limit
+    hints:
+      - The results refer to the assistant's tool_use blocks, so which must be in the history first?
+      - The budget guards the next round of spending.
+    solution: |
+      Limit, call, append the assistant turn, check the stop reason, check the budget, run tools (with the repetition
+      check and tracing), send the results, check the error count - then loop.
+
+  - id: loop-debug
+    type: debug
+    concept: agent-loop-stop-conditions
+    skill: analysis
+    title: Why does this agent hang or crash?
+    prompt: |
+      A first draft of SandPay's agent loop sometimes runs until the job is killed, and sometimes crashes with a
+      `KeyError`. When it does finish, some requests are rejected by the provider. Click **every** line that is a bug.
+    language: python
+    code: |
+      def run(client, task, tools):
+          messages = [{"role": "user", "content": task}]
+          while True:
+              reply = client.create(messages=messages, tools=SPECS, max_tokens=512)
+              if reply.stop_reason == "end_turn":
+                  return reply.text
+              results = []
+              for call in reply.tool_calls:
+                  output = tools[call["name"]](**call["input"])
+                  results.append({"type": "tool_result", "tool_use_id": call["id"], "content": str(output)})
+              messages.append({"role": "user", "content": results})
+    correctLines: [3, 5, 9, 11]
+    lineNotes:
+      - line: 4
+        note: The request itself is fine - messages, tools and a max_tokens cap.
+      - line: 10
+        note: The result block's shape is right; tool_use_id ties it to the call. An is_error flag would be added in the fix for line 9.
+      - line: 2
+        note: Starting with the task as the user message is correct.
+    hints:
+      - What ends this loop if the model never stops asking for tools?
+      - What happens on a max_tokens or refusal stop?
+      - What does the model see when a tool raises - and what does the provider need before a tool_result?
+    solution: |
+      - **Line 3**: `while True` with no step limit, budget or repetition check - a stuck model runs until killed.
+      - **Line 5**: only `end_turn` ends the loop. A `max_tokens` or `refusal` reply has no tool calls, so the loop
+        sends an empty result list and goes round again. Treat every non-`tool_use` stop as the end.
+      - **Line 9**: an unknown tool name raises `KeyError`, and a tool exception crashes the run. Run tools through a
+        function that returns `is_error` results the model can read.
+      - **Line 11**: the assistant's reply (with its `tool_use` blocks) is never appended before the results.
+        Anthropic's loop sends "the assistant's response" and then the `tool_result` blocks; without it the results
+        point at calls that are not in the history.
+      Confirm each with a scripted model: a stuck script for line 3, a `max_tokens` reply for line 5, an unknown tool
+      for line 9, and inspecting `llm.calls[1].messages` for line 11.
+
+  - id: agent-loop-code
+    type: coding
+    concept: agent-loop-stop-conditions
+    skill: application
+    title: The agent loop with guards and a trace
+    prompt: |
+      In `agent_loop.py`, `AgentResult`, `call_key` and `format_trace` are given. Implement `run_tool` (never raises:
+      unknown tool and exceptions become error results) and `run_agent` with the stop conditions in the module
+      docstring, in that order, and the trace events described in its docstring. Tool errors go back to the model
+      as `is_error` results; the run returns an `AgentResult` for every outcome.
+    project: ai
+    files:
+      - exercises/agents/agent_loop.py
+    test: tests/agents/test_agent_loop.py
+    command: .venv/bin/python -m pytest tests/agents/test_agent_loop.py
+    hints:
+      - Write a small inner finish(status, answer=None, error=None) that appends the stop event and builds the result - every exit uses it.
+      - Count steps before calling the model, and check the step limit before counting.
+      - Check the budget only when the reply asked for tools; a final answer is kept even if it crosses the budget.
+      - "A step counts as failing only if every call in it returned is_error; reset the count otherwise."
+    modelAnswer: |
+      The loop shown in the lesson's "The loop, with stop conditions and a trace" section. The parts most drafts miss:
+
+      ```python
+      messages.append({"role": "assistant", "content": reply.content})     # before the results
+      if reply.stop_reason != "tool_use":
+          return finish("done", reply.text) if reply.stop_reason == "end_turn" else finish("stopped")
+      if input_tokens + output_tokens > max_total_tokens:
+          return finish("budget")                                          # before running more tools
+      ...
+      seen[key] = seen.get(key, 0) + 1
+      if seen[key] > max_repeats:
+          return finish("no_progress")                                     # the repeated call is not run
+      ```
+    solution: |
+      Every exit goes through one finish function that writes the stop event. The reference is
+      `practice/ai/solutions/agents/agent_loop.py`.
+    rubric:
+      - Every test in tests/agents/test_agent_loop.py passes.
+      - The assistant turn is appended before the tool results, and each result carries the call's id.
+      - No tool exception or unknown tool name escapes the loop; errors reach the model as is_error results.
+      - Every run ends with a stop event naming the guard that ended it.
+
+  - id: which-guard
+    type: mcq
+    concept: agent-loop-stop-conditions
+    skill: analysis
+    title: Which guard catches this run?
+    prompt: |
+      An agent run's trace shows the model alternating between `get_payout({"payout_id": "po_1042"})` and
+      `get_payout({"payout_id": "po_1043"})`, both succeeding, for 30 steps. The loop has `max_repeats=2`,
+      `max_steps=40` and `max_total_tokens=20000`. Why did repetition detection not stop it at step 5, and what
+      should?
+    options:
+      - id: counts
+        text: It did - each call appears more than twice, so no_progress fires at step 5.
+        feedback: Correct as far as counting goes - the counter is per call over the whole run, not consecutive. The third get_payout for po_1042 is at step 5, so this run stops at step 5. The trace claiming 30 steps would mean the counter resets or only compares with the previous call.
+      - id: budget
+        text: Only the token budget can catch it, because each call is different from the previous one.
+        feedback: That is true of a detector that compares each call only with the one before it. A per-run count of identical calls, like the lesson's, catches alternating loops.
+      - id: tool-errors
+        text: The consecutive-error limit, because repeated calls are errors.
+        feedback: Both calls succeed, so no step is a failing step; the error limit never fires.
+      - id: none
+        text: Nothing can catch it; only a human reviewer can.
+        feedback: Step limits, budgets and per-run repetition counts all catch it - the question is which fires first.
+    correct: [counts]
+    hints:
+      - Does the lesson's `seen` dictionary compare with the previous call, or count across the run?
+      - Count the steps at which po_1042 is requested - 1, 3, 5...
+    solution: |
+      The lesson's detector counts each identical call across the whole run, so alternating calls are caught: the
+      third request for po_1042 (step 5) exceeds `max_repeats=2`. If a trace shows 30 steps, the implementation
+      compares only consecutive calls or resets its counter - a bug a test with an alternating script would have
+      found. A detector that only compares neighbours is a common draft; the budget and step limit are its backstops.
+
+  - id: trace-read
+    type: mcq
+    concept: agent-tracing-and-testing
+    skill: analysis
+    title: Read the trace
+    prompt: |
+      A merchant got the answer "Your payout was reduced by fees." Product says it is wrong: there was also a refund.
+      The trace of the run is:
+
+      ```plaintext
+      step 1 model tool_use in=16   out=12  -> get_payout({"payout_id": "po_1042"})
+      step 1 tool  get_payout   ok    120.0 ms  "{'gross': '1250.00', 'fees': '36.25', 'refunds': '80.00', 'n"
+      step 2 model tool_use in=66   out=10  -> list_refunds({"payout_id": "po_1042"})
+      step 2 tool  list_refunds ERROR 120.0 ms  "TimeoutError: refunds service did not answer in 5 s"
+      step 3 model end_turn in=80   out=8   -> 'Your payout was reduced by fees.'
+      stop: done after 3 model calls
+      ```
+
+      What is the most useful conclusion?
+    options:
+      - id: error-swallowed
+        text: The refunds lookup timed out and the model answered anyway from partial data. Fix the behaviour on tool errors (retry the read, or say the refund data is unavailable), and add a scripted test for it.
+        feedback: Correct - the trace shows the error result reached the model at step 2 and the model chose to answer without it. That is a prompt or policy gap you can now test offline.
+      - id: model-bad
+        text: The model is not capable enough; switch to a larger model.
+        feedback: Possibly, but the trace shows a concrete cause - a tool timeout - that a bigger model would also have to work around. Fix and test the error path first.
+      - id: no-bug
+        text: The run ended with done, so the agent worked correctly.
+        feedback: "done means the model stopped asking for tools, not that the answer is right. The trace shows it answered after a failed lookup."
+      - id: guard
+        text: The step limit was too low and cut the run short.
+        feedback: The stop event says done after 3 calls; no guard fired.
+    correct: [error-swallowed]
+    hints:
+      - Find the ERROR line. What did the model do next?
+      - Which status would a guard have produced?
+    solution: |
+      The trace shows the path: the payout lookup succeeded (and already said refunds were 80.00), the refunds lookup
+      timed out, and the model answered in the next step. Two fixes, both testable with a scripted model: retry
+      idempotent reads on timeouts inside the tool (or the loop) and instruct the model to say when data is missing;
+      and add a check on the final answer that every amount in the payout record is explained. Then add test case
+      "refunds tool times out" to the suite.
+
+  - id: trace-testdesign
+    type: testdesign
+    concept: agent-tracing-and-testing
+    skill: analysis
+    title: Test plan for the refund-capable agent
+    prompt: |
+      SandPay adds a `refund_payment(payment_id, amount)` tool to the support agent. Refunds above 100.00 need a
+      human's approval, and the agent may make at most one refund per conversation. Design offline tests with a
+      scripted model. For each give the preconditions (script, tool fixtures, limits), steps, expected result and
+      the evidence (trace events, messages, tool fixture state) you would keep.
+    modelAnswer: |
+      Preconditions for all: `ScriptedLLM`, fixture payments, a recording `refund_payment` fake, a fake clock.
+
+      1. **Happy path** - script: get_payout, refund_payment(pay_88, 80.00), answer. Expected: `done`, one refund
+         recorded. Evidence: fixture state, trace tool events, final answer.
+      2. **Above the approval limit** - refund 150.00. Expected: the refund is not executed; the run pauses or returns
+         an "approval required" result; no fixture change. Evidence: fixture unchanged, tool_result content.
+      3. **Second refund** - two refund calls. Expected: the second is refused with an `is_error` result; one refund
+         recorded. Evidence: fixture count 1; second result `is_error` true.
+      4. **Repeated identical refund** - same call three times. Expected: `no_progress`, only allowed refunds run.
+      5. **Unknown payment** - refund for pay_404. Expected: `is_error` with a clear message; the model may correct.
+      6. **Stuck model** - refund calls forever with new ids. Expected: guard stops it; refunds never exceed one.
+      7. **Model error after a refund** - the client raises after the refund. Expected: `model_error`, the trace
+         shows the refund happened, so support can follow up. Evidence: trace types `model, tool, error, stop`.
+      8. **Trace hygiene** - a task containing an e-mail address and a long digit run. Expected: masked in the trace.
+      9. **Message shape** - assistant turn before results; every result's `tool_use_id` matches a call.
+      Then a golden-set evaluation with the real model for how often it asks for refunds it should not.
+    rubric:
+      - Each case has a script, steps, an expected result and named evidence (trace events, messages, fixture state).
+      - Covers the approval limit and the one-refund limit as code-enforced rules, not prompt instructions.
+      - Covers stuck, failing and erroring runs, with the refund count checked in each.
+      - Includes trace privacy and says what offline tests cannot show.
+    hints:
+      - Which rules must hold even if the model is told to break them?
+      - What evidence shows a refund did NOT happen?
+    solution: |
+      Enforce the limits in code (the tool or an allow-list), then prove them with scripted runs that try to break them,
+      checking fixture state and trace events, not only the answer.
+
+  - id: stop-conditions-short
+    type: short
+    concept: agent-loop-stop-conditions
+    skill: recall
+    title: Name the guards
+    prompt: |
+      List the stop conditions an agent loop needs besides "the model answered", say what each one protects against,
+      and say why a single tool error should not stop the run.
+    modelAnswer: |
+      - **Maximum steps** - an endless loop; bounds latency and calls (OpenAI's SDK raises `MaxTurnsExceeded`).
+      - **Token or cost budget** - Denial of Wallet (OWASP LLM10); checked before spending on another round.
+      - **No-progress detection** - the same call with the same input again (the repetition failure ReAct reports).
+      - **Consecutive failing steps** - a model that cannot recover from errors.
+      - **Non-tool stop reasons** (`max_tokens`, `refusal`) and **model errors** - end the run without an answer.
+      A single tool error is information: returned as an `is_error` result with an instructive message, the model
+      can fix its input on the next step - the lesson's run recovered from a wrong id format in one step.
+    rubric:
+      - Names a step limit, a budget, repetition detection and an error limit.
+      - Links each to the failure it prevents.
+      - Explains returning tool errors to the model as recoverable information.
+    hints:
+      - Think of the three failing runs in the SandPay example.
+    solution: |
+      Step limit, budget, repetition, consecutive errors, plus non-tool stops and model errors; single tool errors are
+      sent back so the model can correct itself.
+
+  - id: interview-agent
+    type: interview
+    concept: workflows-vs-agents
+    skill: analysis
+    title: "\"Should we build an agent for this?\""
+    prompt: |
+      An interviewer says: "Our support team wants an AI agent that answers merchants' payout questions and can issue
+      refunds. How would you approach it, and how would you test it?"
+    modelAnswer: |
+      **Challenge the shape first.** Which questions are common, and are their steps fixed? Most payout questions
+      ("when does it arrive", "what are the fees") are one call with retrieval, or a routed workflow. I'd reserve an
+      agent for open-ended investigations, and keep refunds out of the first version or behind approval.
+
+      **If an agent**: few, narrow, read-only tools first; the refund tool validated in code (amount limits, one per
+      conversation, executed with the merchant's permissions, human approval above a threshold - OWASP LLM06).
+
+      **Loop guards**: max steps, a token budget, repetition detection, a consecutive-error limit; tool errors returned
+      with `is_error` and instructive messages; transient model errors retried by the client.
+
+      **Observability**: a trace per run - model calls, tool runs with inputs and outcomes, the stop reason - with data
+      masked.
+
+      **Testing**: offline scripted tests for every path (answer, recovery, stuck, failing tools, budget, model error,
+      refund limits), then a golden set with the real model measuring correctness, steps and tokens per task, and how
+      often each guard fires. Compare against the simpler workflow on the same set before shipping.
+    rubric:
+      - Questions whether an agent is needed and proposes a simpler baseline.
+      - Restricts tools and enforces refund limits in code, with human approval for high-impact actions.
+      - Names concrete loop guards and error handling.
+      - Describes tracing and both offline (scripted) and online (golden-set) testing.
+    followUps:
+      - The agent's success rate is 92%, the workflow's 89%, and the agent costs four times as much. What do you ship?
+      - How do you pick the value of max_steps?
+      - A trace shows the agent issued a refund the merchant did not ask for. What do you check first?
+    hints:
+      - Start with "do we need an agent at all?"
+    solution: |
+      Simplest design first; narrow tools and code-enforced limits; loop guards; traces; scripted and golden-set tests;
+      compare with the workflow baseline.
+
+placement:
+  - id: place-workflow
+    type: mcq
+    concept: workflows-vs-agents
+    skill: application
+    title: Workflow or agent?
+    prompt: |
+      A team wants to generate a weekly summary for each merchant: fetch the week's payouts, write a summary, then
+      check that every amount in the summary appears in the data. Which design fits?
+    options:
+      - id: chain
+        text: A workflow - fetch in code, one call to summarise, then a code check of the amounts (a chain with a gate).
+        feedback: Correct - the steps are fixed and known, so code should own the path.
+      - id: agent
+        text: An agent with fetch and check tools, so the model can decide the order.
+        feedback: The order never changes. An agent adds cost, variance and failure modes for no benefit.
+      - id: orchestrator
+        text: Orchestrator-workers, with a model planning the subtasks each week.
+        feedback: The subtasks are the same every week; planning them with a model is unnecessary risk.
+      - id: voting
+        text: Five parallel summaries and a vote.
+        feedback: Voting suits a label, not free text, and does not check the amounts.
+    correct: [chain]
+    hints:
+      - Could you write the steps down before seeing any merchant's data?
+    solution: |
+      Fixed steps mean a workflow. Fetch in code, summarise with one call, and gate on a code check that every amount
+      matches the data.
+
+  - id: place-pattern
+    type: mcq
+    concept: llm-workflow-patterns
+    skill: analysis
+    title: The orchestrator's plan
+    prompt: |
+      An orchestrator-workers feature for merchant audits usually plans 3 to 4 subtasks. One night a request makes it
+      return a plan of 60 subtasks, each with an extra `"tool": "export_all"` key, and the bill spikes. What change
+      would have prevented this?
+    options:
+      - id: validate
+        text: Validate the plan in code before any worker runs - cap the number of subtasks and keep only the expected keys.
+        feedback: Correct - the plan is untrusted model output; code decides how many workers run and with what.
+      - id: prompt
+        text: Add "never plan more than 5 subtasks" to the orchestrator prompt.
+        feedback: Worth doing, but a prompt is a request, not a limit; it does not stop a bad plan from being executed.
+      - id: parallel
+        text: Run the workers in parallel so the run finishes sooner.
+        feedback: Faster, but still 60 workers - the cost is the same.
+      - id: evaluator
+        text: Add an evaluator-optimizer loop after synthesis.
+        feedback: That adds calls after the money has been spent and does nothing about the plan.
+    correct: [validate]
+    hints:
+      - Where should a limit live so the model cannot ignore it?
+    solution: |
+      Treat the plan like any model output: parse, validate, cap, and drop unknown keys before spending on workers.
+
+  - id: place-loop
+    type: mcq
+    concept: agent-loop-stop-conditions
+    skill: application
+    title: The loop that never ends
+    prompt: |
+      An agent loop stops only when the stop reason is `end_turn`. In production one run made 300 model calls - the
+      trace shows the same `search_payments({"merchant": "m_40"})` call and the same result every step. Which change
+      fixes the cause and keeps the run safe if the model gets stuck in other ways?
+    options:
+      - id: guards
+        text: Detect the repeated identical call and stop, and add a step limit and a token budget as backstops.
+        feedback: Correct - repetition detection catches this run early; the limits catch loops that make different calls.
+      - id: timeout
+        text: Add a 30-second timeout to the search tool.
+        feedback: The tool is answering fine. A timeout does not stop the model from asking again.
+      - id: temperature
+        text: Raise the temperature so the model tries something different.
+        feedback: Hoping for different behaviour is not a stop condition; it may also make good runs worse.
+      - id: prompt
+        text: Add "do not repeat yourself" to the system prompt.
+        feedback: Worth trying, but the model already ignored the evidence 300 times; the loop needs a limit it cannot ignore.
+    correct: [guards]
+    hints:
+      - What ends the loop if the model never stops asking?
+    solution: |
+      Stop conditions belong in code. Count identical calls per run and stop on repetition; cap steps and tokens for
+      every other kind of runaway.
+
+  - id: place-trace
+    type: mcq
+    concept: agent-tracing-and-testing
+    skill: application
+    title: Proving the guard works
+    prompt: |
+      You must prove in CI that SandPay's agent stops with `no_progress` when the model repeats a call, without calling
+      a real model. What is the best test?
+    options:
+      - id: scripted
+        text: Script the fake model to request the same call three times; assert status no_progress, 3 model calls, 2 tool events, and a final stop event.
+        feedback: Correct - the scripted model makes the failure happen on demand, and the trace is the evidence.
+      - id: real
+        text: Run the real model on 100 tasks and check that none loops.
+        feedback: That measures how often the real model loops, not whether the guard works - most runs never trigger it.
+      - id: answer
+        text: Check that the final answer is not empty.
+        feedback: A run stopped by a guard has no answer; this checks nothing about the guard.
+      - id: review
+        text: Review the loop code in a pull request.
+        feedback: Reviews help, but CI needs an executable check that fails when the guard breaks.
+    correct: [scripted]
+    hints:
+      - How do you make a model misbehave on demand?
+    solution: |
+      Script the misbehaviour, then assert on status, call counts and trace events - the test fails the moment the
+      guard regresses.
+
+recall:
+  - id: recall-workflow-agent
+    concept: workflows-vs-agents
+    prompt: What is the difference between a workflow and an agent, and which should you try first?
+    answer: In a workflow, code fixes the path and the model fills in each step; in an agent, the model decides its next action (tool call or finish) in a loop. Try one well-prompted call first, then a workflow; use an agent only when the steps cannot be known in advance and an evaluation shows it helps.
+  - id: recall-patterns
+    concept: llm-workflow-patterns
+    prompt: Name the five workflow patterns and the code-owned decision in each.
+    answer: Prompt chaining (gate after a step), routing (known labels and a fallback), parallelisation (aggregation - sectioning, or a strict-majority vote), orchestrator-workers (validate and cap the plan), evaluator-optimizer (feedback in the next prompt and a round limit).
+  - id: recall-voting
+    concept: llm-workflow-patterns
+    prompt: When does majority voting improve accuracy?
+    answer: Only when the samples' errors are independent. In the simulation, five independent 70%-accurate votes gave 84%; five votes that shared their mistakes gave the single-call accuracy at five times the cost.
+  - id: recall-loop
+    concept: agent-loop-stop-conditions
+    prompt: What is one step of the agent loop?
+    answer: Call the model; append its reply as the assistant turn; if it asked for tools, run each one and send the results back as tool_result blocks in one user message; otherwise finish (only end_turn carries an answer).
+  - id: recall-guards
+    concept: agent-loop-stop-conditions
+    prompt: Which guards does an agent loop need?
+    answer: A step limit, a token or cost budget checked before running more tools, no-progress detection (identical calls counted across the run), a consecutive-failing-steps limit, and handling of non-tool stop reasons and model errors.
+  - id: recall-errors
+    concept: agent-loop-stop-conditions
+    prompt: What should happen when a tool raises?
+    answer: Catch it and return an is_error tool_result with an instructive message (what went wrong, what to try), so the model can correct itself; count failing steps and stop if they keep coming.
+  - id: recall-trace
+    concept: agent-tracing-and-testing
+    prompt: What does an agent trace record, and how is it used in tests?
+    answer: A model event per call (stop reason, tokens, tool calls), a tool event per run (input, is_error, output, duration), errors, and a final stop event with the status. Tests script the model's behaviour and assert on the status, the trace and the messages sent.
+  - id: recall-trace-privacy
+    concept: agent-tracing-and-testing
+    prompt: Why do agent traces need the same care as logs?
+    answer: They hold model inputs and outputs and tool data - often personal or payment data (the OpenAI Agents SDK includes sensitive data in traces by default). Mask before writing, limit retention and access.
+
+next:
+  - langgraph-state-machines
+  - langgraph-persistence-and-hitl
+  - multi-agent-systems-crewai
+  - llm-evaluation-and-guardrails

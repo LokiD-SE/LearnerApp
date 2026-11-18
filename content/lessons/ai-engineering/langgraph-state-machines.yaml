@@ -1,0 +1,1468 @@
+id: langgraph-state-machines
+title: LangGraph - state, nodes, edges and cycles
+subject: ai-engineering
+module: ai-agents
+level: advanced
+status: published
+estimatedMinutes: 130
+summary: Model an agent workflow as a state graph by building one - a mini StateGraph in plain Python with a typed state schema, reducers that append instead of overwrite, nodes that return partial updates, fixed and conditional edges between START and END, cycles stopped by a router and capped by a recursion limit, a compile step that rejects broken wiring, and a stream of steps. Then build a SandPay dispute-triage graph on it (classify, assess risk, refund, escalate, or draft and review in a loop) against an offline scripted model. Every output shown was produced by the code shown; each idea is mapped to the real LangGraph API, quoted from its documentation and not run here.
+tags:
+  [
+    LangGraph,
+    StateGraph,
+    state graph,
+    state machine,
+    graph state,
+    state schema,
+    TypedDict,
+    Annotated,
+    reducer,
+    operator.add,
+    add_messages,
+    Overwrite,
+    node,
+    edge,
+    conditional edge,
+    add_conditional_edges,
+    path map,
+    router,
+    START,
+    END,
+    cycle,
+    loop,
+    recursion limit,
+    GraphRecursionError,
+    RemainingSteps,
+    compile,
+    graph validation,
+    stream,
+    stream_mode,
+    super-step,
+    Pregel,
+    evaluator-optimizer,
+    agent workflow,
+    dispute triage,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`; pytest for the exercises. Only the standard library is used
+    (`typing.TypedDict`, `typing.Annotated`, `typing.get_type_hints(..., include_extras=True)`, `operator.add`,
+    `copy.deepcopy`). Every output in this lesson was printed by the code shown, run on Linux on 14 November 2026
+    with `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2`. Nothing is random, so the output is the same on any machine.
+  - **The graph engine is ours, not LangGraph.** `mini_graph.py` (the reference solution of this lesson's first
+    exercise, `practice/ai/solutions/agents/mini_graph.py`) borrows LangGraph's names - `StateGraph`, `START`,
+    `END`, `add_node`, `add_edge`, `add_conditional_edges`, `compile`, `invoke`, `stream`, `Overwrite`,
+    `GraphRecursionError`, `InvalidUpdateError` - so the mapping is easy, but it runs **one node per step** (no
+    parallel super-steps), has no checkpointer, and its validation rules and error messages are its own.
+    `triage_graph.py` (second exercise) is built on it.
+  - **No real model, no network, no API key.** The "LLM" is `ScriptedLLM` from `practice/ai/support/llm_fake.py`,
+    which replays scripted replies and records every request. It shows what the **graph** does with good and bad
+    model output; it says nothing about how often a real model classifies a dispute correctly.
+  - **LangGraph is not installed here, and nothing was installed for this lesson.** Every LangGraph snippet is
+    **from the official docs, not run here (library not installed)**, quoted as documented on 14 November 2026
+    from the LangGraph Python documentation: [Graph API overview](https://docs.langchain.com/oss/python/langgraph/graph-api)
+    (state, channels, reducers, nodes, `START`/`END`, edges, conditional edges, super-steps, compiling, recursion
+    limit), [Build sequences, branches, and loops](https://docs.langchain.com/oss/python/langgraph/graph-api-control-flow)
+    (loops, `recursion_limit`, `GraphRecursionError`, `RemainingSteps`), [Define and update
+    state](https://docs.langchain.com/oss/python/langgraph/graph-api-state) (resetting a reducer field,
+    `Overwrite`) and [Streaming](https://docs.langchain.com/oss/python/langgraph/streaming) (`updates` and
+    `values` modes, the v2 output format). Version-specific facts are labelled with the version the docs name.
+    The library changes quickly; check those pages before relying on a detail.
+  - **Provider article:** Anthropic, [Building effective
+    agents](https://www.anthropic.com/engineering/building-effective-agents) (the workflow and agent definitions,
+    the evaluator-optimizer workflow, stopping conditions). **Security:** OWASP
+    [LLM06:2025 Excessive Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/).
+  - **Synthetic data:** SandPay is a fictional payments company. The dispute `dp_1042`, merchant `mer_77`, the
+    amounts, categories and drafts were written for this lesson.
+  - **Next lesson:** checkpointers, threads, interrupts and resuming after a human approves are in
+    [Persistence and human-in-the-loop in LangGraph](#/lesson/langgraph-persistence-and-hitl). Here, "escalate"
+    just records a decision and ends the run.
+
+prerequisites:
+  - agent-loops-and-workflow-patterns
+  - tool-use-and-function-calling
+
+concepts:
+  - id: lg-state-reducers
+    name: State schema and reducers
+    summary: A graph's state is a typed dict whose keys are channels. Nodes return partial updates - only the keys they change - and the engine merges each key with that key's reducer. With no reducer the new value overwrites the old one; with a reducer such as operator.add (declared with Annotated[list[str], operator.add]) the update is combined with the old value, so lists grow. Because of that, an empty list does not clear an appending key; LangGraph's Overwrite bypasses the reducer. Pick overwrite for "the latest X" and append for histories and audit trails.
+  - id: lg-nodes-edges-routing
+    name: Nodes, edges, conditional edges, START and END
+    summary: A node is a function from state to an update. A normal edge always goes from one node to the next; a conditional edge calls a router with the state after its source node runs and goes where the router says, optionally through a path map from router outputs to node names. START is the virtual entry and END the virtual exit. Keep model calls in nodes and decisions you must be able to test in routers written as plain code; do not give one node both a static edge and conditional edges.
+  - id: lg-cycles-recursion-limit
+    name: Cycles and the recursion limit
+    summary: An edge back to an earlier node makes a cycle - draft, review, draft again - which is how agents retry and refine. A cycle must stop by itself, through a router that returns END or an exit node when a condition holds (passed review, attempts used up). The recursion limit is the safety net that stops a run after a fixed number of steps when the condition never comes; in LangGraph it counts super-steps and raises GraphRecursionError. Keep a business limit (max drafts) inside the graph and the recursion limit above it.
+  - id: lg-compile-stream
+    name: Compiling, validating and streaming a graph
+    summary: Building a graph only records nodes and edges; compile checks the structure (entry point, unknown or unreachable nodes, dead ends) and returns something you can run. Give routers path maps so the checker knows where they can go. Streaming yields after every step - the update each node returned ("updates") or the whole state ("values") - which is how you show progress and how you debug and test the path a run took.
+
+objectives:
+  - Write a state schema with TypedDict and Annotated reducers, and predict the state after a sequence of partial updates, including empty lists and Overwrite.
+  - Build a graph from nodes, normal edges and conditional edges with path maps between START and END, and trace which nodes run for a given input.
+  - Design a cycle that terminates by its own condition, set a recursion limit above it, and explain the difference between the two limits.
+  - Implement compile-time validation and diagnose a graph from its validation messages.
+  - Use streamed updates and values to show progress and to test the exact path a run took.
+  - Map each part of a plain-Python state graph to its LangGraph API name and say which LangGraph features it lacks.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [lg-state-reducers, lg-nodes-edges-routing, lg-cycles-recursion-limit]
+    title: The idea in plain language
+    body: |
+      A SandPay dispute arrives on a shared case file. People work on it in turn: an analyst writes the category
+      on it, a risk checker adds a risk level, a writer drafts the merchant's reply, a reviewer reads the draft and
+      either signs it off or sends it back with notes. A routing slip pinned to the file says who gets it next,
+      and some steps say "it depends": high risk goes to a senior, a duplicate charge goes straight to refunds, a
+      rejected draft goes back to the writer - but only three times, then a senior takes over.
+
+      Two habits keep the file usable. Nobody rewrites it: each person **adds or replaces only their own fields**,
+      and some fields are logs where entries are **added, never replaced** (the review notes, the history of who
+      touched it). And there is a hard rule that the file cannot circulate forever.
+
+      A **state graph** is that office written as code:
+
+      - the case file is the **state**, a dict with a declared schema;
+      - each person is a **node**, a function that reads the state and returns the fields it changes;
+      - the routing slip is the **edges** - fixed ones, and **conditional** ones that ask a router function;
+      - "added, never replaced" is a **reducer** on a key;
+      - "back to the writer" is a **cycle**, and "cannot circulate forever" is the **recursion limit**.
+
+      LangGraph is a library built on exactly this model. In this lesson you write a small engine with the same
+      names, so you know what the library does for you, then build the triage on it.
+
+  - id: what
+    kind: what
+    concepts: [lg-state-reducers, lg-nodes-edges-routing, lg-cycles-recursion-limit, lg-compile-stream]
+    title: The vocabulary, and LangGraph's names for it
+    body: |
+      The LangGraph documentation describes the model in three parts (from the [Graph API
+      overview](https://docs.langchain.com/oss/python/langgraph/graph-api), 14 November 2026):
+
+      > 1. `State`: A shared snapshot of the application. Usually a typed schema.
+      > 2. `Nodes`: Functions that read state, do work, and return updates.
+      > 3. `Edges`: Fixed or conditional transitions that determine the next node.
+      >
+      > In short: nodes do the work; edges decide what runs next.
+
+      | Idea | This lesson's `mini_graph` | LangGraph (from its docs, not run here) |
+      | --- | --- | --- |
+      | State schema | a `TypedDict` passed to `StateGraph(State)` | `StateGraph(State)`; `TypedDict`, dataclass or Pydantic model |
+      | Channel | a key of the state | "named slots in the state schema (the keys of your state object)" |
+      | Reducer | `Annotated[list[str], operator.add]` | the same; `add_messages` for chat messages |
+      | Bypass a reducer | `Overwrite(value)` | `Overwrite` from `langgraph.types` |
+      | Node | `add_node(name, fn)`; `fn(state) -> dict` | `add_node(name, fn)`; may also take `config` and `runtime` |
+      | Normal edge | `add_edge(a, b)` | `add_edge(a, b)` |
+      | Conditional edge | `add_conditional_edges(a, router, path_map)` | the same signature; router may also return a list or `Send` objects |
+      | Entry and exit | `START`, `END` | `START`, `END` from `langgraph.graph` |
+      | Build check | `compile()` raises `GraphError` | `compile()` "checks the graph structure (for example for orphaned nodes)" |
+      | Run | `invoke(inputs, recursion_limit=25)` | `invoke(inputs, {"recursion_limit": 25})` - a config key |
+      | Step cap error | `GraphRecursionError` | `GraphRecursionError` from `langgraph.errors` |
+      | Stream | `stream(inputs, stream_mode="updates" or "values")` | the same modes plus `messages`, `custom`, `checkpoints`, `tasks`, `debug` |
+
+      **Step.** In `mini_graph` one step runs one node. LangGraph runs in **super-steps** in the style of Google's
+      Pregel: "Nodes that run in parallel share one super-step. Nodes that run in sequence use separate
+      super-steps." For a graph with no fan-out, like the triage graph, one super-step is one node.
+
+  - id: why
+    kind: why
+    concepts: [lg-nodes-edges-routing, lg-cycles-recursion-limit]
+    title: Why a graph and not a while loop
+    body: |
+      The agent loop from [Agent loops and workflow patterns](#/lesson/agent-loops-and-workflow-patterns) is a
+      `while` loop: call the model, run tools, repeat. That is fine until the process has several stages, some
+      decided by code and some by the model, with retries in the middle. Then the loop grows flags (`if
+      stage == "review" and attempts < 3 ...`) and nobody can say which paths exist.
+
+      Anthropic's [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+      separates the two cases: "Workflows are systems where LLMs and tools are orchestrated through predefined code
+      paths", while agents "are systems where LLMs dynamically direct their own processes and tool usage". A state
+      graph lets you say exactly how much is predefined. In the triage graph the **model** only classifies and
+      drafts; **code** decides refunds, escalation and when to stop. The review loop is that article's
+      evaluator-optimizer pattern - "one LLM call generates a response while another provides evaluation and
+      feedback in a loop" - with a code check as the evaluator, and the article notes it is "common to include
+      stopping conditions (such as a maximum number of iterations) to maintain control."
+
+      What the graph buys you:
+
+      - **Every path is visible** - nodes and edges are data you can draw, check and count.
+      - **Each node is testable alone** - a function from state to update.
+      - **Decisions live in routers** - plain functions you unit-test with a state dict, no model needed.
+      - **Bounded agency** - an action such as "refund" is reachable only through edges you wrote, which is one
+        of the controls OWASP [LLM06:2025 Excessive Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/)
+        asks for: the model cannot decide to refund a 750.00 EUR dispute, because no edge lets it.
+
+      The same article warns that frameworks "often create extra layers of abstraction that can obscure the
+      underlying prompts and responses, making them harder to debug." Building the engine yourself first is the
+      cure: you will know what LangGraph is doing between your nodes.
+
+  - id: visual-triage
+    kind: visual
+    concepts: [lg-nodes-edges-routing, lg-cycles-recursion-limit]
+    title: The SandPay dispute-triage graph
+    body: |
+      ```mermaid
+      flowchart TD
+        S([START]) --> C["classify (model call)"]
+        C --> R["assess_risk (code)"]
+        R -. high .-> E[escalate]
+        R -. duplicate .-> A[auto_refund]
+        R -. draft .-> D["draft_response (model call)"]
+        D --> V["review (code check)"]
+        V -. pass .-> F[finalize]
+        V -. retry .-> D
+        V -. give_up .-> E
+        A --> X([END])
+        E --> X
+        F --> X
+      ```
+
+      Solid arrows are normal edges; dotted arrows are conditional edges, labelled with the router's return value
+      (the key of the path map). Notice the **cycle** `draft_response -> review -> draft_response`: it ends when
+      the review passes (`finalize`) or the attempts run out (`give_up -> escalate`). Only two of the seven nodes
+      call the model.
+
+  - id: state-and-reducers
+    kind: code
+    concepts: [lg-state-reducers]
+    title: State, partial updates and reducers
+    body: |
+      The schema is an ordinary `TypedDict`. A key whose type is `Annotated[T, fn]` gets `fn` as its reducer; the
+      engine reads it with `typing.get_type_hints(schema, include_extras=True)` - without `include_extras` the
+      `Annotated` wrapper is stripped and every key would overwrite.
+
+      ```python
+      import operator
+      from typing import Annotated, TypedDict
+
+      from agents.mini_graph import Overwrite, apply_update, channels
+
+
+      class State(TypedDict):
+          status: str                              # no reducer: overwrite
+          log: Annotated[list[str], operator.add]  # reducer: append
+
+
+      r = channels(State)
+      print(r)
+      s = {"status": "new", "log": ["received"]}
+      s = apply_update(s, {"status": "open", "log": ["classified"]}, r, node="classify"); print(s)
+      print(apply_update(s, {"log": []}, r))
+      print(apply_update(s, {"log": Overwrite([])}, r))
+      apply_update(s, {"stauts": "closed"}, r, node="review")
+      ```
+
+      ```plaintext
+      {'status': None, 'log': <built-in function add>}
+      {'status': 'open', 'log': ['received', 'classified']}
+      {'status': 'open', 'log': ['received', 'classified']}
+      {'status': 'open', 'log': []}
+      InvalidUpdateError: node 'review' wrote unknown key 'stauts'
+      ```
+
+      Read the four lines:
+
+      1. `status` overwrote (`new` -> `open`) while `log` appended: `operator.add(["received"], ["classified"])`.
+      2. Returning `{"log": []}` changed **nothing** - `["received", "classified"] + []`. An empty list does not
+         clear an appending key.
+      3. `Overwrite([])` bypassed the reducer and cleared it.
+      4. A misspelt key is an error, not a silent new field.
+
+      LangGraph documents the same rules (quoted from the docs, not run here):
+
+      ```python
+      import operator
+      from typing import Annotated
+
+      from typing_extensions import TypedDict
+
+
+      class State(TypedDict):
+          foo: int
+          bar: Annotated[list[str], operator.add]
+      ```
+
+      > Here `foo` overwrites. `bar` appends with `operator.add`. From `{"foo": 1, "bar": ["hi"]}`, an update of
+      > `{"bar": ["bye"]}` becomes `{"foo": 1, "bar": ["hi", "bye"]}`.
+
+      and, on resetting: "With a merging reducer, returning an empty value keeps prior data. That matters for
+      error buffers or retry counters that must clear between attempts." Its fix is `return {"errors":
+      Overwrite([])}`. For chat histories LangGraph recommends `add_messages` instead of `operator.add`, because
+      "Plain `operator.add` only appends, so it cannot update an existing message in place during
+      human-in-the-loop edits."
+
+  - id: triage-state
+    kind: example
+    concepts: [lg-state-reducers]
+    title: Choosing append or overwrite for the triage state
+    body: |
+      Each key of the triage state answers one question, and the question decides the reducer:
+
+      ```python
+      class TriageState(TypedDict):
+          dispute: dict  # id, amount_minor, currency, reason, merchant_id - set once by the caller
+          category: str  # overwrite
+          risk: str  # overwrite: "high" | "low"
+          drafts: int  # overwrite: how many drafts so far
+          draft: str  # overwrite: the latest draft only
+          problems: list[str]  # overwrite: the latest review's problems only (fed to the next draft)
+          review_notes: Annotated[list[str], operator.add]  # append: every problem ever found (audit)
+          log: Annotated[list[str], operator.add]  # append: one line per node run
+          decision: str  # overwrite: "refund" | "escalate" | "respond"
+      ```
+
+      `problems` and `review_notes` hold the same kind of data with opposite reducers on purpose. The next draft
+      must fix **the last review's** problems (overwrite), while an auditor wants **every** problem ever found
+      (append). When the review passes it returns `{"problems": [], "review_notes": []}`: the first clears
+      `problems`, the second adds nothing to the notes - exactly what each key needs.
+
+      Here is the same run with a teammate's schema that forgot the two `Annotated` reducers:
+
+      ```plaintext
+      with reducers:     log: ['classify: not_received', 'assess_risk: low', 'draft_response: attempt 1',
+                              'review: 1 problem(s)', 'draft_response: attempt 2', 'review: ok', 'finalize: respond']
+                         review_notes: ['attempt 1: missing dispute id dp_1042']
+      without reducers:  log: ['finalize: respond']
+                         review_notes: []
+      ```
+
+      Nothing failed. The run reached the right decision, and the audit trail silently kept only the last write -
+      the passing review's empty list wiped the note about the failed first draft. That is why the tests for this
+      lesson assert the **whole** log, not only the decision.
+
+  - id: nodes-and-edges
+    kind: code
+    concepts: [lg-nodes-edges-routing]
+    title: Nodes, edges, START and END
+    body: |
+      A node takes the state and returns a dict of the keys it changes. It must not mutate the state it is given:
+      `mini_graph` passes each node a deep copy, so mutation has no effect at all, and a node that forgets to
+      `return` fails loudly (`InvalidUpdateError: node 'forgot' returned NoneType, expected a dict of updates`).
+
+      ```python
+      def assess_risk(state: dict) -> dict:
+          high = state["category"] == "fraud" or state["dispute"]["amount_minor"] >= high_amount_minor
+          risk = "high" if high else "low"
+          return {"risk": risk, "log": [f"assess_risk: {risk}"]}
+
+
+      graph = StateGraph(TriageState)
+      graph.add_node("classify", classify)
+      graph.add_node("assess_risk", assess_risk)
+      graph.add_edge(START, "classify")          # entry point
+      graph.add_edge("classify", "assess_risk")  # always next
+      graph.add_edge("finalize", END)            # a path that stops
+      ```
+
+      `START` and `END` are not nodes you write; they are markers (`"__start__"` and `"__end__"` in
+      `mini_graph`). `add_node` refuses them as names, `add_edge` refuses `END` as a source and `START` as a target.
+
+      LangGraph's own smallest example (from the docs, not run here) has the same shape, built by chaining:
+
+      ```python
+      from typing_extensions import TypedDict
+
+      from langgraph.graph import END, START, StateGraph
+
+
+      class State(TypedDict):
+          text: str
+
+
+      def node_a(state: State):
+          return {"text": state["text"] + "a"}
+
+
+      graph = (
+          StateGraph(State)
+          .add_node("node_a", node_a)
+          .add_edge(START, "node_a")
+          .add_edge("node_a", END)
+          .compile()
+      )
+
+      graph.invoke({"text": ""})
+      # {'text': 'a'}
+      ```
+
+      LangGraph nodes can also accept a `config` (with values such as `thread_id`) and a `runtime` with "runtime
+      context", which "passes dependencies into nodes without putting them in graph state (for example, model
+      name or a database handle)". The triage graph does the same job with a closure: `build_triage_graph(llm)`
+      defines its nodes inside the function, so they use the injected `llm` and the state stays plain data.
+
+  - id: conditional-edges
+    kind: code
+    concepts: [lg-nodes-edges-routing]
+    title: Conditional edges, routers and path maps
+    body: |
+      A conditional edge runs a **router** after its source node: the router reads the state and returns a label.
+      A **path map** turns labels into node names:
+
+      ```python
+      def route_after_risk(state: dict) -> str:
+          if state["risk"] == "high":
+              return "escalate"
+          if state["category"] == "duplicate":
+              return "auto_refund"
+          return "draft"
+
+
+      graph.add_conditional_edges(
+          "assess_risk",
+          route_after_risk,
+          {"escalate": "escalate", "auto_refund": "auto_refund", "draft": "draft_response"},
+      )
+      ```
+
+      Three disputes through the routes (one model call each - none reaches a drafting node):
+
+      ```plaintext
+      duplicate 12500 -> refund ['classify: duplicate', 'assess_risk: low', 'auto_refund: refund'] calls 1
+      fraud 900 -> escalate ['classify: fraud', 'assess_risk: high', 'escalate: escalate'] calls 1
+      duplicate 75000 -> escalate ['classify: duplicate', 'assess_risk: high', 'escalate: escalate'] calls 1
+      ```
+
+      The order of the `if`s is a business rule: a 750.00 EUR "duplicate" is escalated, not refunded, because the
+      risk check comes first. A router is a pure function of the state, so this rule gets a one-line unit test.
+
+      Why bother with a path map? It gives the labels stable names that do not change when you rename a node, and it
+      tells `compile()` **where the router can go**, so it can find unreachable nodes and typos (next sections).
+      `mini_graph` raises `GraphError` at run time if a router returns a label missing from its map, or (without
+      a map) a name that is not a node.
+
+      LangGraph (from the docs, not run here):
+
+      ```python
+      graph.add_conditional_edges("node_a", routing_function)
+      # Or with an explicit map:
+      graph.add_conditional_edges(
+          "node_a",
+          routing_function,
+          {"path_a": "node_b", "path_b": "node_c"},
+      )
+      ```
+
+      > The routing function can return a node name, `END`, a list of names (fan-out), or `Send` objects for
+      > map-reduce.
+
+      and a warning `mini_graph` turns into a compile error: "For each node, use either static edges or dynamic
+      routing (conditional edges / `Command`), not both. Mixing them can run both paths." `Command` (a node
+      returning `Command(update=..., goto=...)`) is LangGraph's way to update state and route in one return; the
+      docs advise "For routing alone, prefer conditional edges."
+
+  - id: cycles
+    kind: internals
+    concepts: [lg-cycles-recursion-limit]
+    title: Cycles that stop - and the limit for when they do not
+    body: |
+      The review loop is an edge back to an earlier node, chosen by a router:
+
+      ```python
+      def route_after_review(state: dict) -> str:
+          if not state["problems"]:
+              return "pass"
+          if state["drafts"] < max_drafts:
+              return "retry"
+          return "give_up"
+
+
+      graph.add_edge("draft_response", "review")
+      graph.add_conditional_edges(
+          "review",
+          route_after_review,
+          {"pass": "finalize", "retry": "draft_response", "give_up": "escalate"},
+      )
+      ```
+
+      `draft_response` feeds the last review's problems back into the prompt. This is the real second request
+      the scripted model received after a first draft that left out the dispute id:
+
+      ```plaintext
+      Dispute dp_1042 (not_received), amount 12500 minor units EUR.
+      Customer reason: I never received the headphones I ordered.
+      Fix these problems from the last review:
+      - missing dispute id dp_1042
+      ```
+
+      There are **two** limits, and they do different jobs:
+
+      - `max_drafts` is a **business rule inside the graph**. When it is used up the router takes `give_up` to
+        `escalate`, and the run **ends normally** with a decision. With a model that never includes the id and
+        `max_drafts=3`: `escalate after 9 node runs` (classify, assess_risk, three draft/review pairs, escalate),
+        with three review notes.
+      - The **recursion limit** is a **safety net around the run**. It knows nothing about disputes; it stops a
+        run that has taken too many steps, by raising. With `max_drafts=10` and `recursion_limit=8`:
+
+      ```plaintext
+      GraphRecursionError: recursion limit of 8 reached without hitting END (next node: 'draft_response')
+      model calls: 4
+      ```
+
+      Eight node runs happened (classify, assess_risk, three draft/review pairs), the ninth would have started a
+      fourth draft, and the run raised instead - four model calls paid, **no decision recorded**. The longest
+      legitimate path is `3 + 2 x max_drafts` node runs (classify, assess_risk, the pairs, escalate): with
+      `max_drafts=3`, `recursion_limit=9` reaches `escalate` and 8 raises. Set the limit comfortably above that
+      path and treat hitting it as a bug.
+
+      In LangGraph (from the docs, not run here): "The recursion limit caps how many super-steps one run may
+      execute. When the limit is exceeded, LangGraph raises `GraphRecursionError`." It is passed in the run's
+      config - "pass `recursion_limit` as a top-level config key (not under `configurable`)":
+
+      ```python
+      from langgraph.errors import GraphRecursionError
+
+      try:
+          graph.invoke(inputs, {"recursion_limit": 3})
+      except GraphRecursionError:
+          print("Recursion Error")
+      ```
+
+      **Version-specific:** the docs say "Starting in version 1.1.4, the default is 10,007 super-steps. Between
+      1.0.6 and 1.1.3, the default is 10,000 steps", overridable with the `LANGGRAPH_DEFAULT_RECURSION_LIMIT`
+      environment variable. That default is far too high to protect a model-calling loop's budget, so set your
+      own. `mini_graph`'s default of 25 is its own choice. The exact boundary also differs: `mini_graph` allows
+      exactly `recursion_limit` node runs, while the docs' own loop example with `{"recursion_limit": 4}` prints
+      five node lines before "Recursion Error". Check the boundary on your version with a test instead of
+      assuming it.
+
+      LangGraph also offers a proactive version of `max_drafts`: a state key typed `RemainingSteps` ("a
+      Python-only managed value for how many steps remain before the recursion limit") that a router can read to
+      take a completion path "before LangGraph raises `GraphRecursionError`".
+
+  - id: compile-validate
+    kind: code
+    concepts: [lg-compile-stream]
+    title: Compiling - catch broken wiring before the first run
+    body: |
+      `add_*` calls only record nodes and edges. `compile()` checks them and refuses to return a runnable graph
+      when anything is wrong. Here is a half-finished triage graph with a typo in a path map and a node nobody
+      connected:
+
+      ```python
+      g = StateGraph(TriageState)
+      for n in ("classify", "assess_risk", "draft_response", "review", "escalate", "notify_merchant"):
+          g.add_node(n, lambda st: {})
+      g.add_edge(START, "classify").add_edge("classify", "assess_risk")
+      g.add_conditional_edges("assess_risk", route, {"escalate": "escalate", "draft": "draft_respones"})
+      g.add_edge("draft_response", "review")
+      g.add_conditional_edges("review", route, {"retry": "draft_response", "give_up": "escalate"})
+      for p in g.validate():
+          print(p)
+      ```
+
+      ```plaintext
+      path map of 'assess_risk' names unknown node 'draft_respones'
+      node 'escalate' has no outgoing edge
+      node 'notify_merchant' has no outgoing edge
+      node 'draft_response' is unreachable from START
+      node 'review' is unreachable from START
+      node 'notify_merchant' is unreachable from START
+      GraphError raised: 6 problems
+      ```
+
+      One typo made two nodes unreachable - the checker follows edges and path maps from `START`, and
+      `draft_respones` leads nowhere. Fix the first message and the next two disappear. The checks, in the order
+      `validate()` reports them:
+
+      | Check | Why it matters |
+      | --- | --- |
+      | an edge from `START` exists | otherwise nothing runs |
+      | every edge and path-map target is a node or `END` | catches typos before a run takes that branch |
+      | no node has both a static edge and conditional edges, nor two static edges | `mini_graph` runs one node per step; LangGraph would run both paths |
+      | every node has an outgoing edge | `mini_graph`'s own rule: every path must end at `END` explicitly |
+      | every node is reachable from `START` | dead code is usually a wiring mistake |
+
+      A router **without** a path map could return any name, so the checker must assume it reaches every node -
+      and an orphan behind it goes unnoticed. That is the strongest reason to always pass a path map.
+
+      LangGraph documents compile like this (from the docs, not run here): "Compilation checks the graph structure
+      (for example for orphaned nodes). It is also where you attach runtime options such as checkpointers and
+      breakpoints. You must compile the graph before you invoke or stream it." Its exact checks and messages are
+      the library's; `mini_graph`'s list above is this lesson's own. Checkpointers are attached at compile time -
+      that is where [the next lesson](#/lesson/langgraph-persistence-and-hitl) starts.
+
+  - id: streaming
+    kind: code
+    concepts: [lg-compile-stream]
+    title: Streaming the steps
+    body: |
+      `invoke` returns only the final state. `stream` yields after every step, in one of two shapes. On a
+      two-node graph:
+
+      ```python
+      for c in app.stream({"status": "new", "log": []}, stream_mode="values"): print(c)
+      for c in app.stream({"status": "new", "log": []}, stream_mode="updates"): print(c)
+      ```
+
+      ```plaintext
+      {'status': 'new', 'log': []}
+      {'status': 'open', 'log': ['opened']}
+      {'status': 'closed', 'log': ['opened', 'closed']}
+      {'open': {'status': 'open', 'log': ['opened']}}
+      {'close': {'status': 'closed', 'log': ['closed']}}
+      ```
+
+      `values` starts with the input state and then shows the whole merged state; `updates` shows each node's
+      name and exactly what it returned - before the reducer ran (`['closed']`, not `['opened', 'closed']`).
+      Streaming the triage run with `updates` is a complete trace of the cycle:
+
+      ```plaintext
+      classify -> {'category': 'not_received', 'log': ['classify: not_received']}
+      assess_risk -> {'risk': 'low', 'log': ['assess_risk: low']}
+      draft_response -> {'draft': 'The parcel was delivered on 3 March with tracking TRK-88 signed by the cardholder.', 'drafts': 1, 'log': ['draft_response: attempt 1']}
+      review -> {'problems': ['missing dispute id dp_1042'], 'review_notes': ['attempt 1: missing dispute id dp_1042'], 'log': ['review: 1 problem(s)']}
+      draft_response -> {'draft': 'Dispute dp_1042: the parcel was delivered on 3 March with tracking TRK-88 signed by the cardholder.', 'drafts': 2, 'log': ['draft_response: attempt 2']}
+      review -> {'problems': [], 'review_notes': [], 'log': ['review: ok']}
+      finalize -> {'decision': 'respond', 'log': ['finalize: respond']}
+      model calls: 3
+      ```
+
+      Use `updates` to show progress ("reviewing draft 2...") and to test the path: the list of node names is
+      `classify, assess_risk, draft_response, review, draft_response, review, finalize`. Use `values` when a UI
+      needs the current state after each step.
+
+      LangGraph documents the same two modes (from the docs, not run here): "`updates` streams the **updates** to
+      the state after each step of the graph. `values` streams the **full value** of the state after each step of
+      the graph." Its `updates` example prints `` Node `refine_topic` updated: {'topic': 'ice cream and cats'} ``,
+      and its `values` example's first line is the input (`topic: ice cream, joke:`). It also has `messages`
+      (model tokens), `custom`, `checkpoints`, `tasks` and `debug` modes. **Version-specific:**
+      `version="v2"` (LangGraph 1.1 or later) wraps every chunk as `{"type": ..., "ns": ..., "data": ...}`; the
+      default v1 format yields `{"node_name": {...}}` for `updates`, which is the shape `mini_graph` copies. The
+      streaming page also recommends a newer "event streaming" API, introduced in LangGraph v1.2, for new
+      applications.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [lg-nodes-edges-routing, lg-state-reducers]
+    title: The model-calling nodes, line by line
+    body: |
+      ```python
+      def classify(state: dict) -> dict:
+          d = state["dispute"]
+          reply = llm.create(
+              messages=[{"role": "user", "content": f"Dispute {d['id']}: {d['reason']}"}],
+              system=CLASSIFY_SYSTEM,
+              max_tokens=5,
+              temperature=0.0,
+          )
+          category = reply.text.strip().lower()
+          if category not in CATEGORIES:
+              category = "other"
+          return {"category": category, "log": [f"classify: {category}"]}
+      ```
+
+      - `llm` comes from the enclosing `build_triage_graph(llm)`, so tests inject a `ScriptedLLM` and production
+        injects a real client with the same `create` method.
+      - `max_tokens=5`, `temperature=0.0`: one word is expected; there is no reason for variety.
+      - `strip().lower()` then a membership check: `" FRAUD\n"` becomes `fraud`, and `"Chargeback!"` becomes
+        `other`. The model's output is **parsed into a closed set** before any router sees it, so a router never
+        has to handle free text.
+      - The return value has two keys: `category` (overwrite) and one log line (appended by the reducer). The node
+        never touches `risk`, `draft` or anything else.
+
+      ```python
+      def draft_response(state: dict) -> dict:
+          ...
+          if state.get("problems"):
+              lines.append("Fix these problems from the last review:")
+              lines.extend(f"- {p}" for p in state["problems"])
+          ...
+          attempt = state["drafts"] + 1
+          return {"draft": reply.text, "drafts": attempt, "log": [f"draft_response: attempt {attempt}"]}
+      ```
+
+      - `state.get("problems")`: on the first pass the key has never been written, so it is absent.
+      - `drafts` is an overwrite counter: the node computes `old + 1` itself. Giving it an `operator.add` reducer
+        and returning `1` would also work - but mixing the two styles (reducer **and** `old + 1`) doubles the count.
+      - `review` is plain code (`review_draft`), so the loop's exit condition is deterministic and testable; only
+        the draft comes from the model.
+
+  - id: tests
+    kind: tests
+    concepts: [lg-cycles-recursion-limit, lg-nodes-edges-routing, lg-compile-stream]
+    title: Testing a graph
+    body: |
+      A graph is easy to test because each part is a function and the scripted model records every request.
+
+      | Test | Preconditions | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | Duplicate, small amount | script `["duplicate"]`, 125.00 EUR | decision `refund`, no drafting | `log == ['classify: duplicate', 'assess_risk: low', 'auto_refund: refund']`, `len(llm.calls) == 1` |
+      | Fraud, any amount (negative) | script `[" FRAUD\n"]`, 9.00 EUR | `escalate`, never auto-refunded | category `fraud`, risk `high`, log ends `escalate: escalate` |
+      | Unparseable category (negative) | script `["Chargeback!", GOOD]` | category `other`, drafted | full log of five lines |
+      | Review loop recovers | script `["not_received", NO_ID, GOOD]` | `respond`, `drafts == 2` | second prompt ends with the problem; `review_notes` has one entry |
+      | Loop gives up (negative) | three `NO_ID` drafts, `max_drafts=3` | `escalate`, 4 model calls | three review notes; last three log lines |
+      | Recursion limit (negative) | `max_drafts=10`, model never fixes it, `recursion_limit=8` | `GraphRecursionError` | `len(llm.calls) == 4` |
+      | Path | the recovering script | node order | streamed `updates` names |
+      | Wiring (negative) | a typo in a path map | `compile()` raises | the exact messages from `validate()` |
+
+      Assert the **log and the call count**, not only the decision. The missing-reducer bug above produces the
+      right decision with an empty audit trail, and a loop bug that drafts five times still ends in `respond`.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [lg-state-reducers, lg-nodes-edges-routing, lg-cycles-recursion-limit, lg-compile-stream]
+    title: Common mistakes and how to debug them
+    body: |
+      - **A history key without a reducer.** It keeps only the last write. Symptom: a one-line log, empty
+        notes after a failure. Check `channels(State)` (or the schema) for the `Annotated` reducer.
+      - **Clearing an appending key with `[]`.** Nothing happens. Use `Overwrite([])`, or split the key into an
+        overwrite "current" key and an append "history" key, as `problems` and `review_notes` do.
+      - **Mutating `state` in a node and returning nothing.** In `mini_graph` the change is lost and `None` is an
+        error. Return the update.
+      - **A model's raw text in a router.** `"Duplicate."` is not `"duplicate"`. Parse model output into a closed
+        set in the node; let routers compare known values.
+      - **A static edge and a conditional edge from the same node.** LangGraph's docs warn both paths can run.
+      - **A router with no path map.** Typos surface only when that branch runs, and the compile check cannot see
+        orphans behind it.
+      - **A cycle with no exit of its own**, relying on the recursion limit. The run ends with an exception and no
+        decision, after paying for every model call. Count attempts in state and route to an exit.
+      - **A recursion limit below the longest legitimate path.** A dispute that needs the third draft fails with
+        `GraphRecursionError`. Compute the longest path (`3 + 2 x max_drafts` node runs here) and test it.
+
+      **Debugging method:** stream with `updates` and read the node names - the path tells you which router
+      decided wrongly; then call that router on the state from the `values` stream just before it, in a unit test.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [lg-nodes-edges-routing, lg-compile-stream]
+    title: What mini_graph leaves out, and when a graph is overkill
+    body: |
+      `mini_graph` is about 200 lines because it leaves out what a production engine needs. From the LangGraph
+      documentation (not run here):
+
+      - **Parallel super-steps.** "A node can have multiple outgoing edges. Destinations on those edges run in
+        parallel in the next super-step", and a super-step is "transactional: if any branch raises, none of that
+        superstep's updates apply to state". Parallel writers to one key are where reducers become essential.
+      - **`Send`** to run one node per item (map-reduce), and **`Command`** to update and route in one return.
+      - **Checkpointers** that save state at super-step boundaries, threads, interrupts and resume - the subject
+        of [Persistence and human-in-the-loop in LangGraph](#/lesson/langgraph-persistence-and-hitl).
+      - **Node options:** retry policies, caching, async nodes, runtime context; input and output schemas.
+
+      **When not to use a graph.** A single prompt, a fixed two-step chain or a short tool loop is clearer as
+      ordinary code. A graph pays off when there are several stages, branches decided by code, cycles, and a need
+      to observe or pause the run. **When not to use a framework.** If your graph is small and you need full
+      control of every prompt, a few functions and an explicit loop - like `mini_graph` - may be enough; adopt
+      LangGraph when you need what it adds above (persistence, interrupts, parallelism, tracing).
+
+  - id: summary
+    kind: summary
+    concepts: [lg-state-reducers, lg-nodes-edges-routing, lg-cycles-recursion-limit, lg-compile-stream]
+    title: Quick reference
+    body: |
+      - State = typed dict; nodes return **partial** updates; each key merges with its reducer.
+      - No reducer = overwrite; `Annotated[list, operator.add]` = append; `[]` does not clear an append key -
+        `Overwrite([])` does.
+      - `add_edge(a, b)` always; `add_conditional_edges(a, router, path_map)` when it depends; `START` in, `END` out.
+      - Parse model output into a closed set in the node; keep routers plain and unit-tested.
+      - Cycles need their own exit (attempt counter -> exit node); the recursion limit is a safety net that
+        raises `GraphRecursionError`. LangGraph: `{"recursion_limit": n}` in the config, default 10,007 since 1.1.4.
+      - `compile()` checks the wiring; path maps let it check routers too.
+      - `stream_mode="updates"` = `{node: update}` per step; `"values"` = full state, starting with the input.
+      - Test the log, the node path and the model call count, not only the final decision.
+
+exercises:
+  - id: reducer-predict
+    type: mcq
+    concept: lg-state-reducers
+    skill: application
+    title: Predict the state
+    prompt: |
+      ```python
+      class State(TypedDict):
+          status: str
+          notes: Annotated[list[str], operator.add]
+      ```
+
+      The input is `{"status": "new", "notes": ["opened"]}`. Node A returns `{"status": "review", "notes":
+      ["needs id"]}`, then node B returns `{"notes": []}`, then node C returns `{"status": "done"}`. What is the
+      final state?
+    options:
+      - id: right
+        text: "`{'status': 'done', 'notes': ['opened', 'needs id']}`"
+        feedback: Correct - status overwrites twice; notes appends ["needs id"] and then [] adds nothing; C does not mention notes.
+      - id: cleared
+        text: "`{'status': 'done', 'notes': []}`"
+        feedback: B's empty list goes through operator.add, so it is appended (nothing) rather than replacing. Clearing needs Overwrite([]).
+      - id: replaced
+        text: "`{'status': 'done', 'notes': ['needs id']}`"
+        feedback: That is what happens without a reducer. With operator.add the input's "opened" stays.
+      - id: dropped
+        text: "`{'status': 'done'}`"
+        feedback: Nodes return partial updates; keys a node does not return keep their values.
+    correct: [right]
+    hints:
+      - Apply the updates one at a time. Which keys does each node mention?
+      - What is `["opened", "needs id"] + []`?
+    solution: |
+      Partial updates touch only the keys returned. `status`: new -> review -> done (overwrite). `notes`:
+      `["opened"] + ["needs id"]`, then `+ []` (no change). C leaves `notes` alone. This lesson's run showed the
+      same: `apply_update(s, {"log": []}, r)` left the log unchanged.
+    followUp: |
+      Change one line of node B so that `notes` ends empty, in mini_graph and in LangGraph.
+
+  - id: retry-counter-reset
+    type: mcq
+    concept: lg-state-reducers
+    skill: analysis
+    title: The error list that never clears
+    prompt: |
+      A graph keeps `errors: Annotated[list[str], operator.add]`. A `validate` node returns `{"errors": [...]}`
+      with the problems it found, and a router retries while `state["errors"]` is non-empty. After one failure the
+      graph retries until `GraphRecursionError`, even when a later attempt is perfect. Which fix is right?
+    options:
+      - id: overwrite
+        text: "Have `validate` return `{\"errors\": Overwrite(problems)}`, or keep a separate overwrite key `current_errors` for the router and append to `errors` only for audit"
+        feedback: Correct - the router must read "this attempt's errors", which an appending key cannot express. LangGraph documents exactly this pitfall and the Overwrite fix.
+      - id: empty
+        text: "Return `{\"errors\": []}` when validation passes"
+        feedback: That is what it already does in effect. With operator.add, [] adds nothing, so the old error stays and the router keeps retrying.
+      - id: limit
+        text: Raise the recursion limit
+        feedback: The loop is not too short; it can never exit. A higher limit only spends more model calls before the same error.
+      - id: none
+        text: Remove the reducer from `errors`
+        feedback: That fixes routing but loses the history of earlier failures, if anyone needs it. Splitting current and history keeps both.
+    correct: [overwrite]
+    hints:
+      - What does `["bad sql"] + []` evaluate to?
+      - What question does the router ask, and which reducer answers it?
+    solution: |
+      The router asks "did the **latest** attempt fail?" - an overwrite question - but the key is append-only.
+      LangGraph's docs: "With a merging reducer, returning an empty value keeps prior data. That matters for error
+      buffers or retry counters that must clear between attempts", fixed with `Overwrite([])`. The triage graph
+      avoids it by design: `problems` (overwrite) for the router, `review_notes` (append) for audit.
+    followUp: |
+      Write the unit test that would have caught this: which state do you pass to the router, and what do you
+      assert?
+
+  - id: schema-debug
+    type: debug
+    concept: lg-state-reducers
+    skill: analysis
+    title: Why is the audit trail one line long?
+    prompt: |
+      Every triage run reaches the right decision, but auditors complain the stored `log` has one line and
+      `review_notes` is usually empty. Click **every** line that causes it.
+    language: python
+    code: |
+      class TriageState(TypedDict):
+          dispute: dict
+          category: str
+          risk: str
+          drafts: int
+          draft: str
+          problems: list[str]
+          review_notes: list[str]
+          log: list[str]
+          decision: str
+    correctLines: [8, 9]
+    lineNotes:
+      - line: 7
+        note: "`problems` should overwrite - the next draft must fix only the latest review's problems. No reducer is right here."
+      - line: 5
+        note: "`drafts` is an overwrite counter; the node computes `old + 1`. Adding operator.add as well would double count."
+    hints:
+      - Which keys are histories, and what happens to a history with no reducer?
+      - "The passing review returns `{\"review_notes\": []}`."
+    solution: |
+      Lines 8 and 9 need `Annotated[list[str], operator.add]`. Without a reducer every update overwrites: the last
+      node's single log line replaces the rest, and the passing review's `[]` wipes the earlier notes. This lesson's
+      run printed exactly that: `log: ['finalize: respond']`, `review_notes: []`.
+    followUp: |
+      Write the assertion that would fail on this schema in the "review loop recovers" test.
+
+  - id: build-order
+    type: order
+    concept: lg-compile-stream
+    skill: recall
+    title: From schema to a streamed run
+    prompt: Put the steps of building and running a state graph in order.
+    items:
+      - id: state-schema
+        text: Define the state schema, with a reducer on every key that must accumulate
+      - id: builder-nodes
+        text: Create the builder with `StateGraph(State)` and add the nodes
+      - id: start-edge
+        text: Add the entry edge from `START`
+      - id: other-edges
+        text: Add normal and conditional edges (with path maps), including the paths to `END`
+      - id: compile
+        text: Compile, which validates the structure
+      - id: run
+        text: Invoke or stream the compiled graph with an input and a recursion limit
+    hints:
+      - Edges name nodes, so nodes come first; you can only run what compiled.
+    solution: |
+      Schema, builder and nodes, entry edge, other edges, compile, run. LangGraph adds runtime options such as a
+      checkpointer at the compile step and takes the recursion limit in the run's config.
+
+  - id: path-map-miss
+    type: mcq
+    concept: lg-nodes-edges-routing
+    skill: application
+    title: The router and its map disagree
+    prompt: |
+      ```python
+      def route_after_review(state):
+          if not state["problems"]:
+              return "pass"
+          return "retry" if state["drafts"] < 3 else "escalate"
+
+      graph.add_conditional_edges("review", route_after_review,
+                                  {"pass": "finalize", "retry": "draft_response", "give_up": "escalate"})
+      ```
+
+      Compile succeeds. What happens to a dispute whose model never includes the dispute id?
+    options:
+      - id: runtime
+        text: Three drafts, then the router returns "escalate", which is not a key of the path map, so the run fails with a GraphError at run time
+        feedback: Correct - the map's keys are labels, and "escalate" is a node name, not a label. Compile checks map values, not what the router may return.
+      - id: escalates
+        text: It escalates after three drafts, because escalate is a node
+        feedback: With a path map, the router's value is looked up among the map's keys (pass, retry, give_up). "escalate" is not one.
+      - id: compile
+        text: Compile fails because the router can return "escalate"
+        feedback: Neither mini_graph nor a simple checker can see a function's possible return values; compile only checks the map.
+      - id: loop
+        text: It loops until GraphRecursionError
+        feedback: The third failed review returns "escalate", which raises immediately - it does not return "retry".
+    correct: [runtime]
+    hints:
+      - What are the keys of the path map?
+    solution: |
+      `mini_graph` raises `GraphError: router of 'review' returned 'escalate', not in its path map`. The fix is to
+      return `"give_up"`. A test that drives the loop to its limit (the "gives up" test) catches this; a happy-path
+      test never does. In LangGraph a router's return type can be annotated with `Literal[...]` of its destinations,
+      which the docs' loop example does (`-> Literal["b", END]`).
+    followUp: |
+      Write the router as a `Literal`-annotated function and say what a type checker would catch.
+
+  - id: static-and-conditional
+    type: debug
+    concept: lg-nodes-edges-routing
+    skill: analysis
+    title: Two paths out of one node
+    prompt: |
+      In LangGraph this graph sometimes both refunds and drafts a reply for the same dispute. Click the line that
+      causes it.
+    language: python
+    code: |
+      builder = StateGraph(TriageState)
+      builder.add_node("classify", classify)
+      builder.add_node("assess_risk", assess_risk)
+      builder.add_node("auto_refund", auto_refund)
+      builder.add_node("draft_response", draft_response)
+      builder.add_edge(START, "classify")
+      builder.add_edge("classify", "assess_risk")
+      builder.add_edge("assess_risk", "draft_response")
+      builder.add_conditional_edges("assess_risk", route_after_risk,
+                                    {"refund": "auto_refund", "draft": "draft_response"})
+    correctLines: [8]
+    lineNotes:
+      - line: 9
+        note: The conditional edge is the intended routing; the problem is that a static edge from the same node exists too.
+      - line: 7
+        note: classify has a single static edge - that is fine.
+    hints:
+      - How many edges leave `assess_risk`?
+    solution: |
+      Line 8 adds a static edge from `assess_risk`, and lines 9-10 add conditional edges from the same node. The
+      LangGraph docs warn: "For each node, use either static edges or dynamic routing (conditional edges /
+      `Command`), not both. Mixing them can run both paths." Delete line 8. `mini_graph` rejects this at compile
+      time: `node 'assess_risk' has both a static edge and conditional edges`.
+    followUp: |
+      The same docs warn about `Command(goto=...)` plus `add_edge` from one node. Why is that the same mistake?
+
+  - id: loop-steps
+    type: mcq
+    concept: lg-cycles-recursion-limit
+    skill: application
+    title: How high must the limit be?
+    prompt: |
+      In the triage graph (classify, assess_risk, then draft/review pairs, then finalize or escalate), with
+      `max_drafts=5`, what is the smallest `recursion_limit` in `mini_graph` that lets a dispute that fails every
+      review reach `escalate` without `GraphRecursionError`?
+    options:
+      - id: fourteen
+        text: "14, one more than the number of node runs"
+        feedback: "mini_graph checks the limit before each node runs, so a limit of 13 allows exactly 13 runs; 14 works but is not the smallest."
+      - id: thirteen
+        text: "13"
+        feedback: "Correct - 2 + 2 x 5 + 1 = 13 node runs, and mini_graph allows exactly recursion_limit node runs."
+      - id: five
+        text: "5, the same as max_drafts"
+        feedback: The recursion limit counts every node run, not drafts. Five steps stop the run in the second draft.
+      - id: twelve
+        text: "12"
+        feedback: That covers classify, assess_risk and five pairs but not the final escalate node.
+    correct: [thirteen]
+    hints:
+      - Count node runs on the longest path, including the exit node.
+      - mini_graph raises only when the next node would be run number recursion_limit + 1.
+    solution: |
+      Longest path: classify, assess_risk, 5 x (draft_response, review), escalate = `3 + 2 x 5` = 13 node runs,
+      so 13 is the minimum in `mini_graph` - run here, a limit of 13 reached `escalate` and 12 raised after six
+      model calls. In practice leave more headroom, and check your library's exact boundary - the LangGraph docs' example with a limit of 4
+      printed five node lines before the error.
+    followUp: |
+      Write the test that pins the boundary: one run at limit 13 that succeeds, one at 12 that raises.
+
+  - id: two-limits
+    type: short
+    concept: lg-cycles-recursion-limit
+    skill: analysis
+    title: max_drafts or recursion_limit?
+    prompt: |
+      A teammate removes `max_drafts` from the triage graph ("the recursion limit already stops the loop") and sets
+      `recursion_limit=10`. Explain what changes for a dispute whose drafts never pass review - for the merchant,
+      for cost and for the data - and what you would keep.
+    modelAnswer: |
+      Without `max_drafts` the loop has no exit of its own, so it runs until the recursion limit: 10 node runs, then
+      `GraphRecursionError`. The run ends with an **exception instead of a decision** - no `escalate`, so no human
+      sees the dispute unless someone handles the error; the model calls already made (here 1 + 4) are paid; and
+      `invoke` returns nothing, so the log and review notes collected so far are not returned to the caller (in
+      mini_graph they are visible only by streaming). With `max_drafts` the same dispute ends normally at
+      `escalate` with a full audit trail. Keep both: `max_drafts` as the business rule inside the graph, and a
+      recursion limit above the longest legitimate path as a safety net for bugs. LangGraph's `RemainingSteps` is a
+      third option - a router can see the limit coming and take a completion path.
+    rubric:
+      - Says the run ends with GraphRecursionError and no decision
+      - Mentions model calls already spent
+      - Mentions lost or unreturned state (no audit, no escalation)
+      - Recommends keeping a business limit inside the graph and the recursion limit above it
+    hints:
+      - What does invoke return when it raises?
+    solution: |
+      See the model answer: a business limit produces an outcome; the recursion limit produces an exception.
+    followUp: |
+      Anthropic's article recommends "stopping conditions (such as a maximum number of iterations)". Where else in
+      an agent would you put one?
+
+  - id: orphan-hidden
+    type: mcq
+    concept: lg-compile-stream
+    skill: analysis
+    title: Why did compile not complain?
+    prompt: |
+      A graph has a node `notify_merchant` that no edge or path map names. `review` routes with
+      `add_conditional_edges("review", route_after_review)` and **no path map**. `compile()` in `mini_graph`
+      succeeds. Why?
+    options:
+      - id: no-map
+        text: Without a path map the router may return any node name, so the checker must assume `review` can reach every node, including `notify_merchant`
+        feedback: Correct - the checker cannot read the function's possible returns. With a path map it would report "node 'notify_merchant' is unreachable from START".
+      - id: bug
+        text: The checker does not look for unreachable nodes
+        feedback: It does - with a path map the same graph fails with the unreachable message.
+      - id: end
+        text: Nodes are reachable as long as they have an edge to END
+        feedback: Reachability is about edges into a node from START, not edges out of it.
+      - id: runtime
+        text: Compile only checks types; all wiring is checked at run time
+        feedback: mini_graph checks entry, unknown targets, mixed edges, dead ends and reachability at compile time.
+    correct: [no-map]
+    hints:
+      - What does the checker know about where a router without a map can go?
+    solution: |
+      The lesson's test shows both cases: with a path map the result is `["node 'orphan' is unreachable from
+      START"]`; without one it is `[]`. Pass a path map (or, in LangGraph, annotate the router's return type with a
+      `Literal` of destinations) so the structure is checkable.
+    followUp: |
+      Which other check gets weaker when routers have no path map?
+
+  - id: stream-modes
+    type: mcq
+    concept: lg-compile-stream
+    skill: application
+    title: updates or values?
+    prompt: |
+      A support dashboard shows "Reviewing draft 2..." while a triage run is in progress, and a test must assert
+      the exact sequence of nodes. Which stream output fits both, and what does it yield for the review node in the
+      lesson's run after the first draft?
+    options:
+      - id: updates
+        text: "`updates` - `{'review': {'problems': ['missing dispute id dp_1042'], 'review_notes': ['attempt 1: missing dispute id dp_1042'], 'log': ['review: 1 problem(s)']}}`"
+        feedback: Correct - updates name the node and carry exactly what it returned, before the reducer.
+      - id: values
+        text: "`values` - it names the node in each chunk"
+        feedback: values chunks are the full state; they do not say which node just ran.
+      - id: merged
+        text: "`updates` - but it yields the merged log with all four lines so far"
+        feedback: updates carry the node's own return value; the merged log is in the values stream.
+      - id: invoke
+        text: Neither - call invoke and read the log afterwards
+        feedback: invoke returns only at the end, so nothing can show progress during the run.
+    correct: [updates]
+    hints:
+      - Which mode tells you the node's name?
+    solution: |
+      `updates` yields `{node_name: update}`; the list of keys is the path, and the update says what changed. For
+      the review node the lesson printed `review -> {'problems': ['missing dispute id dp_1042'], ...}`. `values`
+      starts with the input and shows the whole merged state after each step.
+    followUp: |
+      In LangGraph's v2 format, how would you read the node name from a chunk?
+
+  - id: triage-test-design
+    type: testdesign
+    concept: lg-cycles-recursion-limit
+    skill: application
+    title: Test plan for the triage graph
+    prompt: |
+      Design five tests for `build_triage_graph` with a `ScriptedLLM` - at least three negative. For each give
+      preconditions (script, dispute, parameters), steps, the expected result and the evidence you capture.
+    modelAnswer: |
+      1. **Review loop recovers** - script `["not_received", NO_ID, GOOD]`, 125.00 EUR, defaults. Invoke. Expect
+         `respond`, `drafts == 2`. Evidence: `review_notes == ["attempt 1: missing dispute id dp_1042"]`,
+         `problems == []`, second draft prompt ends with "Fix these problems from the last review:\n- missing
+         dispute id dp_1042", the first does not.
+      2. **Gives up (negative)** - three `NO_ID` drafts, `max_drafts=3`. Expect `escalate`, 4 model calls, three
+         review notes, log ends `draft_response: attempt 3`, `review: 1 problem(s)`, `escalate: escalate`.
+      3. **Fraud never refunded (negative)** - script `[" FRAUD\n"]`, 9.00 EUR. Expect `escalate`, risk `high`,
+         one model call. Evidence: full log.
+      4. **Large duplicate escalated (negative)** - script `["duplicate"]`, 500.00 EUR with
+         `high_amount_minor=50_000`. Expect `escalate`, not `refund`.
+      5. **Recursion limit (negative)** - a callable script that always drafts without the id, `max_drafts=10`,
+         `recursion_limit=8`. Expect `GraphRecursionError`; evidence `len(llm.calls) == 4`.
+      Plus: the classify request is exact (system prompt, one user message, `temperature 0`, `max_tokens 5`), and
+      the streamed node names match the expected path.
+    rubric:
+      - Each test names the script, dispute and parameters
+      - Includes the give-up path and the recursion limit as separate negatives
+      - Asserts logs, notes or call counts as evidence, not only the decision
+      - Includes a risk rule (fraud or large amount never auto-refunded)
+    hints:
+      - The scripted model's `calls` list shows how many drafts were requested and what each prompt contained.
+    solution: |
+      See the model answer; `tests/agents/test_triage_graph.py` in the practice project contains these cases.
+    followUp: |
+      Which of these tests would you keep, unchanged, if the scripted model were replaced by a real one?
+
+  - id: mini-graph-coding
+    type: coding
+    concept: lg-compile-stream
+    skill: application
+    title: Build the mini StateGraph
+    prompt: |
+      In `mini_graph.py` the builder methods are written. Implement `channels` (read reducers from a TypedDict
+      with `Annotated`), fix the teammate's `apply_update` draft (it ignores reducers, unknown keys and non-dict
+      updates and changes the state in place), and implement `validate` (every message in its docstring, in that
+      order), `CompiledGraph._next` (static edge or router plus path map) and `CompiledGraph.stream` (`updates`
+      and `values` modes, deep copies, the recursion limit). `compile` and `invoke` already use them.
+    project: ai
+    files:
+      - exercises/agents/mini_graph.py
+    test: tests/agents/test_mini_graph.py
+    command: .venv/bin/python -m pytest tests/agents/test_mini_graph.py
+    hints:
+      - "channels: `typing.get_type_hints(schema, include_extras=True)`; `typing.get_origin(hint) is typing.Annotated`; the reducer is in `hint.__metadata__`."
+      - "apply_update: copy the state first; check the type, then each key; Overwrite wins over the reducer; a reducer key with no value yet just stores the update."
+      - "validate: count static edges per source; reachability is a graph search from START over static edges and path-map values (a router without a map reaches every node) - `_reachable()` is written for you."
+      - "stream: apply the input through apply_update; in a loop, check the limit before running the next node; yield `{name: update}` or a copy of the state."
+    modelAnswer: |
+      ```python
+      def channels(schema):
+          result = {}
+          for key, hint in typing.get_type_hints(schema, include_extras=True).items():
+              reducer = None
+              if typing.get_origin(hint) is typing.Annotated:
+                  for meta in hint.__metadata__:
+                      if callable(meta):
+                          reducer = meta
+              result[key] = reducer
+          return result
+
+
+      def apply_update(state, update, reducers, node="?"):
+          if not isinstance(update, dict):
+              raise InvalidUpdateError(f"node '{node}' returned {type(update).__name__}, expected a dict of updates")
+          new_state = dict(state)
+          for key, value in update.items():
+              if key not in reducers:
+                  raise InvalidUpdateError(f"node '{node}' wrote unknown key '{key}'")
+              reducer = reducers[key]
+              if isinstance(value, Overwrite):
+                  new_state[key] = value.value
+              elif reducer is None or key not in new_state:
+                  new_state[key] = value
+              else:
+                  new_state[key] = reducer(new_state[key], value)
+          return new_state
+
+
+      # CompiledGraph.stream, after validating stream_mode and recursion_limit
+      state = apply_update({}, dict(inputs), self.reducers, node=START)
+      if stream_mode == "values":
+          yield copy.deepcopy(state)
+      current, steps = self._next(START, state), 0
+      while current != END:
+          if steps >= recursion_limit:
+              raise GraphRecursionError(
+                  f"recursion limit of {recursion_limit} reached without hitting END (next node: '{current}')"
+              )
+          update = self.nodes[current](copy.deepcopy(state))
+          state = apply_update(state, update, self.reducers, node=current)
+          steps += 1
+          yield {current: copy.deepcopy(update)} if stream_mode == "updates" else copy.deepcopy(state)
+          current = self._next(current, state)
+      ```
+
+      `validate` is a list of checks in the docstring's order (see `solutions/agents/mini_graph.py`). Deep copies
+      make node mutation harmless and stop a later reducer from changing a chunk already yielded; checking the
+      limit **before** a node runs means a run that would reach `END` in exactly `recursion_limit` steps succeeds.
+    rubric:
+      - Every test in test_mini_graph.py passes
+      - apply_update never changes the state it was given
+      - The recursion limit is checked before running a node, not after
+      - You can say which of your validation rules LangGraph documents and which are mini_graph's own
+    solution: |
+      See the model answer. The tests cover reducers from Annotated, append versus overwrite, Overwrite, unknown
+      keys, every validation message, routing with and without path maps, cycles, the recursion limit, both stream
+      modes, node mutation and a node that forgets to return.
+    followUp: |
+      Add fan-out: allow several static edges from one node, run all targets in one "super-step" against the same
+      state, and merge their updates. What must happen when two of them write a key that has no reducer?
+
+  - id: triage-graph-coding
+    type: coding
+    concept: lg-cycles-recursion-limit
+    skill: application
+    title: Build the SandPay dispute-triage graph
+    prompt: |
+      Solve `mini_graph.py` first. Then, in `triage_graph.py`, fix `TriageState` (two keys should append), and
+      implement `review_draft` and `build_triage_graph` exactly as their docstrings say - seven nodes, two
+      conditional edges with path maps, the review cycle bounded by `max_drafts`, and the injected `llm` used only
+      by `classify` and `draft_response`.
+    project: ai
+    files:
+      - exercises/agents/triage_graph.py
+    test: tests/agents/test_triage_graph.py
+    command: .venv/bin/python -m pytest tests/agents/test_triage_graph.py
+    hints:
+      - "Which keys are histories? Give them `Annotated[list[str], operator.add]`."
+      - Define the nodes as inner functions of build_triage_graph so they can use `llm`, `max_drafts` and the thresholds.
+      - "Route after assess_risk in this order: high risk, then duplicate, then draft. Route after review: pass, retry while drafts < max_drafts, else give up."
+      - "The draft prompt reads `state.get(\"problems\")` - absent on the first pass."
+    modelAnswer: |
+      ```python
+      def route_after_review(state):
+          if not state["problems"]:
+              return "pass"
+          if state["drafts"] < max_drafts:
+              return "retry"
+          return "give_up"
+
+
+      graph = StateGraph(TriageState)
+      graph.add_node("classify", classify)
+      graph.add_node("assess_risk", assess_risk)
+      graph.add_node("draft_response", draft_response)
+      graph.add_node("review", review)
+      graph.add_node("finalize", decide("finalize", "respond"))
+      graph.add_node("auto_refund", decide("auto_refund", "refund"))
+      graph.add_node("escalate", decide("escalate", "escalate"))
+      graph.add_edge(START, "classify")
+      graph.add_edge("classify", "assess_risk")
+      graph.add_conditional_edges("assess_risk", route_after_risk,
+                                  {"escalate": "escalate", "auto_refund": "auto_refund", "draft": "draft_response"})
+      graph.add_edge("draft_response", "review")
+      graph.add_conditional_edges("review", route_after_review,
+                                  {"pass": "finalize", "retry": "draft_response", "give_up": "escalate"})
+      for name in ("finalize", "auto_refund", "escalate"):
+          graph.add_edge(name, END)
+      return graph.compile()
+      ```
+
+      `decide(name, decision)` returns a node that sets `decision` and logs `"<name>: <decision>"`. `review`
+      returns both `problems` (overwrite, for the router and the next prompt) and `review_notes` (append, for
+      audit). The model is called only in `classify` and `draft_response`; every decision is code.
+    rubric:
+      - Every test in test_triage_graph.py passes
+      - log and review_notes use operator.add; problems and drafts overwrite
+      - Routers are pure functions of the state and use path maps
+      - No refund or escalation decision depends on raw model text
+    solution: |
+      See the model answer and `solutions/agents/triage_graph.py`. The tests check the review check, each route,
+      the exact classify request, the feedback in the second draft prompt, giving up after `max_drafts`, the
+      recursion limit and the streamed path.
+    followUp: |
+      Add a `request_evidence` node that the review routes to once when the draft lacks a tracking number. How does
+      the longest path - and so the recursion limit you need - change?
+
+  - id: interview-langgraph
+    type: interview
+    concept: lg-nodes-edges-routing
+    skill: analysis
+    title: "Interview: why a graph for this agent?"
+    prompt: |
+      *"We have a dispute-handling agent written as one while loop around a model call with tools. It sometimes
+      refunds when it should escalate and sometimes loops for minutes. Would you move it to a state graph such as
+      LangGraph? How would you design it, and how would you test it?"*
+    hints:
+      - Separate what the model must decide from what code must decide.
+    modelAnswer: |
+      I would, because the problems are control-flow problems. Design: a typed state with overwrite keys for
+      current values and append reducers for histories (log, review notes); nodes for the steps, with the model
+      only where judgement is needed (classify, draft) and its output parsed into a closed set; **routers in plain
+      code** for money decisions - high risk or fraud always escalates, and refunds are reachable only through an
+      edge I wrote, which limits the agent's agency (OWASP LLM06 Excessive Agency). Loops get their own exit - an
+      attempt counter routing to escalate - with a recursion limit above the longest legitimate path as a safety
+      net; LangGraph's default is far higher than any model budget, so I set it explicitly per run. I would give
+      every router a path map so compile can check the wiring, and stream `updates` to log each step.
+
+      Tests: routers as unit tests on state dicts; the whole graph with a scripted model, asserting the path (from
+      the stream), the log, the number of model calls and the prompts; negatives for fraud, large amounts, a loop
+      that never passes review and the recursion limit. Then the next step would be a checkpointer and an interrupt
+      so a human approves escalations, which is LangGraph's persistence and human-in-the-loop support.
+    rubric:
+      - Puts money decisions in code, not in the model, and explains why
+      - Separates overwrite and append state, with an example
+      - Bounds loops with an in-graph condition and a recursion limit, and knows the difference
+      - Tests paths, logs and model call counts with a scripted model
+    followUps:
+      - When would you not use a framework and keep the loop?
+      - Two nodes run in parallel and both write `log`. What happens without a reducer?
+      - How would you add a human approval step before a refund over 500.00 EUR?
+    solution: |
+      See the model answer. Interviewers listen for code-owned decisions, explicit state merging, bounded loops and
+      tests that check the path, not just the answer.
+
+placement:
+  - id: place-reducer
+    type: mcq
+    concept: lg-state-reducers
+    skill: application
+    title: Append or overwrite
+    prompt: |
+      State has `history: Annotated[list[str], operator.add]` and `current: list[str]` (no reducer). Both start as
+      `["a"]`. One node returns `{"history": ["b"], "current": ["b"]}`, the next returns `{"history": [],
+      "current": []}`. What are the two keys at the end?
+    options:
+      - id: right
+        text: "history `['a', 'b']`, current `[]`"
+        feedback: Correct - the reducer appends (and [] adds nothing); no reducer means overwrite.
+      - id: both-empty
+        text: "history `[]`, current `[]`"
+        feedback: An empty list through operator.add appends nothing; it does not clear.
+      - id: swapped
+        text: "history `['b']`, current `['a', 'b']`"
+        feedback: That swaps the behaviours - the Annotated reducer is on history.
+      - id: both-full
+        text: "history `['a', 'b']`, current `['b']`"
+        feedback: current has no reducer, so the second update [] replaces ['b'].
+    correct: [right]
+    solution: |
+      `history`: `["a"] + ["b"] + [] = ["a", "b"]`. `current`: `["a"] -> ["b"] -> []`. To clear `history` you would
+      need `Overwrite([])`.
+
+  - id: place-routing
+    type: mcq
+    concept: lg-nodes-edges-routing
+    skill: application
+    title: Where should the refund decision live?
+    prompt: |
+      A dispute graph must auto-refund only duplicate charges under 500.00 EUR and escalate everything else that is
+      risky. Which design is best?
+    options:
+      - id: router
+        text: A node asks the model for a category and parses it into a fixed set; a plain-code router decides refund or escalate from the category and amount, through a path map
+        feedback: Correct - the model judges, code decides, and the router is unit-testable.
+      - id: model-route
+        text: The router returns the model's raw reply, for example "auto_refund", as the next node name
+        feedback: Free text decides a money movement; a reply like "Auto refund." breaks routing, and a manipulated reply can pick any node.
+      - id: both
+        text: A static edge to auto_refund and a conditional edge to escalate from the same node
+        feedback: Mixing static and conditional edges from one node can run both paths in LangGraph.
+      - id: loop
+        text: A single while loop that lets the model call a refund tool when it thinks it is right
+        feedback: Then the model decides refunds - the excessive-agency risk the graph is meant to remove.
+    correct: [router]
+    solution: |
+      Keep judgement in a node and decisions in a router. Parse model output into a closed set so routers compare
+      known values, and use a path map so compile can check the destinations.
+
+  - id: place-cycle
+    type: mcq
+    concept: lg-cycles-recursion-limit
+    skill: analysis
+    title: A loop that ends in an exception
+    prompt: |
+      A draft/review cycle has no attempt counter. On hard disputes runs end with `GraphRecursionError` after about
+      ten model calls and no decision. What is the right fix?
+    options:
+      - id: counter
+        text: Count attempts in state and route to an escalate node when they run out; keep a recursion limit above that path
+        feedback: Correct - the graph ends with a decision, and the recursion limit stays a safety net.
+      - id: raise
+        text: Raise the recursion limit to 10,000
+        feedback: That only spends more model calls before the same exception.
+      - id: catch
+        text: Catch GraphRecursionError and treat it as approved
+        feedback: That approves drafts that never passed review.
+      - id: remove
+        text: Remove the review node
+        feedback: That removes the quality check instead of bounding it.
+    correct: [counter]
+    solution: |
+      A loop needs its own exit condition; the recursion limit is for bugs. LangGraph also offers `RemainingSteps`
+      for routing to a completion path before the limit.
+
+  - id: place-compile
+    type: mcq
+    concept: lg-compile-stream
+    skill: application
+    title: Reading a validation error
+    prompt: |
+      `compile()` reports `path map of 'assess_risk' names unknown node 'draft_respones'`, `node 'draft_response'
+      is unreachable from START` and `node 'review' is unreachable from START`. What do you do first?
+    options:
+      - id: typo
+        text: Fix the typo in the path map to `draft_response`, then compile again
+        feedback: Correct - the typo is why the drafting branch cannot be reached; the other two messages should disappear.
+      - id: edges
+        text: Add edges from START to draft_response and review
+        feedback: That would run them at the start of every dispute; they are unreachable only because of the typo.
+      - id: remove
+        text: Remove draft_response and review because they are unused
+        feedback: They are the drafting branch; the typo disconnected them.
+      - id: ignore
+        text: Nothing - unreachable nodes are harmless
+        feedback: Here they mean every non-risky dispute fails at run time when the router picks "draft".
+    correct: [typo]
+    solution: |
+      Read validation messages from the first: one wrong target cuts off everything behind it. This is the exact
+      output of the lesson's half-finished graph.
+
+recall:
+  - id: recall-reducer
+    concept: lg-state-reducers
+    prompt: What does a reducer do, and how do you declare one?
+    answer: It merges a node's update for one key with the current value - reducer(old, new). Declare it with Annotated[list[str], operator.add] in the TypedDict schema. No reducer means the update overwrites.
+  - id: recall-clear
+    concept: lg-state-reducers
+    prompt: Why does returning [] not clear an appending key, and what does?
+    answer: The empty list goes through the reducer - old + [] is old. Wrap the value in Overwrite([]) to bypass the reducer, or keep a separate overwrite key for "current" values.
+  - id: recall-edges
+    concept: lg-nodes-edges-routing
+    prompt: What are the kinds of edges, and what is a path map for?
+    answer: Normal edges always go A -> B; conditional edges call a router with the state after A and go where it says; START marks the entry and END the exit. A path map turns router labels into node names and tells compile where the router can go.
+  - id: recall-node
+    concept: lg-nodes-edges-routing
+    prompt: What should a node return, and what should it not do?
+    answer: A dict of only the keys it changes (a partial update). It should not mutate the state it was given or return None, and model output should be parsed into a closed set before routers use it.
+  - id: recall-limit
+    concept: lg-cycles-recursion-limit
+    prompt: How do a loop's own exit and the recursion limit differ?
+    answer: "The exit (attempt counter routing to escalate) ends the run normally with a decision. The recursion limit stops a run after N steps by raising GraphRecursionError - a safety net for bugs. LangGraph takes it as {\"recursion_limit\": n} in the config; the default is 10,007 since 1.1.4."
+  - id: recall-compile
+    concept: lg-compile-stream
+    prompt: What does compiling a graph check in this lesson's engine?
+    answer: An entry edge from START, that every edge and path-map target exists, no node with both static and conditional edges (or two static edges), no dead-end nodes, and that every node is reachable from START.
+  - id: recall-stream
+    concept: lg-compile-stream
+    prompt: What do stream_mode "updates" and "values" yield?
+    answer: "updates yields {node_name: update} after each step - the path plus what changed, before merging. values yields the whole state, starting with the input, after each step."
+
+next:
+  - langgraph-persistence-and-hitl
+  - multi-agent-systems-crewai
+  - agent-memory-and-context

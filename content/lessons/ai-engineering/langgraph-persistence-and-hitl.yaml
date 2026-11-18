@@ -1,0 +1,1530 @@
+id: langgraph-persistence-and-hitl
+title: Persistence and human-in-the-loop in LangGraph
+subject: ai-engineering
+module: ai-agents
+level: advanced
+status: published
+estimatedMinutes: 135
+summary: Make an agent survive crashes and wait for people. Build a checkpointed graph runner on SQLite that saves a snapshot after every step, keyed by thread id; kill the process mid-run and resume from the file in a new one; replay from an old checkpoint and fork it with edited state. Then put a human approval step (approve, edit or reject) in front of a SandPay refund with an interrupt that a Command resumes, and make the refund safe to re-run with an idempotency key derived from durable state. Every output shown was printed by the code shown; LangGraph's own API (checkpointer, thread_id, interrupt, Command(resume=...), get_state_history, update_state) is quoted from its documentation and mapped name by name.
+tags:
+  [
+    LangGraph,
+    checkpointer,
+    checkpoint,
+    persistence,
+    thread_id,
+    StateSnapshot,
+    get_state_history,
+    update_state,
+    durable execution,
+    durability modes,
+    fault tolerance,
+    crash recovery,
+    resume,
+    time travel,
+    replay,
+    fork,
+    human-in-the-loop,
+    HITL,
+    interrupt,
+    Command,
+    resume value,
+    approval workflow,
+    idempotency,
+    idempotency key,
+    side effects,
+    at-least-once,
+    excessive agency,
+    SQLite,
+    agents,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/ai/.venv`; the standard library's `sqlite3` stores the checkpoints;
+    pytest runs the exercises. Every output in this lesson was printed by the code shown, run on Linux in November
+    2026 with `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2`. Nothing is random except where a `uuid4` key is the point of
+    the example, and those outputs only count refunds.
+  - **What runs here:** the plain-Python runners you build in this lesson's exercises -
+    `practice/ai/solutions/agents/checkpoint_runner.py` (`SqliteCheckpointer`, `CheckpointRunner`) and
+    `practice/ai/solutions/agents/approval_flow.py` (`ApprovalRunner`, `Context.interrupt`, `Command`,
+    `SandPayGateway`, `build_refund_graph`). The "LLM" that proposes a refund is `ScriptedLLM` from
+    `practice/ai/support/llm_fake.py`, which replays a scripted tool call; no model, key or network is used.
+  - **LangGraph is not installed and was not run.** Its code in this lesson is quoted **from the official docs, not
+    run here (library not installed), as documented on 14 November 2026**:
+    [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence),
+    [Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) (threads, super-steps, the
+    "choose how to continue a thread" table, `StateSnapshot` fields, replay, `update_state`, durability modes),
+    [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) (`interrupt`, `Command(resume=...)`,
+    approve or reject, review and edit, validating input, the rules of interrupts),
+    [Use time-travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel) (replay, fork, interrupts
+    during time travel) and [Fault tolerance](https://docs.langchain.com/oss/python/langgraph/fault-tolerance)
+    ("Retry boundaries and idempotency", "Protect side effects with an idempotency key", "Treat a missing
+    acknowledgement as unknown"). LangGraph's docs now prefer `graph.stream_events(..., version="v3")` for driving
+    interrupts; this lesson quotes the `invoke` form, which the same pages also show. Check the pages before you
+    rely on a detail - the library changes.
+  - **Simplifications in our runner (on purpose):** one node per step (LangGraph runs a *super-step* of possibly
+    parallel nodes), updates overwrite keys (LangGraph applies reducers), checkpoint ids are counters `0001`,
+    `0002` per thread (LangGraph uses time-ordered UUIDs), one `interrupt` per node, and no pending-writes table.
+  - **Provider and security sources:** Anthropic, [*Building effective
+    agents*](https://www.anthropic.com/engineering/building-effective-agents) (a provider article: agents "can
+    then pause for human feedback at checkpoints or when encountering blockers"); OWASP [LLM06:2025 Excessive
+    Agency](https://genai.owasp.org/llmrisk/llm062025-excessive-agency/) (mitigation 6, "Require user approval").
+  - **Fictional:** SandPay is a fictional payments company; its refunds API (`SandPayGateway`), payment ids
+    (`pay_2001`), cases and merchants are invented. Amounts are integers in minor units (4999 = 49.99 EUR). The
+    `Idempotency-Key` header standard itself is covered in [Idempotency keys](#/lesson/idempotency-keys).
+  - **Not repeated here:** nodes, edges, conditional edges and cycles
+    ([LangGraph - state, nodes, edges and cycles](#/lesson/langgraph-state-machines)); tool schemas and the tool loop
+    ([Tool use and function calling](#/lesson/tool-use-and-function-calling)).
+
+prerequisites:
+  - langgraph-state-machines
+  - tool-use-and-function-calling
+
+concepts:
+  - id: graph-checkpoint-threads
+    name: Checkpoints and threads
+    summary: A checkpointer saves a snapshot of the graph state after the input and after every step, keyed by a thread id. Each checkpoint records the values, the node to run next and its parent checkpoint, so a thread's history is a chain (a tree once you fork). The thread id is the pointer you resume with - the same id continues the same state, a new id starts empty. Snapshots must be immutable copies in durable storage, or a crash, a later mutation or a restart loses or changes the past.
+  - id: checkpoint-resume-time-travel
+    name: Resuming, replaying and forking
+    summary: Invoking a thread with no new input continues from its latest checkpoint - after a crash only the unfinished node runs again, never the ones already saved. Invoking with an older checkpoint's config replays from there - later nodes, their model calls and side effects run again. update_state writes a new checkpoint with edited values (a fork) without changing the original, and execution continues on the fork. LangGraph names these invoke(None, config), invoke(None, snapshot.config) and update_state.
+  - id: hitl-interrupt-resume
+    name: Interrupts for human approval
+    summary: A node calls interrupt(payload) to pause - the runner saves a checkpoint, returns the payload to the caller and waits indefinitely. The caller resumes the same thread with Command(resume=answer); the interrupted node starts again from its first line and interrupt returns the answer. Use it before risky actions with approve, edit or reject answers, validate the answer in code, and loop back to ask again when it is invalid. Never swallow the interrupt in a bare try/except.
+  - id: replay-safe-side-effects
+    name: Idempotent side effects under re-execution
+    summary: Resumes, retries and replays re-run whole nodes, so node execution is at-least-once and any external effect inside a node can happen twice. Put side effects after the approval, in their own node, and send an idempotency key derived from durable state (the case id), never generated inside the node. Treat a missing acknowledgement as unknown - retry with the same key or ask the provider - and expect replay of a node with a side effect to call the external system again.
+
+objectives:
+  - Implement a checkpointer that saves an immutable snapshot per step keyed by thread id and checkpoint id, and read a thread's history newest first.
+  - Resume a run in a new process after a crash so that only unfinished nodes run again, and explain what each of LangGraph's four invocation forms does to a thread.
+  - Replay from an older checkpoint and fork one with edited state, and predict which nodes, model calls and side effects run again.
+  - Build an approve, edit or reject step with an interrupt and a resume command, including validation of the human's answer and the rule that the node restarts from its first line.
+  - Make a payment side effect safe under retry, resume and replay with an idempotency key from durable state, and handle a lost acknowledgement.
+  - Design positive and negative tests for a human-approved refund, with the gateway call count and the checkpoint history as evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [graph-checkpoint-threads, hitl-interrupt-resume]
+    title: The idea in plain language
+    body: |
+      A SandPay support case is handled by a person following a checklist on paper. After every box they tick,
+      the sheet goes into the case folder. If they go home sick halfway through, a colleague opens the folder,
+      sees the last ticked box and carries on from the next one - nobody re-reads the payment history or sends
+      the customer the same email again. When the next step is "refund 49.99 EUR", the checklist says "get a team
+      lead's signature first": the folder sits in the lead's tray until they sign, change the amount or write
+      "no".
+
+      Two habits make that work, and an agent needs both:
+
+      - **Persistence** - after every step, save where you are, under the case number. The case number is how you
+        find the folder again; the saved sheets are how you continue, look back, or try a different path from an
+        earlier step.
+      - **Human in the loop** - before an irreversible action, stop, save, and hand the decision to a person. Carry
+        on with their answer, whenever it comes - an hour later or from a different machine.
+
+      One trap comes with "carry on": if the colleague cannot tell whether the refund was already sent before the
+      first person left, they might send it twice. So the refund form carries the case number, and SandPay
+      refuses to pay the same case number twice.
+
+  - id: what
+    kind: what
+    concepts: [graph-checkpoint-threads, checkpoint-resume-time-travel, hitl-interrupt-resume, replay-safe-side-effects]
+    title: The vocabulary, and LangGraph's names for it
+    body: |
+      | Term | Meaning in this lesson | LangGraph name (from its docs) |
+      | --- | --- | --- |
+      | **Checkpoint** | A saved snapshot of one thread at one step: values, next node, parent | A checkpoint, read back as a `StateSnapshot` (`values`, `next`, `config`, `metadata`, `parent_config`, `tasks`, ...) |
+      | **Checkpointer** | The object that saves and loads checkpoints | `InMemorySaver`, `SqliteSaver`, `PostgresSaver` - any `BaseCheckpointSaver` |
+      | **Thread** | All checkpoints of one conversation or case, found by its id | `thread_id` in `{"configurable": {"thread_id": ...}}` |
+      | **Resume** | Continue a thread's unfinished work from its latest checkpoint | `graph.invoke(None, config)` |
+      | **Replay** | Re-run from an older checkpoint | `graph.invoke(None, snapshot.config)` |
+      | **Fork** | A new checkpoint with edited values, branching off an older one | `graph.update_state(snapshot.config, values)` |
+      | **Interrupt** | A node pauses the run and hands a payload to a human | `interrupt(payload)` inside a node |
+      | **Resume command** | The human's answer, which becomes `interrupt`'s return value | `Command(resume=answer)` |
+      | **Idempotency key** | A value sent with a side effect so the receiver performs it at most once | Not a LangGraph feature: the fault-tolerance page tells *you* to derive one |
+
+      Our runner keeps LangGraph's config shape (`{"configurable": {"thread_id": "case-7", "checkpoint_id":
+      "0002"}}`) and its method names (`invoke`, `get_state`, `get_state_history`, `update_state`) so that what you
+      build maps one to one. The differences are listed in the environment notes: one node per step, no
+      reducers, counter ids.
+
+      Checkpoints are **short-term, thread-scoped** memory. LangGraph's persistence page pairs them with
+      **stores** for long-term memory shared across threads (user preferences, facts) - that is the subject of
+      [Agent memory and context management](#/lesson/agent-memory-and-context).
+
+  - id: why
+    kind: why
+    concepts: [graph-checkpoint-threads, hitl-interrupt-resume]
+    title: Why agents need both
+    body: |
+      - **Agent runs are long and fragile.** A run may make ten model calls and five tool calls over minutes.
+        Deploys restart workers, containers get killed, a provider returns 529. Without checkpoints a crash at
+        step 9 means starting again at step 1 - paying again for the model calls and, worse, repeating the tool
+        calls.
+      - **Some decisions need a person, and people are slow.** The agent cannot hold a Python call open for the
+        hours a team lead takes to answer. It must save everything, end the request, and continue later from
+        whatever process picks the answer up. LangGraph's interrupts page says the graph "waits indefinitely
+        until you resume execution".
+      - **Excessive agency is a top LLM risk.** OWASP LLM06:2025 describes "damaging actions" performed "in
+        response to unexpected, ambiguous or manipulated outputs from an LLM", and its mitigation 6 is to
+        "Utilise human-in-the-loop control to require a human to approve high-impact actions before they are
+        taken." A refund proposed by a model reading a customer's message is exactly such an action: the message
+        may be a prompt injection.
+      - **Debugging needs history.** When an agent refunds the wrong amount, you want every step's state - and the
+        ability to re-run from just before the bad step with the fix, or with edited state, without redoing the
+        whole case. That is time travel.
+
+      Anthropic's *Building effective agents* describes the same shape from the model side: agents "plan and
+      operate independently, potentially returning to the human for further information or judgement" and "can
+      then pause for human feedback at checkpoints or when encountering blockers".
+
+  - id: visual-refund-graph
+    kind: visual
+    concepts: [hitl-interrupt-resume, replay-safe-side-effects]
+    title: The refund graph you build
+    body: |
+      ```mermaid
+      stateDiagram-v2
+        [*] --> draft_refund
+        draft_refund --> human_review: model proposed a refund
+        draft_refund --> [*]: no tool call
+        human_review --> human_review: invalid answer, ask again
+        human_review --> issue_refund: approve or valid edit
+        human_review --> close_rejected: reject
+        issue_refund --> [*]
+        close_rejected --> [*]
+        note right of human_review
+          interrupt(payload) pauses here.
+          The run ends; the thread waits.
+          Command(resume=answer) restarts this node.
+        end note
+        note right of issue_refund
+          The only side effect.
+          Idempotency key refund:case_id
+        end note
+      ```
+
+      Notice where the side effect sits: in its **own node, after** the approval. The review node has no side
+      effects at all, because it runs twice - once to ask, once more when the answer arrives.
+
+  - id: checkpoints
+    kind: internals
+    concepts: [graph-checkpoint-threads]
+    title: A checkpoint per step, keyed by thread
+    body: |
+      The checkpointer is a table. Each row is one checkpoint, keyed by `(thread_id, checkpoint_id)`:
+
+      ```python
+      self.db.execute(
+          "CREATE TABLE IF NOT EXISTS checkpoints ("
+          " thread_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, parent_id TEXT, step INTEGER NOT NULL,"
+          " source TEXT NOT NULL, next TEXT, values_json TEXT NOT NULL,"
+          " PRIMARY KEY (thread_id, checkpoint_id))"
+      )
+      ```
+
+      The runner saves one checkpoint for the input and one after every node:
+
+      ```python
+      while checkpoint.next is not None:
+          node = checkpoint.next
+          update = self.nodes[node](copy.deepcopy(checkpoint.values))
+          values = {**checkpoint.values, **(update or {})}
+          checkpoint = self.checkpointer.put(
+              thread_id, checkpoint.checkpoint_id, checkpoint.step + 1, "loop", self._route(node, values), values
+          )
+      return checkpoint.values
+      ```
+
+      Three details carry the weight:
+
+      - **`next` is saved with the values.** A checkpoint says not only "this is the state" but "this node runs
+        next". That is what makes resuming possible: `next = None` means finished.
+      - **The parent id links the chain.** Each checkpoint points at the one it continued from, so history is a
+        linked list - and, once you replay or fork, a tree.
+      - **Snapshots are copies.** `put` stores `json.dumps(values)` and commits before returning; nodes receive a
+        `deepcopy`. A node that mutates its argument cannot rewrite history, and a value JSON cannot encode
+        raises `TypeError` instead of being saved half-way. (LangGraph's interrupts page asks for the same: the
+        `interrupt` payload "must be JSON-serializable"; its checkpointers use a serializer for state.)
+
+      The SandPay dispute graph used in this section: `load_payment -> assess -> escalate` when the amount is over
+      3000 minor units, otherwise `assess -> refund_draft`. One run, then the thread's history, newest first
+      (real output):
+
+      ```python
+      config = {"configurable": {"thread_id": "case-7"}}
+      runner.invoke({"payment_id": "pay_1001"}, config)
+      for c in runner.get_state_history(config):
+          print(f"{c.checkpoint_id} parent={c.parent_id} step={c.step} source={c.source:5} next={c.next} keys={sorted(c.values)}")
+      ```
+
+      ```plaintext
+        ran load_payment
+        ran assess
+        ran escalate
+      0004 parent=0003 step=3 source=loop  next=None keys=['amount_minor', 'draft', 'merchant', 'payment_id', 'risk']
+      0003 parent=0002 step=2 source=loop  next=escalate keys=['amount_minor', 'merchant', 'payment_id', 'risk']
+      0002 parent=0001 step=1 source=loop  next=assess keys=['amount_minor', 'merchant', 'payment_id']
+      0001 parent=None step=0 source=input next=load_payment keys=['payment_id']
+      ```
+
+      Three nodes, four checkpoints. LangGraph's checkpointers page walks through the same idea for
+      `START -> node_a -> node_b -> END` and says "there will be exactly 4 checkpoints": an empty one with `START`
+      next, one with the input and `node_a` next, one after `node_a` with `node_b` next, and one after `node_b`
+      with nothing next. (It has one more than ours because LangGraph also saves the empty checkpoint before the
+      input.)
+
+  - id: langgraph-checkpointer
+    kind: code
+    concepts: [graph-checkpoint-threads]
+    title: The same thing in LangGraph
+    body: |
+      From the official docs, not run here (library not installed), as documented on 14 November 2026 -
+      compiling with a checkpointer and invoking a thread
+      ([Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)):
+
+      ```python
+      from langgraph.checkpoint.memory import InMemorySaver
+      from langgraph.store.memory import InMemoryStore
+
+      checkpointer = InMemorySaver()
+      store = InMemoryStore()
+
+      graph = builder.compile(checkpointer=checkpointer, store=store)
+
+      result = graph.invoke(
+          {"messages": [{"role": "user", "content": "Hi, my name is Bob."}]},
+          {"configurable": {"thread_id": "thread-1"}},
+      )
+      ```
+
+      and reading the history ([Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers)):
+
+      ```python
+      config = {"configurable": {"thread_id": "1"}}
+      list(graph.get_state_history(config))
+      ```
+
+      The docs state the rules this lesson's runner copies: "When invoking a graph with a checkpointer, you
+      **must** specify a `thread_id`"; "The checkpointer uses `thread_id` as the primary key for storing and
+      retrieving checkpoints"; history is "ordered chronologically with the most recent checkpoint / `StateSnapshot`
+      being the first in the list"; and "New input does not clear the thread ... Use a new `thread_id` to start
+      with empty state."
+
+      | Our runner | LangGraph |
+      | --- | --- |
+      | `SqliteCheckpointer(":memory:")` / `SqliteCheckpointer("case7.db")` | `InMemorySaver()` / `SqliteSaver(...)`, `PostgresSaver(...)` |
+      | `Checkpoint(values, next, parent_id, step, source)` | `StateSnapshot(values, next, parent_config, metadata={"step", "source", ...})` |
+      | `source` `"input"`, `"loop"`, `"update"` | `metadata["source"]` `"input"`, `"loop"`, `"update"` |
+      | `checkpoint.config` | `snapshot.config` |
+      | `put`, `get`, `list` | `BaseCheckpointSaver.put`, `.get_tuple`, `.list` (plus `.put_writes` for pending writes) |
+
+      `InMemorySaver` is for development: the interrupts page says to "use a durable checkpointer in production".
+
+  - id: crash-resume
+    kind: code
+    concepts: [checkpoint-resume-time-travel, graph-checkpoint-threads]
+    title: Kill the process, resume in another
+    body: |
+      To prove that the checkpoints are durable, the run must survive the death of its process. `crash_worker.py`
+      builds the dispute graph on a SQLite **file**; in `start` mode the `assess` node calls `os._exit(137)` - the
+      process ends at once, no `finally`, no clean-up, like a killed container. A second process opens the same
+      file and resumes:
+
+      ```python
+      # crash_worker.py
+      mode, path = sys.argv[1], sys.argv[2]
+      config = {"configurable": {"thread_id": "case-7"}}
+      if mode == "start":
+          build(path, crash=True).invoke({"payment_id": "pay_1001"}, config)
+      else:
+          runner = build(path)
+          print("  latest before resume: next =", runner.get_state(config).next)
+          print("  final:", runner.invoke(None, config))
+      ```
+
+      Real output of running it twice from a shell:
+
+      ```plaintext
+      process 1:
+        ran load_payment
+        ran assess
+        exit code 137
+      process 2:
+        latest before resume: next = assess
+        ran assess
+        ran escalate
+        final: {'amount_minor': 4999, 'draft': 'escalated to a human', 'merchant': 'Lumen Books', 'payment_id': 'pay_1001', 'risk': 'high'}
+      ```
+
+      Read it carefully:
+
+      - `load_payment` ran **once**. Its result was committed in checkpoint `0002` before `assess` started, so the
+        new process loaded it instead of running it again.
+      - `assess` ran **twice** - once in the dead process, once in the new one. A node that dies mid-way has
+        nothing saved, so it starts again from its first line. That is the at-least-once rule you will meet again
+        under idempotency.
+      - Process 2 passed `None` as the input. With new input instead, the runner would have saved an `"input"`
+        checkpoint and started again at the entry node.
+
+      In LangGraph the same choice is spelled out in the checkpointers page's table, quoted from the official docs
+      (not run here, as documented on 14 November 2026):
+
+      | Goal | Invocation | Execution |
+      | --- | --- | --- |
+      | Submit new input | `graph.invoke(input, config)` | Applies the input to saved state and starts from the entry point. |
+      | Continue after an error | `graph.invoke(None, config)` | Loads the latest checkpoint and retries unfinished work. Omit `checkpoint_id`. |
+      | Answer an `interrupt()` | `graph.invoke(Command(resume=answer), config)` | Supplies the interrupt's return value. The interrupted node starts again from its beginning. |
+      | Replay history | `graph.invoke(None, snapshot.config)` | Uses a snapshot from `get_state_history()` and re-executes nodes after that checkpoint. |
+
+      The same page adds: "Resume returns the saved result without running nodes when the latest checkpoint has no
+      unfinished work." Our runner does the same - `invoke(None, config)` on a finished thread returns its values
+      and runs nothing.
+
+  - id: durability
+    kind: internals
+    concepts: [graph-checkpoint-threads]
+    title: When is a checkpoint really durable?
+    body: |
+      Our `put` commits to SQLite before the next node starts, so the crash above lost nothing that had finished.
+      LangGraph lets you trade that guarantee for speed with a **durability mode** passed to the execution method.
+      From the checkpointers page (not run here, as documented on 14 November 2026):
+
+      - `"exit"` - "persists changes only when graph execution exits ... you cannot recover from system failures
+        (like process crashes) mid-execution."
+      - `"async"` - "persists changes asynchronously while the next step executes ... there is a small risk that
+        LangGraph does not write checkpoints if the process crashes during execution."
+      - `"sync"` - "persists changes synchronously before the next step starts", "at the cost of some performance
+        overhead."
+
+      The page also warns that a crash before the first checkpoint is durable leaves the thread
+      "indistinguishable from a thread that was never invoked" - `invoke(None, config)` raises `EmptyInputError`.
+      Our runner raises `EmptyThreadError` in the same situation. If you must tell "never accepted" from
+      "accepted but lost", record the case somewhere else first (the docs suggest an outbox row).
+
+      Two practical consequences:
+
+      - **`:memory:` is not durable.** `SqliteCheckpointer(":memory:")` and `InMemorySaver` die with the process.
+        Use them in tests, not for anything a person waits on.
+      - **The thread id must be stable and stored.** Generate it once per case (or use the case id) and keep it
+        with the case. A thread id you cannot find again is a lost case. (The persistence page also notes that
+        `PostgresSaver` stores it in a column with limited length: "Keep `thread_id` values under 255 characters.")
+
+  - id: time-travel
+    kind: code
+    concepts: [checkpoint-resume-time-travel]
+    title: Replay and fork
+    body: |
+      Every checkpoint carries a config that points at it. Passing that config with `None` replays from there;
+      `update_state` writes an edited copy - a fork - and returns the fork's config. Continuing the same thread
+      as above (real output):
+
+      ```python
+      before = next(c for c in runner.get_state_history(config) if c.next == "assess")   # checkpoint 0002
+      runner.invoke(None, before.config)                        # replay
+
+      fork = runner.update_state(before.config, {"amount_minor": 1200})
+      print("fork config:", fork)
+      print("fork result draft:", runner.invoke(None, fork)["draft"])
+      for c in runner.get_state_history(config)[:6]:
+          print(f"{c.checkpoint_id} parent={c.parent_id} source={c.source:6} next={c.next} draft={c.values.get('draft')}")
+      ```
+
+      ```plaintext
+      === B. replay from before assess
+        ran assess
+        ran escalate
+      === C. fork with amount_minor=1200
+      fork config: {'configurable': {'thread_id': 'case-7', 'checkpoint_id': '0007'}}
+        ran assess
+        ran refund_draft
+      fork result draft: refund 1200 to pay_1001
+      0009 parent=0008 source=loop   next=None draft=refund 1200 to pay_1001
+      0008 parent=0007 source=loop   next=refund_draft draft=None
+      0007 parent=0002 source=update next=assess draft=None
+      0006 parent=0005 source=loop   next=None draft=escalated to a human
+      0005 parent=0002 source=loop   next=escalate draft=None
+      0004 parent=0003 source=loop   next=None draft=escalated to a human
+      original 0004 still: escalated to a human
+      ```
+
+      The history is now a tree rooted at `0002`: the original branch (`0003`, `0004`), the replay (`0005`,
+      `0006`) and the fork (`0007` to `0009`). `load_payment` did not run in either; everything after `0002` did.
+      The fork's lower amount sent it down the other edge. Nothing was overwritten - `0004` still says "escalated".
+
+      The LangGraph version, from the official docs, not run here (library not installed), as documented on
+      14 November 2026 ([Use time-travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel)):
+
+      ```python
+      # Find checkpoint before write_joke
+      history = list(graph.get_state_history(config))
+      before_joke = next(s for s in history if s.next == ("write_joke",))
+
+      # Fork: update state to change the topic
+      fork_config = graph.update_state(
+          before_joke.config,
+          values={"topic": "chickens"},
+      )
+
+      # Resume from the fork — write_joke re-executes with the new topic
+      fork_result = graph.invoke(None, fork_config)
+      ```
+
+      Note `s.next == ("write_joke",)`: LangGraph's `next` is a **tuple** of node names, because a super-step can
+      run several nodes. Ours is a single name or `None`. `update_state` also takes `as_node` to say which node
+      the update is treated as coming from, which decides what runs next; ours always keeps the base checkpoint's
+      `next`.
+
+      The warning that matters most is in the same page: "Nodes after the checkpoint re-execute, including any LLM
+      calls, API requests, and interrupts (which may produce different results)." Replay is **not** a read-only
+      "show me what happened" - it is a new run. To *look* at the past, use `get_state` and `get_state_history`.
+
+  - id: interrupts
+    kind: internals
+    concepts: [hitl-interrupt-resume]
+    title: How an interrupt pauses and resumes
+    body: |
+      An interrupt is an exception the runner understands. `Context.interrupt` raises `GraphInterrupt` when there
+      is no answer yet, and returns the answer when there is one:
+
+      ```python
+      class Context:
+          def __init__(self, resume=_NOTHING):
+              self._resume = resume
+
+          def interrupt(self, payload):
+              if self._resume is _NOTHING:
+                  raise GraphInterrupt(payload)
+              value, self._resume = self._resume, _NOTHING
+              return value
+      ```
+
+      The runner catches **only** `GraphInterrupt`, saves a checkpoint that still names the same node as `next`
+      and remembers the payload, then returns to the caller - the Python call ends:
+
+      ```python
+      try:
+          update = self.nodes[node](copy.deepcopy(values), ctx)
+      except GraphInterrupt as paused:
+          self._save(thread_id, checkpoint, node, values, paused.payload)
+          return {**copy.deepcopy(values), "__interrupt__": [paused.payload]}
+      ```
+
+      Resuming with `Command(resume=answer)` checks that the latest checkpoint is paused, then runs that node
+      again **from its first line**, this time with a `Context` holding the answer. A tiny node shows the
+      consequence:
+
+      ```python
+      def ask(state, ctx):
+          calls.append("before")
+          answer = ctx.interrupt("name?")
+          calls.append(f"after:{answer}")
+          return {"name": answer}
+      ```
+
+      After `invoke({}, "x")` and `invoke(Command(resume="Ada"), "x")`, `calls` is
+      `["before", "before", "after:Ada"]` - the line before the interrupt ran twice (this is asserted in
+      `test_approval_flow.py`).
+
+      LangGraph works the same way. From the official docs, not run here (library not installed), as documented
+      on 14 November 2026 ([Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)): "LangGraph
+      suspends execution by raising an exception that signals the runtime to pause", and "the runtime restarts the
+      entire node from the beginning—it does not resume from the exact line where `interrupt` was called." To use
+      it you need "A **checkpointer** to persist the graph state", "A **thread ID** in your config" and "To call
+      `interrupt()` where you want to pause (payload must be JSON-serializable)". The minimal invoke example from
+      that page:
+
+      ```python
+      config = {"configurable": {"thread_id": "1"}}
+      result = graph.invoke({"answer": None}, config)
+      pending = result["__interrupt__"][0]
+      assert pending.response_schema == Decision.model_json_schema()
+
+      result = graph.invoke(Command(resume={"approved": True}), config)
+      assert result["answer"] == Decision(approved=True)
+      ```
+
+      Three rules from that page follow directly from "the node restarts":
+
+      - "Do not wrap `interrupt` calls in try/except" - a bare `except Exception` catches the pause itself.
+      - "Do not reorder `interrupt` calls within a node" - with several interrupts in one node, answers are matched
+        "strictly index-based".
+      - "Side effects called before `interrupt` must be idempotent" - they will run again on resume.
+
+  - id: approval-flow
+    kind: code
+    concepts: [hitl-interrupt-resume]
+    title: Approve, edit or reject a SandPay refund
+    body: |
+      The review node asks once, and turns the answer into a state update. It validates in code - a human typo
+      must not become a 90.00 EUR refund on a 49.99 EUR payment:
+
+      ```python
+      def human_review(state, ctx):
+          decision = ctx.interrupt({
+              "question": "Approve this SandPay refund?",
+              "case_id": state["case_id"], "payment_id": state["payment_id"],
+              "amount_minor": state["amount_minor"], "captured_minor": state["captured_minor"],
+              "reason": state["reason"], "error": state.get("review_error"),
+          })
+          action = decision.get("action") if isinstance(decision, dict) else None
+          if action == "approve":
+              return {"decision": "approve", "review_error": None}
+          if action == "reject":
+              return {"decision": "reject", "review_error": None, "reject_note": decision.get("note", "")}
+          if action == "edit":
+              amount = decision.get("amount_minor")
+              captured = state["captured_minor"]
+              if not isinstance(amount, int) or isinstance(amount, bool) or not 1 <= amount <= captured:
+                  return {"decision": None, "review_error": f"amount_minor must be an integer from 1 to {captured}"}
+              return {"decision": "approve", "amount_minor": amount, "edited_by_human": True, "review_error": None}
+          return {"decision": None, "review_error": "action must be approve, edit or reject"}
+
+      def after_review(state):
+          return {"approve": "issue_refund", "reject": "close_rejected"}.get(state.get("decision"), "human_review")
+      ```
+
+      An invalid answer routes back to `human_review`, which interrupts again with the error in the payload -
+      the pattern LangGraph's docs recommend under "Validating human input": call `interrupt()` "exactly once" per
+      node run and "use a **conditional edge** to loop back to the node until a valid value is collected".
+
+      A full case (real output; the scripted model proposes refunding 4999 on `pay_2001`):
+
+      ```python
+      r = hitl.invoke({"case_id": "case-42", "message": "I was charged twice for order 7781."}, "t1")
+      print("paused:", r["__interrupt__"])
+      print("gateway calls so far:", gw.calls)
+      r = hitl.invoke(Command(resume={"action": "edit", "amount_minor": 9000}), "t1")
+      print("bad edit ->", r["__interrupt__"][0]["error"])
+      r = hitl.invoke(Command(resume={"action": "edit", "amount_minor": 2500}), "t1")
+      print("good edit ->", {k: r[k] for k in ("status", "amount_minor", "refund")})
+      ```
+
+      ```plaintext
+      paused: [{'question': 'Approve this SandPay refund?', 'case_id': 'case-42', 'payment_id': 'pay_2001', 'amount_minor': 4999, 'captured_minor': 4999, 'reason': 'duplicate charge', 'error': None}]
+      gateway calls so far: 0
+      bad edit -> amount_minor must be an integer from 1 to 4999
+      good edit -> {'status': 'refunded', 'amount_minor': 2500, 'refund': {'refund_id': 're_001', 'payment_id': 'pay_2001', 'amount_minor': 2500}}
+      ```
+
+      The thread's history shows each pause as a checkpoint whose `next` is still `human_review`, and a second
+      `Command` after the end is refused (real output):
+
+      ```plaintext
+      0007 next=None paused=no
+      0006 next=issue_refund paused=no
+      0005 next=human_review paused=yes
+      0004 next=human_review paused=no
+      0003 next=human_review paused=yes
+      0002 next=human_review paused=no
+      0001 next=draft_refund paused=no
+      NoPendingInterrupt thread 't1' is not waiting for input
+      ```
+
+      LangGraph's "Approve or reject" pattern routes with a `Command(goto=...)` returned from the node; quoted from
+      the official docs, not run here (library not installed), as documented on 14 November 2026:
+
+      ```python
+      def approval_node(state: State) -> Command[Literal["proceed", "cancel"]]:
+          # Pause execution; payload shows up on stream.interrupts (with stream_events) or result["__interrupt__"] (with invoke)
+          is_approved = interrupt({
+              "question": "Do you want to proceed with this action?",
+              "details": state["action_details"]
+          })
+
+          # Route based on the response
+          if is_approved:
+              return Command(goto="proceed")  # Runs after the resume payload is provided
+          else:
+              return Command(goto="cancel")
+      ```
+
+      Its "Review and edit state" pattern returns the edited value into state, and its "Interrupts in tools"
+      pattern puts the `interrupt` inside the tool function so every call of that tool asks first. The same page
+      shows `interrupt(..., response_schema=Decision)` with a Pydantic model to validate the answer; with a plain
+      JSON Schema dictionary it "does **not** validate resume values" - so validate in code, as above, whenever
+      you are not sure.
+
+  - id: static-vs-dynamic
+    kind: when
+    concepts: [hitl-interrupt-resume]
+    title: Where to put the approval
+    body: |
+      - **A dynamic `interrupt()` in a node** (this lesson) - pauses only when your code decides to, with a payload
+        built for the reviewer. Use it for approvals: you can skip review for a 2.00 EUR goodwill credit and require
+        it above a threshold, or always for refunds.
+      - **Static `interrupt_before` / `interrupt_after`** set when compiling - LangGraph's docs present these under
+        "Debugging with interrupts", as breakpoints "to step through the graph execution one node at a time". Good
+        for development, not for business rules.
+      - **Inside the tool** - the docs' `send_email` example asks for approval in the tool body, so the rule
+        travels with the tool wherever the model calls it.
+      - **Outside the agent entirely** - OWASP's mitigation says approval "may be implemented in a downstream
+        system (outside the scope of the LLM application)". For money, do both: the agent asks a human, and
+        SandPay's own back office enforces limits and roles no matter what the agent sends.
+
+      A human approval is not a free safety switch. Reviewers who see fifty requests an hour approve on autopilot;
+      show them what the model saw and why (the reason, the payment, the captured amount, any error), keep the
+      payload small, and measure how often they edit or reject.
+
+  - id: idempotency
+    kind: internals
+    concepts: [replay-safe-side-effects]
+    title: Side effects that survive retry, resume and replay
+    body: |
+      Every mechanism in this lesson re-runs **whole nodes**: a crash re-runs the node that died, a resume re-runs
+      the interrupted node, a replay re-runs everything after the checkpoint. LangGraph's fault-tolerance page
+      names the consequence: retries give "**at-least-once** semantics for node execution ... It does not make
+      external side effects happen exactly once." Its example (quoted, not run):
+
+      ```plaintext
+      attempt 1:  node starts -> call payment API -> payment succeeds -> process crashes
+      attempt 2:  node starts -> call payment API -> payment succeeds again
+      ```
+
+      The fix is an idempotency key that the **receiver** uses to deduplicate. Our fake `SandPayGateway.refund`
+      returns the stored refund when it sees a key again (and raises `IdempotencyConflict` when the same key comes
+      with a different payment or amount). The key must be the same on every attempt, so it must come from
+      **durable state**:
+
+      ```python
+      def refund_key(state):
+          return f"refund:{state['case_id']}"
+
+      def issue_refund(state, ctx):
+          refund = gateway.refund(state["payment_id"], state["amount_minor"], idempotency_key=refund_key(state))
+          return {"refund": refund, "status": "refunded"}
+      ```
+
+      Replaying from the checkpoint before `issue_refund`, with that key and with a teammate's `uuid4()` key, on a
+      payment with 120.00 EUR captured (real output):
+
+      ```plaintext
+      refund:{case_id}   gateway calls=2 refunds=['re_001'] refunded_minor=4999
+      uuid4 per attempt  gateway calls=2 refunds=['re_001', 're_002'] refunded_minor=9998
+      uuid4 key, captured 4999 -> ValueError refund exceeds the refundable amount
+      ```
+
+      Both versions **called** SandPay twice - replay always re-executes. Only the stable key turned the second
+      call into a no-op. On a payment of exactly 49.99 EUR, SandPay's own refundable-amount check stopped the
+      duplicate, which is luck, not design: on a partial refund it would have gone through.
+
+      LangGraph's page says the same about where the key comes from: "The key must already be durable **before**
+      the side effect runs. Do not generate it inside the same node and rely on the return value", because a node
+      that dies never returns, so a generated key was never checkpointed. Its recommendation (quoted, not run):
+
+      ```python
+      def charge_customer(state: State) -> dict:
+          # Same order always produces the same key across retries and resumes.
+          idempotency_key = f"charge:{state['order_id']}"
+
+          provider.charge(
+              customer_id=state["customer_id"],
+              amount=state["amount"],
+              idempotency_key=idempotency_key,
+          )
+
+          # Observability only. A retry must not depend on this return value.
+          return {"last_payment_key": idempotency_key, "charged": True}
+      ```
+
+      When no business id exists, it suggests generating the key in **its own node** before the side effect, so
+      the key is checkpointed first - and using `"sync"` durability so that checkpoint survives a crash. It lists
+      two requirements: "The key is reproducible from durable state" and "The external service honors the key.
+      Check the provider's documentation before relying on it."
+
+  - id: lost-ack
+    kind: example
+    concepts: [replay-safe-side-effects]
+    title: The refund happened, but nobody heard
+    body: |
+      The worst case for a payment agent: SandPay commits the refund, then the connection drops before the reply
+      arrives. The node raised, so the graph saved nothing for it. `SandPayGateway(lose_next_ack=True)` simulates
+      it (real output):
+
+      ```plaintext
+      ConnectionError: refund committed, acknowledgement lost
+      refunds at SandPay: [{'refund_id': 're_001', 'payment_id': 'pay_2001', 'amount_minor': 4999}] | graph next: issue_refund
+      retry -> {'refund_id': 're_001', 'payment_id': 'pay_2001', 'amount_minor': 4999} | refunds: 1
+      ```
+
+      The graph's view ("next is `issue_refund`, so no refund yet") is **wrong**, and the money has moved. The
+      retry with the same key got the original refund back. LangGraph's page has a section for exactly this,
+      "Treat a missing acknowledgement as unknown": "Treat missing local state as unknown, not as proof the effect
+      did not happen. Query the provider for the operation's status before compensating or continuing."
+
+      What a tester checks here: the gateway's ledger (not the agent's state) shows one refund; the retry returns
+      the same `refund_id`; and no "compensating" action (such as a second refund to "fix" a missing one) runs
+      without first querying SandPay.
+
+      A side effect **before** an interrupt is the same bug in a quieter form. A teammate logs an audit entry at
+      the top of the review node (real output after one pause and one resume):
+
+      ```python
+      def review(state, ctx):
+          audit.append("review requested")      # side effect BEFORE the interrupt
+          decision = ctx.interrupt("approve?")
+          return {"decision": decision}
+      ```
+
+      ```plaintext
+      audit entries: ['review requested', 'review requested']
+      ```
+
+      LangGraph's interrupts page lists both "Do not perform non-idempotent operations before `interrupt`" and "Do
+      not create new records without checking if they exist", and recommends to "Place side effects after
+      `interrupt` calls" or "Separate side effects into separate nodes when possible".
+
+  - id: tests
+    kind: tests
+    concepts: [graph-checkpoint-threads, checkpoint-resume-time-travel, hitl-interrupt-resume, replay-safe-side-effects]
+    title: Tests for a checkpointed, human-approved refund
+    body: |
+      | # | Case | Setup | Expected result | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | One checkpoint per step | Run the 3-node dispute graph | 4 checkpoints, newest first, parents chained, sources `loop`×3 + `input` | `get_state_history` |
+      | 2 | Snapshots are immutable | A node appends to a list in its argument | The input checkpoint still shows `[]` | Values of checkpoint `0001` |
+      | 3 | Crash and resume (negative) | SQLite file; `assess` raises once; new checkpointer on the same file | Latest `next == "assess"`; resume runs `assess`, `escalate` only | Node-call log |
+      | 4 | Resume a finished thread | Run to the end, then `invoke(None)` | Same values, no node runs, no new checkpoint | Call log, history length |
+      | 5 | Fork keeps history | `update_state` before `assess` with 1200 | New `update` checkpoint, path goes to `refund_draft`, `0004` unchanged | History tree |
+      | 6 | Pause before the refund | Scripted model proposes a refund | `__interrupt__` payload with case, payment, amounts; **0 gateway calls** | Result, `gateway.calls` |
+      | 7 | Approve | Resume with `{"action": "approve"}` | One refund; model called once in total | `gateway.refunds`, `llm.calls` |
+      | 8 | Invalid edit (negative) | Resume with 9000, then `"2500"` (a string), then `"yes please"` | Paused again each time with the matching `error`; no gateway call | Payload `error` |
+      | 9 | Reject (negative) | Resume with reject and a note | `status == "rejected"`, 0 gateway calls | Result, `gateway.calls` |
+      | 10 | Resume without a pause (negative) | `Command` on a new, a finished and another thread | `NoPendingInterrupt` each time | Exception |
+      | 11 | Replay the refund step | Replay from before `issue_refund` | 2 gateway calls, 1 refund, same `refund_id` | Gateway ledger |
+      | 12 | Lost acknowledgement (negative) | `lose_next_ack = True`, approve, then `invoke(None)` | `ConnectionError`; ledger has 1 refund; retry returns `re_001` | Ledger before and after |
+
+      All of these run in milliseconds with a scripted model and a fake gateway; they are in
+      `tests/agents/test_checkpoint_runner.py` and `tests/agents/test_approval_flow.py`. The evidence is always
+      the **external** record (gateway ledger, call counts) and the **checkpoint history** - never only the
+      agent's returned state, which can be wrong (case 12).
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [graph-checkpoint-threads, checkpoint-resume-time-travel, hitl-interrupt-resume, replay-safe-side-effects]
+    title: Common mistakes and how to debug them
+    body: |
+      - **A new `thread_id` per request.** Every call starts with empty state, the resume finds nothing, and the
+        reviewer's answer goes nowhere. Store the thread id with the case.
+      - **Reusing one `thread_id` for different cases.** New input does not clear the thread - the second case
+        inherits the first one's values (our runner merges them, as LangGraph's reducers do).
+      - **`InMemorySaver` (or `:memory:`) in production.** The pause survives exactly as long as the process.
+      - **Storing references instead of copies.** A checkpointer that keeps the live dict lets a later node rewrite
+        "history". Serialise on save.
+      - **Expecting resume to continue mid-node.** The node restarts from its first line; anything before the
+        `interrupt` runs again - LLM calls included, which also costs money.
+      - **`try: ... except Exception:` around `interrupt`.** The pause is an exception; a bare handler swallows it
+        and the node carries on with no answer.
+      - **Generating the idempotency key inside the side-effect node** (`uuid4()`, a timestamp). Each attempt gets
+        a new key, so the receiver cannot deduplicate.
+      - **Treating replay as read-only.** It re-runs nodes, model calls and API calls. Inspect with `get_state`.
+      - **Trusting the agent's state after a lost acknowledgement.** Ask the external system.
+
+      **Debugging method:** print the thread's history (id, parent, source, next, a few key values) and the
+      external system's ledger side by side. Find the last checkpoint whose state matches reality; the node named
+      in its `next` is where the run diverged. Then check that node for side effects before its interrupt and for
+      keys that are not derived from saved state.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [graph-checkpoint-threads, checkpoint-resume-time-travel, replay-safe-side-effects]
+    title: Trade-offs and alternatives
+    body: |
+      - **Checkpoint size and frequency.** Saving full state after every step is simple and makes time travel
+        trivial, but grows with long conversations; LangGraph's page describes a beta `DeltaChannel` that stores
+        increments instead. Small, JSON-friendly state helps every option.
+      - **Durability vs latency.** `"sync"` waits for every write; `"exit"` writes once and cannot survive a crash
+        mid-run. Choose per graph: a refund agent wants `"sync"`; a throwaway summariser may not.
+      - **Node granularity.** One big node is fewer checkpoints but a larger unit to redo after a crash; separate
+        nodes for "decide" and "do" make the side effect's boundary explicit and are what the docs recommend.
+      - **Human review costs time and attention.** Gate on risk (amount, merchant, model confidence) rather than
+        reviewing everything, and keep a downstream limit for when the review is skipped or rubber-stamped.
+      - **Library vs your own.** LangGraph gives you checkpointers for SQLite and Postgres, pending writes for
+        parallel nodes, subgraph namespaces and Studio for inspecting state; a hand-rolled runner like this one is
+        fine for learning and tests, and a liability for production.
+      - **Workflow engines** that are not LLM-specific also checkpoint and retry steps; the idempotency rules are
+        the same wherever a step can run twice.
+
+  - id: summary
+    kind: summary
+    concepts: [graph-checkpoint-threads, checkpoint-resume-time-travel, hitl-interrupt-resume, replay-safe-side-effects]
+    title: Quick reference
+    body: |
+      - Checkpoint = values + next node + parent, saved after the input and every step, keyed by
+        `(thread_id, checkpoint_id)`. History is newest first.
+      - `invoke(input, config)` new work; `invoke(None, config)` continue after an error; `invoke(None,
+        snapshot.config)` replay; `update_state(snapshot.config, values)` fork; `invoke(Command(resume=x), config)`
+        answer an interrupt.
+      - Saved nodes never re-run on resume; the node that crashed or paused re-runs **from its first line**.
+      - Replay re-executes later nodes, model calls, API calls and interrupts. Look with `get_state_history`.
+      - `interrupt(payload)` + checkpointer + thread id = pause for a human. Validate the answer; loop back to ask
+        again; never catch the pause with a bare `except`.
+      - Side effects: after the approval, in their own node, with an idempotency key derived from durable state.
+        Missing acknowledgement = unknown, not "did not happen".
+      - Durable checkpointer (SQLite/Postgres, `"sync"` for money) in production; in-memory only in tests.
+
+exercises:
+  - id: count-checkpoints
+    type: mcq
+    concept: graph-checkpoint-threads
+    skill: application
+    title: How many checkpoints?
+    prompt: |
+      With this lesson's `CheckpointRunner`, a graph `verify -> score -> notify -> END` runs once on a new thread
+      `case-9` and finishes. Then the same thread is invoked again with new input `{"note": "called back"}` and
+      runs to the end again. How many checkpoints does `case-9` have, and what are the first input checkpoint's
+      `parent_id` and the second one's?
+    options:
+      - id: eight
+        text: 8 - one input and three node checkpoints per run; parents None and "0004"
+        feedback: Correct - the second input checkpoint continues the thread from its latest checkpoint, 0004.
+      - id: six
+        text: 6 - one checkpoint per node per run; the input is not saved
+        feedback: The input is saved too, with the entry node as next - that is what lets a run that crashes in its first node resume.
+      - id: four-reset
+        text: 4 - new input starts the thread again from empty, replacing the old checkpoints
+        feedback: New input does not clear the thread; the docs say "Use a new thread_id to start with empty state". Old checkpoints stay.
+      - id: eight-none
+        text: 8 - and both input checkpoints have parent None, because each starts a new run
+        feedback: A new run on the same thread links to the thread's latest checkpoint, so its parent is 0004.
+    correct: [eight]
+    hints:
+      - Count the input checkpoint as well as one per node.
+      - Does new input on an existing thread start from empty?
+    solution: |
+      Run 1 saves `0001` (input, parent None) and `0002`-`0004`. Run 2 merges the note into `0004`'s values and saves
+      `0005` (input, parent `0004`), then `0006`-`0008`. LangGraph would also save an empty checkpoint before the
+      first input, as its docs' 4-checkpoint example for a 2-node graph shows.
+    followUp: |
+      Which config would you pass to run the second request on clean state, and what would its first checkpoint id be?
+
+  - id: crash-what-reruns
+    type: mcq
+    concept: checkpoint-resume-time-travel
+    skill: application
+    title: After the crash
+    prompt: |
+      `fetch_dispute -> ask_llm -> draft_reply -> END` runs with a durable checkpointer. The process is killed
+      while `draft_reply` is waiting for its model call. A new process calls `invoke(None, config)` on the same
+      thread. Which nodes run, and how many model calls are paid for in total if `ask_llm` and `draft_reply` each
+      make one?
+    options:
+      - id: draft-only
+        text: Only draft_reply runs again; 3 model calls in total (ask_llm 1, draft_reply 2)
+        feedback: Correct - ask_llm's result was saved; draft_reply had nothing saved and starts again.
+      - id: all
+        text: All three run again; 4 model calls
+        feedback: That is what passing the original input again does. invoke(None) continues from the latest checkpoint, whose next is draft_reply.
+      - id: none
+        text: Nothing runs - the run already started draft_reply, so it is marked done
+        feedback: A node is only done when its checkpoint is saved after it returns. A killed node saved nothing.
+      - id: resume-mid
+        text: draft_reply continues from the line where it was waiting; 2 model calls
+        feedback: Nodes are not resumed mid-function; they restart from the first line. The first draft_reply call was lost but paid for.
+    correct: [draft-only]
+    hints:
+      - What is the latest checkpoint's next?
+      - Does a killed node get a checkpoint?
+    solution: |
+      The latest checkpoint is the one after `ask_llm`, with `next = draft_reply`. Resuming runs `draft_reply` from
+      the start; its first, interrupted model call was already billed, so 3 calls in total. This is why node
+      boundaries matter: put expensive or risky work in its own node.
+    followUp: |
+      The same crash happens with durability "exit" in LangGraph. What does the new process find?
+
+  - id: invocation-order
+    type: order
+    concept: checkpoint-resume-time-travel
+    skill: application
+    title: Investigate and fix a bad refund with time travel
+    prompt: |
+      A thread refunded the wrong amount because `assess` read the wrong field. Put the steps in order to find the
+      cause and produce a corrected result without touching the original history.
+    items:
+      - id: history
+        text: Print get_state_history for the thread and find the checkpoint whose next is assess
+      - id: compare
+        text: Compare that checkpoint's values with the external system's record to confirm the input to assess was right
+      - id: fix
+        text: Fix the assess node in code, or decide which value to correct
+      - id: update-state
+        text: Call update_state on that checkpoint's config with the corrected values (a fork), or reuse its config unchanged for a replay
+      - id: invoke
+        text: Invoke the graph with None and the fork's (or checkpoint's) config, knowing every later node re-runs
+      - id: verify
+        text: Check the new branch's final checkpoint and the external ledger, and confirm the old branch is unchanged
+    hints:
+      - Look before you run anything - replay is not read-only.
+    solution: |
+      Inspect first (history, then reality), change code or state, then run from the chosen checkpoint, then verify
+      both the new branch and that nothing was duplicated outside. If a later node issues a refund, the replay will
+      call SandPay again - which is why the key must be stable.
+    followUp: |
+      Which of these steps would repeat a side effect, and what protects you?
+
+  - id: replay-side-effects
+    type: mcq
+    concept: checkpoint-resume-time-travel
+    skill: analysis
+    title: "Replay is not 'show me'"
+    prompt: |
+      A teammate wants a "view what the agent did at step 3" button and implements it as
+      `graph.invoke(None, history[k].config)` for the checkpoint at step 3. The graph's step 5 sends the merchant an
+      email. What happens when an analyst clicks the button?
+    options:
+      - id: email
+        text: Steps after the checkpoint run again, including the email node - the merchant may get a second email, and new checkpoints are added
+        feedback: Correct - LangGraph's docs say nodes after the checkpoint re-execute, "including any LLM calls, API requests, and interrupts".
+      - id: view
+        text: It returns the saved values of step 3 without running anything
+        feedback: That is get_state(config). invoke with a checkpoint config is a replay.
+      - id: overwrite
+        text: It overwrites steps 4 and 5 with fresh results
+        feedback: Nothing is overwritten; the replay adds a new branch with the old checkpoint as parent.
+      - id: error
+        text: It raises, because a finished thread cannot be invoked again
+        feedback: Only invoke(None) on the latest, finished checkpoint returns without running. An older checkpoint still has work after it.
+    correct: [email]
+    hints:
+      - Which call reads, and which call runs?
+    solution: |
+      Use `get_state(history[k].config)` (LangGraph `graph.get_state(config)`) to view. Replay is for re-running on
+      purpose, and only with side effects that are idempotent.
+    followUp: |
+      Write a test that would have caught the button: what do you assert about the email sender and the history?
+
+  - id: resume-restarts-node
+    type: mcq
+    concept: hitl-interrupt-resume
+    skill: application
+    title: What runs twice?
+    prompt: |
+      ```python
+      def review(state, ctx):
+          summary = llm_summarise(state["case"])      # a model call
+          answer = ctx.interrupt({"summary": summary})
+          return {"decision": answer}
+      ```
+      The thread pauses, and a reviewer approves the next morning with `Command(resume="approve")`. How many times
+      is `llm_summarise` called, and could the reviewer's approval apply to a different summary than the one they
+      read?
+    options:
+      - id: twice-yes
+        text: Twice; yes - the summary is regenerated on resume and may differ from what the reviewer saw
+        feedback: Correct - the node restarts from its first line. Generate the summary in an earlier node so it is checkpointed, and show that.
+      - id: once
+        text: Once - resume continues from the interrupt line
+        feedback: LangGraph's docs - "the runtime restarts the entire node from the beginning".
+      - id: twice-no
+        text: Twice, but the second result is discarded, so the decision matches what they saw
+        feedback: Nothing discards it - the second summary is in local scope when the answer arrives; if the node stored it, state would show the new one.
+      - id: zero
+        text: Zero on resume - interrupts cache the node's earlier calls
+        feedback: Only the resume value is supplied; the code before interrupt runs normally.
+    correct: [twice-yes]
+    hints:
+      - Where does the node start when it is resumed?
+    solution: |
+      Two calls, and with temperature above 0 or a changed model the second summary can differ. Move the model call
+      to its own node before `review`; its output is saved in a checkpoint, and the review node only reads state.
+    followUp: |
+      The review node contains two interrupts. What does "strictly index-based" matching mean for refactoring it?
+
+  - id: hitl-debug
+    type: debug
+    concept: hitl-interrupt-resume
+    skill: analysis
+    title: An approval node that lets refunds through
+    prompt: |
+      Click **every** line that can let a refund be issued without a valid human approval, or issue it twice.
+    language: python
+    code: |
+      def human_review(state, ctx):
+          ledger.log(state["case_id"], "review requested")
+          try:
+              decision = ctx.interrupt({"case_id": state["case_id"], "amount_minor": state["amount_minor"]})
+          except Exception:
+              decision = {"action": "approve"}
+          if decision.get("action") == "edit":
+              return {"decision": "approve", "amount_minor": decision["amount_minor"]}
+          return {"decision": decision.get("action")}
+
+      def issue_refund(state, ctx):
+          key = f"refund:{state['case_id']}"
+          return {"refund": gateway.refund(state["payment_id"], state["amount_minor"], idempotency_key=key)}
+    correctLines: [5, 6, 8]
+    lineNotes:
+      - line: 2
+        note: A side effect before the interrupt runs again on resume - a duplicate log line, a bug, but it does not issue a refund.
+      - line: 12
+        note: This key is derived from durable state, so a retry or replay is deduplicated. Correct.
+    hints:
+      - What does ctx.interrupt raise to pause?
+      - What stops a reviewer from typing 900000 or "50"?
+    solution: |
+      **Lines 5-6** catch the pause itself (`GraphInterrupt` is an `Exception`) and replace it with an approval -
+      the run never stops for a human. Remove the try, or catch only specific errors. **Line 8** accepts any edited
+      amount: a string, a negative number or more than was captured goes straight to the refund. Validate
+      `1 <= amount <= captured` and loop back with an error. Line 2 is a duplicate-log bug to fix by moving it after
+      the interrupt or into its own node.
+    followUp: |
+      Rewrite the node so it passes the validation tests in this lesson's `test_approval_flow.py`.
+
+  - id: approval-placement
+    type: short
+    concept: hitl-interrupt-resume
+    skill: analysis
+    title: Where should the refund approval live?
+    prompt: |
+      Your SandPay agent has three tools - `lookup_payment`, `send_message` and `issue_refund`. Compare putting
+      the human approval (a) in a review node before the refund node, (b) inside the `issue_refund` tool,
+      (c) as `interrupt_before=["issue_refund"]` at compile time, and (d) in SandPay's back office. Recommend one or
+      a combination, with reasons.
+    modelAnswer: |
+      (a) A review node with a dynamic `interrupt` is explicit in the graph, can build a payload for the reviewer
+      (payment, captured amount, reason, previous error) and can apply a policy (review only above a threshold).
+      (b) Inside the tool, as in LangGraph's `send_email` example, the rule travels with the tool - any path that
+      calls it asks first - but the tool now restarts on resume, so its own code before the interrupt must be
+      side-effect free. (c) Static `interrupt_before` is documented as a debugging breakpoint: it pauses on every
+      call with no payload or validation, so it is the wrong tool for a business rule. (d) A back-office limit is
+      enforced even if the agent is bypassed, mis-wired or injected (OWASP LLM06 notes approval "may be implemented
+      in a downstream system"). I would combine (a) or (b) for the human decision with (d) as a hard limit, plus
+      an idempotency key on the refund call.
+    rubric:
+      - Distinguishes dynamic interrupts from static breakpoints and says why static ones are for debugging
+      - Notes that a tool or node with an interrupt restarts on resume
+      - Includes a control outside the LLM application
+      - Recommends a combination with reasons tied to the refund's risk
+    hints:
+      - Which of these still protects SandPay if the agent's code is wrong?
+    solution: |
+      See the model answer. The key ideas are defence in depth and that the approval should carry what the reviewer
+      needs to decide.
+    followUp: |
+      How would you decide which refunds skip human review, and what would you log to check the rule later?
+
+  - id: idempotency-key-choice
+    type: mcq
+    concept: replay-safe-side-effects
+    skill: application
+    title: Which idempotency key?
+    prompt: |
+      `issue_refund` calls SandPay with an idempotency key. The thread may be retried after a crash, resumed in
+      another process or replayed. Which key prevents a duplicate refund in all three?
+    options:
+      - id: case
+        text: "f\"refund:{state['case_id']}\" - derived from a value saved before the node runs"
+        feedback: Correct - every attempt computes the same key from durable state.
+      - id: uuid-node
+        text: str(uuid.uuid4()) generated at the start of issue_refund
+        feedback: Each attempt generates a new key, so SandPay sees different requests - the lesson's replay refunded twice this way.
+      - id: uuid-returned
+        text: A uuid4 generated in issue_refund and returned in state, so the retry can reuse it
+        feedback: If the node dies after the refund, it never returns - the key was never checkpointed. The docs warn about exactly this.
+      - id: timestamp
+        text: "f\"refund:{state['case_id']}:{time.time()}\""
+        feedback: The timestamp differs per attempt, so the key does too.
+    correct: [case]
+    hints:
+      - When is the key saved, relative to the side effect?
+    solution: |
+      The key must be reproducible from state that was checkpointed before the side effect. If no business id
+      exists, generate one in a separate earlier node (with sync durability) so it is saved first.
+    followUp: |
+      A reviewer forks the thread and changes the amount from 4999 to 2500 after the refund already went through.
+      What does SandPayGateway do with the same key, and what should the agent do instead?
+
+  - id: lost-ack-response
+    type: mcq
+    concept: replay-safe-side-effects
+    skill: analysis
+    title: Timeout after the refund call
+    prompt: |
+      Logs for case-42: `issue_refund` sent the refund with key `refund:case-42`; the call timed out after
+      30 s; the graph's latest checkpoint has `next = issue_refund` and no `refund` in state. An on-call engineer
+      proposes to "close the case as failed and ask the customer to contact support again". What do you do?
+    options:
+      - id: unknown
+        text: Treat the outcome as unknown - query SandPay for refund:case-42 (or retry with the same key) before telling anyone anything
+        feedback: Correct - the refund may have committed; the same key makes a retry safe, and a status query tells you for sure.
+      - id: failed
+        text: Close as failed - the agent's state has no refund, so none was made
+        feedback: The agent's state only shows that no reply arrived. The fault-tolerance docs - "Treat missing local state as unknown, not as proof the effect did not happen."
+      - id: new-key
+        text: Retry with a new key so SandPay does not reject it as a duplicate
+        feedback: A new key turns a possible duplicate into a certain one if the first refund committed.
+      - id: fork
+        text: Fork from before human_review and ask the reviewer to approve again
+        feedback: The approval was fine; the refund's outcome is the open question. A fresh approval does not answer it.
+    correct: [unknown]
+    hints:
+      - Which system knows whether the money moved?
+    solution: |
+      Check the ledger, not the agent: query SandPay (or resume with `invoke(None)`, which retries with the same key
+      and gets the stored refund back, as the lesson's lost-acknowledgement output shows). Only then update the
+      customer.
+    followUp: |
+      What test would you write to make sure a lost acknowledgement never leads to a second refund?
+
+  - id: hitl-test-design
+    type: testdesign
+    concept: hitl-interrupt-resume
+    skill: application
+    title: Test plan for human-approved refunds
+    prompt: |
+      Design five tests for `build_refund_graph(client, gateway)` with a `ScriptedLLM` and a fake gateway - at least
+      three negative. For each give preconditions, steps, the expected result and the evidence.
+    modelAnswer: |
+      1. **Pauses before acting** - script proposes refunding 4999 on pay_2001 (captured 4999). Invoke with case-42.
+         Expect `__interrupt__` with case id, payment, amount, captured, reason, `error: None`; `next ==
+         "human_review"`. Evidence: result, `gateway.calls == 0`.
+      2. **Approve** - resume `{"action": "approve"}`. Expect status `refunded`, one refund `re_001` of 4999, model
+         called once. Evidence: `gateway.refunds`, `len(llm.calls) == 1`.
+      3. **Invalid edit (negative)** - resume with amount 9000, then "2500", then "yes please". Expect a new pause
+         each time with the exact error message; then a valid 2500 edit refunds 2500. Evidence: payload `error`,
+         ledger.
+      4. **Reject (negative)** - resume reject with a note. Expect `rejected`, the note saved, no gateway call.
+      5. **Resume with nothing pending (negative)** - Command on a new thread, a finished thread, another thread.
+         Expect `NoPendingInterrupt`.
+      6. **Replay and lost acknowledgement (negative)** - replay from before `issue_refund`; separately set
+         `lose_next_ack`. Expect one refund at SandPay in both, same `refund_id` on retry.
+    rubric:
+      - Each test has preconditions, steps, expected result and evidence
+      - Asserts zero gateway calls before approval and on reject
+      - Covers invalid human input and resuming a thread that is not paused
+      - Uses the external ledger, not only the agent's state, as evidence for idempotency
+    hints:
+      - "`gateway.calls`, `gateway.refunds` and `llm.calls` are your evidence."
+    solution: |
+      See the model answer; `tests/agents/test_approval_flow.py` contains these cases.
+    followUp: |
+      Which of these would you also run against a real model, and what would change in the expected results?
+
+  - id: checkpoint-runner-coding
+    type: coding
+    concept: graph-checkpoint-threads
+    skill: application
+    title: A SQLite checkpointer and a resumable runner
+    prompt: |
+      In `checkpoint_runner.py`, implement `SqliteCheckpointer.put`, `get` and `list` (the table is created for
+      you), then `CheckpointRunner.invoke` and `update_state` as their docstrings describe: an input checkpoint plus
+      one per node, deep copies for nodes, resume with `None`, replay from a `checkpoint_id`, `EmptyThreadError`
+      for nothing to continue, and forks that never change the original. The tests crash a run, close the
+      connection and resume from the same file with a new checkpointer.
+    project: ai
+    files:
+      - exercises/agents/checkpoint_runner.py
+    test: tests/agents/test_checkpoint_runner.py
+    command: .venv/bin/python -m pytest tests/agents/test_checkpoint_runner.py
+    hints:
+      - "put: count the thread's rows for the next id (f\"{count + 1:04d}\"), store json.dumps(values, sort_keys=True), commit, return json.loads of what you stored."
+      - "get: ORDER BY checkpoint_id DESC LIMIT 1 when no id is given - zero-padded ids sort correctly as text."
+      - "invoke with input: merge into the latest values; parent = latest id; step = latest step + 1 (0 for a new thread); source input; next = entry."
+      - "The loop runs while checkpoint.next is not None - a finished checkpoint returns at once, which is the 'resume a finished thread' case."
+    modelAnswer: |
+      ```python
+      def invoke(self, input, config):
+          thread_id, checkpoint_id = _thread_of(config)
+          if input is not None:
+              latest = self.checkpointer.get(thread_id)
+              values = {**(latest.values if latest else {}), **input}
+              checkpoint = self.checkpointer.put(
+                  thread_id, latest.checkpoint_id if latest else None,
+                  latest.step + 1 if latest else 0, "input", self.entry, values,
+              )
+          else:
+              checkpoint = self.checkpointer.get(thread_id, checkpoint_id)
+              if checkpoint is None:
+                  raise EmptyThreadError(f"thread {thread_id!r} has no checkpoint {checkpoint_id or '(latest)'}")
+          while checkpoint.next is not None:
+              node = checkpoint.next
+              update = self.nodes[node](copy.deepcopy(checkpoint.values))
+              values = {**checkpoint.values, **(update or {})}
+              checkpoint = self.checkpointer.put(
+                  thread_id, checkpoint.checkpoint_id, checkpoint.step + 1, "loop", self._route(node, values), values
+              )
+          return checkpoint.values
+
+      def update_state(self, config, values):
+          thread_id, checkpoint_id = _thread_of(config)
+          base = self.checkpointer.get(thread_id, checkpoint_id)
+          if base is None:
+              raise EmptyThreadError(...)
+          fork = self.checkpointer.put(thread_id, base.checkpoint_id, base.step + 1, "update", base.next,
+                                       {**base.values, **values})
+          return fork.config
+      ```
+
+      Saving `next` with the values is what makes `invoke(None)` work, and JSON on the way in plus `json.loads` on
+      the way out makes every snapshot an independent copy.
+    rubric:
+      - Every test in test_checkpoint_runner.py passes
+      - Each checkpoint is committed before the next node runs
+      - Saved values can never be changed by a node or by a later run
+      - A replay or fork links to its base checkpoint and leaves the old branch intact
+    solution: |
+      See the model answer. The tests check ids, parents, steps and sources, thread isolation, immutability, a crash
+      and resume through a file, resume of a finished thread, new input on an old thread, replay and fork.
+    followUp: |
+      Add `durability="exit"` to `invoke`: keep the checkpoints in a list and write them only when the run ends.
+      Which test now fails, and why is that the point?
+
+  - id: approval-flow-coding
+    type: coding
+    concept: replay-safe-side-effects
+    skill: application
+    title: Interrupt, resume and an idempotent refund
+    prompt: |
+      In `approval_flow.py`, implement `ApprovalRunner.invoke` (new input, `Command(resume=...)` and `None` with an
+      optional `checkpoint_id`; catch only `GraphInterrupt`), the `human_review` node (approve, edit with
+      validation, reject, ask again on invalid answers) and fix the teammate's `refund_key`, which generates a new
+      `uuid4` on every attempt. The tests replay the refund step and lose an acknowledgement; SandPay must end with
+      one refund each time.
+    project: ai
+    files:
+      - exercises/agents/approval_flow.py
+    test: tests/agents/test_approval_flow.py
+    command: .venv/bin/python -m pytest tests/agents/test_approval_flow.py
+    hints:
+      - "Command: the latest checkpoint must have a non-None interrupt, otherwise raise NoPendingInterrupt."
+      - Give the resume value only to the first node you run; set it back to the sentinel afterwards.
+      - "On GraphInterrupt, save a checkpoint with the same next and the payload, then return the values plus __interrupt__: [payload]."
+      - "refund_key: f\"refund:{state['case_id']}\" - nothing that changes between attempts."
+    modelAnswer: |
+      ```python
+      def invoke(self, input, thread_id, checkpoint_id=None):
+          resume = _NOTHING
+          if isinstance(input, Command):
+              checkpoint = self.get_state(thread_id)
+              if checkpoint is None or checkpoint["interrupt"] is None:
+                  raise NoPendingInterrupt(f"thread {thread_id!r} is not waiting for input")
+              resume = input.resume
+          elif input is None:
+              checkpoint = self.get_state(thread_id, checkpoint_id)
+              if checkpoint is None:
+                  raise KeyError(thread_id)
+          else:
+              latest = self.get_state(thread_id)
+              values = {**(latest["values"] if latest else {}), **input}
+              checkpoint = self._save(thread_id, latest, self.entry, values)
+          while checkpoint["next"] is not None:
+              node, values = checkpoint["next"], checkpoint["values"]
+              ctx, resume = Context(resume), _NOTHING
+              try:
+                  update = self.nodes[node](copy.deepcopy(values), ctx)
+              except GraphInterrupt as paused:
+                  self._save(thread_id, checkpoint, node, values, paused.payload)
+                  return {**copy.deepcopy(values), "__interrupt__": [paused.payload]}
+              values = {**values, **(update or {})}
+              checkpoint = self._save(thread_id, checkpoint, self._route(node, values), values)
+          return copy.deepcopy(checkpoint["values"])
+
+      def refund_key(state):
+          return f"refund:{state['case_id']}"
+      ```
+
+      `human_review` is shown in the lesson's "Approve, edit or reject" section. The gateway call stays in its own
+      node after the review, and its key comes from the case id that was saved before the node ran.
+    rubric:
+      - Every test in test_approval_flow.py passes
+      - No gateway call before approval or after a rejection
+      - Only GraphInterrupt is caught; other errors propagate and save nothing for the node
+      - The idempotency key is derived from durable state
+    solution: |
+      See the model answer. The tests check the pause payload, approve, three invalid answers then a valid edit,
+      reject, resuming threads that are not paused, a model reply with no tool call, the node restart, replay of the
+      refund step, a lost acknowledgement and replay from before the review.
+    followUp: |
+      Add an optional `threshold_minor`: refunds at or below it skip review. Which node changes, and which new tests
+      do you write first?
+
+  - id: interview-hitl
+    type: interview
+    concept: replay-safe-side-effects
+    skill: analysis
+    title: "Interview: the agent refunded twice"
+    prompt: |
+      *"Our LangGraph support agent refunds after a human approves. Last week a merchant's customer got the same
+      refund twice. Deploys happened that day. Walk me through how you would find the cause and what you would
+      change."*
+    hints:
+      - List every way a node can run twice.
+    modelAnswer: |
+      First collect evidence: the thread id, its checkpoint history (`get_state_history`: which nodes, which
+      sources - `loop`, `update` - and parents), the deploy and worker logs around the time, and SandPay's records
+      of both refunds with their idempotency keys.
+
+      Then the candidates, each with a check:
+
+      - **Crash/retry during the refund node** - a deploy killed the worker after SandPay committed; the resumed node
+        ran again. Check whether both refunds carry different keys (key generated inside the node) or none.
+      - **Side effect before an interrupt** - the refund (or anything that triggers it) sat in the review node
+        before `interrupt`, so the resume re-ran it. Look at the node code and whether the two refunds are minutes
+        or hours apart (approval delay).
+      - **Replay or fork** - someone replayed or forked from before the refund to "debug"; the history will show a
+        branch (`update` source, or a second chain from the same parent).
+      - **Two threads for one case** - a new thread id per request created a second run; the history shows two
+        threads with the same case id.
+      - **Lost acknowledgement handled as failure** - a timeout led to a manual or automatic retry with a new key.
+
+      Fixes: the refund in its own node after approval; idempotency key from durable state (`refund:<case_id>`),
+      verified to be honoured by the payment API; thread id = stable case id; `"sync"` durability for this graph;
+      unknown outcomes resolved by querying the provider; replay only in a sandbox. Then regression tests with a
+      fake gateway that replay the refund step and simulate a lost acknowledgement, asserting one refund in the
+      ledger.
+    rubric:
+      - Starts from the checkpoint history and the external ledger, not guesses
+      - Lists at least three distinct ways a node runs twice, with how to tell them apart
+      - Fixes with a key derived from durable state and side effects isolated after approval
+      - Turns the incident into tests that assert on the external ledger
+    followUps:
+      - How do you make a refund safe if the payment API does not support idempotency keys?
+      - Why is a key generated in the refund node and returned in state not enough?
+      - What durability mode would you choose for this graph and what does it cost?
+    solution: |
+      See the model answer. Interviewers listen for at-least-once thinking, evidence from both the checkpoints and
+      the payment provider, and fixes that live in both the graph and the external call.
+
+placement:
+  - id: place-checkpoints
+    type: mcq
+    concept: graph-checkpoint-threads
+    skill: application
+    title: Checkpoints of a two-node graph
+    prompt: |
+      In LangGraph, `START -> node_a -> node_b -> END` is compiled with `InMemorySaver()` and invoked once with
+      `{"configurable": {"thread_id": "1"}}`. According to LangGraph's documentation, how many checkpoints does
+      thread "1" have, and what is the `next` of the newest one?
+    options:
+      - id: four-empty
+        text: 4; next is empty () because the run is complete
+        feedback: Correct - an empty checkpoint, the input, after node_a and after node_b, which has no next nodes.
+      - id: two
+        text: 2 - one per node
+        feedback: The docs list four, including the empty START checkpoint and the input checkpoint.
+      - id: one
+        text: 1 - InMemorySaver only keeps the latest state
+        feedback: Every checkpoint is kept, which is what get_state_history returns.
+      - id: four-end
+        text: 4; next is ("__end__",)
+        feedback: A finished graph has no next nodes - next is the empty tuple ().
+    correct: [four-empty]
+    solution: |
+      The checkpointers page says "there will be exactly 4 checkpoints" and the last has "no next nodes to be
+      executed"; `StateSnapshot.next == ()` means the graph is complete.
+
+  - id: place-replay
+    type: mcq
+    concept: checkpoint-resume-time-travel
+    skill: application
+    title: Continue, replay or fork?
+    prompt: |
+      A worker crashed in the middle of a thread. You want to finish the unfinished work without running the
+      completed nodes again. Which call?
+    options:
+      - id: none-latest
+        text: 'graph.invoke(None, {"configurable": {"thread_id": tid}})'
+        feedback: Correct - loads the latest checkpoint and retries unfinished work.
+      - id: input-again
+        text: 'graph.invoke(original_input, {"configurable": {"thread_id": tid}})'
+        feedback: New input starts again from the entry point, re-running completed nodes.
+      - id: first
+        text: 'graph.invoke(None, history[-1].config) - the oldest checkpoint'
+        feedback: That replays from the beginning; every node runs again.
+      - id: new-thread
+        text: 'graph.invoke(original_input, {"configurable": {"thread_id": new_uuid()}})'
+        feedback: A new thread starts with empty state and loses everything saved.
+    correct: [none-latest]
+    solution: |
+      `invoke(None, config)` without a `checkpoint_id` continues the thread's latest checkpoint; only the node that
+      had not finished runs again.
+
+  - id: place-interrupt
+    type: mcq
+    concept: hitl-interrupt-resume
+    skill: application
+    title: Resuming an interrupt
+    prompt: |
+      A node calls `audit.append("asked")`, then `answer = interrupt("approve?")`, then returns. The thread pauses
+      and is resumed with `Command(resume=True)` on the same thread id. How many "asked" entries are in `audit`,
+      and what does `interrupt` return?
+    options:
+      - id: two-true
+        text: 2 entries; interrupt returns True
+        feedback: Correct - the node restarts from its first line, and the resume value becomes interrupt's return value.
+      - id: one-true
+        text: 1 entry; interrupt returns True
+        feedback: Resume does not continue from the interrupt line - the node runs again from the start.
+      - id: two-command
+        text: 2 entries; interrupt returns the Command object
+        feedback: The value inside Command(resume=...) is returned, not the Command.
+      - id: one-none
+        text: 1 entry; interrupt returns None until the node is run a third time
+        feedback: The answer is delivered on the first resume.
+    correct: [two-true]
+    solution: |
+      LangGraph's docs - "The node restarts from the beginning of the node where the interrupt was called when
+      resumed, so any code before the interrupt runs again", and "The value passed to Command(resume=...) becomes
+      the return value of the interrupt call".
+
+  - id: place-idempotency
+    type: mcq
+    concept: replay-safe-side-effects
+    skill: analysis
+    title: A safe payment node
+    prompt: |
+      A node charges a customer through an API that honours idempotency keys. Which version stays safe if the
+      process dies right after the charge succeeds and the thread is resumed?
+    options:
+      - id: durable
+        text: "Key f\"charge:{state['order_id']}\", where order_id was saved by an earlier node"
+        feedback: Correct - the resumed node computes the same key, and the API deduplicates.
+      - id: generated
+        text: Key str(uuid4()) created in the node and returned in state for next time
+        feedback: The node died before returning, so the key was never saved; the retry generates a different one.
+      - id: flag
+        text: 'No key - the node returns {"charged": True}, and the graph skips the node when charged is set'
+        feedback: The flag is never saved if the node dies after charging, so the retry charges again.
+      - id: try
+        text: No key - wrap the charge in try/except and swallow errors so it never retries
+        feedback: Swallowing errors hides failures and does nothing about a crash after success.
+    correct: [durable]
+    solution: |
+      Only a key reproducible from durable state survives a crash between the side effect and the checkpoint - the
+      rule in LangGraph's fault-tolerance page.
+
+recall:
+  - id: recall-checkpoint
+    concept: graph-checkpoint-threads
+    prompt: What does a checkpoint contain, and what is the thread id for?
+    answer: The state values, the node(s) to run next and the parent checkpoint (plus metadata such as step and source), saved after the input and every step. The thread id is the key that finds a thread's checkpoints again - same id continues the state, new id starts empty.
+  - id: recall-invocations
+    concept: checkpoint-resume-time-travel
+    prompt: Name LangGraph's four ways to invoke a thread that has checkpoints.
+    answer: invoke(input, config) new input from the entry point; invoke(None, config) continue the latest checkpoint after an error; invoke(Command(resume=answer), config) answer an interrupt; invoke(None, snapshot.config) replay from an older checkpoint. update_state(snapshot.config, values) creates a fork to continue.
+  - id: recall-replay
+    concept: checkpoint-resume-time-travel
+    prompt: What runs again during replay, and what does not?
+    answer: Nodes before the checkpoint are not re-run (their results are saved). Every node after it re-executes, including LLM calls, API requests and interrupts. Use get_state / get_state_history to look without running.
+  - id: recall-interrupt
+    concept: hitl-interrupt-resume
+    prompt: What does interrupt() need, and what happens on resume?
+    answer: A checkpointer, a thread id and a JSON-serialisable payload. The runtime saves state and returns the payload under __interrupt__. Command(resume=x) on the same thread restarts the node from its first line, and interrupt returns x.
+  - id: recall-interrupt-rules
+    concept: hitl-interrupt-resume
+    prompt: Give three rules for code around interrupt().
+    answer: Do not wrap it in a bare try/except (it pauses by raising); keep multiple interrupts in a fixed order (answers match by index); make anything before it idempotent or move side effects after it or to another node. Validate answers and loop back with a conditional edge.
+  - id: recall-at-least-once
+    concept: replay-safe-side-effects
+    prompt: Why must side effects in nodes be idempotent, and where must the key come from?
+    answer: Retries, resumes and replays re-run whole nodes - node execution is at-least-once. The idempotency key must be reproducible from state saved before the side effect (e.g. refund:case_id), never generated inside the node; and the receiver must honour it.
+  - id: recall-lost-ack
+    concept: replay-safe-side-effects
+    prompt: The payment call timed out after sending. What do you assume, and what do you do?
+    answer: The outcome is unknown, not failed. Query the provider for the operation's status, or retry with the same idempotency key, before compensating or telling the customer.
+
+next:
+  - multi-agent-systems-crewai
+  - agent-memory-and-context
+  - idempotency-keys
