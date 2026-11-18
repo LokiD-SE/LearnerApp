@@ -194,7 +194,7 @@ course.
       the manifest and icons, every diagram type offline, and the shop staying uncached. The update flow was
       also checked by hand in Chrome (banner, Reload, old cache removed).
 
-## Increment 9 - Track I (full stack) and Track J (AI engineering) (in progress)
+## Increment 9 - Track I (full stack) and Track J (AI engineering) (done)
 
 Goal: two end-to-end courses to the same standard as tracks A-H - every lesson from official sources, cited in
 `environment:`, with runnable practice projects that need no paid API key.
@@ -229,6 +229,30 @@ Goal: two end-to-end courses to the same standard as tracks A-H - every lesson f
       in CI. 96 exercises (ml_foundations, deep_learning, genai, agents, mcp, production).
 - [x] Interview question bank entries for both tracks: 20 Track I questions (`fullstack.yaml`) and 21 Track J
       questions (`ai-engineering.yaml`), with the `ai-engineering` competency.
+
+## Increment 10 - Track K (performance testing) and Track L (security testing) (in progress)
+
+Asked for on 2026-11-18: a performance testing track for JMeter and Locust, and a security testing track. The
+owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberately vulnerable app of our own.
+
+- [x] Outline: Track K (`performance-testing`, 31 lessons, stages 16-18: fundamentals, JMeter, Locust, analysis
+      and capstone) and Track L (`security-testing`, 30 lessons, stages 19-21: foundations, web vulnerabilities,
+      API security, DevSecOps, mobile/payments/reporting and capstone); paths `performance-tester` and
+      `security-tester`.
+- [x] `practice/perf`: Python 3.12 venv with Locust 2.47.0 and pytest; Apache JMeter 5.6.3 downloaded by
+      `scripts/get-jmeter.sh` into `tools/` (gitignored, SHA-512 checked); `support/sandpay_target.py`, a
+      loopback-only practice API with configurable latency, capacity, queueing, errors and rate limits;
+      `support/load_tools.py` runs JMeter (non-GUI) and Locust (headless); `PERF_TARGET=solutions`.
+- [x] `practice/security`: Python 3.12 venv with pytest and requests; `support/sandpay_vuln.py`, a deliberately
+      vulnerable SandPay portal bound to loopback only, with 17 flaws (OWASP Top 10:2021 and API Top 10:2023),
+      each closable with `make_app(fixed=...)`; `tests/support` proves every flaw is present and fixable;
+      `SEC_TARGET=solutions`.
+- [ ] Track K lessons, in batches of about 6. Sources: the Apache JMeter user manual and component reference,
+      the Locust documentation, Little's law, Google SRE books, the USE and RED methods, web.dev.
+- [ ] Track L lessons, in batches of about 6. Sources: OWASP WSTG, ASVS, Top 10:2021, API Security Top 10:2023,
+      MASVS/MASTG, cheat sheets and ZAP docs; PortSwigger Web Security Academy; RFCs (JWT, OAuth); FIRST
+      CVSS v4.0; PCI DSS v4.0.1. ZAP, Burp, Semgrep and similar tools are quoted from their docs, not installed.
+- [ ] Interview question bank entries for both tracks.
 
 ## Next increments
 
