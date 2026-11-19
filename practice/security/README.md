@@ -22,5 +22,13 @@ SEC_TARGET=solutions .venv/bin/python -m pytest                  # every test ag
 .venv/bin/python scripts/verify.py                               # what CI runs
 ```
 
+"Fixed" means that flaw's test passes, not that the portal meets a standard: the fixed headers still send HSTS
+over plain HTTP (RFC 6797 section 7.2 says not to) and the CSP lacks `object-src` and `base-uri` (ASVS 5.0.0
+3.4.3) - the WSTG/ASVS lesson uses both as teaching points.
+
+Two behaviours to expect: `/settings` and `/settings/email` need the cookie session (`sid`), not a bearer
+token; and once `weak-session` is fixed the cookie is `Secure`, so clients such as `requests` will not send it
+back over plain `http://` - send the `Cookie` header yourself when testing the fixed portal.
+
 Seeded accounts (synthetic): `alice@shop-a.example` / `alice-pass-1`, `bob@shop-b.example` / `bob-pass-2`,
 `ops@sandpay.example` / `ops-pass-3` (admin).

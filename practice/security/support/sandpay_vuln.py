@@ -439,7 +439,11 @@ class App:
 
     # ---- CSRF ----------------------------------------------------------------------------------------------
     def settings_page(self, req: Request) -> Response:
-        u = self.current_user(req)
+        # A browser page: it needs the cookie session (bearer-token API clients have no CSRF token or form).
+        sid = req.cookies.get("sid")
+        if not sid or sid not in self.sessions:
+            raise HttpError(401, "sign in with a browser session (cookie sid)")
+        u = self.sessions[sid]
         token_field = f'<input type="hidden" name="csrf" value="{u["csrf"]}">' if self.is_fixed("csrf") else ""
         return Response.html(
             "<!doctype html><title>Settings</title>"

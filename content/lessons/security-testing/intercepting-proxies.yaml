@@ -1,0 +1,1359 @@
+id: intercepting-proxies
+title: Intercepting proxies - OWASP ZAP and Burp Suite
+subject: security-testing
+module: security-foundations
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: How an intercepting proxy sits between your browser and the application, why it can read HTTPS only after you trust its own certificate authority, and how testers use one - record, intercept, change, replay and keep evidence. OWASP ZAP and Burp Suite are described from their official documentation; the practice builds a small recording proxy, a repeater that proves an IDOR against the local SandPay portal (and stays quiet once it is fixed), and a redacted HAR 1.2 evidence file.
+tags:
+  [
+    intercepting proxy,
+    manipulator in the middle,
+    forward proxy,
+    OWASP ZAP,
+    ZAP by Checkmarx,
+    Burp Suite,
+    Burp Proxy,
+    Burp Repeater,
+    Burp Intruder,
+    ZAP Requester,
+    ZAP Fuzzer,
+    breakpoints,
+    scope,
+    contexts,
+    protected mode,
+    root CA certificate,
+    TLS interception,
+    CONNECT,
+    absolute-form,
+    hop-by-hop headers,
+    Via,
+    HAR,
+    evidence,
+    redaction,
+    IDOR,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` (pytest 9.2.0, requests 2.34.2). Every output in
+    this lesson was printed by the code shown, run on Linux on 19 November 2026 against
+    `practice/security/support/sandpay_vuln.py`, the deliberately vulnerable SandPay portal, which listens on
+    `127.0.0.1` only. Timings (milliseconds in the HAR, the `Date` header) differ on every run; the requests,
+    statuses and findings do not.
+  - **Practice proxy, not a product:** `practice/security/solutions/foundations/proxy_recorder.py` is a teaching
+    proxy for plain HTTP on loopback. It does not tunnel or intercept TLS (it answers `CONNECT` with `501`) and
+    forwards only to loopback addresses whatever the scope says.
+  - **OWASP ZAP (ZAP by Checkmarx) - from the docs, not run here** (ZAP is not installed on this machine), as
+    documented on 19 November 2026: [Getting Started](https://www.zaproxy.org/getting-started/), the desktop
+    user guide pages [Quick Start](https://www.zaproxy.org/docs/desktop/addons/quick-start/) (Manual Explore),
+    [History tab](https://www.zaproxy.org/docs/desktop/ui/tabs/history/),
+    [Breakpoints](https://www.zaproxy.org/docs/desktop/start/features/breakpoints/),
+    [Requester](https://www.zaproxy.org/docs/desktop/addons/requester/),
+    [Fuzzing](https://www.zaproxy.org/docs/desktop/addons/fuzzer/),
+    [Contexts](https://www.zaproxy.org/docs/desktop/start/features/contexts/),
+    [Scope](https://www.zaproxy.org/docs/desktop/start/features/scope/),
+    [Modes](https://www.zaproxy.org/docs/desktop/start/features/modes/),
+    [Server Certificates](https://www.zaproxy.org/docs/desktop/addons/network/options/servercertificates/) and
+    [Local Servers/Proxies](https://www.zaproxy.org/docs/desktop/addons/network/options/localservers/).
+    Quotations are from those pages.
+  - **Burp Suite (PortSwigger) - from the docs, not run here** (not installed), as documented on 19 November
+    2026: [Burp Proxy](https://portswigger.net/burp/documentation/desktop/tools/proxy),
+    [Intercepting HTTP traffic](https://portswigger.net/burp/documentation/desktop/getting-started/intercepting-http-traffic),
+    [Burp Repeater](https://portswigger.net/burp/documentation/desktop/tools/repeater),
+    [Burp Intruder](https://portswigger.net/burp/documentation/desktop/tools/intruder),
+    [Target scope](https://portswigger.net/burp/documentation/desktop/tools/target/scope),
+    [Installing Burp's CA certificate](https://portswigger.net/burp/documentation/desktop/external-browser-config/certificate)
+    and the [Community Edition download page](https://portswigger.net/burp/communitydownload) (the Community
+    versus Professional list). Features and editions change; check the pages before relying on a detail.
+  - **Standards:** [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) HTTP Semantics - section 3.7
+    Intermediaries, 7.6.1 Connection, 7.6.3 Via, 9.3.6 CONNECT; [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)
+    HTTP/1.1 - section 3.2.2 absolute-form. HAR: Jan Odvarko, [HAR 1.2
+    Spec](http://www.softwareishard.com/blog/har-12-spec/) (the de facto specification; the [W3C
+    draft](https://w3c.github.io/web-performance/specs/HAR/Overview.html) says it "was never published by the
+    W3C Web Performance Working Group and has been abandoned"). OWASP [Web Security Testing Guide v4.2,
+    Appendix A - Testing Tools
+    Resource](https://owasp.org/www-project-web-security-testing-guide/v42/6-Appendix/A-Testing_Tools_Resource).
+  - **Synthetic data:** SandPay is a fictional payments company. Alice (`alice@shop-a.example`, merchant
+    `m_100`), Bob (merchant `m_200`), their payments and passwords exist only in the practice portal.
+  - **Ethics:** use an intercepting proxy - and especially its active features (fuzzing, scanning, replaying
+    changed requests) - only against systems you own or have written permission to test, inside the agreed
+    scope. ZAP's own guide: "You should only use ZAP to attack an application you have permission to test with
+    an active attack."
+  - **Not repeated here:** the parts of a request and response - [HTTP request and response
+    anatomy](#/lesson/http-request-response-anatomy); cookies and tokens - [Sessions, cookies and
+    tokens](#/lesson/sessions-cookies-and-tokens); the browser's own network tools - [Browser DevTools for
+    testers](#/lesson/browser-devtools-for-testers).
+
+prerequisites:
+  - http-request-response-anatomy
+  - security-testing-fundamentals
+  - http-security-for-testers
+
+concepts:
+  - id: sec-proxy-mitm-mechanics
+    name: How an intercepting proxy sees traffic
+    summary: A forward proxy is chosen by the client and receives every request in absolute-form (GET http://host:port/path). It parses the target, removes hop-by-hop fields (Connection and the fields it names, Proxy-Connection, Keep-Alive, TE, Transfer-Encoding, Upgrade), regenerates Host, adds itself to Via and forwards the request. HTTPS arrives as a CONNECT tunnel the proxy cannot read; an intercepting proxy reads it only by terminating TLS with certificates it signs with its own root CA, which the browser must trust - a deliberate manipulator in the middle that is safe only on your own test browser and machine.
+  - id: sec-proxy-tamper-replay
+    name: Intercept, change, replay - within scope
+    summary: The tester's loop is record (History), pick one request, change exactly one thing (Break to edit in flight, Repeater or Requester to resend, Fuzzer or Intruder for many payloads), and compare the responses. Server-side checks are the only ones that count, so a proxy bypasses client-side validation by design. Scope (ZAP contexts, protected mode) keeps active features on the systems you are allowed to test; a probe must prove the flaw and stay quiet when the control works.
+  - id: sec-proxy-evidence
+    name: Evidence from the proxy
+    summary: A finding is only as good as its evidence - the exact raw request, the response, what was changed and when. Keep the original and the changed exchange side by side, export them (HAR 1.2 is readable by browsers and tools; time equals send + wait + receive; custom fields start with an underscore) and redact credentials, cookies and secrets before the file leaves your machine, because a HAR "can contain privacy & security sensitive data".
+
+objectives:
+  - Explain how a forward proxy receives, rewrites and forwards an HTTP request (absolute-form, Host, hop-by-hop fields, Via) and how CONNECT tunnels HTTPS.
+  - Explain how ZAP and Burp read HTTPS with their own root CA, and why that certificate must stay on a test browser or machine.
+  - Use the record - change one thing - replay - compare loop to test a server-side control, and name the ZAP and Burp features for each step.
+  - Configure scope so active features touch only the systems in the engagement, and justify protected mode.
+  - Write a probe that proves an IDOR with replayed requests and does not report the fixed application.
+  - Export recorded traffic as HAR 1.2 and redact credentials and secrets before sharing it as evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay]
+    title: The idea in plain language
+    body: |
+      Imagine every letter you post goes through a sorting office you set up yourself. The clerk writes down
+      each letter and its reply in a ledger, can hold a letter back so you can change a word before it leaves,
+      and can post a copy of any old letter again - with one detail changed - to see whether the reply is
+      different.
+
+      An **intercepting proxy** is that sorting office for HTTP. Your browser sends its requests to the proxy
+      instead of straight to the website; the proxy records them, lets you pause and edit them, and lets you
+      replay them. **OWASP ZAP** and **Burp Suite** are the two proxies most security testers use.
+
+      Why does this matter so much? Because the browser is under the user's control - and an attacker is a
+      user. Hidden form fields, disabled buttons, dropdowns with three choices and JavaScript validation are
+      suggestions. Whatever the browser can send, an attacker can send differently. The proxy lets you send it
+      differently on purpose, so you test what the **server** actually checks.
+
+      The catch is HTTPS. A sealed envelope can't be read by the sorting office. ZAP and Burp solve this by
+      opening the envelope and sealing it again with **their own seal** - which your browser accepts only
+      because you told it to trust that seal. That is why you do this on a test browser on your own machine,
+      and never install a testing tool's certificate where real users browse.
+
+  - id: what
+    kind: what
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Proxy** (forward proxy) | RFC 9110 3.7: "a message-forwarding agent that is chosen by the client, usually via local configuration rules, to receive requests for some type(s) of absolute URI" |
+      | **Gateway / reverse proxy** | an intermediary chosen by the **server** side (load balancer, CDN); it "acts as an origin server for the outbound connection" - not what a tester runs |
+      | **Intercepting proxy** | a forward proxy built to show, hold, change and resend traffic; ZAP calls itself "a 'manipulator-in-the-middle proxy'" |
+      | **absolute-form** | RFC 9112 3.2.2: a client talking to a proxy "MUST send the target URI in 'absolute-form'" - `GET http://www.example.org/pub/WWW/TheProject.html HTTP/1.1` |
+      | **CONNECT** | RFC 9110 9.3.6: asks the proxy to "establish a tunnel to the destination origin server" and then do "blind forwarding of data, in both directions" - how HTTPS normally crosses a proxy |
+      | **Hop-by-hop fields** | fields meant only for the next connection (`Connection` and the fields it names, `Proxy-Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding`, `Upgrade`); an intermediary removes them before forwarding |
+      | **Via** | RFC 9110 7.6.3: each proxy appends an entry, so the chain of intermediaries is visible |
+      | **Root CA certificate** | the tool's own certificate authority; it signs a certificate for every HTTPS site you visit through the tool |
+      | **History** | the tool's list of every request and response it has seen, in order |
+      | **Break / Intercept** | holding a request (or response) so you can edit it before it continues |
+      | **Repeater / Requester** | resend one request, edited by hand, as often as you like (Burp / ZAP names) |
+      | **Fuzzer / Intruder** | send one request many times with payloads inserted at chosen positions (ZAP / Burp names) |
+      | **Context / scope** | ZAP: a context relates "a set of URLs together"; the scope is "the set of URLs you are testing" |
+      | **HAR** | HTTP Archive, a JSON format for recorded requests and responses; version 1.2 is the one tools exchange |
+
+  - id: why
+    kind: why
+    concepts: [sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Why testers work through a proxy
+    body: |
+      **Client-side controls are not security controls.** ZAP's breakpoint page states the purpose directly: a
+      breakpoint lets you change a request "before it is submitted to the web application you are testing",
+      which "allows you to change disabled or hidden fields, and will allow you to bypass client side
+      validation (often enforced using javascript)". If the server trusts a hidden `price` field, a
+      `role=merchant` dropdown or a payment id that the UI only ever shows to its owner, the proxy finds out in
+      one edited request.
+
+      **APIs have no UI to stop you.** A single-page app or a mobile app talks to an API; the proxy shows you the
+      API calls the screens make, including ones you would never find by clicking - and every parameter in
+      them.
+
+      **Repeatable evidence.** A screenshot of a page proves little. "Request 3 in the history, replayed with
+      `pay_2001` instead of `pay_1001`, returned Bob's payment with status 200" is a finding a developer can
+      reproduce in a minute. Burp's tutorial puts the habit simply: in the HTTP history "you can see the history
+      of all HTTP traffic that has passed through Burp Proxy, even while intercept was switched off" - so you
+      can browse normally and study the exchanges afterwards.
+
+      **Passive findings for free.** ZAP's guide notes that "ZAP will passively scan all of the requests and
+      responses proxied through it", which "does not change responses in any way and is considered safe" - so
+      missing security headers, cookie flags and information leaks show up while you explore.
+
+      What it is **not**: a proxy does not find vulnerabilities by itself (scanners are covered in [DAST with
+      OWASP ZAP](#/lesson/dast-with-owasp-zap)), and it gives no permission to test anything - the engagement's
+      written scope does.
+
+  - id: internals-forwarding
+    kind: internals
+    concepts: [sec-proxy-mitm-mechanics]
+    title: What a proxy does with one request
+    body: |
+      With a proxy configured, the browser no longer sends `GET /api/payments/pay_1001` to the portal. It
+      connects to the proxy and sends the **whole URL** in the request line (RFC 9112 3.2.2, absolute-form):
+
+      ```http
+      GET http://127.0.0.1:8765/api/payments/pay_1001 HTTP/1.1
+      Host: 127.0.0.1:8765
+      Proxy-Connection: keep-alive
+      Authorization: Bearer eyJhbGciOi...
+      ```
+
+      The proxy then follows the rules every HTTP intermediary follows:
+
+      1. **Parse the target** from the request line: scheme, host, port (80 if absent), path and query.
+      2. **Check it** - a testing proxy checks the target against the scope before it does anything active.
+      3. **Rewrite Host.** "When a proxy receives a request with an absolute-form of request-target, the proxy
+         MUST ignore the received Host header field (if any) and instead replace it with the host information
+         of the request-target."
+      4. **Drop hop-by-hop fields.** RFC 9110 7.6.1: intermediaries "MUST parse a received Connection header
+         field before a message is forwarded and, for each connection-option in this field, remove any header
+         or trailer field(s) from the message with the same name", then remove `Connection` itself; they
+         "SHOULD remove or replace" `Proxy-Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding` and `Upgrade`.
+      5. **Add Via.** "Each intermediary appends its own information about how the message was received."
+      6. **Forward** the request in origin-form (`GET /api/payments/pay_1001`) to the server, read the response,
+         **record the pair**, and relay the response to the browser.
+
+      The practice proxy in this lesson does exactly these six steps. Its own rewrite of the request above,
+      printed by `parse_target` and `clean_headers`:
+
+      ```plaintext
+      Target(method='GET', scheme='http', host='127.0.0.1', port=8765, path='/api/payments/pay_1001', version='HTTP/1.1')
+         ('Host', '127.0.0.1:8765')
+         ('Authorization', 'Bearer eyJ...')
+         ('Accept', '*/*')
+         ('Via', '1.1 sandpay-recorder')
+      ```
+
+      (Input: `Host`, `Proxy-Connection: keep-alive`, `Connection: keep-alive`, `Authorization`, `Accept`.)
+      `Proxy-Connection` and `Connection` are gone, `Host` was regenerated from the target and `Via` was
+      appended. The `Authorization` header passes through untouched - the proxy sees your credentials, which is
+      one more reason its history and exports are sensitive.
+
+  - id: internals-tls
+    kind: internals
+    concepts: [sec-proxy-mitm-mechanics]
+    title: HTTPS - CONNECT, and why the tool's CA is the whole trick
+    body: |
+      For an `https://` URL the browser cannot send the request through a plain proxy, because the proxy would
+      see it. Instead it asks for a tunnel (RFC 9110 9.3.6):
+
+      ```http
+      CONNECT server.example.com:443 HTTP/1.1
+      Host: server.example.com:443
+      ```
+
+      After a `2xx`, the proxy does "blind forwarding of data, in both directions" - TLS runs end to end and the
+      proxy sees only encrypted bytes. (Note "There is no default port": the port is always in a CONNECT.)
+
+      An **intercepting** proxy answers the CONNECT itself and then **plays the server**: it completes the TLS
+      handshake with the browser using a certificate for `server.example.com` that it created on the spot, and
+      opens its own TLS connection to the real server. ZAP's Server Certificates page describes it: "every data
+      send to and received from the server is encrypted/decrypted by using the original server's certificate
+      inside ZAP. This way, ZAP knows the plain text. To establish a SSL protected session from you (your
+      browser), ZAP is using its own certificate."
+
+      A browser rejects such certificates - unless it trusts whoever signed them. So both tools generate a
+      **root CA certificate** on first start and ask you to trust it: "Every certificate created by ZAP is in the
+      direct chain of trust from the 'ZAP Root CA' certificate ... once you've added the ZAP Root CA
+      certificate to your list of trusted Root CAs, your browser doesn't recognize the man in the middle."
+
+      That last sentence is the risk. PortSwigger spells it out: "If you install a trusted root certificate in
+      your browser, then an attacker who has the private key for that certificate may be able to
+      man-in-the-middle your TLS connections without obvious detection, even when you are not using an
+      intercepting proxy. To protect against this, Burp generates a unique CA certificate for each
+      installation, and the private key for this certificate is stored on your computer, in a user-specific
+      location." Hence the rules:
+
+      - Prefer the **tool's own browser**, which needs no system-wide trust: ZAP's Manual Explore launches
+        browsers that "will be configured to proxy via ZAP and will ignore certificate errors, so you will not
+        need to import the ZAP Root CA Certificate"; Burp's browser is "preconfigured to work with Burp Proxy".
+      - If you must import the CA, import it into a **separate test browser profile**, never your everyday
+        browser, and never on a shared or production machine. Remove it when the engagement ends.
+      - Never copy the CA's private key anywhere.
+
+      Mobile apps add their own obstacles - which certificate authorities the platform and the app trust, and
+      certificate pinning - covered in [Mobile app security testing](#/lesson/mobile-app-security-testing).
+
+  - id: when
+    kind: when
+    concepts: [sec-proxy-tamper-replay]
+    title: When to reach for which feature
+    body: |
+      | You want to ... | ZAP (from the docs) | Burp Suite (from the docs) | In this lesson's practice |
+      | --- | --- | --- | --- |
+      | browse with every exchange recorded | Manual Explore, History tab | Proxy > HTTP history | `RecordingProxy.history` |
+      | change a request in flight | Breakpoints, Break tab | Proxy > Intercept | - (edit the replay instead) |
+      | resend one request with edits | Requester add-on ("manually edit and send messages") | Repeater ("modify and send an interesting HTTP or WebSocket message over and over") | `proxy_repeater.send`, `with_path_segment` |
+      | send many payloads into one position | Fuzzer ("submitting lots of data to a target") | Intruder ("inserting different payloads into predefined positions each time") | later lessons |
+      | keep testing on the agreed systems only | Contexts + Scope + Protected mode | Target > Scope (with "log or intercept in-scope requests only") | `in_scope` |
+      | hand over evidence | save session, reports | save project (Professional) | HAR 1.2 export with `redact` |
+
+      **Use the browser's DevTools** instead when you only need to **look** at traffic you generate yourself -
+      it is already there and changes nothing. Use a proxy when you need to **change, replay or record** it, or
+      when the client is not a browser (a mobile app, a desktop app, an API client).
+
+      **Don't use active features out of scope.** ZAP's modes make this concrete: in **Protected** mode "you can
+      only perform (potentially) dangerous actions on URLs in the scope", and the actions it blocks out of scope
+      include "Spidering, Active Scanning, Fuzzing, Force Browsing, Breaking (intercepting), Resending
+      requests". "By default nothing is in scope", so you add the target's context first. ZAP recommends
+      Protected mode "to ensure that you only attack sites that you mean to".
+
+      **Editions matter for Burp.** The Community Edition page lists "HTTP(s) / WebSockets proxy and history",
+      "Repeater, Decoder, Sequencer, and Comparer" and "Burp Intruder (demo)"; "Burp Intruder - full version",
+      the web vulnerability scanner and saving project files are Professional features. ZAP is free and open
+      source; its guide notes it "requires Java 17+" outside the macOS installer and Docker images.
+
+  - id: visual
+    kind: visual
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay]
+    title: One request through the proxy, then a replay
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant B as Test browser
+        participant P as Intercepting proxy
+        participant S as SandPay portal
+        B->>P: GET absolute URI, Bearer token of Alice
+        Note over P: check scope, rewrite Host, drop hop-by-hop, add Via
+        P->>S: GET /api/payments/pay_1001
+        S-->>P: 200, payment of merchant m_100
+        Note over P: record the exchange in History
+        P-->>B: 200, relayed unchanged
+        Note over P: tester replays request 3 with pay_2001
+        P->>S: GET /api/payments/pay_2001, same token
+        S-->>P: 200, payment of merchant m_200
+        Note over P: diff the two responses and keep both as evidence
+      ```
+
+      Notice that the replay needs **no browser at all** and **no new login**: the recorded request already
+      carries Alice's credentials. Changing one path segment is the whole test - and the diff is the evidence.
+
+  - id: code-tools
+    kind: code
+    concepts: [sec-proxy-tamper-replay]
+    title: The same loop in ZAP and Burp (from the docs, not run here)
+    collapsed: true
+    body: |
+      **ZAP**, following its Getting Started guide and desktop user guide:
+
+      1. Start ZAP; choose whether to persist the session ("By default, ZAP sessions are always recorded to disk
+         in a HSQLDB database").
+      2. Switch the mode to **Protected** and create a **context** for the target ("Contexts are defined as a
+         set of regular expressions ... applied to all of the URLs in the Sites Tree. Note: The regular
+         expressions must match the whole URL"), then include it in scope.
+      3. **Quick Start > Manual Explore**: enter the URL and press **Launch Browser**. Explore every feature by
+         hand - "Spiders ... will only enter basic default data into forms in your web application but a user
+         can enter more relevant information".
+      4. Read the **History** tab: for each request, "The request index", method, URL, response code, the time
+         the request took, alerts, notes and tags.
+      5. To change a request in flight, set a breakpoint ("a 'global' breakpoint on requests or responses using
+         the buttons on the top level toolbar", or "Break..." on a History entry for specific criteria).
+      6. To resend with edits, open the request in **Requester**; to send many payloads, right-click it and
+         choose **Attack / Fuzz...**.
+
+      **Burp Suite**, following its "Intercepting HTTP traffic" tutorial:
+
+      1. Go to **Proxy > Intercept** and click **Open Browser** - Burp's browser "is preconfigured to work with
+         Burp right out of the box".
+      2. With intercept on, a request "is held here so that you can study it, and even modify it, before
+         forwarding it to the target server"; click **Forward** to send it.
+      3. Because browsers send many requests, "you often won't want to intercept every single one of them" -
+         set **Intercept off** and browse; everything still lands in **Proxy > HTTP history**, where you can
+         "view the raw HTTP request, along with the corresponding response".
+      4. Send an interesting request to **Repeater** to edit and resend it, or to **Intruder** to insert payloads
+         at marked positions (a demo in Community Edition).
+
+      PortSwigger's advice applies to both tools: "Until you are fully familiar with its functionality and
+      settings, you should only use Burp Proxy against non-production systems."
+
+  - id: code-practice
+    kind: code
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: The practice tools - record, replay, export
+    body: |
+      The practice project has a minimal recording proxy, a repeater and a HAR exporter
+      (`practice/security/solutions/foundations/proxy_*.py`). This run starts the vulnerable portal on port
+      8765, browses through the proxy as Alice, replays request 3 with Bob's payment id, and then does the same
+      against the portal with the `idor` flaw fixed:
+
+      ```python
+      with serve(make_app(), port=8765) as base, run_proxy(["127.0.0.1:8765"]) as proxy:
+          token = login_through(proxy, base)                        # POST /api/login
+          via(proxy, "GET", base + "/api/payments", auth(token))
+          via(proxy, "GET", base + "/api/payments/pay_1001", auth(token))
+          via(proxy, "GET", "http://127.0.0.1:9/health")            # not in scope
+          x = proxy.history[2]                                       # request 3, as recorded
+          raw = f"{x.method} /api/payments/pay_1001 HTTP/1.1\n" + "".join(f"{n}: {v}\n" for n, v in x.request_headers) + "\n"
+          finding = probe_idor(parse_raw_request(raw), "pay_1001", "pay_2001")
+      ```
+
+      Output against the **vulnerable** portal:
+
+      ```plaintext
+       # method status url
+       1 POST   200    http://127.0.0.1:8765/api/login
+       2 GET    200    http://127.0.0.1:8765/api/payments
+       3 GET    200    http://127.0.0.1:8765/api/payments/pay_1001
+      out-of-scope request status: 403
+      probe_idor -> IDOR: pay_2001 readable by the owner of pay_1001
+         json amount_minor: 2500 -> 4999
+         json card_last4: '4242' -> '1881'
+         json id: 'pay_1001' -> 'pay_2001'
+         json merchant_id: 'm_100' -> 'm_200'
+      ```
+
+      And against `make_app({"idor"})`, the same steps:
+
+      ```plaintext
+      probe_idor -> None
+         ['status 200 -> 404', 'json amount_minor: removed', 'json card_last4: removed', 'json currency: removed', "json error: added 'payment not found'", 'json id: removed', 'json merchant_id: removed', 'json status: removed']
+      ```
+
+      The out-of-scope request never reached anything and is not in the history. The fixed portal answers `404
+      payment not found` - the same answer as for an id that does not exist, so it does not even confirm that
+      `pay_2001` exists.
+
+      The raw login exchange as the proxy recorded it (the session id is shown because this is a local
+      practice run; in evidence it is redacted):
+
+      ```http
+      POST http://127.0.0.1:8765/api/login HTTP/1.1
+      Host: 127.0.0.1:8765
+      Accept-Encoding: identity
+      Content-Length: 61
+      Content-Type: application/json
+      Via: 1.1 sandpay-recorder
+
+      HTTP/1.1 200 OK
+      Server: SandPayPortal/0.9 Python/3.12
+      Date: Thu, 19 Nov 2026 05:15:48 GMT
+      Content-Type: application/json
+      Set-Cookie: sid=94yNJmlUz-RKkbFdBuRbZsxKuW_hJRLp; Path=/
+      Content-Length: 209
+      ```
+
+      Two more findings are visible without sending anything unusual: the `Server` header discloses the stack
+      and versions, and the session cookie has no `HttpOnly`, `Secure` or `SameSite` attribute. That is the
+      passive-scanning value of simply browsing through a proxy.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay]
+    title: Why the important lines are written that way
+    body: |
+      From `clean_headers` (the recorder):
+
+      ```python
+      named = set()
+      for name, value in headers:
+          if name.lower() == "connection":
+              named.update(opt.strip().lower() for opt in value.split(",") if opt.strip())
+      drop = named | set(HOP_BY_HOP)
+      ```
+
+      - The `Connection` field can **name** other fields as hop-by-hop (`Connection: keep-alive, X-Debug-Trace`),
+        so it is parsed first; RFC 9110 says the intermediary MUST remove fields with those names. Header names
+        are case-insensitive, hence `.lower()` everywhere.
+
+      ```python
+      host_value = target.host if target.port == 80 else f"{target.host}:{target.port}"
+      ```
+
+      - `Host` comes from the **request line**, not from the received `Host` header - a client could send a
+        different one, and RFC 9112 says the proxy "MUST generate a new Host field value based on the received
+        request-target". Port 80 is the default for `http`, so it is left out.
+
+      ```python
+      if lower == "via" and not via_done:
+          out.append((name, f"{value}, {via_member}"))
+      ```
+
+      - An existing `Via` (another proxy, such as a corporate gateway) is **extended**, not replaced: each
+        intermediary appends itself, so the whole chain stays visible.
+
+      From `probe_idor` (the repeater):
+
+      ```python
+      if not 200 <= original.status < 300 or not isinstance(oj, dict) or owner_field not in oj:
+          raise ValueError(...)
+      ```
+
+      - If the **original** request fails (expired token, wrong id), a failing replay proves nothing - the probe
+        refuses to judge instead of reporting "no IDOR".
+
+      ```python
+      if 200 <= replayed.status < 300 and isinstance(rj, dict) and rj.get(owner_field) != oj[owner_field]:
+          return Finding(...)
+      return None
+      ```
+
+      - A finding needs **someone else's object**: success alone is not enough (the other id might also be the
+        caller's), and a `403` or `404` is the control working. This is what keeps the probe quiet on the fixed
+        portal - no false positive.
+
+      From `in_scope`:
+
+      ```python
+      if e_host.lower() == host and (e_port == "*" or e_port == str(port)):
+      ```
+
+      - Whole-host equality, not `startswith` or `in`: `127.0.0.10` is not `127.0.0.1`, and
+        `evil-shop.example` is not `shop.example`. A sloppy scope check is how testers end up sending attack
+        traffic to someone else's system.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Setting up a proxy for an engagement, step by step
+    body: |
+      1. **Read the scope** in the written authorisation: hosts, ports, environments, accounts, allowed tests and
+         testing windows. No scope, no testing.
+      2. **Use a dedicated test browser** (the tool's own browser, or a separate profile). Trust the tool's CA only
+         there, if at all.
+      3. **Configure scope in the tool first**: a context per application in scope and Protected mode (ZAP), or
+         Target > Scope and in-scope-only proxy logging (Burp). Exclude third-party hosts (analytics, payment provider pages) unless they
+         are explicitly in scope.
+      4. **Get test accounts** for every role you need (two users of the same role for IDOR, plus an admin), all
+         provided by the client - never real users' accounts.
+      5. **Explore by hand** with intercept off. Use every feature, every form, every role. Add notes or tags to
+         interesting requests as you go.
+      6. **Pick one request and change one thing** at a time in Repeater/Requester: an id, a role field, a hidden
+         field, a header. Compare each response with the original.
+      7. **Confirm** a suspected flaw with a second, minimal reproduction (another object, another account) and
+         check the opposite case (the control working) so you are not fooled by a coincidence.
+      8. **Save the evidence**: original and changed requests and responses, timestamps, account used. Export,
+         then **redact** credentials, cookies and secrets before the file leaves your machine.
+      9. **Clean up**: stop the proxy, remove the CA from the test browser if you imported it, delete stored
+         sessions per the engagement's data-handling rules.
+
+  - id: example
+    kind: example
+    concepts: [sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: 'Example: the payment that belonged to someone else'
+    body: |
+      SandPay asks you to test the merchant portal before release. Scope: `portal.sandpay.example` in the
+      staging environment, two merchant test accounts and one admin.
+
+      Browsing as Merchant A with the proxy recording, you open a payment. History shows
+      `GET /api/payments/pay_1001` with A's bearer token. In Repeater you change `pay_1001` to an id you saw in
+      Merchant B's account, `pay_2001`, and send. Status `200`, and the body has `merchant_id: m_200` and B's
+      amount and card's last four digits.
+
+      Before reporting, you confirm:
+
+      - the original request returns A's own payment (so the token works and the endpoint is right);
+      - a second id of B's also comes back (not a one-off);
+      - B's own token returns the same object (it really is B's), and an id that does not exist returns `404`;
+      - nothing else changed between the two requests - one path segment only.
+
+      The finding: **broken object-level authorisation on `GET /api/payments/{id}`** - any merchant can read any
+      payment by id. Evidence: the two raw exchanges side by side, the diff, the accounts and the time, exported
+      as HAR with tokens and cookies redacted. Severity is a later lesson ([Reporting vulnerabilities and scoring
+      with CVSS](#/lesson/vulnerability-reporting-and-cvss)); the test itself is covered in depth in [Testing
+      access control and IDOR](#/lesson/testing-access-control-idor).
+
+      What a tester also checks here: does the **list** endpoint leak B's payments with a filter? Does the
+      **refund** endpoint accept B's id? Read-only leaks often have write-side twins.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Checks for your proxy setup and your probes
+    body: |
+      | Check | Expected result | Evidence |
+      | --- | --- | --- |
+      | request to an in-scope host through the proxy | relayed unchanged, recorded in history | history row with method, URL, status |
+      | request to an out-of-scope host | refused (practice proxy: `403`), **not** recorded | status, empty history |
+      | `CONNECT` to the practice proxy | `501` - it does not intercept TLS | status |
+      | origin-form request line sent to the proxy | `400` - a proxy needs the absolute URI | status |
+      | hop-by-hop fields from the browser | not forwarded; `Host` regenerated; `Via` appended | the forwarded headers in the record |
+      | IDOR probe, vulnerable portal | finding with the owner field changed | both replies and the diff |
+      | IDOR probe, portal with `idor` fixed | no finding | the `404` reply |
+      | IDOR probe, other id belongs to the same merchant | no finding | both replies have `m_100` |
+      | IDOR probe, original request fails | the probe refuses to judge | `ValueError` |
+      | HAR export | `version` `1.2`, entries oldest first, `time` = send + wait + receive | the JSON |
+      | redacted HAR | no password, token, cookie or secret values left; URLs, statuses and cookie flags kept | search the file for each secret |
+
+      The last two rows matter for every engagement: run a search for each credential you used over the file
+      you are about to send, and expect zero hits.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Common mistakes and a debugging method
+    body: |
+      **Mistakes:**
+
+      - **Trusting the tool's CA in your everyday browser** or on a shared machine. Anyone with the private key
+        can read your TLS traffic without a warning. Use the tool's browser or a separate profile, and remove
+        the CA afterwards.
+      - **No scope configured**, so the spider, fuzzer or scanner follows a link to a third-party site (an
+        analytics domain, a payment provider) and attacks it. Set the scope and Protected mode **first**.
+      - **Changing several things at once** in a replay. When the response changes you can't say why. One change
+        per request; keep the original for comparison.
+      - **Reporting an IDOR from a single 200.** The other id might be the caller's own object, or a public one.
+        Check the owner field, and check the fixed case.
+      - **Treating "not found" as "not vulnerable"** without checking that the original request still works -
+        tokens expire mid-session and every replay then fails for an unrelated reason.
+      - **Sharing raw exports.** HAR files and proxy sessions hold passwords, tokens and cookies. Redact first,
+        and search the redacted file for each secret.
+      - **Forgetting the proxy is a client too**: proxies can add or change headers (`Via`, `Accept-Encoding`)
+        and connection behaviour. If something works through the proxy but not without it (or the other way
+        round), compare the raw requests.
+
+      **Debugging method when traffic does not show up or breaks:**
+
+      1. **Is the client using the proxy?** Check the client's proxy settings (or use the tool's browser), and
+         its proxy bypass list - clients can be configured, or built, to skip the proxy for some hosts, local
+         addresses among them.
+      2. **HTTPS errors?** The certificate is the tool's: either trust its CA in the test browser or use the
+         tool's browser. Apps with certificate pinning reject it by design.
+      3. **Out of scope?** In Protected mode, ZAP blocks intercepting and resending out of scope - check the
+         context.
+      4. **Look at the raw request in history**, not the browser's view of it. The difference between what you
+         think you sent and what was sent is usually the bug.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay]
+    title: Trade-offs and alternatives
+    body: |
+      | Option | Strengths | Limits |
+      | --- | --- | --- |
+      | ZAP | free, open source, scanners and fuzzer included, scriptable, automation framework and Docker images | Java 17+ desktop app; many features to learn |
+      | Burp Suite Community | widely used manual workflow, Repeater, Decoder, Comparer, built-in browser | Intruder is a demo; no scanner and no project files (Professional) |
+      | Burp Suite Professional | full Intruder, scanner, project files, extensions | paid licence |
+      | Browser DevTools | already installed, zero setup, great for looking | cannot hold or replay with edits as conveniently; browser only |
+      | A script (requests, curl, this lesson's repeater) | exact, repeatable, can become a regression test | no live view; you must know which request to script |
+
+      The usual answer is **both**: explore and discover with a proxy, then turn each confirmed finding into a
+      small script or test that proves it and keeps proving it after the fix (see [Automating security
+      regression tests](#/lesson/security-regression-automation)).
+
+      Intercepting TLS also changes what you test: the proxy's TLS handshake with the browser is not the real
+      server's, so TLS configuration itself (versions, ciphers, certificate) must be tested **without** the
+      proxy - see [Testing cryptography and sensitive data
+      exposure](#/lesson/testing-cryptography-and-data-exposure).
+
+  - id: summary
+    kind: summary
+    concepts: [sec-proxy-mitm-mechanics, sec-proxy-tamper-replay, sec-proxy-evidence]
+    title: Quick reference
+    body: |
+      - A forward proxy receives absolute-form requests, regenerates `Host`, drops hop-by-hop fields
+        (`Connection` and what it names, `Proxy-Connection`, `Keep-Alive`, `TE`, `Transfer-Encoding`,
+        `Upgrade`), appends `Via`, forwards and records.
+      - HTTPS crosses a proxy as a `CONNECT` tunnel; ZAP and Burp read it only by signing their own certificates
+        with a root CA your browser trusts. Keep that trust on a test browser; remove it afterwards.
+      - Loop: record - pick one request - change one thing - replay - compare. ZAP: History, Break, Requester,
+        Fuzzer. Burp: HTTP history, Intercept, Repeater, Intruder (demo in Community).
+      - Configure scope first; ZAP Protected mode blocks dangerous actions outside it. Test only with written
+        permission.
+      - A probe proves the flaw **and** stays quiet when the control works; check the original request too.
+      - Evidence = raw original + changed exchange, diff, account, time. HAR 1.2; redact secrets before sharing.
+
+exercises:
+  - id: absolute-form-mcq
+    type: mcq
+    concept: sec-proxy-mitm-mechanics
+    skill: recall
+    title: What the proxy receives
+    prompt: |
+      Your browser is configured to use a proxy on `127.0.0.1:8080` and you open
+      `http://127.0.0.1:8765/api/me`. What request line does the proxy receive?
+    options:
+      - id: absolute
+        text: '`GET http://127.0.0.1:8765/api/me HTTP/1.1`'
+        feedback: Correct - RFC 9112 3.2.2 requires the absolute-form when talking to a proxy, so the proxy knows where to forward.
+      - id: origin
+        text: '`GET /api/me HTTP/1.1` with `Host: 127.0.0.1:8765`'
+        feedback: That is origin-form, what the browser sends to the server directly. A proxy needs the whole URI in the request line.
+      - id: connect
+        text: '`CONNECT 127.0.0.1:8765 HTTP/1.1`'
+        feedback: CONNECT asks for a tunnel - used for https URLs, not plain http.
+      - id: proxyhost
+        text: '`GET /api/me HTTP/1.1` with `Host: 127.0.0.1:8080`'
+        feedback: The Host names the target, never the proxy - and the request line would not say where to go.
+    correct: [absolute]
+    hints:
+      - The proxy has to know which server you want.
+      - RFC 9112 calls the form "absolute-form".
+    solution: |
+      A client talking to a proxy "MUST send the target URI in 'absolute-form'" (RFC 9112 3.2.2). The proxy then
+      forwards in origin-form to the server.
+
+  - id: hop-by-hop-mcq
+    type: mcq
+    concept: sec-proxy-mitm-mechanics
+    skill: application
+    title: Which header does not reach the server?
+    prompt: |
+      The browser sends these fields to the proxy:
+
+      ```http
+      Connection: keep-alive, X-Client-Trace
+      X-Client-Trace: 7
+      Authorization: Bearer eyJ...
+      Accept: application/json
+      ```
+
+      Following RFC 9110 7.6.1, which of them does the proxy forward?
+    options:
+      - id: auth-accept
+        text: Authorization and Accept only (plus the Host and Via the proxy sets)
+        feedback: Correct - Connection is hop-by-hop, and it names X-Client-Trace as hop-by-hop too.
+      - id: all-but-connection
+        text: Everything except Connection
+        feedback: Connection lists X-Client-Trace as a connection option, so that field must be removed as well.
+      - id: all
+        text: All four, unchanged
+        feedback: Intermediaries MUST parse Connection and remove the fields it names, then Connection itself.
+      - id: accept-only
+        text: Accept only - a proxy strips credentials
+        feedback: Authorization is end-to-end; a forward proxy passes it on. (That is also why the proxy's history contains your credentials.)
+    correct: [auth-accept]
+    hints:
+      - What does listing a field name in Connection mean?
+    solution: |
+      Remove every field named in Connection, then Connection itself (and the known hop-by-hop fields).
+      Authorization and Accept are end-to-end.
+
+  - id: tls-ca-mcq
+    type: mcq
+    concept: sec-proxy-mitm-mechanics
+    skill: recall
+    title: How ZAP reads HTTPS
+    prompt: How does an intercepting proxy such as ZAP read the content of HTTPS requests from your browser?
+    options:
+      - id: own-ca
+        text: It terminates TLS with a certificate for the site that it signs with its own root CA, which your browser trusts, and opens its own TLS connection to the server
+        feedback: Correct - a deliberate manipulator in the middle that works only because you trust the tool's CA.
+      - id: server-key
+        text: It uses the server's private key
+        feedback: The tool never has the server's key. It presents its own certificate instead.
+      - id: connect-read
+        text: It reads the bytes inside the CONNECT tunnel
+        feedback: A CONNECT tunnel carries end-to-end TLS; the bytes are encrypted.
+      - id: downgrade
+        text: It downgrades the connection to plain HTTP
+        feedback: Neither ZAP nor Burp works that way; the browser still sees HTTPS - with the tool's certificate.
+    correct: [own-ca]
+    hints:
+      - Why do you have to import or trust something before HTTPS works through the tool?
+    solution: |
+      ZAP: "To establish a SSL protected session from you (your browser), ZAP is using its own certificate", all
+      "in the direct chain of trust from the 'ZAP Root CA' certificate".
+
+  - id: ca-risk-mcq
+    type: mcq
+    concept: sec-proxy-mitm-mechanics
+    skill: analysis
+    title: The shared laptop
+    prompt: |
+      A colleague wants to import the Burp CA certificate into the system trust store of the team's shared
+      laptop, which is also used for email and banking, "so every browser works with Burp". What is the risk?
+    options:
+      - id: key-mitm
+        text: Anyone who gets that CA's private key from the laptop could intercept all TLS on it without a warning, even with Burp closed
+        feedback: Correct - PortSwigger warns exactly this; trust the CA only in a dedicated test browser.
+      - id: slow
+        text: Browsing becomes slower
+        feedback: Performance is not the issue - trust is.
+      - id: none
+        text: None - the certificate is only used while Burp is running
+        feedback: Trust stays in the store whether Burp runs or not; whoever holds the key can use it.
+      - id: licence
+        text: It breaks the Burp licence
+        feedback: The documentation's concern is interception by an attacker, not licensing.
+    correct: [key-mitm]
+    hints:
+      - What can the holder of a trusted root CA's private key do?
+    solution: |
+      A trusted root's private key lets its holder "man-in-the-middle your TLS connections without obvious
+      detection, even when you are not using an intercepting proxy". Use the tool's browser or a separate
+      profile.
+
+  - id: client-validation-mcq
+    type: mcq
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: The read-only amount
+    prompt: |
+      The refund form shows the refundable amount in a read-only field, and JavaScript blocks submitting a larger
+      value. What does a proxy-based test do?
+    options:
+      - id: edit-request
+        text: Submit the form, hold or replay the request, raise the amount in the request and check that the server rejects it
+        feedback: Correct - only the server's check counts; the proxy sends what the UI won't.
+      - id: trust-ui
+        text: Nothing - the field is read-only, so the amount cannot change
+        feedback: Read-only and JavaScript checks exist only in the browser. ZAP's docs name bypassing client side validation as the purpose of breakpoints.
+      - id: devtools-only
+        text: Remove the readonly attribute in DevTools and resubmit, then close the bug as "UI issue"
+        feedback: Editing the DOM can work, but the finding is about the server accepting the value, not the UI.
+      - id: scanner
+        text: Run an active scan and wait for an alert
+        feedback: A scanner does not know the business rule "refund at most the captured amount".
+    correct: [edit-request]
+    hints:
+      - Who enforces the rule - the browser or the server?
+    solution: |
+      Breakpoints "allow you to bypass client side validation". Change the amount in the request and expect a
+      server-side rejection (for example `422`) - anything else is a finding.
+
+  - id: one-change-mcq
+    type: mcq
+    concept: sec-proxy-tamper-replay
+    skill: analysis
+    title: Two changes, one result
+    prompt: |
+      In Repeater you change the payment id **and** remove the `Authorization` header, then get `401`. What can
+      you conclude about object-level access control?
+    options:
+      - id: nothing
+        text: Nothing yet - the 401 is explained by the missing token; replay with only the id changed
+        feedback: Correct - one change per request, or you cannot say which change caused the response.
+      - id: secure
+        text: It works - another merchant's payment was refused
+        feedback: The request was refused before any object check, because it had no credentials.
+      - id: vulnerable
+        text: It is broken - the server answered differently
+        feedback: A different answer to two changes says nothing about either one.
+      - id: auth-bug
+        text: Authentication is broken
+        feedback: 401 without a token is authentication working as designed.
+    correct: [nothing]
+    hints:
+      - Which of your two changes alone explains a 401?
+    solution: |
+      Change one thing at a time and keep the original as a baseline. Here, replay with Alice's token and Bob's
+      id only.
+
+  - id: scope-mcq
+    type: mcq
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: The spider found the payment provider
+    prompt: |
+      Your scope is `portal.sandpay.example` (staging). While exploring, ZAP's Sites tree also shows
+      `checkout.psp.example`, the payment provider's hosted page. ZAP is in Standard mode. What should you do
+      before fuzzing?
+    options:
+      - id: protected
+        text: Put the portal in a context, include only that context in scope and switch to Protected mode
+        feedback: Correct - Protected mode blocks fuzzing, scanning, breaking and resending outside the scope.
+      - id: include-psp
+        text: Add the provider to scope - it is part of the payment flow
+        feedback: Only if the written authorisation includes it, which it does not. Third parties are out of scope by default.
+      - id: attack-mode
+        text: Switch to ATTACK mode so new nodes are scanned automatically
+        feedback: ATTACK mode actively scans new in-scope nodes as they are discovered - it adds risk, it does not limit it.
+      - id: ignore
+        text: Nothing - the fuzzer only touches the request you right-click
+        feedback: True for that one request, but in Standard mode nothing stops the next active action on the provider's host.
+    correct: [protected]
+    hints:
+      - Which ZAP mode limits dangerous actions to the scope?
+    solution: |
+      "Protected - you can only perform (potentially) dangerous actions on URLs in the scope", and "By default
+      nothing is in scope". Define the context first.
+
+  - id: burp-edition-mcq
+    type: mcq
+    concept: sec-proxy-tamper-replay
+    skill: recall
+    title: What Community Edition gives you
+    prompt: According to PortSwigger's comparison page, which is part of Burp Suite Community Edition?
+    options:
+      - id: repeater
+        text: The proxy with HTTP history, and Repeater, Decoder, Sequencer and Comparer
+        feedback: Correct - plus a demo of Intruder.
+      - id: scanner
+        text: The web vulnerability scanner
+        feedback: The scanner is listed under Professional.
+      - id: intruder-full
+        text: The full version of Intruder
+        feedback: Community lists "Burp Intruder (demo)"; the full version is Professional.
+      - id: projects
+        text: Saving project files
+        feedback: 'Project files (save your work) is listed under Professional.'
+    correct: [repeater]
+    hints:
+      - The page splits features into Community and "Everything in Community Edition, plus".
+    solution: |
+      Community: "HTTP(s) / WebSockets proxy and history", "Repeater, Decoder, Sequencer, and Comparer", "Burp
+      Intruder (demo)". Editions change - check the page.
+
+  - id: har-time-mcq
+    type: mcq
+    concept: sec-proxy-evidence
+    skill: application
+    title: A HAR entry that does not add up
+    prompt: |
+      A HAR 1.2 entry has `"timings": {"blocked": -1, "dns": -1, "connect": -1, "send": 1.5, "wait": 3.7,
+      "receive": 0.1}` and `"time": 12.0`. What is wrong?
+    options:
+      - id: sum
+        text: '`time` must equal the sum of the timings, ignoring -1 values - here 5.3'
+        feedback: Correct - the spec requires entry.time to be the sum of the available timings.
+      - id: negative
+        text: Timings may not be -1
+        feedback: -1 means "does not apply" and is allowed for blocked, dns, connect and ssl.
+      - id: nothing
+        text: Nothing - time also includes the proxy's own work
+        feedback: The spec defines time as the sum of the timings object, nothing else.
+      - id: required
+        text: '`connect` is required'
+        feedback: blocked, dns, connect and ssl are optional; send, wait and receive are required.
+    correct: [sum]
+    hints:
+      - Read the definition of `time` in the HAR 1.2 spec.
+    solution: |
+      "The time value for the request must be equal to the sum of the timings supplied in this section (excluding
+      any -1 values)": 1.5 + 3.7 + 0.1 = 5.3.
+
+  - id: har-redact-mcq
+    type: mcq
+    concept: sec-proxy-evidence
+    skill: analysis
+    title: What to redact before sending evidence
+    prompt: |
+      You will attach a HAR of your IDOR reproduction to the ticket. Which redaction keeps the evidence and
+      removes the risk?
+    options:
+      - id: secrets
+        text: Mask Authorization, Cookie and Set-Cookie values, passwords and tokens in bodies; keep URLs, statuses, other headers, cookie flags and the leaked fields
+        feedback: Correct - the evidence is what was requested and returned; the credentials are not needed to understand it.
+      - id: bodies
+        text: Delete all request and response bodies
+        feedback: The leaked object in the response body IS the evidence.
+      - id: nothing
+        text: Nothing - the ticket system is internal
+        feedback: The HAR spec warns files "can contain privacy & security sensitive data". Tickets get copied, exported and read widely.
+      - id: urls
+        text: Mask the URLs, because they reveal the vulnerable endpoint
+        feedback: The developer needs the endpoint to fix it.
+    correct: [secrets]
+    hints:
+      - What does the developer need to reproduce the issue, and what would an attacker want?
+    solution: |
+      Redact credentials and secrets, keep the request, the changed value and the response. Then search the
+      redacted file for each secret you used.
+
+  - id: proxy-steps-order
+    type: order
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: From scope to evidence
+    prompt: Put the steps of a proxy-based test in order.
+    items:
+      - id: scope-doc
+        text: Read the written scope and get test accounts for each role
+      - id: tool-scope
+        text: Configure a context and scope in the tool and switch to Protected mode
+      - id: explore
+        text: Explore every feature by hand in the tool's browser with intercept off
+      - id: pick
+        text: Pick an interesting request from the history
+      - id: change-one
+        text: Replay it with exactly one change and compare the responses
+      - id: confirm
+        text: Confirm with a second reproduction and check the control-working case
+      - id: export
+        text: Export the exchanges and redact credentials before sharing
+    hints:
+      - Nothing active happens before the tool knows the scope.
+      - Confirmation comes before evidence leaves your machine.
+    solution: |
+      Scope on paper, scope in the tool, explore, pick, change one thing, confirm both ways, export redacted.
+      Doing anything active before the tool knows the scope risks testing someone else's system.
+
+  - id: in-scope-debug
+    type: debug
+    concept: sec-proxy-tamper-replay
+    skill: analysis
+    title: The scope check that let too much through
+    prompt: |
+      This scope check is meant to allow only the hosts listed (as `host:port` or `host:*`). A tester's fuzzer
+      sent traffic to `shop.example.attacker.example`. Click the line with the defect.
+    language: python
+    code: |
+      def in_scope(host, port, scope):
+          host = host.lower()
+          for entry in scope:
+              e_host, sep, e_port = entry.rpartition(":")
+              if not sep:
+                  continue
+              if host.startswith(e_host.lower()) and (e_port == "*" or e_port == str(port)):
+                  return True
+          return False
+    correctLines: [7]
+    lineNotes:
+      - line: 2
+        note: Lower-casing is right - host names are case-insensitive.
+      - line: 4
+        note: rpartition splits on the last colon, so host and port separate correctly; not the defect.
+    hints:
+      - Which comparison would `shop.example.attacker.example` pass for the scope entry `shop.example:*`?
+    solution: |
+      `startswith` matches any host that begins with the scope host - `shop.example.attacker.example`,
+      `127.0.0.10`. Compare whole hosts with `==`.
+
+  - id: proxy-vs-devtools-short
+    type: short
+    concept: sec-proxy-mitm-mechanics
+    skill: analysis
+    title: Why not just DevTools?
+    prompt: |
+      A developer says: "DevTools already shows every request. Why do you need ZAP?" Answer in a few sentences,
+      and say when DevTools is enough.
+    modelAnswer: |
+      DevTools shows what the browser sent; a proxy lets me hold, change and resend it, which is how I test what
+      the server enforces - hidden fields, client-side validation, other users' ids. A proxy also records clients
+      that are not browsers (mobile and desktop apps, API clients), keeps a history I can search and export as
+      evidence, and passively flags missing headers and cookie flags as I go. DevTools is enough when I only need
+      to look at traffic my own browser generates and don't need to change or replay it.
+    rubric:
+      - Says a proxy can hold, edit and replay requests to test server-side checks.
+      - Mentions non-browser clients (mobile, desktop, API).
+      - Mentions history and evidence (export) or passive findings.
+      - Says when DevTools is enough.
+    hints:
+      - What can a proxy do to a request that DevTools does not?
+    solution: |
+      Looking versus changing: DevTools to look, a proxy to change, replay, record any client and keep evidence.
+
+  - id: proxy-testdesign
+    type: testdesign
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: Proxy-based tests for the refund form
+    prompt: |
+      SandPay's portal has a refund form: payment id (hidden field), amount (prefilled, editable up to the
+      captured amount by JavaScript), reason (dropdown of four values) and a CSRF token. Design proxy-based test
+      cases. For each, give preconditions, the single change you make, the expected result and the evidence.
+    modelAnswer: |
+      Preconditions for all: written scope covering the staging portal; two merchant accounts (A, B) with
+      captured payments; ZAP in Protected mode with the portal context in scope; requests replayed from the
+      recorded valid refund by A.
+
+      1. **Amount above captured** - change `amount` to captured + 1. Expected: rejected (for example 422), no
+         refund created. Evidence: request/response pair; A's payment unchanged.
+      2. **Negative or zero amount** - `-100`, `0`. Expected: rejected. Evidence: pairs.
+      3. **Another merchant's payment** - change the hidden payment id to B's. Expected: 404 or 403, no refund.
+         Evidence: pair; B's payment unchanged (check as B).
+      4. **Reason outside the dropdown** - a fifth value, a long string. Expected: rejected or safely stored and
+         encoded. Evidence: pair, how it is displayed afterwards.
+      5. **Missing or wrong CSRF token** - drop it; use B's token. Expected: 403. Evidence: pairs.
+      6. **Replay the same valid refund twice** - expected: one refund (idempotency), or the second rejected.
+         Evidence: both responses and the refund list.
+      7. **Control case** - the original valid request still succeeds, so failures above are the controls, not a
+         broken session.
+    rubric:
+      - Each case changes exactly one thing in a recorded valid request.
+      - Each case has preconditions, an expected result and concrete evidence (request/response pairs, state checked afterwards).
+      - Covers amount limits, another merchant's object, values outside the UI's choices and the CSRF token.
+      - Includes a control case and checks the server-side state, not just the status code.
+    hints:
+      - List every field the UI restricts. Each restriction is a server-side test.
+      - How do you prove no refund was created?
+    solution: |
+      One change per case against a recorded valid refund, expected server-side rejection, and state checked
+      afterwards - plus a control case.
+
+  - id: proxy-interview
+    type: interview
+    concept: sec-proxy-mitm-mechanics
+    skill: analysis
+    title: 'Interview: how does Burp see HTTPS traffic?'
+    prompt: |
+      "You're testing a web app over HTTPS with Burp. Walk me through how Burp is able to read and modify that
+      traffic, and what precautions you take."
+    modelAnswer: |
+      The browser is configured to use Burp as its proxy. For an https URL it sends a CONNECT for host:port. Burp
+      answers it itself instead of building a blind tunnel, then completes the TLS handshake with the browser
+      using a certificate for that host which Burp generates and signs with its own CA. The browser accepts it
+      only because I trust Burp's CA - in Burp's own browser that is preconfigured, in an external browser I
+      import the CA. Burp opens its own TLS connection to the real server, so it sees plaintext in the middle and
+      can hold, edit and replay requests.
+
+      Precautions: the CA's private key lets anyone holding it intercept TLS silently, so I trust it only in a
+      dedicated test browser or profile, never system-wide or on a shared machine, and remove it afterwards. I
+      configure the target scope first and only test what the written authorisation covers. I keep history and
+      exports private and redact credentials before sharing evidence. And I remember TLS configuration itself
+      has to be tested without the proxy, since the browser is talking TLS to Burp.
+    rubric:
+      - Explains CONNECT and that the proxy terminates TLS instead of tunnelling.
+      - Explains per-host certificates signed by the tool's CA and why the browser must trust that CA.
+      - Names the risk of a trusted CA private key and limits trust to a test browser.
+      - Mentions scope and permission.
+      - Mentions protecting or redacting the captured data, or testing TLS config without the proxy.
+    followUps:
+      - Why might a mobile app's traffic not appear even with the CA installed?
+      - What changes if the app uses HTTP/2 or WebSockets?
+      - How would you prove a finding to a developer who cannot install Burp?
+    hints:
+      - Start from what the browser sends for an https URL through a proxy.
+    solution: |
+      CONNECT, TLS terminated by the proxy with per-host certificates from its own CA, trust only in a test
+      browser, scope first, evidence redacted.
+
+  - id: recorder-code
+    type: coding
+    concept: sec-proxy-mitm-mechanics
+    skill: application
+    title: Build the recording proxy's core
+    prompt: |
+      In `foundations/proxy_recorder.py`, implement `parse_target`, `in_scope` and `clean_headers`. The server
+      around them (`RecordingProxy`, `run_proxy`) is given and calls your functions for every request. Follow the
+      docstrings: absolute-form and CONNECT parsing, whole-host scope matching, and the RFC 9110 / 9112 header
+      rules (hop-by-hop removal, Host regeneration, Via).
+    project: security
+    files:
+      - exercises/foundations/proxy_recorder.py
+    test: tests/foundations/test_proxy_recorder.py
+    command: .venv/bin/python -m pytest tests/foundations/test_proxy_recorder.py
+    hints:
+      - '`urllib.parse.urlsplit` gives scheme, hostname (already lower-case), port and path; `.port` raises ValueError for a bad port.'
+      - For CONNECT, split the authority on the last colon and require a numeric port.
+      - In clean_headers, collect the names listed in Connection first, then build the output in one pass.
+    modelAnswer: |
+      ```python
+      def in_scope(host, port, scope):
+          host = host.lower()
+          for entry in scope:
+              e_host, sep, e_port = entry.rpartition(":")
+              if sep and e_host.lower() == host and (e_port == "*" or e_port == str(port)):
+                  return True
+          return False
+
+      def clean_headers(headers, target):
+          named = set()
+          for name, value in headers:
+              if name.lower() == "connection":
+                  named.update(o.strip().lower() for o in value.split(",") if o.strip())
+          drop = named | set(HOP_BY_HOP)
+          host_value = target.host if target.port == 80 else f"{target.host}:{target.port}"
+          out, host_done, via_done = [], False, False
+          for name, value in headers:
+              lower = name.lower()
+              if lower in drop:
+                  continue
+              if lower == "host":
+                  if not host_done:
+                      out.append(("Host", host_value)); host_done = True
+                  continue
+              if lower == "via" and not via_done:
+                  out.append((name, f"{value}, 1.1 {VIA_NAME}")); via_done = True
+                  continue
+              out.append((name, value))
+          if not host_done:
+              out.append(("Host", host_value))
+          if not via_done:
+              out.append(("Via", f"1.1 {VIA_NAME}"))
+          return out
+      ```
+
+      `parse_target` splits the request line into three parts, handles `CONNECT host:port` separately, rejects
+      origin-form and non-http schemes, and uses `urlsplit` for the rest (see the reference solution).
+    rubric:
+      - Every test in tests/foundations/test_proxy_recorder.py passes.
+      - Host is generated from the request-target, never copied from the received Host header.
+      - Scope matching compares whole hosts; an empty scope allows nothing.
+      - Out-of-scope requests are refused before anything is forwarded or recorded.
+    solution: |
+      Parse the absolute-form target, check whole-host scope, then apply the intermediary header rules - the
+      given server does the forwarding and recording.
+
+  - id: repeater-code
+    type: coding
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: A repeater that proves an IDOR - and stays quiet when fixed
+    prompt: |
+      In `foundations/proxy_repeater.py`, implement `parse_raw_request`, `with_path_segment`, `diff` and
+      `probe_idor`. The tests run your probe against the vulnerable portal (it must report the IDOR), the portal
+      with `idor` fixed (no finding), a replay that returns the caller's own payment (no finding) and a failing
+      original request (refuse to judge).
+    project: security
+    files:
+      - exercises/foundations/proxy_repeater.py
+    test: tests/foundations/test_proxy_repeater.py
+    command: .venv/bin/python -m pytest tests/foundations/test_proxy_repeater.py
+    hints:
+      - Normalise CRLF to LF, then split the head from the body at the first blank line.
+      - Split the URL path on "/" and compare whole segments.
+      - A finding needs two successful replies whose owner field differs.
+    modelAnswer: |
+      ```python
+      def probe_idor(req, own_id, other_id, owner_field="merchant_id"):
+          original = send(req)
+          oj = original.json()
+          if not 200 <= original.status < 300 or not isinstance(oj, dict) or owner_field not in oj:
+              raise ValueError(f"the original request did not return an owned object (status {original.status})")
+          replayed = send(with_path_segment(req, own_id, other_id))
+          rj = replayed.json()
+          if 200 <= replayed.status < 300 and isinstance(rj, dict) and rj.get(owner_field) != oj[owner_field]:
+              return Finding(f"IDOR: {other_id} readable by the owner of {own_id}", original, replayed,
+                             diff(original, replayed))
+          return None
+      ```
+
+      The original request is the control: if it fails, nothing can be concluded. Only someone else's object
+      returned successfully is a finding.
+    rubric:
+      - Every test in tests/foundations/test_proxy_repeater.py passes.
+      - The probe changes exactly one path segment and keeps every header of the recorded request.
+      - The probe reports nothing against the fixed portal or when the other id belongs to the caller.
+      - The diff output is readable enough to paste into a finding.
+    solution: |
+      Parse the recorded request, change one segment, compare owners - finding only when someone else's object
+      comes back.
+
+  - id: evidence-code
+    type: coding
+    concept: sec-proxy-evidence
+    skill: application
+    title: Export redacted HAR 1.2 evidence
+    prompt: |
+      In `foundations/proxy_evidence.py`, implement `to_har` (recorded `Exchange`s to a HAR 1.2 log) and `redact`
+      (a copy with credentials and secrets masked). Follow the field rules in the docstrings, which come from
+      the HAR 1.2 spec.
+    project: security
+    files:
+      - exercises/foundations/proxy_evidence.py
+    test: tests/foundations/test_proxy_evidence.py
+    command: .venv/bin/python -m pytest tests/foundations/test_proxy_evidence.py
+    hints:
+      - '`datetime.isoformat(timespec="milliseconds")` then replace `+00:00` with `Z`.'
+      - '`urllib.parse.parse_qsl(query, keep_blank_values=True)` keeps `debug=`.'
+      - For redact, deep-copy first; parse JSON bodies and mask matching keys at any depth.
+    modelAnswer: |
+      ```python
+      def to_har(exchanges, creator_name="sandpay-recorder", creator_version="1.0"):
+          entries = [_entry(x) for x in sorted(exchanges, key=lambda x: x.started)]
+          return {"log": {"version": "1.2", "creator": {"name": creator_name, "version": creator_version},
+                          "entries": entries}}
+      ```
+
+      `_entry` builds `request` (method, url without fragment, httpVersion, cookies from Cookie, headers,
+      queryString, headersSize -1, bodySize, postData only with a body), `response` (status, statusText,
+      cookies from Set-Cookie with httpOnly/secure flags, content size/mimeType/text, redirectURL from
+      Location), `cache` `{}`, `timings` (send, wait, receive) and `time` as their sum. `redact` deep-copies,
+      masks sensitive header values and every cookie value, sensitive query values, and sensitive keys in JSON
+      or form bodies - keeping URLs, statuses and cookie flags as evidence.
+    rubric:
+      - Every test in tests/foundations/test_proxy_evidence.py passes.
+      - time equals send + wait + receive, and entries are oldest first.
+      - redact does not change its input and leaves no credential values in the output.
+      - The evidence that proves the finding (URL, status, leaked fields, cookie flags) survives redaction.
+    solution: |
+      Build the HAR 1.2 structure field by field from the spec, then redact on a deep copy and search the result
+      for every secret.
+
+placement:
+  - id: place-host-rewrite
+    type: mcq
+    concept: sec-proxy-mitm-mechanics
+    skill: application
+    title: Two hosts in one request
+    prompt: |
+      A proxy receives `GET http://127.0.0.1:8765/api/me HTTP/1.1` with `Host: admin.internal.example`. Which
+      Host does it send to the server?
+    options:
+      - id: target
+        text: '`127.0.0.1:8765`, taken from the request-target'
+        feedback: Correct - RFC 9112 3.2.2 - the proxy MUST ignore the received Host and generate a new one from the request-target.
+      - id: received
+        text: '`admin.internal.example`, as received'
+        feedback: Forwarding the received Host is exactly what the RFC forbids for absolute-form requests.
+      - id: both
+        text: Both, as two Host fields
+        feedback: A request has one Host; the proxy replaces it.
+      - id: reject
+        text: None - the proxy must reject the request
+        feedback: The RFC says to ignore the received Host and replace it, not to reject.
+    correct: [target]
+    solution: |
+      With an absolute-form request-target, the proxy "MUST ignore the received Host header field (if any) and
+      instead replace it with the host information of the request-target".
+
+  - id: place-change-one
+    type: order
+    concept: sec-proxy-tamper-replay
+    skill: application
+    title: Testing a hidden field
+    prompt: Order the steps to test whether the server trusts a hidden `merchant_id` field.
+    items:
+      - id: record
+        text: Submit the form normally through the proxy and find the request in the history
+      - id: baseline
+        text: Replay it unchanged and confirm it still succeeds
+      - id: change
+        text: Replay it with only merchant_id changed to another merchant's id
+      - id: compare
+        text: Compare the responses and check the other merchant's data afterwards
+    solution: |
+      Record, baseline, change one thing, compare - the baseline proves that a later failure comes from the
+      change, not from an expired session.
+
+  - id: place-har-share
+    type: mcq
+    concept: sec-proxy-evidence
+    skill: analysis
+    title: Sending the session file
+    prompt: |
+      A developer asks for "the ZAP session" to reproduce your finding. The session contains three days of
+      traffic with two test accounts' passwords and tokens. What do you send?
+    options:
+      - id: minimal-redacted
+        text: Only the exchanges that reproduce the finding, exported and redacted, with the steps
+        feedback: Correct - minimal, redacted, reproducible.
+      - id: whole
+        text: The whole session - more context helps
+        feedback: It holds credentials and unrelated traffic; the HAR spec warns such files contain sensitive data.
+      - id: screenshot
+        text: A screenshot of the response only
+        feedback: A screenshot is hard to reproduce from and omits the request that caused it.
+      - id: passwords
+        text: The test passwords so they can log in and look themselves
+        feedback: Share credentials through the agreed channel, if at all - not with the evidence.
+    correct: [minimal-redacted]
+    solution: |
+      Send the minimal redacted exchanges plus steps; keep the full session private.
+
+recall:
+  - id: recall-absolute-form
+    concept: sec-proxy-mitm-mechanics
+    prompt: What does a browser send to a proxy for http://host:port/path, and what does the proxy send on?
+    answer: 'To the proxy - absolute-form, GET http://host:port/path HTTP/1.1. To the server - origin-form, GET /path, with Host regenerated from the target, hop-by-hop fields removed and Via appended.'
+  - id: recall-hop-by-hop
+    concept: sec-proxy-mitm-mechanics
+    prompt: Which fields does an intermediary remove before forwarding (RFC 9110 7.6.1)?
+    answer: Connection and every field it names, plus Proxy-Connection, Keep-Alive, TE, Transfer-Encoding and Upgrade.
+  - id: recall-tls
+    concept: sec-proxy-mitm-mechanics
+    prompt: How do ZAP and Burp read HTTPS, and what is the precaution?
+    answer: They answer the CONNECT and terminate TLS with per-host certificates signed by their own root CA, which the browser trusts. Trust that CA only in a test browser - its private key would let anyone intercept your TLS.
+  - id: recall-loop
+    concept: sec-proxy-tamper-replay
+    prompt: What is the tester's proxy loop, and the ZAP and Burp tools for each step?
+    answer: Record (History / HTTP history), hold and edit (Break / Intercept), resend with one change (Requester / Repeater), many payloads (Fuzzer / Intruder), compare.
+  - id: recall-protected
+    concept: sec-proxy-tamper-replay
+    prompt: What does ZAP's Protected mode do?
+    answer: Allows potentially dangerous actions (spidering, active scanning, fuzzing, breaking, resending) only on URLs in scope. By default nothing is in scope.
+  - id: recall-har
+    concept: sec-proxy-evidence
+    prompt: Two HAR 1.2 rules to remember when exporting evidence?
+    answer: entry.time equals the sum of the timings (ignoring -1), and the file can contain sensitive data - redact credentials, cookies and secrets before sharing.
+
+next:
+  - reconnaissance-and-attack-surface
+  - testing-access-control-idor
+  - testing-session-management
+  - dast-with-owasp-zap
