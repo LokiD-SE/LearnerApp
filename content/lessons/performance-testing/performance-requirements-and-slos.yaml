@@ -1,0 +1,1259 @@
+id: performance-requirements-and-slos
+title: Performance requirements and SLOs
+subject: performance-testing
+module: perf-fundamentals
+level: intermediate
+status: published
+estimatedMinutes: 135
+summary: Turn "it must be fast" into requirements a load test can pass or fail - a transaction, a percentile, a threshold and a load - using the SLI, SLO and SLA vocabulary and error budgets of Google's SRE books. Then judge a real JMeter run of the SandPay practice API per transaction, and learn when the honest verdict is "inconclusive" rather than "pass".
+tags:
+  [
+    performance requirements,
+    non-functional requirements,
+    NFR,
+    SLI,
+    SLO,
+    SLA,
+    service level objective,
+    error budget,
+    burn rate,
+    percentile,
+    p95,
+    p99,
+    acceptance criteria,
+    pass fail criteria,
+    inconclusive,
+    throughput,
+    response time,
+    ISO 25010,
+    performance efficiency,
+    JMeter,
+    JTL,
+    Google SRE,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/perf/.venv`, Apache JMeter 5.6.3 on OpenJDK 17.0.21, Linux. Every
+    output in this lesson was printed by the code shown (the JMeter runs on 19 November 2026): the requirement
+    review and the budget arithmetic are exact and repeat on any machine; the JMeter runs measure **this**
+    machine, so your response times and throughput will differ - the verdict logic will not. Even the error
+    count varies: the practice API injects errors from one seeded random generator shared by all concurrent
+    requests, so thread timing changes which requests fail - two runs of the error demo gave 31 and 26 failed
+    payments out of 600 (5.17% and 4.33%), both a clear fail against 1%.
+  - **Practice target:** `practice/perf/support/sandpay_target.py`, a SandPay practice API on the loopback
+    interface with configurable service time, jitter and injected errors. SandPay is fictional and every
+    merchant, token and payment is synthetic. Never point a load test at a system you do not own or have
+    written permission to test.
+  - **The JMeter plan** is `practice/perf/tests/fundamentals/slo_payments.jmx`: a thread group whose threads
+    each fetch a token once (Once Only Controller + JSON Extractor), then list and create payments. Non-GUI
+    mode and `-J` properties are described in the [JMeter user
+    manual](https://jmeter.apache.org/usermanual/get-started.html) (section 2.4, "Running JMeter"), as
+    documented on 18 November 2026. JMeter itself is taught from
+    [JMeter architecture and test plans](#/lesson/jmeter-architecture-and-test-plans) onwards; here it is only
+    the thing that produces results to judge.
+  - **SLI, SLO, SLA and error budgets** are quoted from Google's free SRE books, as published on sre.google on
+    18 November 2026: [Site Reliability Engineering, chapter 4 "Service Level
+    Objectives"](https://sre.google/sre-book/service-level-objectives/) and [chapter 3 "Embracing
+    Risk"](https://sre.google/sre-book/embracing-risk/); [The Site Reliability Workbook, chapter 2
+    "Implementing SLOs"](https://sre.google/workbook/implementing-slos/) and [chapter 5 "Alerting on
+    SLOs"](https://sre.google/workbook/alerting-on-slos/). They describe Google's practice; the terms are
+    widely used, but not a formal standard.
+  - **ISO/IEC 25010** (the SQuaRE product quality model) is a paid standard; this lesson only names its
+    quality characteristic **performance efficiency**. Its history - ISO/IEC 25010:2011 replaced ISO/IEC 9126,
+    "Efficiency" was renamed "performance efficiency" and "Capacity" was added as a subcharacteristic - is from
+    the [Wikipedia article on ISO/IEC 9126](https://en.wikipedia.org/wiki/ISO/IEC_9126), not from the standard
+    itself. ISO catalogue: [ISO/IEC 25010:2011](https://www.iso.org/standard/35733.html); check the catalogue
+    for the current edition before you quote it.
+  - **The requirement grammar** (`p95 of POST /v1/payments < 300 ms at 50 req/s`) and the reason codes
+    (`no-load`, `average`, ...) belong to this lesson's exercise, not to any standard. The rules behind them -
+    say how it is measured and under what conditions, prefer percentiles to averages, avoid absolutes - are
+    the SRE book's.
+
+prerequisites:
+  - performance-testing-types
+  - performance-metrics-and-percentiles
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-slo-testable-requirements
+    name: Testable performance requirements
+    summary: A performance requirement is testable when it names the transaction, the statistic (a percentile, not an average), the threshold with a unit, and the load at which it must hold - plus, where it matters, where it is measured. "Fast", "scalable", "always" and "100%" cannot be passed or failed by any run; ask the questions that turn them into numbers.
+  - id: perf-slo-sli-slo-sla
+    name: SLIs, SLOs, SLAs and error budgets
+    summary: An SLI is a carefully defined quantitative measure of service (best as good events / all events); an SLO is a target for an SLI; an SLA is a contract with consequences for missing its SLOs. The error budget is 100% minus the SLO, counted in bad events; the burn rate is how fast it is being spent (1 = exactly used up at the end of the window).
+  - id: perf-slo-run-verdicts
+    name: Judging a load test run against requirements
+    summary: Judge each transaction separately - latency as a percentile of successful requests, errors as a rate - and only at the load the requirement names. A run with too few samples, or that never reached the stated load, is inconclusive, not a pass. The overall result fails if any verdict fails and passes only if every one passes.
+
+objectives:
+  - Rewrite a vague performance wish as testable requirements that name the transaction, percentile, threshold, load and measurement point.
+  - Explain the difference between an SLI, an SLO and an SLA, and classify a given statement as one of them.
+  - Calculate an error budget, the share of it consumed, a burn rate and the days until it runs out, exactly.
+  - Evaluate a load test result per transaction against its requirements and justify pass, fail or inconclusive.
+  - Diagnose evaluation mistakes - averages, failed requests mixed into latency, an unreached load, too few samples.
+  - Write acceptance criteria for a load test that a stakeholder and a tester read the same way.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-slo-testable-requirements, perf-slo-run-verdicts]
+    title: The idea in plain language
+    body: |
+      A product owner at SandPay says: *"Payments must be fast, even on Black Friday."* Everyone nods. A month
+      later the load test report says "average response time 245 ms - passed", and on Black Friday one merchant
+      in twenty waits three seconds for a payment page. Was the requirement met? Nobody can say, because the
+      requirement never said **what** to measure, **how much** is fast enough, or **under what load**.
+
+      Think of a parcel company promising "fast delivery". That promise can't be checked. "95% of parcels
+      posted before 17:00 arrive the next working day, measured by the delivery scan, in a week with up to
+      40,000 parcels a day" can: it names the thing measured (a parcel, by its scan), the share that must
+      meet the target (95%), the target (next working day) and the conditions (posting time, volume). If they
+      deliver 30,000 parcels in the test week, nobody learns whether 40,000 would work.
+
+      Performance requirements work the same way. This lesson turns wishes into statements like
+      `p95 of POST /v1/payments < 300 ms at 20 req/s`, borrows the vocabulary Google's SRE teams use for
+      such statements (SLIs, SLOs, SLAs and error budgets), and then judges a real load test run against them,
+      including the verdict testers forget: **inconclusive**, when the run could not prove anything either way.
+
+  - id: what
+    kind: what
+    concepts: [perf-slo-testable-requirements, perf-slo-sli-slo-sla, perf-slo-run-verdicts]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Non-functional requirement (NFR)** | a requirement about *how well* the system does something - performance, security, usability - rather than *what* it does |
+      | **Performance efficiency** | the ISO/IEC 25010 quality characteristic for performance; *capacity* is one of its subcharacteristics (the standard is paid; see the environment notes) |
+      | **Transaction** | one kind of request or user step you measure separately: `POST /v1/payments`, "open checkout" |
+      | **Percentile (pN)** | the value at or below which N% of the measurements fall; p95 = 95th percentile |
+      | **Threshold** | the number with a unit that the statistic must not exceed: `300 ms`, `1%` |
+      | **Load condition** | the load under which the target must hold: `at 20 req/s` (arrival rate) or `at 200 concurrent users` |
+      | **SLI** | service level indicator - "a carefully defined quantitative measure of some aspect of the level of service that is provided" (SRE book, ch. 4) |
+      | **SLO** | service level objective - "a target value or range of values for a service level that is measured by an SLI" (ch. 4) |
+      | **SLA** | service level agreement - "an explicit or implicit contract with your users that includes consequences of meeting (or missing) the SLOs they contain" (ch. 4) |
+      | **Error budget** | "100% minus the SLO" (SRE workbook, ch. 2), usually counted as how many bad events the window allows |
+      | **Burn rate** | "how fast, relative to the SLO, the service consumes the error budget" (workbook, ch. 5) |
+      | **Verdict** | per requirement: `pass`, `fail`, or `inconclusive` when the run cannot support either |
+
+      The SRE book adds a test for telling SLOs from SLAs: *"ask 'what happens if the SLOs aren't met?': if
+      there is no explicit consequence, then you are almost certainly looking at an SLO."* A rebate to the
+      customer makes it an SLA.
+
+  - id: why
+    kind: why
+    concepts: [perf-slo-testable-requirements, perf-slo-sli-slo-sla]
+    title: Why vague requirements fail everyone
+    body: |
+      A requirement nobody can fail is a requirement nobody can pass. With "the API must be fast":
+
+      - **The tester** cannot write an expected result, so the report becomes an opinion ("looks fine").
+      - **The developer** cannot tell when to stop optimising, or which endpoint matters.
+      - **The business** discovers the real requirement in production, from customers.
+
+      The most common half-fix is an **average**: "average response time under 200 ms". The SRE book warns
+      that "most metrics are better thought of as distributions rather than averages" and that "a simple
+      average can obscure these tail latencies, as well as changes in them". If 95 payments take 100 ms and 5
+      take 3,000 ms, the mean is (95 x 100 + 5 x 3,000) / 100 = **245 ms** - a pass - while one customer in
+      twenty waits three seconds. A percentile describes the users you care about: "a high-order percentile,
+      such as the 99th or 99.9th, shows you a plausible worst-case value, while using the 50th percentile (also
+      known as the median) emphasizes the typical case."
+
+      The second half-fix is a target with **no load**. Any system is fast with one user. A response time
+      target without a load condition is passed by every quiet test environment and tells you nothing about
+      Black Friday.
+
+      The third is the **absolute** - "always", "every request", "100%". The SRE book's advice is "Avoid
+      absolutes": a system that "can scale its load 'infinitely' without any latency increase and that is
+      'always' available ... is unrealistic". For a tester it is worse than unrealistic: one slow request out
+      of a million fails it, and a run of a thousand requests can never prove it.
+
+      SLOs and error budgets fix the conversation as well as the test. The SRE book says the error budget
+      "removes the politics from negotiations between the SREs and the product developers when deciding how
+      much risk to allow" - and the same is true between testers and release managers.
+
+  - id: anatomy
+    kind: internals
+    concepts: [perf-slo-testable-requirements]
+    title: The anatomy of a testable requirement
+    body: |
+      The SRE book's own example shows every part:
+
+      > 99% (averaged over 1 minute) of Get RPC calls will complete in less than 100 ms (measured across all
+      > the backend servers).
+
+      | Part | In the example | Question to ask the stakeholder |
+      | --- | --- | --- |
+      | statistic | 99% (a percentile) | "How many of these may be slower - one in twenty? one in a hundred?" |
+      | transaction | Get RPC calls | "Which request or user step? Do all of them matter equally?" |
+      | threshold | less than 100 ms | "How long can a customer wait before it hurts the business?" |
+      | aggregation | averaged over 1 minute | "Over what window - the whole test, each minute?" |
+      | measurement point | across all the backend servers | "Measured where - server, load generator, browser?" |
+      | load (added for testing) | - | "At what traffic - today's peak, Black Friday, next year?" |
+
+      The book adds that "SLOs should specify how they're measured and the conditions under which they're
+      valid", and that a team may set several targets on one curve:
+
+      > 90% of Get RPC calls will complete in less than 1 ms.
+      > 99% of Get RPC calls will complete in less than 10 ms.
+      > 99.9% of Get RPC calls will complete in less than 100 ms.
+
+      Production SLOs often leave the load out, because production carries whatever load it gets. A
+      **load test** requirement cannot: the test chooses the load, so the requirement must say which.
+
+      **Measured where matters.** The SRE book notes that "some systems should be instrumented with client-side
+      collection, because not measuring behavior at the client can miss a range of problems that affect users
+      but don't affect server-side metrics." A load generator measures from outside the server, including the
+      network and the server's accept queue; server metrics start when the application sees the request. In a
+      saturated system the two can differ by seconds. Write down which one the requirement means.
+
+      **Error requirements need their own line.** A failed payment that returns `500` in 5 ms is *fast*. If
+      failures count towards latency they make the percentile look better; if they are ignored, a run that
+      fails every second request "passes". So judge latency on successful requests and failures with an
+      error-rate requirement such as `error rate of POST /v1/payments below 0.5% at 50 req/s`.
+
+  - id: slo-budget
+    kind: internals
+    concepts: [perf-slo-sli-slo-sla]
+    title: SLIs as ratios, error budgets and burn rate
+    body: |
+      The SRE workbook recommends "treating the SLI as the ratio of two numbers: the number of good events
+      divided by the total number of events" - for example "Number of successful HTTP requests / total HTTP
+      requests". A latency SLI fits the same shape: good = successful **and** no slower than the threshold.
+      With the SLI on a 0-100% scale, "the error budget is 100% minus the SLO":
+
+      > if you have a 99.9% success ratio SLO, then a service that receives 3 million requests over a four-week
+      > period had a budget of 3,000 (0.1%) errors over that period. If a single outage is responsible for 1,500
+      > errors, that error costs 50% of the error budget.
+
+      The workbook's chapter on alerting adds **burn rate**: a burn rate of 1 "means that it's consuming error
+      budget at a rate that leaves you with exactly 0 budget at the end of the SLO's time window"; with "an
+      SLO of 99.9% over a time window of 30 days, a constant 0.1% error rate uses exactly all of the error
+      budget: a burn rate of 1." So burn rate = observed error rate / (100% - SLO), and a full budget lasts
+      window / burn rate.
+
+      The practice module `slo_budget.py` does this with `Decimal`, because in binary floating point
+      `(100 - 99.9) / 100 * 3_000_000` is not 3,000 but a value just under it (Python prints 2999.99... with a
+      long tail of digits), and a budget check of "bad < budget" can then go the wrong way by one event. Run
+      against the reference solution:
+
+      ```plaintext
+      budget 99.9% of 3,000,000: 3000.000
+      1,500 errors consumed: 0.5
+      burn rate at 0.1% errors: 1
+      burn rate at 0.6% errors: 6 -> budget lasts 5 days of 30
+      ```
+
+      **What error budgets mean for a tester.** The SRE book's release rule is that "as long as there is error
+      budget remaining ... new releases can be pushed". A load test can estimate how much budget a release
+      would burn: 31 failed payments out of 600 in a run is 5.17%; against a 99.9% SLO that is a burn rate of
+      about 52 - the month's budget gone in about 14 hours at that load. That sentence gets a release stopped;
+      "some errors were seen" does not.
+
+  - id: when
+    kind: when
+    concepts: [perf-slo-testable-requirements, perf-slo-sli-slo-sla]
+    title: When to use which kind of target
+    body: |
+      | Situation | Use | Not |
+      | --- | --- | --- |
+      | a load test before a release | per-transaction percentile + threshold **at a stated load**, plus an error rate | one average for "the API" |
+      | production monitoring | SLOs over a window (28 or 30 days), error budgets, burn-rate alerts | load-test thresholds copied unchanged |
+      | a contract with merchants | an SLA with consequences, built on looser SLOs than the internal ones | your internal SLO, word for word |
+      | capacity planning | the highest load at which every requirement still passes | a single "passed at 50 users" |
+      | a batch job or report | completion time for a stated data volume | per-request latency |
+
+      **How many targets?** The SRE book: "Choose just enough SLOs to provide good coverage of your system's
+      attributes. Defend the SLOs you pick". For a load test that usually means the few transactions that make
+      money or block the user (create payment, authorise, checkout), not every endpoint.
+
+      **Internal tighter than external.** "Using a tighter internal SLO than the SLO advertised to users gives
+      you room to respond to chronic problems before they become visible externally" (SRE book, "Keep a safety
+      margin"). Test against the internal one.
+
+      **What requirements do not replace.** A pass at 20 req/s says nothing about 200 req/s, about a 12-hour
+      soak, or about the first request after a deploy. Those are separate requirements and separate tests -
+      see [Types of performance testing](#/lesson/performance-testing-types).
+
+  - id: visual
+    kind: visual
+    concepts: [perf-slo-testable-requirements, perf-slo-run-verdicts]
+    title: From a wish to a verdict
+    body: |
+      ```mermaid
+      flowchart TD
+        W["Stakeholder wish - payments must be fast"] --> Q{"Which transaction, which percentile, what threshold, at what load, measured where?"}
+        Q --> R["p95 of POST /v1/payments under 300 ms at 20 req/s"]
+        R --> T["Load test at the stated load"]
+        T --> E{"Enough samples and load reached?"}
+        E -- "no" --> I["inconclusive - fix the test, never report a pass"]
+        E -- "yes" --> V{"Observed against target"}
+        V -- "within" --> P["pass"]
+        V -- "outside" --> F["fail"]
+      ```
+
+      Notice that the run is checked **before** the result is compared with the target: a run that never
+      reached the stated load cannot pass or fail the requirement, however fast it was.
+
+  - id: code
+    kind: code
+    concepts: [perf-slo-testable-requirements, perf-slo-run-verdicts]
+    title: Reviewing requirements and judging a real JMeter run
+    body: |
+      The demo reviews seven candidate requirements with `slo_spec.review`, keeps the testable ones, runs the
+      JMeter plan `slo_payments.jmx` twice against the practice API (4 threads x 150 loops; once healthy, once
+      with 5% of payment creations failing on purpose) and judges each run with `slo_evaluate.evaluate`:
+
+      ```python
+      texts = [
+          "The payments API must be fast",
+          "Average response time of GET /v1/payments under 200 ms at 40 req/s",
+          "p95 of POST /v1/payments < 300 ms",
+          "100% of GET /health complete within 50 ms at 10 req/s",
+          "p95 of POST /v1/payments < 300 ms at 20 req/s",
+          "p99 of GET /v1/payments < 0.5 s at 20 req/s",
+          "error rate of POST /v1/payments below 1% at 20 req/s",
+      ]
+      reqs = [r for r in review(texts).values() if not isinstance(r, list)]
+
+      for name, cfg in [("healthy", TargetConfig(latency_ms=20, jitter_ms=10)),
+                        ("errors", TargetConfig(latency_ms=20, jitter_ms=10, error_rate=0.05))]:
+          with serve(cfg) as base:
+              jtl = run_jmeter(ROOT / "tests/fundamentals/slo_payments.jmx",
+                               {"port": base.rsplit(":", 1)[1], "threads": 4, "loops": 150}, out / name)
+          vs = evaluate(from_jtl(read_jtl(jtl)), reqs)
+      ```
+
+      Output of one run, 19 November 2026 (the `Requirement(...)` lines are shortened here to the fields that matter):
+
+      ```plaintext
+      == review
+      REJECT 'The payments API must be fast': no-transaction, no-threshold, no-load
+      REJECT 'Average response time of GET /v1/payments under 200 ms at 40 req/s': average
+      REJECT 'p95 of POST /v1/payments < 300 ms': no-load
+      REJECT '100% of GET /health complete within 50 ms at 10 req/s': absolute
+      OK     'p95 of POST /v1/payments < 300 ms at 20 req/s' -> latency, percentile=95.0, threshold_ms=300.0
+      OK     'p99 of GET /v1/payments < 0.5 s at 20 req/s' -> latency, percentile=99.0, threshold_ms=500.0
+      OK     'error rate of POST /v1/payments below 1% at 20 req/s' -> errors, max_error_percent=1.0
+
+      == run healthy: 1204 samples
+      pass          latency  POST /v1/payments  target 300 observed 60 (600 samples; achieved 60.4 req/s)
+      pass          latency  GET /v1/payments   target 500 observed 32 (600 samples; achieved 60.4 req/s)
+      pass          errors   POST /v1/payments  target 1 observed 0 (600 samples; achieved 60.4 req/s)
+      overall: pass
+
+      == run errors: 1204 samples
+      pass          latency  POST /v1/payments  target 300 observed 60 (600 samples; achieved 60.2 req/s)
+      pass          latency  GET /v1/payments   target 500 observed 32 (600 samples; achieved 60.5 req/s)
+      fail          errors   POST /v1/payments  target 1 observed 5.17 (600 samples; achieved 60.2 req/s)
+      overall: fail
+      budget at 99.9%: 0.600 errors allowed; 31 bad; consumed 51.67; release allowed: False
+      ```
+
+      The raw JTL rows the verdicts came from (timestamp column left out with `cut -d, -f2,3,4,8,13`):
+
+      ```plaintext
+      elapsed,label,responseCode,success,allThreads
+      64,POST /auth/token,200,true,4
+      41,POST /v1/payments,500,false,4
+      14,GET /v1/payments,200,true,4
+      ```
+
+      And JMeter's own end-of-run summary line from `jmeter.log` for the second run:
+
+      ```plaintext
+      summary =   1204 in 00:00:10 =  117.3/s Avg:    31 Min:    12 Max:    64 Err:    31 (2.57%)
+      ```
+
+      Read that last line carefully. Across **all** samples the error rate is 2.57%; for the one transaction
+      that failed it is 5.17%. A requirement written per transaction catches what an all-samples summary halves.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-slo-run-verdicts]
+    title: The evaluation rules, line by line
+    body: |
+      The core of `evaluate` in `solutions/fundamentals/slo_evaluate.py`:
+
+      ```python
+      mine = [s for s in samples if s.label == req.transaction]
+      if len(mine) < min_samples:
+          ...  # inconclusive: "only 20 samples (need 100)"
+      if req.load_unit == "req/s":
+          rate = achieved_rate(mine)
+          load_ok = rate >= LOAD_TOLERANCE * req.load        # 0.9
+      else:
+          load_ok = max(s.threads for s in mine) >= req.load
+      if req.kind == "latency":
+          ok_times = [s.elapsed_ms for s in mine if s.success]
+          observed = percentile(ok_times, req.percentile)
+          passed = observed <= req.threshold_ms
+      else:
+          observed = round(100 * sum(1 for s in mine if not s.success) / len(mine), 2)
+          passed = observed <= req.max_error_percent
+      status = "inconclusive" if not load_ok else ("pass" if passed else "fail")
+      ```
+
+      - **`s.label == req.transaction`** - one verdict per transaction. JMeter writes each sampler's name to
+        the `label` column, so the plan names its samplers exactly as the requirements do.
+      - **`min_samples`** - a percentile needs data. With 50 samples, the nearest-rank p99 is
+        `ceil(0.99 x 50) = 50`, the single slowest request; one hiccup decides the verdict. The default of 100
+        is a floor for this exercise, not a statistical rule; more is better for high percentiles.
+      - **`achieved_rate`** - samples divided by the seconds from the first start to the last end. A closed
+        model (a fixed number of threads, no pacing) produces whatever throughput the system allows - here about 60
+        req/s with 4 threads - so the load must be **checked**, not assumed. The 10% tolerance is this
+        exercise's choice; write yours into the test plan.
+      - **`if s.success`** - latency only over successful requests, for the reason in the anatomy section.
+      - **`round(..., 2)`** - the error rate as a percentage, compared with the requirement's `%`.
+      - **`"inconclusive" if not load_ok`** - the load check wins over the comparison: a fast result at the
+        wrong load is not evidence.
+
+      `percentile` is the **nearest-rank** method: sort, take the value at rank `ceil(p/100 x n)`. Tools
+      differ - some interpolate between values - so state the method when two tools disagree by a millisecond.
+      Percentiles are covered in depth in [Performance metrics and
+      percentiles](#/lesson/performance-metrics-and-percentiles).
+
+  - id: steps
+    kind: steps
+    concepts: [perf-slo-testable-requirements, perf-slo-sli-slo-sla]
+    title: Turning a wish into acceptance criteria, step by step
+    body: |
+      1. **List the transactions that matter.** From the user journeys and the money: for SandPay, create
+         payment, list payments, get a token. Ignore the health check.
+      2. **Find the load.** Today's peak arrival rate from production logs or analytics, times the growth or
+         event factor the business expects (see [Workload modelling from production
+         data](#/lesson/workload-modelling-from-production)). Write it as req/s per transaction, or as
+         concurrent users with a stated think time.
+      3. **Ask for the tail, not the average.** "How many customers may wait longer than X?" gives you the
+         percentile; "how long is too long?" gives you X.
+      4. **Add an error-rate target per transaction** - and agree which responses count as errors (a `422`
+         for invalid input in the test data is the test's fault, a `500` is not).
+      5. **Say where it is measured** - load generator (client side) or server metrics - and over what window.
+      6. **Write each requirement in one line** and run it through a review: transaction, statistic,
+         threshold, load. `slo_spec.review` does this mechanically.
+      7. **Agree the run rules** before the run: minimum duration and samples, warm-up excluded or not, what
+         makes a run invalid (load not reached, generator saturated). Results are then pass, fail or
+         inconclusive - decided by rules written before anybody saw the numbers.
+      8. **Link to SLOs.** If production SLOs exist, make the test targets at least as strict as the internal
+         SLOs, and translate failures into error budget burn for the release decision.
+
+  - id: example
+    kind: example
+    concepts: [perf-slo-testable-requirements, perf-slo-run-verdicts, perf-slo-sli-slo-sla]
+    title: "Example: SandPay's Black Friday sign-off"
+    body: |
+      **The wish:** "Checkout must cope with Black Friday."
+
+      **What the tester found out:**
+
+      - Last year's peak was 9 payment creations per second; marketing expects 2x, so the test load is
+        **20 req/s** for `POST /v1/payments` and the same for `GET /v1/payments` (merchants refresh the list
+        while sales come in).
+      - The product owner accepts that 1 payment in 20 may take up to 300 ms, and that 1 list in 100 may take
+        half a second; more than 1% failed payments is a stop.
+      - Production has an internal SLO of 99.9% successful payment creations over 30 days.
+
+      **The requirements:**
+
+      ```plaintext
+      p95 of POST /v1/payments < 300 ms at 20 req/s
+      p99 of GET /v1/payments < 0.5 s at 20 req/s
+      error rate of POST /v1/payments below 1% at 20 req/s
+      ```
+
+      **The run** (the second JMeter run in the code section): both latency targets pass, the error target
+      fails at 5.17%, overall **fail**. The tester's report does not say "some 500s seen"; it says:
+
+      > POST /v1/payments failed 31 of 600 requests (5.17%) at 60.2 req/s, against a requirement of below
+      > 1%. At this rate the 99.9% production SLO's 30-day error budget would be consumed in about 14 hours
+      > (burn rate 51.7). Evidence - results.jtl rows with responseCode 500, the server's error body
+      > "acquirer timeout (simulated)". Recommendation - do not release; re-test after the fix with the same
+      > plan and load.
+
+      **What the tester checks before signing anything:** that the achieved load is in the report next to every
+      verdict, that the error rate is per transaction (JMeter's summary showed 2.57% across all samples), and
+      that latency was computed on successful requests only.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-slo-run-verdicts, perf-slo-testable-requirements]
+    title: Testing the requirements and the verdicts
+    body: |
+      | # | Case | Input | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | testable latency requirement | `p95 of POST /v1/payments < 300 ms at 50 req/s` | parsed: latency, p95, 300 ms, 50 req/s | the `Requirement` |
+      | 2 | vague wish | `The payments page must be fast` | rejected: `no-transaction`, `no-threshold`, `no-load` - all three, not the first | reason list |
+      | 3 | average | `Average response time of GET /v1/payments under 200 ms at 40 req/s` | rejected: `average` | reason list |
+      | 4 | absolute | `100% of GET /health complete within 50 ms at 10 req/s` | rejected: `absolute` | reason list |
+      | 5 | slow failures excluded from latency | 100 successes at 50 ms, 10 failures at 5,000 ms | latency p95 = 50 ms, pass; error requirement judges the failures | verdict |
+      | 6 | load not reached | samples every 100 ms (10 req/s), requirement at 50 req/s | `inconclusive`, note "load not reached" | verdict note |
+      | 7 | too few samples | 20 samples | `inconclusive`, observed `None` | verdict |
+      | 8 | real run with injected errors | JMeter plan, 30% failing creations | error verdict `fail`; overall `fail` | JTL + verdicts |
+      | 9 | exact budget | 99.9% of 3,000,000 | exactly 3,000 (Decimal) | value |
+      | 10 | budget exhausted | 99.9%, 20,000 events, 20 bad | release not allowed | boolean |
+
+      The negative cases (2-4, 6, 7) matter most: an evaluator that never says "no" or "inconclusive" looks
+      perfect in a demo and certifies broken releases.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-slo-testable-requirements, perf-slo-run-verdicts, perf-slo-sli-slo-sla]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Averages as targets.** A mean of 245 ms can hide 5% of requests at three seconds. Use percentiles.
+      - **One number for the whole API.** Health checks and list calls drown the slow payment creation; JMeter's
+        all-samples summary showed 2.57% errors where the payment transaction had 5.17%.
+      - **No load in the requirement.** Every quiet environment passes it.
+      - **Calling an unreached load a pass.** A closed-model test with too few threads produces less traffic
+        than the requirement; the verdict is inconclusive and the test needs more threads or an open model
+        (see [Little's law and workload models](#/lesson/littles-law-and-workload-models)).
+      - **Fast failures inside the latency percentile.** Failed requests are often the fastest; they pull the
+        percentile down. Judge latency on successes and failures with their own requirement.
+      - **p99 from a handful of samples.** With 50 samples p99 is the maximum. Run long enough.
+      - **Moving the target after the run.** Thresholds, load and run rules are agreed before the numbers are
+        seen; otherwise the report is a negotiation.
+      - **SLA where an SLO is meant.** If there is no contractual consequence, it is an SLO - and the SLA is
+        usually looser than the internal SLO.
+      - **100% SLOs.** No budget, no releases, and no run can prove it. The SRE workbook starts from "100% is
+        the wrong number".
+
+      **Debugging a surprising verdict:** (1) check the sample count and the achieved load for that transaction;
+      (2) recompute the percentile from the raw JTL rows for that label and success = true; (3) count errors
+      for that label only; (4) compare the measurement point - generator or server - with what the requirement
+      says; (5) only then question the system.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-slo-sli-slo-sla, perf-slo-testable-requirements]
+    title: Trade-offs and alternatives
+    body: |
+      - **Strict targets vs useful targets.** The SRE book: "It's better to start with a loose target that you
+        tighten than to choose an overly strict target that has to be relaxed when you discover it's
+        unattainable." A load-test target nobody can meet gets waived, and then ignored.
+      - **Several percentiles vs one.** p50, p95 and p99 together describe the curve; each extra target is one
+        more thing to defend. Keep to the ones the business can explain.
+      - **Client-side vs server-side measurement.** The load generator sees what a client sees, including
+        queues in front of the application; server metrics are cheaper and cover real traffic. Requirements
+        should name one; reports should show both when they disagree.
+      - **Per-run thresholds vs error budgets.** A threshold gives a clear pass/fail for one test; an error
+        budget connects the result to production risk. Use the threshold to gate, the budget to explain.
+      - **Apdex and similar scores** compress the distribution into one number; useful on dashboards, but a
+        requirement still needs the threshold and percentile behind it. (Apdex in the JMeter dashboard is
+        covered in [The JMeter HTML dashboard and CI runs](#/lesson/jmeter-html-dashboard-and-ci).)
+      - **Don't overachieve.** The SRE book warns that if real performance is much better than the SLO, "users
+        will come to rely on its current performance". A test far inside its target is good news, but it is not
+        a new promise.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-slo-testable-requirements, perf-slo-sli-slo-sla, perf-slo-run-verdicts]
+    title: Quick reference
+    body: |
+      - Testable = **transaction + percentile + threshold (with unit) + load** (+ measured where, over what window).
+      - Reject: "fast", averages, "always"/"100%", no load, no transaction.
+      - SLI = a measure (best: good events / all events). SLO = target for an SLI. SLA = contract with
+        consequences.
+      - Error budget = 100% - SLO; 99.9% of 3,000,000 = 3,000 bad events. Burn rate = error rate / (100% - SLO);
+        a full budget lasts window / burn rate.
+      - Judge per transaction: latency as a percentile of **successful** requests; errors as a rate.
+      - **Inconclusive** when samples are too few or the stated load was not reached - never "pass".
+      - Overall: any fail -> fail; all pass -> pass; otherwise inconclusive.
+      - Agree thresholds, load and run rules **before** the run.
+
+exercises:
+  - id: classify-sla
+    type: mcq
+    concept: perf-slo-sli-slo-sla
+    skill: recognition
+    title: SLI, SLO or SLA?
+    prompt: |
+      SandPay's merchant contract says: "If fewer than 99.9% of payment API requests succeed in a calendar month,
+      SandPay credits 10% of that month's fees." What is this statement?
+    options:
+      - id: sla
+        text: An SLA - it contains an SLO and a consequence for missing it
+        feedback: Correct - the SRE book's test is "what happens if the SLOs aren't met?" A fee credit is an explicit consequence.
+      - id: slo
+        text: An SLO - it is a target for a measured value
+        feedback: It contains an SLO (99.9% successful requests), but the fee credit makes the whole statement an agreement.
+      - id: sli
+        text: An SLI - it measures successful requests
+        feedback: The SLI is the measured ratio of successful requests; the statement sets a target and a consequence on top.
+      - id: nfr-only
+        text: A functional requirement about refunds
+        feedback: The credit is a contractual consequence of service level, not a product feature.
+    correct: [sla]
+    hints:
+      - Ask what happens if the target is missed.
+    solution: |
+      An SLA - an explicit contract with consequences (a fee credit) for missing the SLO (99.9% success per month)
+      it contains. The SLI is the monthly success ratio.
+
+  - id: pick-testable
+    type: mcq
+    concept: perf-slo-testable-requirements
+    skill: application
+    title: Which requirement can a load test pass or fail?
+    prompt: Which of these requirements is testable as written?
+    options:
+      - id: good
+        text: "p99 of GET /v1/payments under 400 ms at 60 req/s, measured at the load generator"
+        feedback: Correct - transaction, percentile, threshold, load and measurement point are all there.
+      - id: average
+        text: Average payment API response time below 150 ms at 60 req/s
+        feedback: An average hides the tail and names no transaction; 5% of requests could take seconds and it would still pass.
+      - id: always
+        text: Payments always complete within 2 seconds
+        feedback: '"Always" is an absolute - one slow request out of millions fails it, and no run can prove it. It also has no load.'
+      - id: noload
+        text: p95 of POST /v1/payments under 300 ms
+        feedback: No load condition - any quiet environment passes it.
+    correct: [good]
+    hints:
+      - Check each option for transaction, statistic, threshold and load.
+    solution: |
+      Only the first names all four parts (and where it is measured). The others are missing the percentile,
+      contain an absolute, or have no load.
+
+  - id: mean-hides-tail
+    type: mcq
+    concept: perf-slo-testable-requirements
+    skill: analysis
+    title: The average that passed
+    prompt: |
+      A run of 100 `POST /v1/payments` requests had 95 at 100 ms and 5 at 3,000 ms, all successful. Which
+      requirement **fails**?
+    options:
+      - id: p99
+        text: p99 under 1,000 ms
+        feedback: Correct - the nearest-rank p99 is the 99th value of 100, which is 3,000 ms.
+      - id: mean
+        text: Average under 300 ms
+        feedback: The mean is (95 x 100 + 5 x 3,000) / 100 = 245 ms - it passes, which is exactly the problem with averages.
+      - id: p95
+        text: p95 under 300 ms
+        feedback: The nearest-rank p95 is the 95th value, 100 ms - it passes. One customer in twenty still waits 3 s; pick the percentile for the tail you care about.
+      - id: p50
+        text: Median under 150 ms
+        feedback: The median is 100 ms - it passes.
+    correct: [p99]
+    hints:
+      - Sort the 100 values. Which value is at rank 95? At rank 99?
+      - Mean = total time / count.
+    solution: |
+      Mean 245 ms, p50 100 ms, p95 100 ms (rank 95), p99 3,000 ms (rank 99). Only p99 sees the slow 5%. A
+      requirement's percentile must match the share of users you are willing to let wait.
+
+  - id: unreached-load
+    type: mcq
+    concept: perf-slo-run-verdicts
+    skill: application
+    title: Fast, but at what load?
+    prompt: |
+      The requirement is `p95 of POST /v1/payments < 300 ms at 100 req/s`. The run used 4 threads with no
+      pacing: 600 samples of that transaction, p95 = 60 ms, achieved 60.4 req/s. What is the verdict?
+    options:
+      - id: inconclusive
+        text: Inconclusive - the stated load was not reached, so the run cannot support pass or fail
+        feedback: Correct - re-run with enough threads (or an open-model arrival rate) to reach 100 req/s.
+      - id: pass
+        text: Pass - 60 ms is well under 300 ms
+        feedback: At about 60% of the load. Latency usually grows with load; this run tells you nothing about 100 req/s.
+      - id: fail
+        text: Fail - the system could only do 60.4 req/s
+        feedback: The closed-model test produced 60.4 req/s because of its 4 threads, not because the system hit a limit. That is a test design problem, not a system failure.
+      - id: pass-scaled
+        text: Pass - scale linearly, 60 ms x 100 / 60.4 is still under 300 ms
+        feedback: Response time is not linear in load; queues make it grow sharply near saturation.
+    correct: [inconclusive]
+    hints:
+      - Which part of the requirement did this run not satisfy?
+    solution: |
+      Check the run before the result: the load was not reached, so the honest verdict is inconclusive. Fix the
+      test (more threads or an arrival-rate model) and re-run.
+
+  - id: budget-calc
+    type: mcq
+    concept: perf-slo-sli-slo-sla
+    skill: application
+    title: How much budget is left?
+    prompt: |
+      An internal SLO is 99.95% successful payment creations over 30 days. So far this window there were
+      2,000,000 creations and 400 failures. How much of the error budget is consumed?
+    options:
+      - id: forty
+        text: 40% - the budget is 1,000 failures
+        feedback: Correct - (100 - 99.95)% of 2,000,000 = 0.05% = 1,000; 400 / 1,000 = 40%.
+      - id: four
+        text: 4% - the budget is 10,000 failures
+        feedback: That uses 0.5%, not 0.05%. 100 - 99.95 = 0.05.
+      - id: point-two
+        text: 0.02% - 400 out of 2,000,000
+        feedback: That is the error rate, not the share of the budget it uses.
+      - id: eighty
+        text: 80% - the budget is 500 failures
+        feedback: 0.05% of 2,000,000 is 1,000, not 500.
+    correct: [forty]
+    hints:
+      - Budget = (100% - SLO) x total events.
+    solution: |
+      Budget = 0.05% x 2,000,000 = 1,000 bad events. 400 / 1,000 = 0.4 = 40% consumed; releases may still go out.
+
+  - id: burn-calc
+    type: mcq
+    concept: perf-slo-sli-slo-sla
+    skill: application
+    title: Burn rate under load
+    prompt: |
+      A load test at the expected peak shows 0.5% of payment creations failing. The production SLO is 99.9%
+      over 30 days. If production behaved like the test, how long would a full error budget last?
+    options:
+      - id: six
+        text: 6 days - burn rate 5
+        feedback: Correct - burn rate = 0.5% / 0.1% = 5; 30 days / 5 = 6 days.
+      - id: thirty
+        text: 30 days - the budget lasts the window
+        feedback: That is a burn rate of 1, which needs a 0.1% error rate, not 0.5%.
+      - id: one-fifty
+        text: 150 days
+        feedback: Multiplying instead of dividing. A higher error rate uses the budget faster.
+      - id: never
+        text: Forever - 0.5% is under 1%
+        feedback: The SLO allows 0.1% errors, not 1%.
+    correct: [six]
+    hints:
+      - Burn rate = observed error rate / allowed error rate.
+    solution: |
+      Allowed rate = 100% - 99.9% = 0.1%. Burn rate = 0.5 / 0.1 = 5. A full budget lasts 30 / 5 = 6 days.
+
+  - id: fast-failures
+    type: mcq
+    concept: perf-slo-run-verdicts
+    skill: analysis
+    title: Why did p95 improve?
+    prompt: |
+      After a deploy, the p95 of `POST /v1/payments` **dropped** from 180 ms to 60 ms in the load test, and the
+      tester reported an improvement. The evaluator computes the percentile over all samples. What should the
+      tester check first?
+    options:
+      - id: errors
+        text: The error rate - fast failures (for example 500s returned in a few ms) pull a percentile over all samples down
+        feedback: Correct - judge latency on successful requests and errors with their own requirement.
+      - id: cache
+        text: Whether a cache was added - that explains faster responses
+        feedback: Possible, but check the cheap, common explanation first; a drop this large with a percentile over all samples is a classic sign of failures.
+      - id: jvm
+        text: Whether JMeter's JVM warmed up better this time
+        feedback: Generator warm-up affects the first seconds, not a 3x change across the run.
+      - id: nothing
+        text: Nothing - lower latency is always good news
+        feedback: Not if the "fast" responses are errors.
+    correct: [errors]
+    hints:
+      - What kind of response is often the fastest?
+    solution: |
+      Count failures for that label in the JTL. If many are fast errors, recompute p95 over successful samples
+      only - the evaluator in this lesson does this, and reports errors in a separate verdict.
+
+  - id: measured-where
+    type: mcq
+    concept: perf-slo-testable-requirements
+    skill: analysis
+    title: Two numbers for one request
+    prompt: |
+      During a load test the application's own metrics say p95 = 40 ms for `POST /v1/payments`, while the load
+      generator's JTL says p95 = 900 ms for the same transaction. Both are correct. What most likely explains
+      the gap, and what should the requirement say?
+    options:
+      - id: queue
+        text: Requests wait before the application sees them (accept queue, proxy, thread pool); the requirement should name where it is measured - usually the client side for user experience
+        feedback: Correct - the SRE book notes that not measuring at the client "can miss a range of problems that affect users but don't affect server-side metrics".
+      - id: bug
+        text: One of the tools is wrong; trust the server metrics
+        feedback: Both measure something real - they start the clock at different places.
+      - id: avg
+        text: The server reports an average, the generator a percentile
+        feedback: The prompt says both are p95.
+      - id: network
+        text: It must be the network; the requirement should exclude the network
+        feedback: On a loopback or same-datacentre setup the network cannot explain 860 ms; waiting in front of the application can.
+    correct: [queue]
+    hints:
+      - When does each tool start its clock?
+    solution: |
+      The server's clock starts when its code receives the request; the generator's starts when it sends it.
+      Under saturation, waiting in queues happens between those points. Requirements must name the measurement
+      point.
+
+  - id: safety-margin
+    type: mcq
+    concept: perf-slo-sli-slo-sla
+    skill: application
+    title: Which target should the load test use?
+    prompt: |
+      The merchant SLA promises 99.5% successful payment creations per month. The internal SLO is 99.9%. Which
+      error-rate threshold should the pre-release load test enforce for payment creation?
+    options:
+      - id: internal
+        text: The internal one - at most 0.1% failures
+        feedback: 'Correct - the SRE book''s "Keep a safety margin" - the tighter internal SLO leaves room to react before customers are affected.'
+      - id: sla
+        text: The SLA's - at most 0.5% failures
+        feedback: Testing only against the contract means you discover problems when they already cost money.
+      - id: zero
+        text: Zero failures
+        feedback: An absolute; one transient failure in a long run fails it, and nobody can meet it in production either.
+      - id: one
+        text: 1% - load tests are noisy
+        feedback: Noise is handled with enough samples and repeated runs, not by loosening the target past the contract.
+    correct: [internal]
+    hints:
+      - Which target gives you warning before a customer notices?
+    solution: |
+      Gate on the internal SLO (0.1% failures). The SLA is the line you must never cross; the SLO is the line
+      that warns you in time.
+
+  - id: tiny-sample
+    type: mcq
+    concept: perf-slo-run-verdicts
+    skill: analysis
+    title: p99 from a short smoke test
+    prompt: |
+      A 10-second smoke test produced 50 samples of `GET /v1/payments`. The requirement is `p99 < 500 ms`. The
+      evaluator reports p99 = 620 ms - a fail. What is the soundest response?
+    options:
+      - id: inconclusive
+        text: Treat it as inconclusive - with 50 samples the nearest-rank p99 is the single slowest request; run long enough for the percentile to mean something
+        feedback: Correct - ceil(0.99 x 50) = 50, the maximum.
+      - id: fail
+        text: Report a failure - the number is over the threshold
+        feedback: One outlier decides it; the run cannot support a p99 verdict either way.
+      - id: p95
+        text: Switch the requirement to p95 so the test passes
+        feedback: Changing the requirement to fit the data is moving the target after the run.
+      - id: drop
+        text: Drop the slowest sample as an outlier and recompute
+        feedback: Removing inconvenient data without a documented rule hides real problems - the slow sample may be the tail you care about.
+    correct: [inconclusive]
+    hints:
+      - Compute the rank of p99 for n = 50.
+    solution: |
+      Rank = ceil(0.99 x 50) = 50, the maximum. Set a minimum sample count before the run (this lesson's
+      evaluator uses 100) and report inconclusive below it.
+
+  - id: wish-to-criteria
+    type: order
+    concept: perf-slo-testable-requirements
+    skill: application
+    title: From a wish to acceptance criteria
+    prompt: Put the steps for turning "checkout must cope with Black Friday" into acceptance criteria in order.
+    items:
+      - id: transactions
+        text: List the transactions that matter (create payment, list payments, get token)
+      - id: load
+        text: Derive the load per transaction from last year's peak and the expected growth
+      - id: tail
+        text: Ask how many customers may wait longer than how long - percentile and threshold
+      - id: errors
+        text: Add an error-rate target per transaction and agree what counts as an error
+      - id: where
+        text: State where it is measured and over what window
+      - id: rules
+        text: Agree the run rules (duration, minimum samples, invalid-run conditions) before running
+    hints:
+      - You cannot set a load without knowing which transactions carry it.
+      - Run rules come last but always before the numbers are seen.
+    solution: |
+      Transactions, load, percentile and threshold, error rate, measurement point and window, run rules. Each step
+      depends on the previous ones, and agreeing the rules before the run keeps the verdict honest.
+
+  - id: buggy-judge
+    type: debug
+    concept: perf-slo-run-verdicts
+    skill: analysis
+    title: An evaluator that certifies broken releases
+    prompt: |
+      This function judges one latency requirement. Click **every** line that makes it give a wrong or
+      unjustified verdict.
+    language: python
+    code: |
+      def judge(samples, req, min_samples=100):
+          mine = [s for s in samples if s.label == req.transaction]
+          if len(mine) < min_samples:
+              return "inconclusive"
+          rate = achieved_rate(mine)
+          if rate < 0.1 * req.load:
+              return "inconclusive"
+          times = [s.elapsed_ms for s in mine]
+          observed = sum(times) / len(times)
+          if observed <= req.threshold_ms:
+              return "pass"
+          return "fail"
+    correctLines: [6, 8, 9]
+    lineNotes:
+      - line: 2
+        note: Filtering by the transaction's label is right - one verdict per transaction.
+      - line: 3
+        note: A minimum sample count is correct.
+      - line: 10
+        note: Comparing observed with the threshold is right once observed is the right statistic.
+    hints:
+      - Which statistic does the requirement name?
+      - Which samples should latency be computed over?
+      - How much of the stated load must the run reach?
+    solution: |
+      Line 6 accepts a run at 10% of the stated load. Line 8 mixes failed requests into latency. Line 9 uses the
+      mean instead of the requirement's percentile. Fix: `rate < 0.9 * req.load`, filter `if s.success`, and use
+      `percentile(times, req.percentile)`.
+
+  - id: why-not-scale
+    type: short
+    concept: perf-slo-run-verdicts
+    skill: analysis
+    title: Why a pass at 60 req/s proves nothing about 200 req/s
+    prompt: |
+      A developer argues: "p95 was 60 ms at 60 req/s with 4 threads. 200 req/s is about 3.3 times more, so p95
+      will be about 200 ms - still under the 1 second target. Ship it." Explain in a few sentences why this is
+      not evidence and what you would do instead.
+    modelAnswer: |
+      Response time is not linear in load. Below saturation it stays roughly flat; as utilisation of the
+      limiting resource (a worker pool, a database connection pool, CPU) approaches 100%, requests queue and
+      response time grows sharply - often from milliseconds to seconds over a small increase in load. The run
+      never got near that point, so it says nothing about it. Also, a 4-thread closed model with no pacing
+      produces only as much traffic as 4 threads waiting for each response can - about 60 req/s per transaction
+      here; it measured the test's limit, not the system's. Instead: run at 200 req/s
+      (enough threads or an arrival-rate model), check that the load was reached, and judge the requirement
+      there; better still, step the load up to find where it breaks.
+    rubric:
+      - Says response time grows non-linearly near saturation (queueing).
+      - Notes the closed-model test could not produce the higher load.
+      - Proposes testing at the stated load and checking it was reached.
+      - Mentions stepping the load to find the limit (optional).
+    hints:
+      - What happens to a queue as arrivals approach the service rate?
+    solution: |
+      Latency grows non-linearly near saturation, so extrapolating a light-load result is not evidence. Test at
+      the stated load and verify it was reached.
+
+  - id: bf-testdesign
+    type: testdesign
+    concept: perf-slo-testable-requirements
+    skill: application
+    title: Acceptance tests for the Black Friday requirements
+    prompt: |
+      Given the three SandPay requirements from the example (p95 POST < 300 ms, p99 GET < 0.5 s, POST error rate
+      below 1%, all at 20 req/s), design the acceptance test cases for the load test itself. For each case give
+      preconditions, steps, the expected result and the evidence you would keep. Include at least one case that
+      should come out inconclusive.
+    modelAnswer: |
+      Preconditions for all: the test environment sized like production (or the difference documented), seeded
+      data volumes, the JMeter plan naming samplers after the transactions, the generator monitored (CPU below
+      about 70%) so it is not the bottleneck.
+
+      1. **Steady state at target load** - ramp to 20 req/s per transaction, hold 30 minutes, exclude the first
+         5 minutes as warm-up (agreed beforehand). Expected - all three verdicts pass. Evidence - JTL, achieved
+         rate per transaction, generator CPU, server metrics.
+      2. **Load check** - same plan with too few threads (or capped arrival rate at 10 req/s). Expected -
+         every verdict inconclusive with "load not reached". Evidence - verdict notes. (Proves the evaluator
+         will not certify a weak run.)
+      3. **Error injection** - a dependency stub returns 500 for 5% of payment creations. Expected - the error
+         verdict fails; latency verdicts are computed on successes only. Evidence - JTL rows with 500, verdicts.
+      4. **Minimum samples** - a 1-minute run. Expected - p99 GET inconclusive below the agreed sample count.
+         Evidence - sample counts.
+      5. **Above target** - step load to 30 and 40 req/s. Expected - record where the first requirement fails
+         (headroom). Evidence - verdict per step.
+      6. **Measurement point** - compare generator p95 with server p95 during case 1. Expected - documented
+         difference; the requirement's point decides. Evidence - both values.
+    rubric:
+      - Each case has preconditions, steps, an expected result and evidence.
+      - Includes a run at the stated load with the achieved load checked.
+      - Includes a case designed to be inconclusive (load not reached or too few samples).
+      - Includes a failure case with errors judged separately from latency.
+      - Mentions warm-up and generator health agreed before the run.
+    hints:
+      - Test the test - when must the evaluator refuse to pass?
+    solution: |
+      Cover the passing run at the stated load, a deliberately weak run that must be inconclusive, an
+      error-injection run, a short run below the sample minimum and a step above the load - all with evidence.
+
+  - id: interview-nfr
+    type: interview
+    concept: perf-slo-testable-requirements
+    skill: analysis
+    title: "Interview: \"the business just says it should be fast\""
+    prompt: |
+      "Our product owner says the new checkout API should be fast and scale for peak season. How would you
+      turn that into something you can test, and how would you report the result?"
+    modelAnswer: |
+      I'd turn it into a few one-line requirements that each name a transaction, a percentile, a threshold
+      and a load - for example "p95 of POST /payments under 300 ms at 20 requests per second" - plus an error
+      rate per transaction. To get there I ask: which steps matter to revenue; how many customers may wait
+      longer than how long (that gives me the percentile and threshold - not an average, because averages hide
+      the tail); what peak load we expect, from last year's analytics times growth; and where we measure - at
+      the client, usually, because server metrics miss queueing in front of the app. If there's a production
+      SLO, I align with the internal SLO, which is tighter than any SLA.
+
+      Before running I agree the run rules: duration, warm-up, minimum samples, and that a run that doesn't reach
+      the stated load is inconclusive. I report per transaction - observed percentile, error rate, achieved load,
+      sample count - with pass, fail or inconclusive, and the evidence files. If it fails, I translate the error
+      rate into error-budget burn: "at this rate the month's budget lasts six days", which is what release
+      managers act on.
+    rubric:
+      - Breaks the wish into transaction, percentile, threshold and load.
+      - Explains why percentiles beat averages.
+      - Separates error rate from latency.
+      - Mentions agreeing run rules beforehand and the inconclusive verdict.
+      - Uses SLO/SLA/error budget vocabulary correctly.
+    followUps:
+      - How would you choose between p95 and p99 for this API?
+      - What would you do if the test environment is half the size of production?
+      - Your load test passes, but production misses its SLO a week later. Where do you look?
+    hints:
+      - Structure - questions you ask, the requirement you write, how you judge and report.
+    solution: |
+      Ask the questions that produce transaction, percentile, threshold, load and measurement point; agree run
+      rules first; report per transaction with achieved load and evidence; connect failures to error budgets.
+
+  - id: slo-spec-code
+    type: coding
+    concept: perf-slo-testable-requirements
+    skill: application
+    title: Review requirements for testability
+    prompt: |
+      In `exercises/fundamentals/slo_spec.py`, implement `parse_requirement` and `review`. Accept latency
+      requirements (`p95 of POST /v1/payments < 300 ms at 50 req/s`, `99% of GET /v1/payments complete in under
+      0.2 s at 40 req/s`, `... at 200 concurrent users`) and error-rate requirements (`error rate of POST
+      /v1/payments below 0.5% at 50 req/s`); reject everything else with **every** reason code that applies
+      (`no-transaction`, `no-threshold`, `average`, `no-percentile`, `absolute`, `no-load`).
+    project: perf
+    files:
+      - exercises/fundamentals/slo_spec.py
+    test: tests/fundamentals/test_slo_spec.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_slo_spec.py
+    hints:
+      - Write one regular expression per part (transaction, percentile, threshold, load) and search the text for each.
+      - Convert seconds to milliseconds when the unit is "s".
+      - Collect reasons in a list and raise once at the end.
+    modelAnswer: |
+      ```python
+      _TRANSACTION = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/\S*)")
+      _PERCENTILE = re.compile(r"\bp(\d+(?:\.\d+)?)\b|(\d+(?:\.\d+)?)\s*%\s+of\b", re.I)
+      _THRESHOLD = re.compile(r"(?:<=?|under|within|less than|below)\s*(\d+(?:\.\d+)?)\s*(ms|s)\b", re.I)
+      _LOAD = re.compile(r"\bat\s+(\d+(?:\.\d+)?)\s*(req/s|requests per second|rps|concurrent users|users)\b", re.I)
+
+      reasons = []
+      if not _TRANSACTION.search(text):
+          reasons.append("no-transaction")
+      ...  # threshold, average / no-percentile, absolute, load
+      if reasons:
+          raise UntestableRequirement(text, reasons)
+      ```
+
+      Reporting every reason at once is what makes the review useful: "fast" fails on transaction, threshold and
+      load together, and the stakeholder can answer all three questions in one conversation.
+    rubric:
+      - Every test in tests/fundamentals/test_slo_spec.py passes.
+      - Reports all applicable reasons, not just the first.
+      - Converts seconds to milliseconds.
+      - Treats averages and absolutes as untestable rather than guessing a percentile.
+    solution: |
+      One pattern per part, collect every missing part as a reason code, and raise once - averages and
+      absolutes are rejected, not reinterpreted.
+
+  - id: slo-evaluate-code
+    type: coding
+    concept: perf-slo-run-verdicts
+    skill: application
+    title: Judge a real JMeter run per transaction
+    prompt: |
+      In `exercises/fundamentals/slo_evaluate.py`, implement `from_jtl`, `percentile` (nearest rank),
+      `latency_sli`, `achieved_rate`, `evaluate` and `overall` so that a run is judged per transaction: latency
+      as a percentile of successful samples, errors as a rate, and **inconclusive** when there are too few
+      samples or the stated load was not reached. One test runs the real JMeter plan
+      `tests/fundamentals/slo_payments.jmx` against the practice API with 30% of payment creations failing.
+    project: perf
+    files:
+      - exercises/fundamentals/slo_evaluate.py
+    test: tests/fundamentals/test_slo_evaluate.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_slo_evaluate.py
+    hints:
+      - "Nearest rank: rank = math.ceil(p / 100 * n); the answer is sorted_values[rank - 1]."
+      - Check the sample count, then the load, then compare - in that order.
+      - JMeter writes success as the text "true" or "false".
+    modelAnswer: |
+      ```python
+      if req.kind == "latency":
+          ok_times = [s.elapsed_ms for s in mine if s.success]
+          observed = percentile(ok_times, req.percentile) if ok_times else None
+          passed = observed is not None and observed <= req.threshold_ms
+      else:
+          observed = round(100 * sum(1 for s in mine if not s.success) / len(mine), 2)
+          passed = observed <= req.max_error_percent
+      if not load_ok:
+          status = "inconclusive"
+      else:
+          status = "pass" if passed else "fail"
+      ```
+
+      The load check wins over the comparison, and latency ignores failed samples, which the error verdict
+      judges instead.
+    rubric:
+      - Every test in tests/fundamentals/test_slo_evaluate.py passes, including the real JMeter run.
+      - Latency is computed on successful samples only.
+      - Unreached load and too few samples give inconclusive, never pass.
+      - Overall is fail if any verdict fails and pass only if all pass.
+    solution: |
+      Filter per transaction, check samples and load first, then compare a nearest-rank percentile of successes
+      (or the error rate) with the target.
+
+  - id: slo-budget-code
+    type: coding
+    concept: perf-slo-sli-slo-sla
+    skill: application
+    title: Error budgets with exact arithmetic
+    prompt: |
+      In `exercises/fundamentals/slo_budget.py`, implement `error_budget`, `budget_consumed`, `burn_rate`,
+      `days_to_exhaustion` and `release_allowed` with `Decimal`. The tests use the SRE workbook's example (99.9%
+      of 3,000,000 requests = 3,000; 1,500 errors = 50%) and the release rule "as long as there is error budget
+      remaining".
+    project: perf
+    files:
+      - exercises/fundamentals/slo_budget.py
+    test: tests/fundamentals/test_slo_budget.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_slo_budget.py
+    hints:
+      - "_slo() already turns \"99.9\" into a Decimal and rejects 0 and 100."
+      - Budget = (100 - SLO) / 100 x total; burn rate = observed % / (100 - SLO).
+    modelAnswer: |
+      ```python
+      def error_budget(slo_percent, total_events):
+          if total_events < 0:
+              raise ValueError("total_events must not be negative")
+          return (Decimal(100) - _slo(slo_percent)) / Decimal(100) * total_events
+
+      def burn_rate(slo_percent, observed_error_percent):
+          return Decimal(str(observed_error_percent)) / (Decimal(100) - _slo(slo_percent))
+
+      def release_allowed(slo_percent, total_events, bad_events):
+          return budget_consumed(slo_percent, total_events, bad_events) < 1
+      ```
+
+      With floats, `(100 - 99.9) / 100 * 3_000_000` comes out just under 3,000; `Decimal` keeps the count exact.
+    rubric:
+      - Every test in tests/fundamentals/test_slo_budget.py passes.
+      - Uses Decimal, not float, for the arithmetic.
+      - Rejects 0% and 100% SLOs.
+      - Can explain burn rate 1 as "budget used up exactly at the end of the window".
+    solution: |
+      Budget = (100 - SLO)% of events, consumed = bad / budget, burn = observed rate / allowed rate - all in
+      Decimal.
+
+placement:
+  - id: place-testable
+    type: mcq
+    concept: perf-slo-testable-requirements
+    skill: analysis
+    title: Approve the requirement
+    prompt: |
+      Which requirement would you approve for a pre-release load test of SandPay's refund endpoint?
+    options:
+      - id: right
+        text: "p95 of POST /v1/refunds under 400 ms, error rate below 0.5%, at 15 req/s measured at the load generator"
+        feedback: Correct - transaction, percentile, threshold, error rate, load and measurement point.
+      - id: mean
+        text: Mean refund response time under 200 ms at 15 req/s
+        feedback: A mean hides the slow tail; a refund taking 5 s for 1 customer in 20 would pass.
+      - id: always
+        text: Refunds always succeed within 1 second
+        feedback: '"Always" is absolute and there is no load - no run can prove it.'
+      - id: noload
+        text: p99 of POST /v1/refunds under 400 ms
+        feedback: No load - any quiet environment passes.
+    correct: [right]
+    solution: |
+      A testable requirement names the transaction, a percentile, a threshold, an error rate and the load (and
+      ideally where it is measured). Averages, absolutes and missing loads cannot be passed or failed honestly.
+
+  - id: place-budget
+    type: mcq
+    concept: perf-slo-sli-slo-sla
+    skill: application
+    title: Release or not?
+    prompt: |
+      SLO: 99.9% successful requests over 30 days. This window so far - 5,000,000 requests, 4,200 failed.
+      Following the SRE book's error budget policy, may the team release?
+    options:
+      - id: yes
+        text: Yes - 4,200 of a 5,000-error budget is used (84%); budget remains
+        feedback: Correct - 0.1% of 5,000,000 = 5,000; releases go out while budget remains.
+      - id: no
+        text: No - 4,200 failures is far too many
+        feedback: The SLO allows 5,000 failures for this volume; the count alone does not decide.
+      - id: no-rate
+        text: No - the error rate is 0.084%, which breaks the 99.9% SLO
+        feedback: 0.084% is below the allowed 0.1%; the SLO is being met.
+      - id: sla
+        text: It depends on the SLA, not the SLO
+        feedback: The release policy in the SRE book is based on the SLO's error budget.
+    correct: [yes]
+    solution: |
+      Budget = 0.1% x 5,000,000 = 5,000; consumed 4,200 / 5,000 = 84%. Budget remains, so releases may go out -
+      carefully, because 16% is left.
+
+  - id: place-verdict
+    type: mcq
+    concept: perf-slo-run-verdicts
+    skill: analysis
+    title: Read the run
+    prompt: |
+      Requirement: `p95 of POST /v1/payments < 300 ms at 40 req/s`. The run - 1,800 samples for that
+      transaction, achieved 41.2 req/s, 9% of them failed with 500 in under 10 ms, p95 over **all** samples
+      = 120 ms, p95 over **successful** samples = 340 ms. What is the latency verdict?
+    options:
+      - id: fail
+        text: Fail - latency is judged on successful requests, 340 ms is over 300 ms
+        feedback: Correct - and the 9% failures fail any sensible error-rate requirement as well.
+      - id: pass
+        text: Pass - p95 is 120 ms
+        feedback: That percentile is pulled down by fast failures.
+      - id: inconclusive
+        text: Inconclusive - too many errors to judge latency
+        feedback: Samples and load are sufficient; errors are judged by their own requirement, latency on the successes.
+      - id: na
+        text: Not applicable - only error rate matters when there are errors
+        feedback: Both matter; judge each with its own requirement.
+    correct: [fail]
+    solution: |
+      Load reached (41.2 >= 40), enough samples, so judge: p95 of successes = 340 ms > 300 ms - fail. Fast
+      failures would have hidden it in an all-samples percentile.
+
+recall:
+  - id: recall-testable
+    concept: perf-slo-testable-requirements
+    prompt: What four parts make a load-test latency requirement testable?
+    answer: The transaction, the statistic (a percentile), the threshold with a unit, and the load at which it must hold - plus, ideally, where it is measured.
+  - id: recall-sli-slo-sla
+    concept: perf-slo-sli-slo-sla
+    prompt: Define SLI, SLO and SLA in one line each.
+    answer: SLI - a carefully defined quantitative measure of service (best as good / all events). SLO - a target for an SLI. SLA - a contract with users that includes consequences of meeting or missing its SLOs.
+  - id: recall-budget
+    concept: perf-slo-sli-slo-sla
+    prompt: What is the error budget of a 99.9% SLO over 3 million requests?
+    answer: 100% - 99.9% = 0.1% of 3,000,000 = 3,000 bad requests (the SRE workbook's example).
+  - id: recall-burn
+    concept: perf-slo-sli-slo-sla
+    prompt: What does a burn rate of 1 mean?
+    answer: The error budget is being used at exactly the rate that empties it at the end of the SLO window; burn rate = observed error rate / (100% - SLO).
+  - id: recall-inconclusive
+    concept: perf-slo-run-verdicts
+    prompt: When is a load test verdict inconclusive rather than pass?
+    answer: When the run cannot support a verdict - too few samples for the percentile, or the load named in the requirement was not reached.
+  - id: recall-failures
+    concept: perf-slo-run-verdicts
+    prompt: Why judge latency on successful requests only?
+    answer: Failed requests are often the fastest (an immediate 500) and pull the percentile down; errors are judged by their own error-rate requirement.
+
+next:
+  - workload-modelling-from-production
+  - performance-test-environments-and-data
+  - reading-load-test-results
+  - performance-testing-in-ci-cd

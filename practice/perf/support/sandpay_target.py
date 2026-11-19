@@ -230,6 +230,8 @@ def _route(state: State, method: str, path: str, query: dict[str, str], headers:
 def _handler_for(state: State) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Headers and body go out as separate writes; without this, Nagle + delayed ACK add ~40 ms per keep-alive request.
+        disable_nagle_algorithm = True
 
         def _serve(self) -> None:
             split = urllib.parse.urlsplit(self.path)
@@ -265,6 +267,13 @@ def _handler_for(state: State) -> type[BaseHTTPRequestHandler]:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 1024
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A load generator that stops mid-request closes its sockets; that is not a server fault.
+        import sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 @contextlib.contextmanager

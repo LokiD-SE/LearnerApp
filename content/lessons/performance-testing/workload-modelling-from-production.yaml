@@ -1,0 +1,1465 @@
+id: workload-modelling-from-production
+title: Workload modelling from production data
+subject: performance-testing
+module: perf-fundamentals
+level: intermediate
+status: published
+estimatedMinutes: 150
+summary: Turn one day of SandPay API access log into a workload model you can defend - name the transactions, remove traffic that is not users, split logins and nightly batches into their own scenarios, find the peak at the right window size, size the concurrency with Little's law, project growth, and measure how skewed the data is. Then express the same model in Locust task weights and JMeter Throughput Controllers and prove, with real runs, that both tools reproduce it.
+tags:
+  [
+    workload model,
+    workload modelling,
+    transaction mix,
+    access log,
+    peak hour,
+    peak factor,
+    arrival rate,
+    Little's law,
+    concurrency,
+    sessions,
+    think time,
+    growth projection,
+    capacity planning,
+    headroom,
+    hot keys,
+    data skew,
+    test data,
+    Locust,
+    task weights,
+    poisson,
+    constant_throughput,
+    JMeter,
+    Throughput Controller,
+    Once Only Controller,
+    Random Controller,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/perf/.venv` with Locust 2.47.0 and pytest 9.2.0; Apache JMeter 5.6.3
+    on OpenJDK 17 (from `practice/perf/scripts/get-jmeter.sh`). Every output in this lesson was printed by the
+    code or tool run shown, on Linux on 19 November 2026. The log analysis is deterministic, so its numbers are
+    the same on any machine. **Response times in the Locust and JMeter output are from this laptop only** -
+    they show the format, not a benchmark; the lesson uses only the request counts.
+  - **Target:** `practice/perf/support/sandpay_target.py`, the local SandPay practice API (loopback only), with
+    5 ms of service time per request for the demo runs (with the target's Nagle fix of 19 November 2026). Never load a system you do not own or have written
+    permission to test.
+  - **Synthetic data:** SandPay is a fictional payments company. The access log comes from
+    `practice/perf/support/workload_fixture.py`: one day (17 November 2026, UTC) with 6,000 merchant sessions
+    on a daily curve, a monitoring probe, a nightly report batch, some errors and three malformed lines. The IP
+    addresses are from the documentation ranges reserved by RFC 5737; merchant ids and payment ids are invented.
+  - **Locust**, as documented for version 2.47.0 on 19 November 2026: [Writing a
+    locustfile](https://docs.locust.io/en/2.47.0/writing-a-locustfile.html) - the `@task` weight, the `tasks`
+    dict, the `weight` and `fixed_count` user attributes, and the `constant_throughput`, `constant_pacing` and
+    `poisson` wait times. Quotations are from that page.
+  - **JMeter**, as documented on 19 November 2026: [Component
+    reference](https://jmeter.apache.org/usermanual/component_reference.html) - Throughput Controller, Once Only
+    Controller, Random Controller and Constant Throughput Timer. Quotations are from that page. How percent mode
+    behaved (exact counts) is what this lesson's runs showed, not a documented guarantee.
+  - **Capacity planning:** Google, *Site Reliability Engineering* (O'Reilly, 2016, free at sre.google),
+    chapter 21 [Handling Overload](https://sre.google/sre-book/handling-overload/) and chapter 18 [Software
+    Engineering in SRE](https://sre.google/sre-book/software-engineering-in-sre/) ("Traditional Capacity
+    Planning"). Quotations are from those pages.
+  - **Little's law:** J. D. C. Little, "A Proof for the Queuing Formula L = lambda W", *Operations Research*
+    9(3), 1961 - cited for the formula only (the paper is not freely available and was not fetched). The
+    law itself is taught in [Little's law and workload models](#/lesson/littles-law-and-workload-models).
+  - **Not repeated here:** percentiles and why averages mislead - [Performance metrics and
+    percentiles](#/lesson/performance-metrics-and-percentiles); turning the model into targets -
+    [Performance requirements and SLOs](#/lesson/performance-requirements-and-slos).
+
+prerequisites:
+  - performance-metrics-and-percentiles
+  - littles-law-and-workload-models
+  - performance-requirements-and-slos
+
+concepts:
+  - id: perf-workload-mix
+    name: Transaction mix and scenarios
+    summary: Which requests real users send and in what proportions - named transactions, with monitoring removed and logins and batches modelled as their own scenarios - expressed as task weights or Throughput Controller percentages.
+  - id: perf-workload-peak-arrival
+    name: Peak arrival rate, concurrency and growth
+    summary: The busiest window at a size that matches the risk, the peak factor, the concurrency Little's law gives from session arrivals and duration, and the peak projected for growth plus headroom.
+  - id: perf-workload-data-skew
+    name: Data distribution and hot keys
+    summary: How unevenly traffic falls across merchants, accounts or records, and test data that reproduces that skew so caches, locks and partitions behave as in production.
+
+objectives:
+  - Derive a transaction mix from an access log, naming transactions consistently and excluding traffic that is not user workload.
+  - Separate once-per-session steps and scheduled batches from the interactive mix and model them as their own scenarios.
+  - Find the peak arrival rate at a window size that matches the risk, and calculate the peak factor.
+  - Size concurrency from session arrivals and duration with Little's law, and project the peak for growth and headroom.
+  - Measure traffic skew across keys and design test data that reproduces it.
+  - Express one model as Locust task weights and as JMeter Throughput Controllers, and verify from a real run that each tool reproduces it.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: The idea in plain language
+    body: |
+      Imagine you are asked to test whether a supermarket's tills can cope with Saturday. You could send 1,000
+      people through the doors at once, each buying one apple. The tills would probably cope - and you would have
+      learned nothing, because real Saturday shoppers fill trolleys, a few pay by cheque, the bakery queue peaks
+      at 11:00, a delivery lorry blocks the car park at 07:00, and half the customers want the same discounted
+      milk.
+
+      A **workload model** is the description of that real Saturday, written down so a load test can replay it:
+
+      - **what** people do and in what proportions (the *transaction mix*);
+      - **how many** arrive and **when** - the busiest moment, not the daily average (the *peak arrival rate*);
+      - **how long** each visit lasts, which tells you how many are in the shop at once (*concurrency*);
+      - **which** shelves they all reach for (the *data distribution* - the hot items);
+      - **what else** happens that is not a shopper - the lorry, the cleaner, the security guard walking the aisles
+        (batches and monitoring).
+
+      For SandPay's merchant API the shop is a log file. One day of access log already contains every answer -
+      if you read it carefully. This lesson reads one, builds the model, and then makes Locust and JMeter
+      reproduce it, with tests that prove they do.
+
+  - id: what
+    kind: what
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Terms you need
+    body: |
+      | Term | Meaning | In this lesson |
+      | --- | --- | --- |
+      | **Transaction** | one kind of request, named the same way every time | `GET /v1/payments/{id}` - ids and query strings removed |
+      | **Transaction mix** | the share of each transaction in the workload | 55 % list, 27 % get, 15 % create, 3 % report |
+      | **Scenario** | a group of users that behave the same way, with its own mix and rate | interactive merchants; the nightly report batch |
+      | **Session** | one user's visit: login, a few calls, think time between them | 4.5 calls after login, 93.8 s on average |
+      | **Think time** | the pause between one user's requests | 2-40 s in the log; `wait_time` in Locust, timers in JMeter |
+      | **Arrival rate** (lambda) | new sessions (or requests) per second | 481 sessions in the peak hour = 0.1336 /s |
+      | **Peak window** | the busiest interval of a chosen length | 12:00-13:00 by the hour; 02:01 by the minute |
+      | **Peak factor** | peak rate divided by the mean rate over the period | 1.98 hourly, 8.95 per minute |
+      | **Little's law** | L = lambda x W: items in a system = arrival rate x time each spends there | 0.1336 /s x 93.8 s = 12.5 concurrent sessions |
+      | **Growth projection** | the peak scaled for expected growth over the planning horizon | 40 % a year for 18 months, plus 30 % headroom |
+      | **Headroom** | capacity kept spare above the projected peak | 30 % |
+      | **Skew / hot keys** | traffic concentrated on a few keys (merchants, accounts, products) | the top 10 % of merchants send 61.8 % of requests |
+      | **Open vs closed model** | load set by arrivals (open) or by a fixed number of looping users (closed) | taught in [Little's law and workload models](#/lesson/littles-law-and-workload-models) |
+
+      Two tool terms, from their documentation:
+
+      - **Locust task weight** - "`@task` takes an optional weight argument that can be used to specify the
+        task's execution ratio." A user picks one task per iteration, at random, by weight.
+      - **JMeter Throughput Controller** - "Percent executions causes the controller to execute a certain
+        percentage of the iterations through the test plan." The manual adds: "This controller is badly named,
+        as it does not control throughput."
+
+  - id: why
+    kind: why
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Why a load test needs a model from production
+    body: |
+      A load test answers "will it cope?" only for the load it applies. Get the model wrong and the test
+      passes while production fails - or fails for a reason production never sees.
+
+      **The mix decides which resource runs out.** In SandPay's API a settlement report costs ten times a
+      payment lookup, and a payment creation twice. A test that only hammers `GET /v1/payments` finds the
+      connection pool's limit and never touches the report query that actually locks the database at 02:00.
+      Google's SRE book makes the same point about capacity in general: "We learned this lesson the hard way:
+      modeling capacity as "queries per second" or using static features of the requests that are believed to
+      be a proxy for the resources they consume ... often makes for a poor metric. Even if these metrics perform
+      adequately at one point in time, the ratios can change." Requests per second means nothing without the
+      mix behind it.
+
+      **The peak decides whether it falls over.** Systems are sized for averages and fail at peaks. SandPay's
+      log averages about 0.4 user requests per second over the day; lunchtime runs at twice that, and one minute
+      at 02:01 runs at almost nine times it. Each of those is a different test.
+
+      **The data decides whether caches and locks behave.** If every virtual merchant asks for a different random
+      payment, caches stay cold and you measure the database. If, as in production, a handful of large merchants
+      send most of the traffic, the cache is hot - and the rows those merchants share are where lock contention
+      lives. Test data that is uniformly random measures neither.
+
+      **And it makes the result defensible.** "We tested 2 requests per second" invites "why 2?". "We tested the
+      peak hour of 17 November - 0.77 requests per second with this mix - projected for 18 months of 40 %
+      growth plus 30 % headroom" is an answer a reviewer can check against the same log.
+
+  - id: from-log-to-model
+    kind: internals
+    concepts: [perf-workload-mix]
+    title: From log lines to a transaction mix
+    body: |
+      A line of SandPay's access log (the format is described in `support/workload_fixture.py`):
+
+      ```plaintext
+      203.0.113.24 - merchant-7 [17/Nov/2026:12:03:41 +0000] "GET /v1/payments?limit=20 HTTP/1.1" 200 812 0.034
+      ```
+
+      Client IP, authenticated client, timestamp, request line, status, bytes, duration in seconds. Turning
+      42,216 of these into a mix takes five decisions, each of which changes the answer.
+
+      **1. Parse strictly, and count what you drop.** Real logs contain truncated writes and garbage from
+      scanners. A strict, anchored pattern that returns "no record" for anything that does not match is safer
+      than a loose one that turns garbage into a strange transaction. This day has three malformed lines - and
+      you report that number, because if it were 3,000 the model would be built on a biased sample.
+
+      **2. Name transactions, not URLs.** `/v1/payments/pay_100123` and `/v1/payments/pay_100457` are the same
+      transaction; `?limit=20` does not make a new one. Replace ids with a placeholder and drop query strings,
+      or the mix has 750 "transactions" with 0.1 % each.
+
+      **3. Remove what is not user workload.** The monitoring probe calls `GET /health` every 10 seconds, all
+      day. It is real traffic, but your load test does not create the probe - production's probe will still be
+      there. Left in, it is the second-largest transaction:
+
+      ```plaintext
+      Mix of ALL requests:
+        GET /v1/payments              35.2%
+        GET /health                   20.5%
+        GET /v1/payments/{id}         17.3%
+        POST /auth/token              14.2%
+        POST /v1/payments              9.4%
+        GET /v1/reports/settlement     3.4%
+
+      Mix of user requests (GET /health excluded):
+        GET /v1/payments              44.3%
+        GET /v1/payments/{id}         21.8%
+        POST /auth/token              17.9%
+        POST /v1/payments             11.8%
+        GET /v1/reports/settlement     4.2%
+      ```
+
+      **4. Split once-per-session steps out of the mix.** `POST /auth/token` is 17.9 % of user requests - but
+      no merchant logs in at random between calls; each logs in once at the start of a session. If you give
+      login a weight of 18, every virtual user keeps logging in mid-session and the token endpoint gets the
+      wrong pattern. Model it as a setup step: Locust's `on_start`, JMeter's Once Only Controller ("For testing
+      that requires a login, consider placing the login request in this controller since each thread only needs
+      to login once").
+
+      **5. Split scheduled work into its own scenario.** 600 of the day's settlement reports come from one
+      merchant in three minutes at 02:00 - a batch job, not merchants clicking. Mixed into the interactive
+      model it inflates the report share from about 3 % to 4.2 % all day, and hides the real risk: a burst at
+      night. It gets its own scenario with its own rate (a Locust user class with `fixed_count`, or its own
+      JMeter Thread Group).
+
+      Remove the health probe, the logins and the batch, and what is left is the interactive mix - the one the
+      exercises use:
+
+      ```plaintext
+      Interactive calls after login (health, login and the batch removed):
+        GET /v1/payments              55.1%
+        GET /v1/payments/{id}         27.1%
+        POST /v1/payments             14.7%
+        GET /v1/reports/settlement     3.1%
+      Weights: {'GET /v1/payments': 55, 'GET /v1/payments/{id}': 27, 'POST /v1/payments': 15, 'GET /v1/reports/settlement': 3}
+      ```
+
+      Integer weights come from the **largest remainder method**: floor every exact share, then hand the
+      leftover units to the largest fractions, keeping at least 1 for every transaction so rare but real
+      requests (a 0.2 % refund) are not rounded out of the test.
+
+  - id: peaks-and-concurrency
+    kind: internals
+    concepts: [perf-workload-peak-arrival]
+    title: Peaks, window size, Little's law and growth
+    body: |
+      **The peak depends on the window you look through.** Count user requests in fixed windows and take the
+      busiest:
+
+      ```plaintext
+      Peak hour: 12:00 UTC, 2775 requests = 0.77 req/s; peak factor 1.98
+
+      Peak minute: 02:01 UTC, 209 requests = 3.48 req/s; peak factor 8.95
+      ```
+
+      By the hour, lunchtime is the peak and it is only twice the average. By the minute, the nightly batch is
+      the peak and it is almost nine times the average - a different time of day, a different transaction, a
+      different bottleneck. Neither is "the" peak. Choose the window to match what can fail: connection pools,
+      thread pools and rate limits saturate in seconds, so minute (or shorter) peaks matter for them; capacity
+      and cost plans work in hours. Report both, and say which one each test targets.
+
+      The **peak factor** is the peak rate divided by the mean rate over the whole period - including quiet
+      windows. Averaging only over windows that had traffic overstates the mean and understates the factor;
+      the debug exercise is exactly that bug.
+
+      **From arrivals to concurrency: Little's law.** A load tool needs a number of virtual users. Little's law,
+      L = lambda x W, says the average number in a system equals the arrival rate times the average time each
+      spends there - for any stable system, whatever the distributions. From the log:
+
+      ```plaintext
+      Sessions: 5994, mean 4.50 calls after login, mean duration 93.8 s
+      Sessions starting 12:00-13:00: 481 -> arrival rate 0.1336/s
+      Little's law, concurrent sessions at peak: L = lambda x W = 0.1336 x 93.8 = 12.5
+      ```
+
+      About 12-13 merchant sessions are in progress at once during the peak hour. A *closed* model (a fixed
+      number of looping users) with realistic think time would therefore use about 13 users; an *open* model
+      would start 0.1336 sessions per second and let concurrency follow. Getting this backwards - 481 users
+      because "481 merchants in the peak hour" - overloads the system about 38-fold.
+
+      **Growth.** A test sized for today's peak tells you about today. Capacity planning, in the SRE book's
+      words, starts with "Collect demand forecasts. How many resources are needed? When and where are these
+      resources needed?" and "Typically covers anywhere from several quarters to years". Project the peak to the
+      end of your planning horizon with compound growth, then add headroom:
+
+      ```plaintext
+      Peak hour 0.771 req/s -> in 18 months at 40%/year growth, +30% headroom: 1.660 req/s
+      ```
+
+      0.771 x 1.4^(18/12) x 1.3 = 1.660. The growth rate is a business input (a forecast), not something the log
+      can tell you - write down who gave it and when, because "capacity planning is a neverending cycle:
+      assumptions change, deployments slip, and budgets are cut".
+
+  - id: data-skew
+    kind: internals
+    concepts: [perf-workload-data-skew]
+    title: Data distribution - hot keys and skew
+    body: |
+      Traffic is rarely spread evenly across the data. Counting requests per merchant:
+
+      ```plaintext
+      Top 10% of merchants send 61.8% of user requests
+      ```
+
+      Five of SandPay's fifty merchants send almost two thirds of the traffic. That changes what a test must do
+      with its data:
+
+      - **Caches.** Production's cache is mostly full of those five merchants' data, so their requests are cheap.
+        Uniform random test data spreads requests across everybody, gets a cold cache, and over-reports database
+        load. A test where every virtual user uses the *same* merchant does the opposite - everything hits the
+        cache and the database looks idle.
+      - **Contention.** Hot keys are where row locks, counters and per-merchant rate limits collide. A big
+        merchant creating payments in parallel contends on its own balance row; fifty small ones do not.
+      - **Partitions and shards.** If data is partitioned by merchant, the busiest partition, not the average, is
+        your bottleneck.
+      - **Volume.** The *size* of the data matters as well as its shape - a query plan on 750 payments is not
+        the plan on 75 million. That is the subject of [Test environments and test
+        data](#/lesson/performance-test-environments-and-data).
+
+      So the workload model includes a **data model**: which merchants (and payments, cards, accounts) the
+      virtual users act as, and with which frequencies. A simple way is to give test data the same rank
+      frequencies as the log - for example in Locust, choose the merchant for each user by weighted choice over
+      the log's counts; in JMeter, a CSV Data Set whose rows repeat hot merchants in proportion.
+
+  - id: when
+    kind: when
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: When to model from production - and when you cannot
+    body: |
+      | Situation | What to build the model from |
+      | --- | --- |
+      | an existing system with logs or APM traces | production logs for a representative peak day (and a known bad day) - this lesson |
+      | an existing system, new feature | today's model plus the product team's adoption estimate for the new transaction, labelled as an estimate |
+      | a new system, no traffic yet | business forecasts (merchants, payments per day, peak events), analytics from a similar product, and stated assumptions - then replace them with real data after launch |
+      | a known event (a sale, a migration, a month-end batch) | the same event last time, scaled; or the business's forecast for it |
+      | an incident reproduction | the log from the incident window, at minute (or second) resolution |
+
+      **What a workload model does not replace:**
+
+      - **Requirements.** The model says what load to apply; [requirements and
+        SLOs](#/lesson/performance-requirements-and-slos) say what "good" looks like under it.
+      - **Stress and spike tests.** A model of the busiest day tests normal peak. Finding the breaking point
+        means going beyond it on purpose - see [Types of performance
+        testing](#/lesson/performance-testing-types).
+      - **Privacy rules.** Production logs contain personal and payment data. Use aggregated counts, or logs
+        your organisation allows you to use; never copy card data or personal details into test data.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: From access log to two load tools
+    body: |
+      ```mermaid
+      flowchart LR
+        LOG["Access log - one peak day"] --> P["Parse strictly, count malformed"]
+        P --> N["Name transactions - ids and queries removed"]
+        N --> X["Remove monitoring"]
+        X --> S{"Split scenarios"}
+        S -- "once per session" --> LOGIN["Login - on_start or Once Only"]
+        S -- "scheduled" --> BATCH["Batch scenario - own rate"]
+        S -- "interactive" --> MIX["Mix - integer weights"]
+        X --> PEAK["Peak per hour and per minute"]
+        PEAK --> LL["Little's law - concurrency"]
+        LL --> GROW["Growth and headroom"]
+        X --> SKEW["Skew per merchant - test data"]
+        MIX --> LOC["Locust - task weights"]
+        MIX --> JM["JMeter - Throughput Controllers"]
+        GROW --> LOC
+        GROW --> JM
+      ```
+
+      Notice that one cleaned set of records feeds three separate results - the mix, the rate and the data
+      shape - and that two of the five scenario decisions (login and batch) take requests *out* of the mix
+      before any weights are computed.
+
+  - id: code-analysis
+    kind: code
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: The analysis, run on the log
+    collapsed: true
+    body: |
+      The script that printed the numbers in this lesson calls the functions you write in the first coding
+      exercise (`fundamentals/workload_log_model.py`; this run used the reference solution):
+
+      ```python
+      from workload_fixture import generate_access_log
+      from fundamentals.workload_log_model import (client_share, parse_line, peak_factor, peak_window,
+                                                   project_peak, task_weights, transaction_mix)
+
+      lines = generate_access_log()
+      records = [parse_line(line) for line in lines]
+      print(f"{len(lines)} lines, {sum(r is None for r in records)} malformed")
+      mix = transaction_mix(records)                      # GET /health excluded by default
+      for label, w in (("hour", 3600), ("minute", 60)):
+          start, count, rate = peak_window(records, w)
+          print(f"Peak {label}: {start:%H:%M} UTC, {count} requests = {rate:.2f} req/s; "
+                f"peak factor {peak_factor(records, w):.2f}")
+      print(f"Top 10% of merchants send {client_share(records):.1%} of user requests")
+      print("Task weights (total 100):", task_weights(mix))
+      peak = peak_window(records)[2]
+      print(f"{project_peak(peak, 0.4, 18, 0.3):.3f} req/s in 18 months, +30% headroom")
+      ```
+
+      ```plaintext
+      42216 lines, 3 malformed
+      Peak hour: 12:00 UTC, 2775 requests = 0.77 req/s; peak factor 1.98
+      Peak minute: 02:01 UTC, 209 requests = 3.48 req/s; peak factor 8.95
+      Top 10% of merchants send 61.8% of user requests
+      Task weights (total 100): {'GET /v1/payments': 44, 'GET /v1/payments/{id}': 22, 'POST /auth/token': 18, 'POST /v1/payments': 12, 'GET /v1/reports/settlement': 4}
+      1.660 req/s in 18 months, +30% headroom
+      ```
+
+      Note the weights here still contain the login and the batch - which is why the lesson splits them out
+      before building the tools' mix (55/27/15/3).
+
+  - id: code-locust
+    kind: code
+    concepts: [perf-workload-mix]
+    title: The model in Locust - task weights
+    body: |
+      The second coding exercise, `fundamentals/workload_locustfile.py` (reference solution, shortened):
+
+      ```python
+      MODEL = {"GET /v1/payments": 55, "GET /v1/payments/{id}": 27,
+               "POST /v1/payments": 15, "GET /v1/reports/settlement": 3}
+
+      class MerchantUser(HttpUser):
+          wait_time = constant(0)            # the demo measures the mix; see "pacing" below
+
+          def on_start(self):                # once per user: login + payment ids to choose from
+              ...
+
+          @task(MODEL["GET /v1/payments"])
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=20", name="GET /v1/payments")
+
+          @task(MODEL["GET /v1/payments/{id}"])
+          def get_payment(self):
+              self.client.get(f"/v1/payments/{random.choice(self.payment_ids)}", name="GET /v1/payments/{id}")
+
+          @task(MODEL["POST /v1/payments"])
+          def create_payment(self):
+              self.client.post("/v1/payments", json={"amount_minor": random.randint(100, 50000), "currency": "EUR"},
+                               headers={"Idempotency-Key": str(uuid.uuid4())}, name="POST /v1/payments")
+
+          @task(MODEL["GET /v1/reports/settlement"])
+          def settlement_report(self):
+              self.client.get("/v1/reports/settlement", name="GET /v1/reports/settlement")
+      ```
+
+      Run headless for 10 seconds with 8 users against the practice API:
+
+      ```bash
+      .venv/bin/locust -f solutions/fundamentals/workload_locustfile.py --headless -u 8 -r 8 -t 10s \
+          --host http://127.0.0.1:8093 --only-summary
+      ```
+
+      ```plaintext
+      Type     Name                                  # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+      --------|------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+      GET      GET /v1/payments                       3443     0(0.00%) |      9       6      49      9 |  356.37        0.00
+      GET      GET /v1/payments/{id}                  1720     0(0.00%) |      9       6      46      9 |  178.03        0.00
+      GET      GET /v1/reports/settlement              181     0(0.00%) |     54      51      88     54 |   18.73        0.00
+      POST     POST /auth/token                          8     0(0.00%) |     18      14      28     17 |    0.83        0.00
+      POST     POST /v1/payments                       930     0(0.00%) |     14      11      50     14 |   96.26        0.00
+      GET      setup: payment ids                        8     0(0.00%) |     17      10      25     15 |    0.83        0.00
+      --------|------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+               Aggregated                             6290     0(0.00%) |     11       6      88      9 |  651.04        0.00
+      ```
+
+      (Name column shortened.) Of the 6,274 model requests, 3,443 / 1,720 / 930 / 181 are 54.9 / 27.4 / 14.8 /
+      2.9 % - the model, within sampling noise. Logins: exactly 8, one per user. Because a task is *chosen at
+      random by weight*, a short run never matches exactly; the test for this exercise allows four standard
+      errors of a binomial proportion, which shrinks as the run gets longer.
+
+      **Pacing.** `constant(0)` makes users loop flat out - fine for checking the mix, wrong for a load test.
+      Locust 2.47 offers `constant_throughput` ("an adaptive time that ensures the task runs (at most) X times
+      per second"), `constant_pacing` (its inverse), and `poisson` ("a random time sampled from an exponential
+      distribution, so that tasks arrive as a Poisson process with the given average rate ... a better
+      approximation of how real users arrive"). Two documented caveats: "Wait time is applied after task
+      execution", and "Wait times apply to tasks, not requests". **Scenarios:** the batch is a second user class;
+      the docs' `fixed_count` ("only that exact number users will be spawned") suits a single batch job, and a
+      class `weight` sets the ratio between user classes ("Locust spawn 3 times as many WebUsers as
+      MobileUsers").
+
+  - id: code-jmeter
+    kind: code
+    concepts: [perf-workload-mix]
+    title: The model in JMeter - Throughput Controllers
+    body: |
+      The third coding exercise, `fundamentals/workload_plan.jmx`, has this tree:
+
+      ```plaintext
+      Test Plan
+      +- HTTP Request Defaults (127.0.0.1, port from -Jport)
+      +- Thread Group "Merchants" (threads and loops from -Jthreads, -Jloops)
+         +- HTTP Header Manager (Content-Type, Authorization: Bearer ${token})
+         +- Once Only Controller "Login once per merchant"
+         |  +- POST /auth/token      + JSON Extractor token = $.access_token
+         |  +- setup: payment ids    + JSON Extractor pid = $.data[*].id (match no. -1: all)
+         +- Throughput Controller "55% list"            Percent Executions 55
+         |  +- GET /v1/payments
+         +- Throughput Controller "27% get by id"       Percent Executions 27
+         |  +- GET /v1/payments/${__V(pid_${__Random(1,${pid_matchNr})})}
+         +- Throughput Controller "15% create"          Percent Executions 15
+         |  +- POST /v1/payments    + Header Manager Idempotency-Key: ${__UUID()}
+         +- Throughput Controller "3% settlement report" Percent Executions 3
+            +- GET /v1/reports/settlement
+      ```
+
+      One controller, as saved in the `.jmx` file:
+
+      ```xml
+      <ThroughputController guiclass="ThroughputControllerGui" testclass="ThroughputController" testname="55% list">
+        <intProp name="ThroughputController.style">1</intProp>
+        <boolProp name="ThroughputController.perThread">false</boolProp>
+        <intProp name="ThroughputController.maxThroughput">1</intProp>
+        <FloatProperty>
+          <name>ThroughputController.percentThroughput</name>
+          <value>55.0</value>
+        </FloatProperty>
+      </ThroughputController>
+      ```
+
+      Run headless with 2 threads x 200 loops:
+
+      ```bash
+      tools/apache-jmeter-5.6.3/bin/jmeter -n -t solutions/fundamentals/workload_plan.jmx -l run.jtl \
+          -Jport=8094 -Jthreads=2 -Jloops=200
+      ```
+
+      ```plaintext
+      Created the tree successfully using solutions/fundamentals/workload_plan.jmx
+      Starting standalone test @ 2026 Nov 19 10:16:43 IST (epoch ms elided)
+      Waiting for possible Shutdown/StopTestNow/HeapDump/ThreadDump message on port 4447
+      summary =    404 in 00:00:03 =  160.9/s Avg:    10 Min:     7 Max:    54 Err:     0 (0.00%)
+      Tidying up ...    @ 2026 Nov 19 10:16:45 IST (epoch ms elided)
+      ... end of run
+      ```
+
+      (The epoch-millisecond timestamps JMeter prints in brackets are elided here.) Counting labels in
+      `run.jtl`:
+
+      ```plaintext
+          220 GET /v1/payments
+          108 GET /v1/payments/{id}
+           12 GET /v1/reports/settlement
+            2 POST /auth/token
+           60 POST /v1/payments
+            2 setup: payment ids
+      ```
+
+      220 / 108 / 60 / 12 of 400 iterations is exactly 55 / 27 / 15 / 3 % - in these runs percent mode spread
+      executions evenly rather than at random (with 1 thread it was 110 / 54 / 30 / 6 of 200). Each controller
+      decides on its own, so one iteration may run none or two of the transactions; only the totals follow
+      the model. With "Per User" unchecked, the manual says the calculation "will be global for all users".
+
+      **A tempting variant that does not work:** putting the four controllers under a **Random Controller**
+      (to "pick one per iteration") gave 106 / 54 / 30 / 4 samples from 400 iterations in a run here (an
+      earlier run: 107 / 49 / 34 / 2). Only about 195 requests were sent, so half the iterations sent nothing,
+      and the report's 3 % fell to 1-2 %. The manual warns about exactly this: "Interactions
+      between multiple controllers can yield complex behavior. This is particularly true of the Random
+      Controller. Experiment before you assume what results any given interaction will give". Measure the mix
+      your plan produces; do not assume it.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-workload-mix, perf-workload-peak-arrival]
+    title: The lines that make the model right
+    body: |
+      From the reference solution of `workload_log_model.py`:
+
+      ```python
+      LINE = re.compile(
+          r'^(?P<ip>\S+) - (?P<client>\S+) \[(?P<ts>[^\]]+)\] "(?P<method>[A-Z]+) (?P<target>\S+) HTTP/[0-9.]+" '
+          r"(?P<status>\d{3}) (?P<bytes>\d+) (?P<duration>\d+\.\d+)$"
+      )
+      ```
+
+      Anchored at both ends (`^ ... $`): a truncated line or a scanner's binary junk does not match, so it is
+      dropped and counted, never mis-parsed into a fake transaction.
+
+      ```python
+      path = target.split("?", 1)[0]
+      parts = ["{id}" if ID_SEGMENT.match(p) else p for p in path.split("/")]
+      ```
+
+      The query string goes first, then each path *segment* that is an id becomes `{id}`. Replacing digits
+      anywhere (`re.sub(r"\d+", ...)`) would also mangle `/v1/` into `/v{id}/`.
+
+      ```python
+      counts = Counter(int(r["ts"].timestamp()) // window_s for r in _user_records(records, exclude))
+      best = min(counts, key=lambda w: (-counts[w], w))
+      ```
+
+      Windows are aligned to the epoch, so "12:00-13:00" means the same thing in every run and in every tool;
+      ties go to the earliest window so the answer is deterministic.
+
+      ```python
+      span = max(windows) - min(windows) + 1
+      mean_rate = len(users) / (span * window_s)
+      ```
+
+      The mean runs over *every* window from first to last, including the empty ones at night. Dividing by the
+      number of non-empty windows is the classic bug - it inflates the mean and hides how peaky the day is.
+
+      ```python
+      weights = {k: max(1, math.floor(x)) for k, x in exact.items()}
+      ```
+
+      Floor first, then distribute the remainder to the largest fractions. Rounding each share independently
+      can produce 99 or 101 in total; and the `max(1, ...)` keeps rare transactions in the test.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Building a workload model, step by step
+    body: |
+      1. **Choose the day.** A representative peak day (and, separately, a known bad day or event). Agree it with
+         the people who run the system; write down why it was chosen.
+      2. **Get the data you are allowed to use.** Access logs, load balancer logs or APM traces - aggregated where
+         possible; no personal or card data leaves production.
+      3. **Parse strictly.** Count malformed lines and stop if the share is not negligible.
+      4. **Name transactions.** Strip ids and query strings; agree the names with developers so the same names
+         appear in the load test, the dashboards and the report.
+      5. **Remove non-user traffic.** Health checks, monitoring, internal crawlers - production keeps those running
+         during the real peak anyway.
+      6. **Split scenarios.** Once-per-session steps (login) become setup; scheduled jobs and batch clients become
+         their own scenarios with their own rate and time.
+      7. **Compute the interactive mix** and integer weights (largest remainder, minimum 1).
+      8. **Find peaks** per hour and per minute; compute peak factors; note what drives each peak.
+      9. **Size concurrency** with Little's law from session arrival rate and duration (closed model), or keep the
+         arrival rate (open model). Take think time from the log.
+      10. **Project growth and headroom** from a named forecast; record the source.
+      11. **Measure skew** per merchant (or account, product) and design the test data to match.
+      12. **Encode it** in the tool (weights, controllers, pacing, data files) and **verify** - run it and compare
+          the observed mix and rate with the model before running the real test.
+
+  - id: example
+    kind: example
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: "Example: reviewing a load test plan for SandPay's year-end"
+    body: |
+      A colleague's plan for the year-end freeze test says: "500 users, each looping through login, list, get,
+      create and report, no think time, merchant ids random from 1-50, run 30 minutes." You review it against
+      the 17 November log.
+
+      | Plan says | The log says | What you ask for |
+      | --- | --- | --- |
+      | 500 users | 481 sessions in the peak hour, 93.8 s each: about 12.5 concurrent | size from Little's law (about 13 today, more after growth) - or use an open model at 0.13 sessions/s |
+      | login every loop | login once per session, 17.9 % of user requests | login in `on_start` / Once Only |
+      | each transaction once per loop (20 % each) | 55 / 27 / 15 / 3 | weights 55 / 27 / 15 / 3 |
+      | report as part of the loop | 600 reports in 3 minutes at 02:00 from one client | a separate batch scenario, plus a test of the 02:00 minute |
+      | no think time | 2-40 s between calls | pacing from the log (or an open model) |
+      | uniform merchants | top 10 % send 61.8 % | weighted merchant choice |
+      | today's numbers | 40 % a year growth forecast (product) | the projected peak plus headroom, as a second run |
+
+      The evidence you attach: the analysis output (mix, peaks, sessions, skew) with the script that produced
+      it, the date of the log, the growth forecast's source, and a short verification run showing the tool's
+      observed mix within tolerance of the model.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Testing the model and the script that implements it
+    body: |
+      A workload model is a claim; check it like one.
+
+      | # | Check | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Parser on known lines, including a malformed one | fields exact; malformed returns no record | unit tests (exercise 1) |
+      | 2 | Transaction naming | ids and query strings never create new transactions | the list of distinct names is short and stable |
+      | 3 | Exclusions | `GET /health` absent from the mix; its share reported separately | mix output with and without exclusions |
+      | 4 | Totals | every mix sums to 1; weights sum to 100 with no zero weights | assertion |
+      | 5 | Login per session | the tool logs in exactly once per virtual user | Locust stats: 8 logins for 8 users; JTL: 2 for 2 threads |
+      | 6 | Observed mix (Locust) | each share within sampling error of the model | stats CSV vs model, binomial tolerance |
+      | 7 | Observed mix (JMeter) | each share within one point of the model | label counts in the JTL / iterations |
+      | 8 | No functional errors at low load | 0 failures; creates return 201 | stats / JTL `success` column |
+      | 9 | Rate | the run's request rate matches the target for the scenario | tool summary vs model |
+      | 10 | Negative: Random Controller parent | mix distorted (seen: half the iterations empty, 3 % became 1-2 %) | JTL counts - the reason not to use it here |
+
+      Checks 6-8 are what the coding exercises automate: a model that your script does not reproduce is not the
+      model you tested.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Using the daily average.** 0.4 requests/s all day hides a 0.77/s lunchtime and a 3.48/s minute at
+        02:01.
+      - **Only one window size.** Hourly data hides second- and minute-scale bursts that saturate pools and
+        rate limits.
+      - **Counting URLs, not transactions.** Hundreds of "transactions" of 0.1 % each; nothing to model.
+      - **Leaving monitoring in.** The health probe becomes 20 % of the "user" load.
+      - **Login as a weighted task.** Virtual users re-authenticate mid-session; the token service sees a
+        pattern production never makes.
+      - **Mixing a batch into the interactive mix.** Inflates a transaction all day and never tests the burst.
+      - **Users = visitors.** Using the number of sessions in an hour as concurrent users (481 instead of about
+        13).
+      - **Uniform random test data.** Cold caches, no hot-key contention.
+      - **Assuming the tool reproduces the model.** Random Controllers, misplaced Once Only Controllers, a typo
+        in a request name that splits one transaction into two rows - all change the mix silently.
+      - **Growth with no source.** A number nobody can trace cannot be reviewed.
+
+      **Debugging method when the test's results do not resemble production:** compare like with like. Take
+      the *tool's* request log for one steady interval and run it through the same analysis as the production
+      log - names, mix, peak, per-merchant counts. The first number that differs is where the model or the
+      script is wrong. Fix it and re-verify before reading any response times.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Trade-offs and alternatives
+    body: |
+      - **Fidelity vs maintainability.** You could replay the log line by line. That reproduces one day exactly
+        - including its accidents - and is hard to scale, vary or reason about. A model (mix, rates, think time,
+        data shape) is smaller, explainable and scalable, at the cost of losing correlations the model does not
+        capture (for example, which transaction follows which). Session journeys are the middle ground - see
+        [Task sets, weights and realistic user flows](#/lesson/locust-task-sets-and-user-flows).
+      - **Random vs deterministic selection.** Locust's weighted random choice produces realistic interleaving
+        but needs longer runs (and tolerances) to converge; JMeter's percent mode was exact in these runs but
+        evenly spaced, which can create unrealistically regular patterns.
+      - **Closed vs open models.** A closed model (fixed users, think time) is easy and self-limiting: when the
+        system slows down, users send less, which can hide overload. An open model (fixed arrival rate) keeps
+        sending, which is what real traffic does - see [Little's law and workload
+        models](#/lesson/littles-law-and-workload-models).
+      - **Requests per second vs resources.** The mix ties requests to cost, but "the ratios can change" - a new
+        release can make a transaction cheaper or dearer. Re-derive the model after significant releases.
+      - **Granularity of data.** Logs give requests, not intent. Analytics (journeys, funnels) or APM traces add
+        context at the cost of another data source to clean and reconcile.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-workload-mix, perf-workload-peak-arrival, perf-workload-data-skew]
+    title: Quick reference
+    body: |
+      - Workload model = **mix + peak arrival rate + session shape (think time, duration) + data distribution
+        + growth**, per scenario.
+      - Parse strictly, count malformed lines; name transactions (ids and queries removed).
+      - Remove monitoring; split **login** (once per session) and **batches** (own scenario) out of the mix.
+      - Integer weights by largest remainder, minimum 1.
+      - Peaks at **two window sizes** (hour, minute); peak factor = peak rate / mean over the whole period.
+      - **Little's law** L = lambda x W: concurrency = session arrival rate x session duration.
+      - Growth: peak x (1 + g)^(months/12) x (1 + headroom), from a named forecast.
+      - Skew: top 10 % of keys share; test data must reproduce it.
+      - Locust: `@task(weight)`, `on_start`, user class `weight` / `fixed_count`, `poisson` /
+        `constant_throughput` pacing.
+      - JMeter: Throughput Controller in percent mode ("badly named"), Once Only Controller for login, separate
+        Thread Groups for scenarios; avoid Random Controller parents without measuring.
+      - **Verify:** run the script and compare the observed mix and rate with the model before the real test.
+
+exercises:
+  - id: exclude-health
+    type: mcq
+    concept: perf-workload-mix
+    skill: application
+    title: The probe in the mix
+    prompt: |
+      In one day of logs, `GET /health` from the monitoring system is 20.5 % of all requests. You are building
+      the transaction mix for a peak-hour load test. What do you do with it?
+    options:
+      - id: exclude
+        text: Exclude it from the user mix, and note its rate, because production's probe keeps running during the test
+        feedback: Correct - the load test models users; the real probe will still be there, so adding it to the virtual users would count it twice.
+      - id: keep
+        text: Keep it at 20.5 %, because a load test should reproduce all traffic
+        feedback: Your test would generate probe traffic on top of the real probe - and a fifth of your virtual load would hit the cheapest endpoint, diluting the test.
+      - id: double
+        text: Keep it and double it, to be safe
+        feedback: Extra cheap requests make the test easier to pass, not safer.
+      - id: delete-endpoint
+        text: Ask developers to remove the health endpoint during the test
+        feedback: Monitoring is part of production; removing it changes the system under test.
+    correct: [exclude]
+    hints:
+      - Who sends this request in production, and will they still send it during the test?
+    solution: |
+      Model users, not everything in the log. Report the excluded share so a reviewer can see what was removed
+      and why.
+
+  - id: login-in-mix
+    type: mcq
+    concept: perf-workload-mix
+    skill: analysis
+    title: Login is 18 % of requests
+    prompt: |
+      `POST /auth/token` is 17.9 % of user requests. Each session logs in once, then makes on average 4.5 calls.
+      How should the load test include login?
+    options:
+      - id: on-start
+        text: As a once-per-user setup step (Locust on_start, JMeter Once Only Controller), with sessions starting at the observed rate
+        feedback: Correct - its share follows from session arrivals; as a weighted task it would happen in the middle of sessions.
+      - id: weight-18
+        text: As a task with weight 18
+        feedback: Then each virtual user logs in at random between calls, about once every 5 tasks for ever - a pattern production never makes, and the token is replaced mid-session.
+      - id: ignore
+        text: Leave it out, it is only authentication
+        feedback: Login often hits a different service and a password hash or signature - expensive by design. It belongs in the test, at the right rate.
+      - id: every-request
+        text: Before every request, so each request is independent
+        feedback: That multiplies login load by 4.5 and tests a client that does not exist.
+    correct: [on-start]
+    hints:
+      - How many times does one merchant log in during one session?
+    solution: |
+      Once-per-session steps are setup, not mix. Their rate comes from session arrivals: 481 sessions in the peak
+      hour means 481 logins that hour.
+
+  - id: batch-scenario
+    type: mcq
+    concept: perf-workload-mix
+    skill: analysis
+    title: The 02:00 reports
+    prompt: |
+      600 settlement reports arrive from `merchant-3` between 02:00:00 and 02:02:59. All other report requests
+      are spread over the day. How should the workload model treat these 600?
+    options:
+      - id: own-scenario
+        text: As a separate batch scenario with its own rate and time, tested in its own run or alongside the night-time interactive load
+        feedback: Correct - it is one client on a schedule; averaging it into the interactive mix both inflates the report share all day and hides the burst.
+      - id: in-mix
+        text: Inside the interactive mix - they are real requests
+        feedback: That raises the report share from about 3 % to 4.2 % at lunchtime too, and never reproduces 200 reports a minute.
+      - id: discard
+        text: Discard them as an outlier
+        feedback: They are the busiest minute of the day. A batch is a scheduled, repeatable load - exactly what a test should cover.
+      - id: users-600
+        text: As 600 extra virtual users at peak hour
+        feedback: The batch runs at 02:00 from one client, not at lunchtime from 600 merchants.
+    correct: [own-scenario]
+    hints:
+      - Is this many merchants behaving like merchants, or one client on a timer?
+    solution: |
+      Split scheduled work out. In Locust a second user class (for example with `fixed_count = 1`); in JMeter a
+      second Thread Group. Test the 02:00 minute explicitly.
+
+  - id: window-size
+    type: mcq
+    concept: perf-workload-peak-arrival
+    skill: analysis
+    title: Which peak?
+    prompt: |
+      By the hour, the peak is 12:00-13:00 at 0.77 requests/s. By the minute, the peak is 02:01 at 3.48
+      requests/s. The risk you are testing is the database connection pool (20 connections), which saturates
+      within seconds. Which peak drives this test?
+    options:
+      - id: minute
+        text: The minute peak - a pool fills in seconds, so short bursts matter more than the hourly average
+        feedback: Correct - match the window to how fast the resource saturates; report both peaks and say which one each test targets.
+      - id: hour
+        text: The hour peak - it is the busiest time of day
+        feedback: It is the busiest hour, but within it the rate is smoothed; the pool sees the burst, not the hourly mean.
+      - id: average
+        text: The daily average, scaled by two
+        feedback: A guessed factor of two would miss a minute that runs at almost nine times the average.
+      - id: max-ever
+        text: The single busiest second, multiplied by 3600, sustained for an hour
+        feedback: That turns a burst into a sustained load the system never sees - a stress test, not the peak model.
+    correct: [minute]
+    hints:
+      - How long does it take a connection pool to fill up?
+    solution: |
+      Window size is a modelling choice. Capacity plans use hours; pools, queues and rate limits react to seconds
+      and minutes.
+
+  - id: peak-factor-calc
+    type: mcq
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: Calculate the peak factor
+    prompt: |
+      Over 24 hours an API received 86,400 user requests. The busiest hour had 7,200. What is the hourly peak
+      factor?
+    options:
+      - id: two
+        text: '2.0'
+        feedback: Correct - mean 1 request/s (86,400 / 86,400 s); peak 2 requests/s (7,200 / 3,600 s); 2 / 1 = 2.0.
+      - id: point-zero-eight
+        text: '0.083'
+        feedback: That is 7,200 / 86,400 - the peak hour's share of the day, not a ratio of rates.
+      - id: twelve
+        text: '12'
+        feedback: 86,400 / 7,200 is how many peak hours fit in the day's volume, not the peak factor.
+      - id: depends
+        text: It cannot be calculated without the number of users
+        feedback: A peak factor is a ratio of request rates; users are not needed.
+    correct: [two]
+    hints:
+      - Turn both numbers into requests per second first.
+    solution: |
+      Peak rate / mean rate = (7,200 / 3,600) / (86,400 / 86,400) = 2.0. The mean covers the whole day,
+      including quiet hours.
+
+  - id: littles-law-users
+    type: mcq
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: How many virtual users?
+    prompt: |
+      In the peak hour 481 merchant sessions start. A session lasts 93.8 s on average (login to last call,
+      including think time). For a closed-model test with realistic think time, about how many concurrent
+      virtual users reproduce the peak?
+    options:
+      - id: thirteen
+        text: About 13 (0.1336 sessions/s x 93.8 s = 12.5)
+        feedback: Correct - Little's law, L = lambda x W.
+      - id: four-eighty-one
+        text: '481'
+        feedback: 481 sessions start during the hour, but each lasts about 94 s - only about 13 are in progress at any moment. 481 users would overload the system about 38-fold.
+      - id: eight
+        text: About 8 (481 / 60)
+        feedback: That is sessions per minute, not sessions in progress.
+      - id: forty-five
+        text: About 45 (93.8 / 2.1)
+        feedback: No step of Little's law divides duration by anything; multiply the arrival rate by the duration.
+    correct: [thirteen]
+    hints:
+      - Arrival rate is per second; duration is in seconds.
+    solution: |
+      lambda = 481 / 3600 = 0.1336 /s; W = 93.8 s; L = 12.5. Round up and add the growth projection on top.
+
+  - id: growth-calc
+    type: mcq
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: Project the peak
+    prompt: |
+      Today's peak is 10 requests/s. The product team forecasts 50 % growth a year. The test must cover the next
+      12 months with 20 % headroom. What rate should the capacity test target?
+    options:
+      - id: eighteen
+        text: 18 requests/s
+        feedback: Correct - 10 x 1.5 x 1.2 = 18.
+      - id: seventeen
+        text: 17 requests/s
+        feedback: That adds the percentages (10 x (1 + 0.5 + 0.2)); growth and headroom multiply.
+      - id: fifteen
+        text: 15 requests/s
+        feedback: That forgets the headroom.
+      - id: twelve
+        text: 12 requests/s
+        feedback: That is today's peak with headroom only; the system will see the grown peak by the end of the period.
+    correct: [eighteen]
+    hints:
+      - Growth first, then headroom on top of the grown peak.
+    solution: |
+      peak x (1 + growth)^(months / 12) x (1 + headroom). Record where the 50 % came from and when.
+
+  - id: hot-keys
+    type: mcq
+    concept: perf-workload-data-skew
+    skill: analysis
+    title: The cache looks perfect
+    prompt: |
+      A test reaches the target rate with a 99 % cache hit ratio and an idle database. In production, at the same
+      rate, the hit ratio is 80 % and the database is busy. The test data file has one merchant, `merchant-1`,
+      used by every virtual user. What is the most likely explanation?
+    options:
+      - id: data-skew
+        text: The test data is far more concentrated than production - one hot key - so nearly everything is served from cache
+        feedback: Correct - production traffic is skewed (top 10 % of merchants send 61.8 %) but not to a single merchant; the test must reproduce the real distribution.
+      - id: faster-hardware
+        text: The test environment has faster hardware
+        feedback: Possible in general, but hardware does not explain a 99 % hit ratio; the hit ratio depends on which keys are requested.
+      - id: mix-wrong
+        text: The transaction mix is wrong
+        feedback: The mix decides which requests are sent; the cache hit ratio for the same request depends on which data they ask for.
+      - id: cache-bug
+        text: The cache is broken in production
+        feedback: An 80 % hit ratio is plausible for real, spread-out traffic. Check the test data before blaming production.
+    correct: [data-skew]
+    hints:
+      - What does a cache key depend on?
+    solution: |
+      Data distribution is part of the model. Use merchants (and payment ids) with the same rank frequencies as
+      production - weighted choice in Locust, a proportional CSV in JMeter.
+
+  - id: locust-weights
+    type: mcq
+    concept: perf-workload-mix
+    skill: recall
+    title: What a Locust weight means
+    prompt: |
+      ```python
+      class MerchantUser(HttpUser):
+          @task(3)
+          def list_payments(self): ...
+
+          @task(1)
+          def create_payment(self): ...
+      ```
+      According to the Locust documentation, what does this do?
+    options:
+      - id: ratio
+        text: Each time the user picks a task, list_payments is three times as likely to be picked as create_payment
+        feedback: Correct - "@task takes an optional weight argument that can be used to specify the task's execution ratio."
+      - id: sequence
+        text: Each iteration runs list_payments three times, then create_payment once
+        feedback: Tasks are picked at random by weight; for a fixed order you need a SequentialTaskSet.
+      - id: users
+        text: Locust starts three users for list_payments and one for create_payment
+        feedback: That describes the weight attribute on user classes, not the task decorator.
+      - id: rps
+        text: list_payments runs at 3 requests per second
+        feedback: Weights are ratios, not rates; rates come from the number of users and wait_time.
+    correct: [ratio]
+    hints:
+      - Look at what the docs call the argument - a ratio of what?
+    solution: |
+      Task weights are selection ratios. User class `weight` sets the ratio of users; `wait_time` sets the pacing.
+
+  - id: throughput-controller
+    type: mcq
+    concept: perf-workload-mix
+    skill: application
+    title: The badly named controller
+    prompt: |
+      You need 15 % of iterations to create a payment. A colleague suggests a Throughput Controller set to
+      "Total Executions 15". What does the JMeter manual say each mode does?
+    options:
+      - id: percent
+        text: Use Percent Executions 15 - percent mode runs in that percentage of iterations; total mode stops after a number of executions
+        feedback: Correct - "Total executions causes the controller to stop executing after a certain number of executions have occurred."
+      - id: total-ok
+        text: Total Executions 15 is right; it means 15 per hundred
+        feedback: Total mode is an absolute count - after 15 executions (per thread or globally) it stops creating payments.
+      - id: throughput
+        text: Either is fine; the controller sets the throughput to 15 per second
+        feedback: The manual says it "is badly named, as it does not control throughput" - for a rate, use the Constant Throughput Timer.
+      - id: timer
+        text: Neither; use a Constant Throughput Timer set to 15
+        feedback: That timer paces samples per minute; it does not choose which transaction runs.
+    correct: [percent]
+    hints:
+      - One mode is a percentage, the other a count.
+    solution: |
+      Percent Executions for a mix; Total Executions for "do this N times"; Constant Throughput Timer for a rate.
+
+  - id: pipeline-order
+    type: order
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: From log to load test
+    prompt: Put the steps of building and using a workload model in order.
+    items:
+      - id: parse
+        text: Parse the log strictly and count malformed lines
+      - id: name
+        text: Name transactions - strip ids and query strings
+      - id: exclude
+        text: Remove monitoring and other non-user traffic
+      - id: split
+        text: Split once-per-session steps and scheduled batches into their own scenarios
+      - id: mix-peak
+        text: Compute the interactive mix and the peaks at hour and minute resolution
+      - id: size
+        text: Size concurrency with Little's law and project growth plus headroom
+      - id: encode
+        text: Encode the model in the tool and run a short verification of the observed mix
+    hints:
+      - You cannot name transactions in lines you have not parsed.
+      - Weights come after you have removed what does not belong in the mix.
+    solution: |
+      Clean, name, exclude and split before any number is computed; size and project from the cleaned data;
+      verify the script reproduces the model before the real run.
+
+  - id: peak-factor-debug
+    type: debug
+    concept: perf-workload-peak-arrival
+    skill: analysis
+    title: The peak factor is too low
+    prompt: |
+      This function reports an hourly peak factor of 1.3 for a day whose true factor is 2.0 (the night has hours
+      with no requests). Which line is wrong?
+    language: python
+    code: |
+      def peak_factor(records, window_s=3600):
+          counts = Counter(int(r["ts"].timestamp()) // window_s for r in records)
+          peak_rate = max(counts.values()) / window_s
+          mean_rate = sum(counts.values()) / (len(counts) * window_s)
+          return peak_rate / mean_rate
+    correctLines: [4]
+    lineNotes:
+      - line: 2
+        note: Bucketing by window is right - and windows with no requests simply do not appear in the Counter, which is the clue.
+      - line: 3
+        note: The busiest window's count divided by its length is the peak rate.
+    hints:
+      - Which windows does the Counter contain?
+      - What is the denominator for a true mean over the whole day?
+    solution: |
+      `len(counts)` counts only windows that had requests, so the empty night hours vanish, the mean goes up and
+      the factor goes down. Divide by the full span: (last window - first window + 1) x window_s.
+
+  - id: mix-tolerance
+    type: short
+    concept: perf-workload-mix
+    skill: analysis
+    title: Why the Locust run is not exactly 55 %
+    prompt: |
+      A 10-second Locust run with task weights 55 / 27 / 15 / 3 produced 3,443 / 1,720 / 930 / 181 requests. A
+      reviewer asks why it is not exactly 55 / 27 / 15 / 3 % and whether the test is wrong. Answer, and say how
+      you would decide if a deviation is a real problem.
+    modelAnswer: |
+      Locust picks each task at random by weight, so the counts are a sample: 3,443 / 6,274 = 54.9 %, 1,720 = 27.4 %,
+      930 = 14.8 %, 181 = 2.9 %. Random selection never gives exact proportions in a finite run; the deviation
+      shrinks roughly with the square root of the number of requests. To decide, compare each share with a
+      tolerance based on sampling error - for example four standard errors of a binomial proportion,
+      4 x sqrt(p(1 - p) / n) (about 2.5 points for 55 % at 6,300 requests) - and investigate anything outside it:
+      a typo that splits a request name into two rows, a task that fails before sending, or a wrong weight.
+      Longer runs give tighter checks.
+    rubric:
+      - Says task selection is random by weight, so short runs deviate.
+      - Computes or reads the observed shares and finds them close to the model.
+      - Proposes a tolerance based on sampling error (it shrinks as n grows).
+      - Names real causes to investigate when a share is outside tolerance.
+    hints:
+      - What does "picked at random, with weighting" imply for a finite run?
+    solution: |
+      Random weighted selection gives sampled proportions; judge them against a sampling-error tolerance, not
+      exact equality.
+
+  - id: data-model-testdesign
+    type: testdesign
+    concept: perf-workload-data-skew
+    skill: application
+    title: Prove the test data has production's skew
+    prompt: |
+      Production logs show the top 10 % of SandPay's 50 merchants send 61.8 % of user requests, and payment
+      lookups concentrate on the newest payments. Design checks that prove your load test's data reproduces this
+      before you run the real test. Give preconditions, steps, expected results and evidence.
+    modelAnswer: |
+      Preconditions: the production analysis output (per-merchant counts, top 10 % share, age of looked-up
+      payments) for the chosen day; the load script with its data source (weighted merchant choice or CSV);
+      the practice environment seeded with at least the same merchants.
+
+      1. **Merchant distribution in the data file.** Steps - count rows per merchant in the CSV (or sample 10,000
+         weighted choices). Expected - the top 10 % share within a few points of 61.8 %; every merchant present.
+         Evidence - the count table and the computed share.
+      2. **Merchant distribution in a run.** Steps - a short verification run; run the tool's request log
+         through the same `client_share` analysis. Expected - top 10 % share close to 61.8 %. Evidence - analysis
+         output for the run.
+      3. **Payment recency.** Steps - for GET by id, record which payments were requested; compare their age
+         distribution with production's. Expected - similar concentration on recent payments. Evidence - two
+         histograms.
+      4. **Cache behaviour (sanity).** Steps - run at the target rate; read the cache hit ratio. Expected - close
+         to production's (not 99 %, not 0 %). Evidence - the metric from the run and from production.
+      5. **Negative check.** Steps - swap in a one-merchant data file. Expected - the hit ratio jumps and the
+         check in step 2 fails. Evidence - that the checks detect wrong data.
+    rubric:
+      - Each check has preconditions, steps, expected result and concrete evidence.
+      - Compares the data file and an actual run with the production distribution.
+      - Includes a data dimension beyond merchants (payment recency, size).
+      - Uses a behavioural signal such as cache hit ratio as a sanity check.
+      - Includes a negative check that proves the checks catch bad data.
+    hints:
+      - Check the data before the run, and the requests during the run.
+      - How would you show that your checks would catch a single-merchant data file?
+    solution: |
+      Measure the test's own requests with the same analysis as production's, and add a sanity signal (cache hit
+      ratio) and a negative check.
+
+  - id: interview-workload
+    type: interview
+    concept: perf-workload-peak-arrival
+    skill: analysis
+    title: 'Interview: how do you decide what load to apply?'
+    prompt: |
+      "We are about to load test our payments API before the holiday season. How would you decide what load to
+      apply - how many users, doing what?"
+    modelAnswer: |
+      I would build a workload model from production rather than pick a number. From the access logs (or APM)
+      for a representative peak day, and last year's holiday peak: name the transactions, remove monitoring,
+      and compute the mix - separating logins, which happen once per session, and batch jobs, which get their own
+      scenario. Then find the peak arrival rate at the hour and the minute level, because pools and rate limits
+      react to short bursts. To get virtual users I use Little's law: concurrent sessions equal the session
+      arrival rate times the session duration - for example 0.13 sessions a second times 94 seconds is about 13,
+      not the 481 who visit in the hour. I take think time from the gaps in the logs. I measure how skewed the
+      traffic is across merchants so the test data heats the cache and contends on hot rows the way production
+      does. Finally I project the peak with the business's growth forecast and add headroom, and record where
+      each number came from. Before the real run I verify the script: a short run whose observed mix, rate and
+      merchant distribution match the model. Then the model also tells me which stress or spike tests to run
+      beyond it.
+    rubric:
+      - Builds the model from production data, not a guessed user count.
+      - Separates login and batch scenarios from the interactive mix and removes monitoring.
+      - Uses peaks at more than one window size and Little's law for concurrency.
+      - Includes data skew and growth with headroom, with sources recorded.
+      - Verifies the script reproduces the model before testing.
+    followUps:
+      - What would you do for a brand-new product with no production traffic?
+      - When would you choose an open model over a closed one?
+      - How do you handle a transaction that is 0.2 % of traffic but very expensive?
+    hints:
+      - Structure it - data source, mix, peak, concurrency, data, growth, verification.
+    solution: |
+      Mix, peak at the right window, Little's law for users, skewed data, growth and headroom - all from
+      production data, then verify the script.
+
+  - id: workload-log-code
+    type: coding
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: Build the model from the access log
+    prompt: |
+      In `fundamentals/workload_log_model.py`, implement `parse_line`, `endpoint`, `transaction_mix`,
+      `peak_window`, `peak_factor`, `client_share`, `task_weights` (largest remainder, minimum 1) and
+      `project_peak`. The tests run them on one synthetic day of SandPay access log from
+      `support/workload_fixture.py` and expect the numbers in this lesson.
+    project: perf
+    files:
+      - exercises/fundamentals/workload_log_model.py
+    test: tests/fundamentals/test_workload_log_model.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_workload_log_model.py
+    hints:
+      - "parse_line: one anchored regular expression; datetime.strptime with %d/%b/%Y:%H:%M:%S %z; return None on any mismatch."
+      - "peak_factor: the mean covers every window from the first to the last, including empty ones."
+      - "task_weights: floor with a minimum of 1, then give leftover units to the largest fractional parts (ties alphabetical)."
+    modelAnswer: |
+      ```python
+      def peak_window(records, window_s=3600, exclude=NOT_USER_TRAFFIC):
+          counts = Counter(int(r["ts"].timestamp()) // window_s for r in _user_records(records, exclude))
+          best = min(counts, key=lambda w: (-counts[w], w))
+          return datetime.fromtimestamp(best * window_s, timezone.utc), counts[best], counts[best] / window_s
+
+      def peak_factor(records, window_s=3600, exclude=NOT_USER_TRAFFIC):
+          users = _user_records(records, exclude)
+          windows = [int(r["ts"].timestamp()) // window_s for r in users]
+          span = max(windows) - min(windows) + 1
+          return peak_window(users, window_s, frozenset())[2] / (len(users) / (span * window_s))
+
+      def task_weights(mix, total=100):
+          s = sum(mix.values())
+          exact = {k: v / s * total for k, v in mix.items()}
+          weights = {k: max(1, math.floor(x)) for k, x in exact.items()}
+          ...  # hand out total - sum(weights) to the largest remainders; take back from the largest if over
+      ```
+
+      The full file is `solutions/fundamentals/workload_log_model.py`. Epoch-aligned windows make the answer
+      reproducible; the mean over the whole span keeps quiet hours in the average.
+    rubric:
+      - Every test in tests/fundamentals/test_workload_log_model.py passes.
+      - Malformed lines are dropped (None), never turned into transactions.
+      - Monitoring is excluded through a parameter, not hard-coded deletion.
+      - Weights always add up to the total and never drop a transaction.
+    solution: |
+      Strict parsing, consistent names, epoch-aligned windows, a mean over the whole span and largest-remainder
+      weights.
+
+  - id: workload-locust-code
+    type: coding
+    concept: perf-workload-mix
+    skill: application
+    title: The model as a Locust user
+    prompt: |
+      In `fundamentals/workload_locustfile.py`, add four weighted tasks to `MerchantUser` - one per model
+      transaction, with the model's weights, each request named after its transaction, and a fresh
+      `Idempotency-Key` on every payment creation. The test runs real Locust headless against the practice API
+      and checks the observed mix, the grouping of `GET /v1/payments/{id}`, one login per user and no failures.
+    project: perf
+    files:
+      - exercises/fundamentals/workload_locustfile.py
+    test: tests/fundamentals/test_workload_locustfile.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_workload_locustfile.py
+    hints:
+      - "Use @task(MODEL[...]) so the weights come from one place."
+      - "Pass name=... on every request; without it each payment id becomes its own row."
+      - "The practice API answers 400 to a POST without an Idempotency-Key header."
+    modelAnswer: |
+      ```python
+      @task(MODEL["GET /v1/payments/{id}"])
+      def get_payment(self):
+          self.client.get(f"/v1/payments/{random.choice(self.payment_ids)}", name="GET /v1/payments/{id}")
+
+      @task(MODEL["POST /v1/payments"])
+      def create_payment(self):
+          self.client.post("/v1/payments", json={"amount_minor": random.randint(100, 50000), "currency": "EUR"},
+                           headers={"Idempotency-Key": str(uuid.uuid4())}, name="POST /v1/payments")
+      ```
+
+      plus the list and report tasks the same way. Login stays in `on_start`, so it happens once per user.
+    rubric:
+      - Every test in tests/fundamentals/test_workload_locustfile.py passes.
+      - Weights come from the MODEL dict, not repeated literals.
+      - Request names match the model's transaction names exactly.
+      - Explains why the observed mix is close to, but not exactly, the model.
+    solution: |
+      Weighted tasks with model names and a unique idempotency key; login in on_start; check the mix with a
+      sampling-error tolerance.
+
+  - id: workload-jmeter-code
+    type: coding
+    concept: perf-workload-mix
+    skill: application
+    title: The model as a JMeter plan
+    prompt: |
+      `fundamentals/workload_plan.jmx` has four Throughput Controllers at 0 % and no `Idempotency-Key` on
+      payment creation. Set each controller's Percent Executions from the model (55 / 27 / 15 / 3) and add a
+      Header Manager as a child of `POST /v1/payments` with `Idempotency-Key` = `${__UUID()}`. You can edit
+      the plan in the JMeter GUI (`tools/apache-jmeter-5.6.3/bin/jmeter`) or in the XML. The test runs real
+      JMeter in non-GUI mode with 2 threads x 200 loops and checks the label counts in the JTL.
+    project: perf
+    files:
+      - exercises/fundamentals/workload_plan.jmx
+    test: tests/fundamentals/test_workload_plan.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_workload_plan.py
+    hints:
+      - "In the file, the percentage is the FloatProperty ThroughputController.percentThroughput."
+      - "A Header Manager applies to the samplers in its scope - as the sampler's child it affects only that sampler."
+      - "__UUID() returns a new value each time the header is evaluated, so every request gets its own key."
+    modelAnswer: |
+      ```xml
+      <FloatProperty>
+        <name>ThroughputController.percentThroughput</name>
+        <value>15.0</value>
+      </FloatProperty>
+      ...
+      <HTTPSamplerProxy ... testname="POST /v1/payments"> ... </HTTPSamplerProxy>
+      <hashTree>
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Idempotency-Key">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Idempotency-Key</stringProp>
+              <stringProp name="Header.value">${__UUID()}</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      With 55 / 27 / 15 / 3 the run produced 220 / 108 / 60 / 12 samples of 400 iterations.
+    rubric:
+      - Every test in tests/fundamentals/test_workload_plan.py passes.
+      - The Idempotency-Key header is scoped to the payment creation only.
+      - Login stays in the Once Only Controller (2 logins for 2 threads).
+      - Explains why the controllers are not placed under a Random Controller.
+    solution: |
+      Percent Executions from the model, a sampler-scoped Header Manager with __UUID(), login once per thread -
+      and verify the label counts.
+
+placement:
+  - id: place-mix-scenarios
+    type: mcq
+    concept: perf-workload-mix
+    skill: analysis
+    title: What belongs in the mix?
+    prompt: |
+      A day's log for an API: 30 % `GET /orders`, 25 % `GET /health` (load balancer checks), 20 %
+      `POST /login`, 15 % `GET /orders/{id}`, 10 % `GET /export` (all from one nightly job). Which transactions
+      belong in the interactive users' weighted mix?
+    options:
+      - id: two
+        text: GET /orders and GET /orders/{id} only (about 67 % / 33 %), with login as per-session setup and the export as its own scenario
+        feedback: Correct - health checks are not users, login happens once per session, and a nightly job is a separate scenario.
+      - id: all
+        text: All five, in their observed proportions
+        feedback: That makes virtual users send health checks, log in at random mid-session and export all day.
+      - id: no-health
+        text: Everything except GET /health
+        feedback: Login and the nightly export still distort the mix - they are setup and a separate scenario.
+      - id: orders-login
+        text: GET /orders, GET /orders/{id} and POST /login
+        feedback: Login as a weighted task makes users log in repeatedly between calls.
+    correct: [two]
+    solution: |
+      Remove monitoring, move once-per-session steps to setup and scheduled jobs to their own scenarios; the rest
+      is the mix (30 / 15 -> about 67 / 33 %).
+
+  - id: place-users
+    type: mcq
+    concept: perf-workload-peak-arrival
+    skill: application
+    title: Users from arrivals
+    prompt: |
+      At peak, 720 sessions start per hour and each lasts 150 s on average. How many concurrent sessions does a
+      closed-model test with realistic think time need?
+    options:
+      - id: thirty
+        text: '30'
+        feedback: Correct - 720 / 3600 = 0.2 sessions/s; 0.2 x 150 = 30.
+      - id: seven-twenty
+        text: '720'
+        feedback: That is sessions per hour, not sessions in progress at once.
+      - id: twelve
+        text: '12'
+        feedback: That is sessions per minute; it ignores how long each lasts.
+      - id: four-point-eight
+        text: '4.8'
+        feedback: That divides 720 by 150; Little's law multiplies the arrival rate by the duration.
+    correct: [thirty]
+    solution: |
+      L = lambda x W = (720 / 3600) x 150 = 30.
+
+  - id: place-skew
+    type: mcq
+    concept: perf-workload-data-skew
+    skill: application
+    title: Test data for a skewed API
+    prompt: |
+      In production, 5 % of customer accounts receive 70 % of balance lookups. Which test data plan reproduces
+      production behaviour best?
+    options:
+      - id: weighted
+        text: Choose accounts with the production frequencies - a few hot accounts chosen often, the rest rarely
+        feedback: Correct - caches, locks and partitions then see the same concentration as in production.
+      - id: uniform
+        text: Pick accounts uniformly at random from all accounts
+        feedback: Uniform choice gives a colder cache and less contention than production.
+      - id: one
+        text: Use one account for every virtual user, to keep the data simple
+        feedback: One hot key gives an unrealistically warm cache and extreme contention on a single row.
+      - id: new
+        text: Create a fresh account per request
+        feedback: New, empty accounts never hit the cache and have no history - unlike production's busy accounts.
+    correct: [weighted]
+    solution: |
+      Reproduce the distribution, not just the volume: weighted choice by production frequency.
+
+recall:
+  - id: recall-model-parts
+    concept: perf-workload-mix
+    prompt: What are the parts of a workload model?
+    answer: Per scenario - the transaction mix, the peak arrival rate (and its window), the session shape (think time, duration, so concurrency), the data distribution, and growth plus headroom.
+  - id: recall-split
+    concept: perf-workload-mix
+    prompt: Which requests come out of the interactive mix, and where do they go?
+    answer: Monitoring and health checks (removed - production keeps them), once-per-session steps such as login (setup - on_start or Once Only Controller), and scheduled or batch work (its own scenario with its own rate).
+  - id: recall-window
+    concept: perf-workload-peak-arrival
+    prompt: Why compute peaks at more than one window size?
+    answer: Longer windows smooth bursts away. Pools, queues and rate limits saturate in seconds, so minute or second peaks matter for them; hourly peaks suit capacity planning. Different windows can even point at different times of day.
+  - id: recall-little
+    concept: perf-workload-peak-arrival
+    prompt: How do you get concurrent virtual users from production data?
+    answer: Little's law - L = lambda x W - session arrival rate (per second) times average session duration (seconds, including think time).
+  - id: recall-growth
+    concept: perf-workload-peak-arrival
+    prompt: How do you project a peak for growth?
+    answer: peak x (1 + annual growth)^(months / 12) x (1 + headroom), using a named, dated forecast from the business.
+  - id: recall-skew
+    concept: perf-workload-data-skew
+    prompt: Why must test data reproduce production's skew?
+    answer: Caches, locks and partitions behave according to which keys are hit. Uniform data gives a cold cache and little contention; a single key gives a perfect cache and extreme contention; neither matches production.
+  - id: recall-tools
+    concept: perf-workload-mix
+    prompt: How do Locust and JMeter express a transaction mix?
+    answer: Locust - @task(weight), a random choice by ratio per iteration (user class weight or fixed_count for scenarios). JMeter - Throughput Controllers in Percent Executions mode (badly named - they do not control throughput), separate Thread Groups for scenarios.
+
+next:
+  - performance-test-environments-and-data
+  - locust-task-sets-and-user-flows
+  - jmeter-logic-controllers
+  - reading-load-test-results

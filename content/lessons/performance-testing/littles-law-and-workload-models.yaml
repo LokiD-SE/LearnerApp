@@ -1,0 +1,1274 @@
+id: littles-law-and-workload-models
+title: Little's law and workload models
+subject: performance-testing
+module: perf-fundamentals
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Use Little's law (L = λW) and its closed-loop form, the response time law, to work out how many virtual users a load test needs, check that a run's numbers add up, and choose between an open workload (requests arrive on a schedule) and a closed one (each user waits for its reply). Real JMeter and Locust runs against the SandPay practice API show the difference - when the server slows down tenfold, the open model keeps sending 100 requests while the closed model quietly sends about a ninth as many.
+tags:
+  [
+    Little's law,
+    response time law,
+    queueing,
+    workload model,
+    open model,
+    closed model,
+    partly-open model,
+    think time,
+    pacing,
+    virtual users,
+    concurrency,
+    throughput,
+    arrival rate,
+    Constant Throughput Timer,
+    Precise Throughput Timer,
+    Open Model Thread Group,
+    constant_throughput,
+    constant_pacing,
+    poisson,
+    Locust,
+    JMeter,
+    capacity planning,
+  ]
+
+environment: |
+  - **Runs:** Linux, Python 3.12.3, Apache JMeter 5.6.3 on OpenJDK 17.0.21, Locust 2.47.0, all on one machine
+    against `practice/perf/support/sandpay_target.py`, the SandPay practice API on the loopback interface. All runs
+    were made on 19 November 2026. Every number shown was printed by the code or command
+    shown. Timings depend on the machine - the shape of the results (what grows, what stays flat) is what
+    transfers, not the milliseconds.
+  - **SandPay is fictional.** The practice API, its merchants (`merchant-1` .. `merchant-50`) and its payments are
+    synthetic. Never point a load test at a system you do not own or have written permission to test.
+  - **Little's law:** stated and derived in E. D. Lazowska, J. Zahorjan, G. S. Graham, K. C. Sevcik, [*Quantitative
+    System Performance*](https://homes.cs.washington.edu/~lazowska/qsp/) (Prentice-Hall, 1984; free online from
+    the authors), [chapter 3, "Fundamental
+    Laws"](https://homes.cs.washington.edu/~lazowska/qsp/Images/Chap_03.pdf), section 3.3 (Little's law, the
+    response time law and the worked examples quoted here). The law is named for J. D. C. Little, who published the
+    first general proof: "A Proof for the Queuing Formula: L = λW", *Operations Research* 9(3), 1961, pages
+    383-387 (cited, not quoted - the paper is behind a paywall).
+  - **Open and closed models:** B. Schroeder, A. Wierman, M. Harchol-Balter, ["Open Versus Closed: A Cautionary
+    Tale"](https://www.usenix.org/legacy/event/nsdi06/tech/full_papers/schroeder/schroeder.pdf), NSDI '06 - the
+    definitions and principles (i), (ii) and (vii) are quoted from it.
+  - **JMeter:** [Component Reference](https://jmeter.apache.org/usermanual/component_reference.html), as
+    documented on 18 November 2026 - Thread Group, Open Model Thread Group (marked "experimental" in the manual),
+    Constant Throughput Timer and Precise Throughput Timer. The `.jmx` property names
+    (`OpenModelThreadGroup.schedule`, `OpenModelThreadGroup.random_seed`) were read from the JMeter 5.6.3 jar and
+    the plan was run, not only written.
+  - **Locust:** [Writing a locustfile - wait_time attribute](https://docs.locust.io/en/stable/writing-a-locustfile.html)
+    (the page reports "Locust 2.47.0 documentation"), and the source of
+    [`locust/user/wait_time.py` at 2.47.0](https://github.com/locustio/locust/blob/2.47.0/locust/user/wait_time.py)
+    for `constant_pacing`, `constant_throughput` and `poisson`.
+  - **Not repeated here:** percentiles and why averages mislead - [Performance metrics and
+    percentiles](#/lesson/performance-metrics-and-percentiles); thread groups and timers in depth - [Thread groups,
+    ramp-up and timers](#/lesson/jmeter-thread-groups-and-timers); Locust basics - [Locust
+    fundamentals](#/lesson/locust-fundamentals).
+
+prerequisites:
+  - performance-testing-types
+  - performance-metrics-and-percentiles
+
+concepts:
+  - id: perf-little-law
+    name: Little's law and the response time law
+    summary: The average number of requests in a system equals its throughput times the average time a request spends there (L = λW, written N = XR in QSP). Applied to a closed loop of N users with think time Z it becomes N = X(R + Z), and solved for R the response time law R = N/X - Z. It needs only very weak assumptions, so it checks whether a run's measurements are consistent and turns any two of the quantities into the third.
+  - id: perf-little-open-closed
+    name: Open and closed workload models
+    summary: In a closed model a fixed number of users each send the next request only after the previous reply (plus think time), so a slower server automatically receives less load. In an open model requests arrive on a schedule independent of completions, so a slower server accumulates requests in flight. Classic thread-per-user tools are closed by default; JMeter's Open Model Thread Group and arrival-rate timers, or enough users with pacing, approximate an open workload.
+  - id: perf-little-pacing
+    name: Think time, pacing and sizing virtual users
+    summary: Think time is a delay after each iteration; pacing fixes the time from the start of one iteration to the start of the next, so each user's rate stays constant while the server keeps up. Size a closed test with N = X(R + Z), rounded up, and remember that timers and wait times can only slow users down - they cannot start new users, so a slow server still caps throughput at N divided by the iteration time.
+
+objectives:
+  - Calculate concurrency, throughput or residence time from the other two with Little's law, and response time with the response time law R = N/X - Z.
+  - Size a closed-loop load test - the virtual users and pacing needed for a target request rate, including several requests per iteration.
+  - Check a run's measurements against Little's law and explain the end effects that make a cut window disagree.
+  - Explain the difference between open and closed workload models and predict how each reacts when the server slows down.
+  - Configure JMeter (Open Model Thread Group, Constant and Precise Throughput Timers) and Locust (constant_throughput, constant_pacing, poisson) for the model a requirement describes.
+  - Design tests that prove a load generator actually delivered the load a requirement names.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-little-law, perf-little-open-closed]
+    title: The idea in plain language
+    body: |
+      Picture SandPay's payment API as a café counter. Customers walk in, wait while their order is made, and leave.
+      If 20 customers arrive every minute and each spends 3 minutes inside, then on average **60 customers are in the
+      café**. That is Little's law: *how many are inside = how fast they come through × how long each stays*. It
+      does not care how the barista works, in what order orders are made, or whether customers arrive evenly or in
+      bursts - over a long enough time, the averages must agree.
+
+      For a load tester the law answers everyday questions:
+
+      - "We need 200 requests per second and each takes 50 ms - how many requests are in flight?" **10**.
+      - "Our 64 users think for 30 s between actions and we measured 2 actions per second - what is the response
+        time?" **2 seconds**, without looking at a single timing.
+      - "The report says 5000 users, 100 requests per second and a 200 ms average. Does that add up?" Only if the
+        users spend about 49.8 s thinking per action - so check the think time before believing the report.
+
+      The café also shows the **two ways customers can arrive**. In a *closed* café there are exactly ten regulars;
+      each one orders, waits, drinks (thinks), and only then orders again. If the barista slows down, the regulars
+      simply order less often - the queue never grows past ten. In an *open* café customers walk in from the street
+      at their own pace; if the barista slows down, the street does not know, and the queue grows. Real users of a
+      public payment page behave much more like the street than like ten regulars - but most load test tools, by
+      default, behave like the regulars. That mismatch hides problems, and this lesson shows it on a real run.
+
+  - id: what
+    kind: what
+    concepts: [perf-little-law, perf-little-open-closed, perf-little-pacing]
+    title: Terms you need
+    body: |
+      | Term | Meaning | Symbol (QSP) |
+      | --- | --- | --- |
+      | **Throughput** | completions per unit of time - requests, transactions or iterations per second | X (λ when it is an arrival rate) |
+      | **Residence time** | time a request spends in the system you are looking at - queueing plus service | R (W in Little's paper) |
+      | **Population / concurrency** | average number of requests in that system | N (L in Little's paper) |
+      | **Little's law** | "the average number of requests in a system must equal the product of the throughput of that system and the average time spent in that system by a request" (QSP 3.1) | N = XR, L = λW |
+      | **Think time** | the delay a user takes between receiving a reply and sending the next request | Z |
+      | **Response time law** | Little's law applied to users plus system in a closed loop: N = X(R + Z), so R = N/X - Z | |
+      | **Closed system model** | "new job arrivals are only triggered by job completions (followed by think time)" (Schroeder et al.) | the number of users N is fixed |
+      | **Open system model** | "new jobs arrive independently of job completions" (Schroeder et al.) | the arrival rate λ is fixed |
+      | **Partly-open model** | users arrive from outside (open), send a few requests with think time (closed within the session), then leave | |
+      | **Virtual user (VU)** | one simulated user - a JMeter thread or a Locust `User` instance | |
+      | **Pacing** | the time from the start of one iteration to the start of the next, for one user | |
+      | **Iteration** | one pass through a user's script - for example "get a token, list payments, view one" | |
+
+      Little's law holds for **any** boundary you choose, as long as you count consistently: one server's request
+      queue, the whole API, or the whole loop of users plus API. QSP: "The key to success is consistency: the
+      definitions of population, throughput, and residence time must be compatible with one another."
+
+  - id: why
+    kind: why
+    concepts: [perf-little-law, perf-little-open-closed]
+    title: Why a load tester needs this
+    body: |
+      **Sizing.** A requirement says "40 payment creations per second". Your tool asks for a number of threads. Too
+      few and the test cannot reach the rate however fast the server is; too many and you send a burst the
+      requirement never asked for. Little's law turns the requirement into a thread count before the first run.
+
+      **Sanity-checking results.** QSP lists Little's law first among its reasons to matter: "because it is so widely
+      applicable (it requires only very weak assumptions), it will be valuable to us in checking the consistency of
+      measurement data." If a report's users, throughput, response time and think time do not satisfy
+      N = X(R + Z), something in the measurement is wrong - a different time window, a load generator that ran out
+      of CPU, requests that were never sent.
+
+      **Not fooling yourself with the wrong model.** Schroeder, Wierman and Harchol-Balter tested real web
+      servers, databases and an auction site under both models and found that "closed and open system models yield
+      significantly different results, even when both models are run with the same load and service demands". Their
+      principle (i): "For a given load, mean response times are significantly lower in closed systems than in open
+      systems." A closed-loop test of an open-world system therefore tends to report better response times than real
+      users will see - the slower the server gets, the less the test pushes it.
+
+  - id: internals
+    kind: internals
+    concepts: [perf-little-law]
+    title: Why L = λW holds - the area argument
+    body: |
+      QSP derives the law from a graph of two step functions over an observation interval of length T: the total
+      **arrivals** so far and the total **completions** so far. "At any instant, the vertical distance between the
+      arrival and completion functions represents the number of requests present in the system. Over any time
+      interval, the area between the arrival and completion functions represents the accumulated time in system
+      during that interval, measured in request-seconds."
+
+      Call that area W (request-seconds) and the number of completions C. Then:
+
+      - average number in the system: **N = W / T** (area divided by time);
+      - throughput: **X = C / T**;
+      - average residence time: **R = W / C** (area shared among the completed requests).
+
+      Multiply the last two: X · R = (C / T) · (W / C) = W / T = N. That is the whole proof for measured data -
+      which is why the law needs no assumption about arrival patterns, service time distributions or scheduling.
+
+      The catch is in "the requests that completed". QSP: "if the observation interval begins and ends at instants
+      when system is empty, then this correspondence is exact", and otherwise "end effects" appear - requests
+      already running at the start, or still running at the end, contribute area but not completions (or the
+      reverse). Over a long window with many requests the effect is small; over a short window cut through busy
+      traffic it is not. The `little_check` exercise measures both cases on a real run:
+
+      ```plaintext
+      requests: 81
+      whole run : L=3.950  X=132.2/s  R=29.9 ms  X*R=3.950  error=1.12e-16
+      cut window: L=4.000  X=151.4/s  R=32.5 ms  X*R=4.919  error=2.30e-01
+      ```
+
+      Four Python threads looped against the practice API (20 ms service time) for 0.6 s. Over the whole run - empty
+      at both ends - L and X·R agree to the last bit of floating point. Cut 105 ms off each end and the error jumps to
+      23 %: the window always had four requests running (L = 4.000), but it counted more completions than started
+      inside it. In a real test the fix is a **long steady-state window**, not a shorter one.
+
+  - id: response-time-law
+    kind: internals
+    concepts: [perf-little-law, perf-little-pacing]
+    title: The response time law - Little's law around the whole loop
+    body: |
+      QSP applies Little's law at several levels. At the outermost level the "system" is the users plus the server:
+      every user is either waiting for a reply (time R) or thinking (time Z), so each interaction stays in the loop
+      for R + Z. With N users, Little's law gives **N = X(R + Z)**. QSP's example: "Suppose that there are 10 users,
+      average think time is 5 seconds, and average response time is 15 seconds. Then Little's law tells us that the
+      system throughput must be 10 / (15 + 5) = 0.5 interactions/second."
+
+      Solved for R, it gets its own name - **the response time law: R = N/X - Z**. QSP's second example: 64 users,
+      30 s think time, 2 interactions per second, so "response time must be 64/2 - 30 = 2 seconds".
+
+      Two practical lessons follow:
+
+      - **Throughput is the robust number.** QSP shows that a 5 % error in projected throughput (1.9 instead of 2
+        per second) becomes an 85 % error in the response time derived from it (3.7 s instead of 2 s), because R is a
+        small difference of two large numbers. Measure response time directly; use the law to cross-check.
+      - **Think time is a lever, not a detail.** With N fixed, doubling Z roughly halves X. If a test "passes" at
+        5000 users with 60 s of think time, it proved about 83 requests per second, not "5000 users".
+
+      For a load test with k requests per iteration, each taking R, then think time Z, the iteration takes k·R + Z
+      and the users needed for a target **request** rate are N = (target / k) · (k·R + Z), rounded up. The
+      `little_calc` exercise implements exactly this:
+
+      ```plaintext
+      L for 200/s at 0.05 s     : 10.0
+      users for 30/s, R=0.2 Z=1 : 36
+      users for 31/s, R=0.2 Z=1 : 38
+      R for N=64 X=2 Z=30       : 2.0
+      pacing for 20/s, 5 users  : 0.25
+      constant_throughput arg   : 4.0
+      max closed X, R=0.5 pace=.25: 10.0
+      ValueError: inconsistent measurements: N/X - Z = -1.000 s is negative
+      ```
+
+  - id: when
+    kind: when
+    concepts: [perf-little-open-closed]
+    title: Which model does the requirement describe?
+    body: |
+      Choose the model from how real load reaches the system, not from what the tool does by default.
+
+      | Real situation | Model | Why |
+      | --- | --- | --- |
+      | a public checkout page, card payments from many independent shoppers | **open** (or partly-open with short sessions) | a new shopper does not wait for another shopper's payment to finish |
+      | webhooks or card-network messages arriving from other systems | **open** | the sender's schedule does not depend on your latency |
+      | a fixed team of 40 support agents working through a queue | **closed** | each agent sends the next request after reading the last reply |
+      | a batch job with 8 worker threads | **closed** | at most 8 requests in flight, by construction |
+      | a mobile app session: open the app, list payments, open two, close | **partly-open** | sessions arrive openly; inside a session each step waits for the previous one |
+
+      Schroeder et al. give a rule of thumb for partly-open systems (principle vii): a partly-open system "behaves
+      similarly to an open system when the expected number of requests per session is small (≤ 5 as a
+      rule-of-thumb) and similarly to a closed system when the expected number of requests per session is large
+      (≥ 10 as a rule-of-thumb)."
+
+      **What the law does not replace.** Little's law relates *averages*. It says nothing about the p95 or p99, which
+      is what most requirements name - see [Performance metrics and
+      percentiles](#/lesson/performance-metrics-and-percentiles). And it does not tell you where the bottleneck is -
+      that is [Bottleneck analysis](#/lesson/bottleneck-analysis).
+
+  - id: visual
+    kind: visual
+    concepts: [perf-little-open-closed]
+    title: The two loops
+    body: |
+      ```mermaid
+      flowchart LR
+        subgraph Closed["Closed model - N users"]
+          U["User: think Z"] -- "send request" --> Q1["Queue"] --> S1["Server"]
+          S1 -- "reply after R" --> U
+        end
+        subgraph Open["Open model - arrival rate"]
+          A["Arrivals: lambda per second"] -- "new request" --> Q2["Queue"] --> S2["Server"] --> D["Done"]
+        end
+      ```
+
+      Notice where the arrow back to the start is. In the closed loop the server's reply *causes* the next request,
+      so a slow server throttles its own load and the queue can never hold more than N. In the open model nothing
+      flows back: arrivals continue at λ whatever the server does, so when service slows, the queue - and the number
+      in flight, by Little's law λ·W - grows.
+
+  - id: code
+    kind: code
+    concepts: [perf-little-open-closed]
+    title: "One API, two models: real JMeter and Locust runs"
+    body: |
+      **Closed model in Locust.** Ten users with `wait_time = constant(0)`: each sends the next request as soon as
+      the previous reply arrives. The practice API was started with a 50 ms and then a 500 ms service time, and Locust
+      ran for 5 s each time (`--headless -u 10 -r 100 -t 5s`):
+
+      ```python
+      from locust import HttpUser, constant, task
+
+
+      class Merchant(HttpUser):
+          wait_time = constant(0)  # closed loop, no think time: the next request waits for the previous reply
+
+          @task
+          def token(self):
+              self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+      ```
+
+      ```plaintext
+      service time 50 ms: requests=531 failures=0 rps=178.7 avg=54 ms  X*R=9.72 users  server max_in_flight=10
+      service time 500 ms: requests=70 failures=0 rps=19.5 avg=507 ms  X*R=9.91 users  server max_in_flight=10
+      ```
+
+      The server got ten times slower and the test sent **about nine times fewer** requests, yet it reported no failures.
+      X·R stays at about 10 - the number of users - exactly as Little's law demands for a closed loop with no think
+      time, and the server never saw more than 10 requests at once. (The client measured 54 ms at a 50 ms service
+      time: the rest is the HTTP stack on both sides - response time measured at the client always includes it.)
+
+      **Open model in JMeter.** JMeter 5.5 added the *Open Model Thread Group*, which the manual describes as
+      "experimental": "The users are generated according to the schedule." The schedule below asks for random
+      arrivals at 20 per second for 5 seconds (then a 2 s pause so running requests can finish - the manual: "The
+      thread groups terminates threads as soon as the schedule ends"):
+
+      ```xml
+      <OpenModelThreadGroup guiclass="OpenModelThreadGroupGui" testclass="OpenModelThreadGroup"
+                            testname="Token requests arriving at 20/sec">
+        <stringProp name="OpenModelThreadGroup.schedule">rate(${__P(rate,20)}/sec) random_arrivals(${__P(seconds,5)} sec) pause(2 sec)</stringProp>
+        <stringProp name="OpenModelThreadGroup.random_seed">42</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="OpenModelThreadGroupController"/>
+      </OpenModelThreadGroup>
+      ```
+
+      Run non-GUI (`jmeter -n -t open_model.jmx -l results.jtl -Jport=... -Jrate=20 -Jseconds=5`) against the same
+      two service times:
+
+      ```plaintext
+      service time 50 ms: samples=100 codes=['200'] arrival span=4.52s mean elapsed=56 ms server max_in_flight=5
+      service time 500 ms: samples=100 codes=['200'] arrival span=4.54s mean elapsed=506 ms server max_in_flight=18
+      ```
+
+      The open model sent **100 requests both times** - the arrivals do not care how slow the server is. What
+      changed is the number in flight: at 20 arrivals per second and 0.5 s each, Little's law predicts 10 on average,
+      and the server saw up to 18 at once. Had the server's capacity been 8, the open test would have shown queueing
+      and errors; the closed test, with 10 users, would have shown a slower but "healthy" system.
+
+  - id: tools
+    kind: code
+    concepts: [perf-little-pacing, perf-little-open-closed]
+    title: How JMeter and Locust express think time, pacing and arrival rate
+    body: |
+      **Locust** - `wait_time` on the `User` class. From the docs (Locust 2.47.0): "A User's wait_time method makes it
+      easy to introduce delays after each task execution. If no wait_time is specified, the next task will be
+      executed as soon as one finishes."
+
+      | Function | Docs / source | Model |
+      | --- | --- | --- |
+      | `constant(s)`, `between(a, b)` | a fixed or random wait **after** each task | closed loop with think time |
+      | `constant_pacing(s)` | "an adaptive time that ensures the task runs (at most) once every X seconds" | closed loop with pacing |
+      | `constant_throughput(x)` | "an adaptive time that ensures the task runs (at most) X times per second"; "the mathematical inverse of constant_pacing" | closed loop with pacing |
+      | `poisson(rate)` | "a random time sampled from an exponential distribution, so that tasks arrive as a Poisson process with the given average rate" | still a closed loop per user, with random gaps |
+
+      Three notes from the same page matter for sizing: "Wait time can only constrain the throughput, not launch new
+      Users to reach the target"; "Wait time is applied after task execution, so if you have a high spawn rate/ramp
+      up you may end up exceeding your target during ramp-up"; and "Wait times apply to tasks, not requests. For
+      example, if you specify wait_time = constant_throughput(2) and do two requests in your tasks, your request
+      rate/RPS will be 4 per User." The source shows why pacing gives up when the server is slow: `constant_pacing`
+      waits `max(0, wait_time - run_time)`, and its docstring says "If a task execution exceeds the specified
+      wait_time, the wait will be 0 before starting the next task."
+
+      **JMeter** - a Thread Group's threads run their samplers in a loop; timers add delays.
+
+      | Element | From the Component Reference |
+      | --- | --- |
+      | Thread Group | "defines a pool of users that will execute a particular test case against your server" - a closed loop |
+      | Constant Throughput Timer | "introduces variable pauses, calculated to keep the total throughput (in terms of samples per minute) as close as possible to a given figure. Of course the throughput will be lower if the server is not capable of handling it" |
+      | Precise Throughput Timer | "models Poisson arrivals schedule"; "The timer does not generate threads, so the resulting throughput will be lower if the server is not capable of handling it, or if other timers add too big delays, or if there's not enough threads" |
+      | Open Model Thread Group | users "generated according to the schedule", for example `rate(10/sec) random_arrivals(1 min)` - an open model |
+
+      The Constant Throughput Timer's target is in **samples per minute** and can be shared among "this thread only",
+      "all active threads in current thread group" or "all active threads". The manual adds about the Precise
+      Throughput Timer: "in many cases, Open Model Thread Group would be a better choice for generating the desired
+      load profile", and "Constant Throughput Timer converges to the specified rate, however it tends to produce
+      samples at even intervals."
+
+      Every one of these except the Open Model Thread Group is still a closed loop underneath: a fixed pool of users
+      whose waits shrink to zero when the server is slow. They approximate an open model only while there are enough
+      users for each one to finish its iteration well within its pacing.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-little-pacing]
+    title: A paced Locust user - line by line
+    body: |
+      The `little_paced_locustfile` exercise: 5 users together send 20 payment-list requests per second.
+
+      ```python
+      from locust import HttpUser, constant_throughput, task
+
+      TARGET_RPS = 20
+      USERS = 5
+
+
+      class PacedMerchant(HttpUser):
+          wait_time = constant_throughput(TARGET_RPS / USERS)
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"},
+                                   name="POST /auth/token")
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=1", name="GET /v1/payments")
+      ```
+
+      - `constant_throughput(TARGET_RPS / USERS)` - 4 task runs per second per user, so pacing of 0.25 s. It is
+        per **task**, and the task sends exactly one request, so 4 tasks = 4 requests.
+      - `on_start` - runs once per user before its tasks. The token request is not part of the paced rate, so it is
+        named separately and the statistics keep it apart.
+      - `self.client.headers[...]` - the `HttpSession` keeps the header for every later request of this user.
+      - `name="GET /v1/payments"` - groups the statistics under a stable name.
+
+      Run for 10 s with `-u 5 -r 50`, against 20 ms and then 500 ms of service time:
+
+      ```plaintext
+      service 20 ms: GET /v1/payments count=185 fails=0 rps=20.5 avg=27 ms; tokens=5
+      service 500 ms: GET /v1/payments count=80 fails=0 rps=9.3 avg=504 ms; tokens=5
+      ```
+
+      With a fast server, pacing holds the rate at the target. With a slow one, each task takes longer than its
+      0.25 s pacing, the wait drops to 0, and 5 users can manage at most 5 / 0.504 ≈ 9.9 per second - the run
+      measured 9.3. No error, no warning: just **less load than the requirement asked for**. That is the single most
+      important thing to check in any closed-loop result.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-little-pacing, perf-little-law]
+    title: Sizing a load test, step by step
+    body: |
+      1. **Take the target from the requirement** - a request or transaction rate at a named load ("40 payment
+         creations per second"), and decide whether real arrivals are open, closed or partly-open (see the table
+         above).
+      2. **Estimate the response time** - from production monitoring or a small exploratory run - and use the
+         *expected worst* value at the target load, not the idle value.
+      3. **Decide think time** from real user behaviour (analytics, logs), or zero for system-to-system traffic.
+      4. **Compute the users:** N = (target / k) · (k·R + Z), rounded up, where k is requests per iteration. Add
+         headroom - if R doubles under load, a test sized for the idle R cannot reach the target.
+      5. **Set the pacing** so the users do not exceed the target while the server is fast: pacing = N·k / target
+         seconds per iteration (Locust `constant_throughput(target / (N·k))` per task of k requests; JMeter
+         Constant Throughput Timer at target × 60 samples per minute shared across the group) - or use an open
+         model (Open Model Thread Group) if the requirement describes arrivals.
+      6. **Run, then verify the load you actually delivered:** achieved rate versus target, and N ≈ X(R + Z) from
+         the run's own numbers. A shortfall means the result answers a different question from the one asked.
+
+  - id: example
+    kind: example
+    concepts: [perf-little-law, perf-little-pacing, perf-little-open-closed]
+    title: "Example: the merchant dashboard test that passed too easily"
+    body: |
+      A SandPay team's requirement: "the payment list (GET /v1/payments) answers within 300 ms at p95 at 150
+      requests per second at peak". The test report:
+
+      ```plaintext
+      Users: 60   Think time: 1.0 s (constant)   Duration: 30 min
+      GET /v1/payments  p95 240 ms  avg 180 ms  throughput 50.8/s  errors 0
+      Verdict: PASS
+      ```
+
+      What a tester checks:
+
+      - **Does it add up?** N = X(R + Z) gives 50.8 × (0.18 + 1.0) ≈ 60 users. Consistent - the measurements are
+        fine.
+      - **Did it test the requirement?** No. It reached 50.8 requests per second, a third of 150. With R = 0.18 s and
+        Z = 1.0 s, reaching 150 per second needs N = 150 × 1.18 = 177 users - and more if the response time rises
+        under the higher load.
+      - **Is a closed model right?** Dashboard users are merchants who open the page, read, refresh - a partly-open
+        system with sessions of several requests. A closed model is defensible for one merchant's session, but the
+        number of merchants arriving at peak is open: more merchants do not wait for others to finish.
+      - **The verdict** should have been *inconclusive* - "not tested at the stated load" - with the evidence
+        (achieved rate and the arithmetic), not PASS. See [Performance requirements and
+        SLOs](#/lesson/performance-requirements-and-slos) for how to judge a run.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-little-law, perf-little-pacing, perf-little-open-closed]
+    title: Tests that prove the load was delivered
+    body: |
+      | # | Test | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Fast server (stub or low latency), paced users, short run | achieved rate within ±10 % of target | tool's rate per transaction; server request counter |
+      | 2 | Same plan, server slowed 10× | closed model: rate falls - the test must **report the shortfall**, not pass; open model: rate holds, in-flight rises | achieved rate, server `max_in_flight` |
+      | 3 | Little's law cross-check over the steady-state window | N ≈ X(R + Z) within a few percent | the run's own X, R, Z and N |
+      | 4 | Several requests per task | request rate = task rate × k | per-request counts |
+      | 5 | Ramp-up spike | no burst above target during ramp-up (Locust warns this can happen) | per-second rate chart |
+      | 6 | Generator health | load generator CPU below its limit throughout | generator CPU metric; JMeter/Locust warnings |
+      | 7 | Too few users | N below X(R + Z) | test flags "target not reachable" before or during the run |
+
+      The `little_paced_locustfile` tests implement 1 and 2 against the practice API; `little_check` implements 3.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-little-law, perf-little-open-closed, perf-little-pacing]
+    title: Common mistakes and a debugging method
+    body: |
+      - **"5000 users" as the requirement.** Users are an input to a closed model, not a load. Translate every
+        "users" figure into a rate with N = X(R + Z) and ask which think time was assumed.
+      - **Not checking the achieved rate.** A closed-loop test against a slow server sends less load, reports no
+        errors, and "passes". Always compare achieved and target rate per transaction.
+      - **Forgetting requests per task.** `constant_throughput(2)` with two requests per task is 4 requests per
+        second per user - the Locust docs say so explicitly.
+      - **Sizing from idle response times.** R grows under load; size for the response time you expect at the
+        target, plus headroom.
+      - **Short or busy measurement windows.** End effects make L and X·R disagree; use a long steady-state window
+        that excludes ramp-up and ramp-down.
+      - **Treating every closed loop as realistic.** Schroeder et al. principle (ii): "As the MPL grows, closed
+        systems become open, but convergence is slow for practical purposes." A few hundred users do not make a
+        closed test open.
+      - **Timers that cannot help.** JMeter's throughput timers "do not generate threads"; if the thread count is too
+        low, no timer setting reaches the target.
+
+      **Debugging method** when a run's numbers look wrong:
+
+      1. Write down N, X, R and Z for the same time window.
+      2. Compute X(R + Z). If it is far from N, the inputs disagree - look for a different window, a generator that
+         ran out of CPU, users that were not all running, or think time that was not what you configured.
+      3. If they agree but X is below the target, the model throttled itself - the server is slower than you
+         sized for, or there are too few users.
+      4. Compare client-side counts with the server's own counter (`/metrics` on the practice API) to rule out
+         requests the tool counted but never sent.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-little-open-closed, perf-little-pacing]
+    title: Trade-offs and alternatives
+    body: |
+      | Approach | Strength | Weakness |
+      | --- | --- | --- |
+      | Closed loop, think time | models a known population (agents, workers); simple; bounded load on the generator | under-loads a slow server; reports optimistic response times for open-world traffic |
+      | Closed loop with pacing (Constant Throughput Timer, `constant_throughput`) | holds a target rate while the server keeps up | silently falls short when iterations exceed pacing; needs enough users |
+      | Poisson-style waits (Precise Throughput Timer, `poisson`) | realistic burstiness | still capped by the user count |
+      | Open model (Open Model Thread Group) | arrivals independent of the server - shows queue growth honestly | marked experimental in JMeter; an overloaded server means ever more threads on the generator, so cap or watch them |
+      | Partly-open (sessions arrive openly, steps inside are closed) | closest to most web and mobile traffic | more design work - sessions per second **and** steps per session |
+
+      Little's law itself has limits: it relates **averages over a long window** and says nothing about percentiles,
+      bursts or which resource saturates. Use it to size and to sanity-check; use percentiles to judge and resource
+      metrics to explain.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-little-law, perf-little-open-closed, perf-little-pacing]
+    title: Quick reference
+    body: |
+      - **Little's law:** L = λW (N = XR). In flight = throughput × time in system. Holds for any consistent
+        boundary, with very weak assumptions; exact over a window that starts and ends empty.
+      - **Closed loop:** N = X(R + Z); **response time law:** R = N/X - Z.
+      - **Users needed:** N = (target / k) · (k·R + Z), rounded up, with headroom for R under load.
+      - **Pacing per user:** N·k / target seconds; Locust `constant_throughput(target / (N·k))` per task.
+      - **Closed model:** a slower server gets less load - check the achieved rate. **Open model:** arrivals
+        continue - in-flight grows.
+      - **Locust:** wait time is per task, applied after it; it can only slow users down.
+      - **JMeter:** timers "do not generate threads"; the Open Model Thread Group (experimental) schedules arrivals.
+
+exercises:
+  - id: little-mcq-concurrency
+    type: mcq
+    concept: perf-little-law
+    skill: application
+    title: Requests in flight
+    prompt: |
+      SandPay's payment creation endpoint handles 50 requests per second in steady state, and each request spends
+      on average 0.2 s inside the API. How many payment creations are inside the API on average?
+    options:
+      - id: ten
+        text: '10'
+        feedback: Correct - L = λW = 50 × 0.2 = 10.
+      - id: two-fifty
+        text: '250'
+        feedback: That divides 50 by 0.2. Little's law multiplies throughput by time in the system.
+      - id: fifty
+        text: '50 - the throughput'
+        feedback: Throughput is completions per second, not the number in the system; you need the time each one stays.
+      - id: unknown
+        text: It can't be known without the arrival distribution
+        feedback: Little's law needs only very weak assumptions - no arrival or service distribution - which is why it is so useful.
+    correct: [ten]
+    hints:
+      - Which two of L, λ and W do you have?
+    solution: |
+      L = λW = 50 per second × 0.2 s = 10 requests in the API on average. No distribution is needed - only long-run
+      averages over a consistent boundary.
+
+  - id: little-mcq-assumptions
+    type: mcq
+    concept: perf-little-law
+    skill: recall
+    title: What Little's law needs
+    prompt: Which statement about the conditions for Little's law is right?
+    options:
+      - id: weak
+        text: It needs only very weak assumptions - long-run averages measured consistently over the same boundary
+        feedback: Correct - QSP says it "requires only very weak assumptions", which is why it checks measurement data.
+      - id: poisson
+        text: It holds only for Poisson arrivals and exponential service times
+        feedback: That describes the M/M/1 queue, a much narrower model. Little's law holds regardless of distributions.
+      - id: fcfs
+        text: It holds only when requests are served first come, first served
+        feedback: The area argument never uses the order of service.
+      - id: single
+        text: It applies to a single server only, not to a whole system
+        feedback: QSP applies it at four levels, from one resource to users plus system; the key is consistency.
+    correct: [weak]
+    hints:
+      - Think about the area proof - which quantities does it use?
+    solution: |
+      The proof uses only the area between the arrival and completion curves, the completions and the window length.
+      It needs consistent definitions and a window where end effects are small - nothing about distributions or
+      scheduling.
+
+  - id: little-mcq-response-time-law
+    type: mcq
+    concept: perf-little-law
+    skill: application
+    title: Response time from the other three
+    prompt: |
+      A closed-loop test ran 64 virtual users with an average think time of 30 s and measured 2 interactions per
+      second. What average response time do these numbers imply?
+    options:
+      - id: two
+        text: 2 s
+        feedback: Correct - R = N/X - Z = 64/2 - 30 = 2 s (QSP's own example).
+      - id: thirty-two
+        text: 32 s
+        feedback: 64/2 = 32 s is R + Z - the whole loop. Subtract the think time.
+      - id: sixty-two
+        text: 62 s
+        feedback: That subtracts the throughput from the users; the law divides N by X.
+      - id: half
+        text: 0.5 s
+        feedback: That is 1/X - the time between completions, not each one's response time.
+    correct: [two]
+    hints:
+      - Around the whole loop, each interaction spends R + Z.
+    solution: |
+      N = X(R + Z), so R = N/X - Z = 32 - 30 = 2 s. Because R is a small difference of two large numbers, small errors
+      in X give large errors in R - measure response time directly and use the law to cross-check.
+
+  - id: little-mcq-users-needed
+    type: mcq
+    concept: perf-little-pacing
+    skill: application
+    title: Users for a target rate
+    prompt: |
+      Each virtual user sends one request (about 0.2 s) and then thinks for 1.0 s. How many users do you need for 31
+      requests per second?
+    options:
+      - id: thirty-eight
+        text: '38'
+        feedback: Correct - 31 × (0.2 + 1.0) = 37.2, rounded up to 38.
+      - id: thirty-seven
+        text: '37'
+        feedback: 37.2 rounded down falls short; a fraction of a user can't run, so round up.
+      - id: thirty-one
+        text: '31'
+        feedback: That ignores the time each user spends waiting and thinking - each user only sends one request per 1.2 s.
+      - id: seven
+        text: '7'
+        feedback: That uses only the response time (31 × 0.2 = 6.2); the think time is part of each user's loop.
+    correct: [thirty-eight]
+    hints:
+      - How long is one user's loop?
+    solution: |
+      N = X(R + Z) = 31 × 1.2 = 37.2, so 38 users - and more if the response time rises under that load.
+
+  - id: little-mcq-closed-slowdown
+    type: mcq
+    concept: perf-little-open-closed
+    skill: analysis
+    title: The server got ten times slower
+    prompt: |
+      A Locust test with 10 users and `wait_time = constant(0)` reported 179 requests per second, 54 ms average and
+      no failures. After a deploy, the same test reports 19.5 requests per second, 507 ms average and still no failures.
+      What happened to the load the server received?
+    options:
+      - id: fell
+        text: It fell about nine times - a closed loop sends the next request only after each reply, so a slower server receives less load
+        feedback: Correct - X·R stays at about 10 users in both runs; the load the server received collapsed with its speed.
+      - id: same
+        text: The same load - the test ran the same 10 users for the same time
+        feedback: The users are the same; the requests they sent are not. 10 users waiting 507 ms each send about 20 per second.
+      - id: tool
+        text: Locust ran out of CPU, so the result is invalid
+        feedback: Nothing points to that - X·R ≈ N in both runs, which is what a healthy closed loop shows.
+      - id: open
+        text: The server rejected the extra requests
+        feedback: There were no failures; the requests were simply never sent.
+    correct: [fell]
+    hints:
+      - In a closed loop, what triggers each new request?
+    solution: |
+      Closed loop: X = N / (R + Z) = 10 / 0.507 ≈ 19.7 per second. The test measured a slower server under a ninth of
+      the load - comparing the two runs' response times compares different loads.
+
+  - id: little-mcq-open-slowdown
+    type: mcq
+    concept: perf-little-open-closed
+    skill: analysis
+    title: The open model under the same slowdown
+    prompt: |
+      JMeter's Open Model Thread Group with `rate(20/sec) random_arrivals(5 sec)` sent 100 requests at 50 ms service
+      time. The service time rises to 500 ms. What do you expect?
+    options:
+      - id: hundred
+        text: Still about 100 requests; the average number in flight rises from about 1 to about 10
+        feedback: Correct - arrivals follow the schedule, and L = λW = 20 × 0.5 = 10. The real run saw a maximum of 18 in flight.
+      - id: eighteen
+        text: About 18 requests, as in the closed model
+        feedback: That is the closed-loop behaviour; open arrivals don't wait for replies.
+      - id: errors
+        text: JMeter stops sending because the server is slow
+        feedback: The schedule continues regardless - that is the point of an open model.
+      - id: fewer-in-flight
+        text: Fewer requests in flight, because each takes longer
+        feedback: Longer requests at the same arrival rate mean more in flight, by Little's law.
+    correct: [hundred]
+    hints:
+      - Apply L = λW with λ fixed.
+    solution: |
+      λ stays 20 per second, so the count stays at about 100 over 5 s, and the in-flight average grows with W: 20 ×
+      0.05 = 1 before, 20 × 0.5 = 10 after. If the server's capacity were below that, the open test would show
+      queueing and errors that the closed test hides.
+
+  - id: little-mcq-locust-per-task
+    type: mcq
+    concept: perf-little-pacing
+    skill: application
+    title: Two requests per task
+    prompt: |
+      ```python
+      class Merchant(HttpUser):
+          wait_time = constant_throughput(2)
+
+          @task
+          def browse(self):
+              self.client.get("/v1/payments?limit=10")
+              self.client.get("/v1/payments/pay_100001")
+      ```
+
+      With 10 users and a fast server, what request rate do you expect?
+    options:
+      - id: forty
+        text: About 40 requests per second
+        feedback: Correct - 2 tasks per second per user × 2 requests per task × 10 users. The Locust docs give this exact example.
+      - id: twenty
+        text: About 20 requests per second
+        feedback: constant_throughput counts task runs, not requests - "Wait times apply to tasks, not requests."
+      - id: two
+        text: About 2 requests per second in total
+        feedback: The argument is per user, not for the whole test.
+      - id: unbounded
+        text: As many as the server allows - constant_throughput does not limit requests
+        feedback: It does limit task runs per user; it can't raise throughput above what the server allows.
+    correct: [forty]
+    hints:
+      - Is the wait applied per task or per request?
+    solution: |
+      Per user: 2 task runs per second × 2 requests = 4 requests per second; × 10 users = 40. To get 20 requests per
+      second, use constant_throughput(1) or one request per task.
+
+  - id: little-mcq-timer-limit
+    type: mcq
+    concept: perf-little-pacing
+    skill: recall
+    title: What a throughput timer cannot do
+    prompt: Which statement about JMeter's Constant and Precise Throughput Timers is right?
+    options:
+      - id: no-threads
+        text: They can only add pauses; they don't create threads, so too few threads or a slow server keeps throughput below target
+        feedback: Correct - the manual says "The timer does not generate threads" and "the throughput will be lower if the server is not capable of handling it".
+      - id: add-threads
+        text: They start extra threads automatically when the target is not met
+        feedback: No JMeter timer starts threads; that is the Thread Group's (or the Open Model Thread Group's) job.
+      - id: per-second
+        text: The Constant Throughput Timer's target is in samples per second
+        feedback: It is in samples per minute - an easy factor-of-60 mistake.
+      - id: precise-even
+        text: The Precise Throughput Timer produces samples at exactly even intervals
+        feedback: The manual says it "models Poisson arrivals schedule"; the Constant Throughput Timer tends to produce even intervals.
+    correct: [no-threads]
+    hints:
+      - What does a timer do to a thread?
+    solution: |
+      Timers delay threads. Throughput is bounded by threads ÷ iteration time, so size the thread count first (N =
+      X(R + Z) with headroom), then let the timer hold the rate down.
+
+  - id: little-mcq-model-choice
+    type: mcq
+    concept: perf-little-open-closed
+    skill: analysis
+    title: Which model for card payments at checkout?
+    prompt: |
+      You test SandPay's hosted checkout page, where shoppers of many different merchants pay. Each shopper's session
+      is two or three requests. Which workload model fits best?
+    options:
+      - id: open
+        text: Open (or partly-open with short sessions) - new shoppers arrive regardless of how fast others are served
+        feedback: Correct - and Schroeder et al. note a partly-open system with about 5 or fewer requests per session behaves like an open one.
+      - id: closed
+        text: Closed with a fixed number of users, because the tool uses threads
+        feedback: The tool's default should not choose the model - the real arrival process should.
+      - id: closed-big
+        text: Closed with many users, because a big enough closed system is the same as an open one
+        feedback: Principle (ii) - closed systems become open as the population grows, "but convergence is slow for practical purposes".
+      - id: either
+        text: It doesn't matter; both give the same response times at the same load
+        feedback: Principle (i) - for a given load, mean response times are significantly lower in closed systems.
+    correct: [open]
+    hints:
+      - Does one shopper wait for another shopper's payment?
+    solution: |
+      Shoppers arrive independently, so arrivals are open; inside a short session steps follow each other. Use an
+      arrival-rate model (Open Model Thread Group) or a partly-open design, and size threads for the in-flight count
+      L = λW with headroom.
+
+  - id: little-mcq-end-effects
+    type: mcq
+    concept: perf-little-law
+    skill: analysis
+    title: L and X·R disagree
+    prompt: |
+      From a run, you computed L = 4.000 but X·R = 4.919 for a window cut 105 ms inside both ends of a busy 0.6 s run.
+      Over the whole run, from first start to last end, they agree exactly. Why?
+    options:
+      - id: end
+        text: End effects - requests running across the window's edges add area without matching completions
+        feedback: Correct - QSP says the correspondence is exact only when the window starts and ends with the system empty.
+      - id: broken
+        text: Little's law does not hold for short runs
+        feedback: It holds exactly on the whole-run window here; the cut window is the problem, not the law.
+      - id: tool
+        text: The load generator measured the response times wrongly
+        feedback: The same measurements agree perfectly over the whole run, so the timings are consistent.
+      - id: think
+        text: The think time was not included
+        feedback: L here is the number of requests in the API; think time belongs to the outer loop, not this boundary.
+    correct: [end]
+    hints:
+      - Which requests contribute area but not a completion inside the window?
+    solution: |
+      Use a long steady-state window so the requests cut at the edges are a tiny fraction; that is also why reports
+      exclude ramp-up and ramp-down.
+
+  - id: little-order-sizing
+    type: order
+    concept: perf-little-pacing
+    skill: application
+    title: Size a closed-loop load test
+    prompt: Put the steps for sizing a closed-loop load test in order.
+    items:
+      - id: target
+        text: Take the target rate and the arrival model from the requirement
+      - id: response
+        text: Estimate the response time expected at the target load
+      - id: think
+        text: Decide the think time from real user behaviour
+      - id: users
+        text: Compute N = (target / k) · (k·R + Z), round up and add headroom
+      - id: pacing
+        text: Set pacing or a throughput timer so users don't exceed the target
+      - id: verify
+        text: Run, then compare the achieved rate with the target and check N ≈ X(R + Z)
+    hints:
+      - You can't compute users before you know the loop time.
+    solution: |
+      Requirement first, then the two times that make the loop (R and Z), then users, then the pacing that caps the
+      rate, and finally evidence that the run delivered what was asked.
+
+  - id: little-debug-wait-time
+    type: debug
+    concept: perf-little-pacing
+    skill: analysis
+    title: Twice the planned load
+    prompt: |
+      The team wanted 40 requests per second from 10 users, but the run sent about 80 per second. Which line is the
+      defect? (Authentication is left out of this excerpt.)
+    language: python
+    code: |
+      from locust import HttpUser, constant_throughput, task
+
+      TARGET_RPS = 40  # requests per second across all users
+      USERS = 10
+
+      class Merchant(HttpUser):
+          wait_time = constant_throughput(TARGET_RPS / USERS)
+
+          @task
+          def browse(self):
+              self.client.get("/v1/payments?limit=10")
+              self.client.get("/v1/payments/pay_100001")
+    correctLines: [7]
+    lineNotes:
+      - line: 3
+        note: The target itself is right - 40 requests per second is what the team wanted.
+      - line: 11
+        note: The requests are fine; the problem is how the pacing counts them.
+      - line: 12
+        note: A second request per task is legitimate - but the wait time must account for it.
+    hints:
+      - Does constant_throughput count tasks or requests?
+      - How many requests does one task send?
+    solution: |
+      Line 7 paces **tasks** at 4 per second per user, and each task sends 2 requests, so each user sends 8 per second -
+      80 in total. Use `constant_throughput(TARGET_RPS / (USERS * 2))`, or one request per task.
+
+  - id: little-short-optimistic
+    type: short
+    concept: perf-little-open-closed
+    skill: analysis
+    title: Why the test looked better than production
+    prompt: |
+      A closed-loop test with 200 users and 2 s of think time reported a p95 of 350 ms. In production, at about the
+      same average throughput, the p95 during a busy hour was well over a second. Give two reasons the workload model
+      can explain, and what you would change in the test.
+    modelAnswer: |
+      In a closed loop each user waits for its reply, so when the server slows down the users send less - the load
+      throttles itself and queues stay short. Schroeder et al.'s principle (i): for a given load, mean response times
+      are significantly lower in closed systems than in open ones. Production arrivals are open: shoppers keep
+      arriving during a slow spell, so requests pile up and the tail grows. Also, constant think time spreads requests
+      evenly, while real arrivals are bursty, which also lengthens queues. I would model arrivals (an Open Model
+      Thread Group, or a partly-open design with sessions arriving at a rate), use random rather than constant gaps,
+      size threads for L = λW with headroom, and report the achieved rate and in-flight counts.
+    rubric:
+      - Explains that a closed loop throttles its own load when the server slows.
+      - Cites or paraphrases that closed systems show lower response times than open ones at the same load.
+      - Mentions burstiness or variability of real arrivals.
+      - Proposes an open or partly-open model with realistic arrival variation.
+    hints:
+      - What happens to the users' send rate in a closed loop when replies get slower?
+    solution: |
+      Closed loops self-throttle and spread requests evenly; production is open and bursty. Model the arrivals, not
+      the users.
+
+  - id: little-testdesign-delivered
+    type: testdesign
+    concept: perf-little-law
+    skill: application
+    title: Prove the load test delivered its load
+    prompt: |
+      Before anyone reads response times, SandPay wants proof that a load test delivered "40 payment creations per
+      second for 30 minutes". Design the checks: preconditions, steps, expected results and evidence.
+    modelAnswer: |
+      Preconditions: the requirement's rate and model are written down; a server-side request counter or access log
+      exists; the generator's CPU and memory are monitored.
+
+      1. **Achieved rate** - compute payment creations per second over the steady-state window. Expected: 40 ± 5 %.
+         Evidence: per-transaction rate from the tool and from the server counter; they agree.
+      2. **Little's law** - with N users, measured R and configured Z, check N ≈ X(R + Z) (closed) or in-flight ≈ λW
+         (open). Expected: within a few percent. Evidence: the arithmetic with the window stated.
+      3. **Shortfall detection** - rerun against a deliberately slowed server. Expected: a closed test reports a
+         shortfall (and fails the "load delivered" check); an open test holds the rate. Evidence: both reports.
+      4. **No ramp-up burst** - per-second rate during ramp-up. Expected: never far above 40. Evidence: rate chart.
+      5. **Generator health** - generator CPU stays below its limit. Expected: yes throughout. Evidence: CPU chart,
+         tool warnings.
+      6. **Per-request versus per-task** - with several requests per task, count each request name. Expected: the
+         payment-creation count matches 40 per second, not the task rate. Evidence: per-name counts.
+    rubric:
+      - Checks the achieved rate per transaction against the target over a stated window.
+      - Uses Little's law (or the response time law) as a consistency check.
+      - Includes a slowed-server case showing the shortfall is detected.
+      - Checks the generator's own health and ramp-up behaviour.
+      - Names concrete evidence for each check, ideally server-side as well as client-side.
+    hints:
+      - How would you notice a closed loop that quietly sent less?
+    solution: |
+      Achieved rate (tool and server), the law as a cross-check, a slowed-server run, ramp-up and generator health -
+      each with evidence, before any response time is judged.
+
+  - id: little-interview-users
+    type: interview
+    concept: perf-little-pacing
+    skill: analysis
+    title: "Interview: how many virtual users for 500 transactions per second?"
+    prompt: |
+      "We need to prove our payment API handles 500 transactions per second. How many virtual users would you
+      configure, and how would you know the test really did that?"
+    modelAnswer: |
+      I'd first ask what kind of traffic it is. Card payments from many independent shoppers are open arrivals, so
+      ideally I'd schedule arrivals at 500 per second - JMeter's Open Model Thread Group, for example - and size the
+      threads for how many are in flight. By Little's law that is λW: at 500 per second and, say, 300 ms per
+      transaction, about 150 in flight on average, so I'd allow a few times that for slow spells.
+
+      If I use a classic closed loop instead, I use N = X(R + Z). If each user does one transaction of 0.3 s and then
+      thinks for 0.7 s, that's 500 × 1.0 = 500 users; with no think time it's 150. I'd add headroom because the
+      response time rises under load, and use pacing - Constant Throughput Timer or Locust's constant_throughput - so
+      the users don't overshoot when the server is fast.
+
+      To know it worked, I check the achieved rate per transaction against 500 over the steady-state window, compare
+      it with the server's own count, and check that N ≈ X(R + Z). If the server slows down, a closed test sends less
+      without any errors, so a shortfall means "not tested at 500", not "passed".
+    rubric:
+      - Asks or reasons about open versus closed arrivals before choosing a number.
+      - Applies Little's law (λW for in-flight, N = X(R + Z) for users) with explicit numbers.
+      - Adds headroom because response time grows under load.
+      - Mentions pacing or throughput control to avoid overshooting.
+      - Verifies the achieved rate (ideally server-side) and treats a shortfall as inconclusive.
+    followUps:
+      - What changes if each iteration contains three API calls?
+      - The report shows 500 users, 300 TPS and 200 ms average. What do you conclude?
+      - Why might the open model need more threads than the closed one during a slowdown?
+    hints:
+      - Structure it as - the model, the arithmetic, the verification.
+    solution: |
+      Model first (open arrivals vs closed users), then Little's law for threads or users with headroom, then proof of
+      the achieved rate.
+
+  - id: little-calc-code
+    type: coding
+    concept: perf-little-pacing
+    skill: application
+    title: A load test sizing calculator
+    prompt: |
+      In `exercises/fundamentals/little_calc.py`, implement `concurrency`, `users_needed`, `response_time_from`,
+      `pacing_seconds`, `locust_constant_throughput` and `max_closed_throughput`. The tests include QSP's worked
+      examples (10 users, Z = 5 s, R = 15 s gives 0.5 per second; 64 users, Z = 30 s, X = 2 gives R = 2 s), rounding
+      up, several requests per iteration, and inputs that must raise `ValueError`.
+    project: perf
+    files:
+      - exercises/fundamentals/little_calc.py
+    test: tests/fundamentals/test_little_calc.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_little_calc.py
+    hints:
+      - Write the closed-loop law N = X(R + Z) first; everything else is a rearrangement.
+      - With k requests per iteration, an iteration takes k·R + Z and the iteration rate is target / k.
+      - Round up with math.ceil, but subtract a tiny epsilon first so 36.000000001 stays 36.
+    modelAnswer: |
+      ```python
+      def users_needed(target_rps, response_time_s, think_time_s=0.0, requests_per_iteration=1):
+          _check_non_negative(target_rps=target_rps, response_time_s=response_time_s, think_time_s=think_time_s)
+          if requests_per_iteration < 1:
+              raise ValueError("requests_per_iteration must be at least 1")
+          k = requests_per_iteration
+          exact = target_rps / k * (k * response_time_s + think_time_s)
+          return math.ceil(exact - 1e-9)
+
+      def response_time_from(users, throughput_per_s, think_time_s=0.0):
+          if throughput_per_s <= 0:
+              raise ValueError("throughput must be positive")
+          r = users / throughput_per_s - think_time_s
+          if r < 0:
+              raise ValueError(f"inconsistent measurements: N/X - Z = {r:.3f} s is negative")
+          return r
+
+      def max_closed_throughput(users, iteration_s, pacing_s=0.0, requests_per_iteration=1):
+          cycle = max(iteration_s, pacing_s)
+          if cycle == 0:
+              raise ValueError("iteration time and pacing are both zero - throughput is unbounded")
+          return users * requests_per_iteration / cycle
+      ```
+
+      A negative response time from the law is not a number to report - it proves the measurements came from
+      different windows or a broken generator.
+    rubric:
+      - Every test in tests/fundamentals/test_little_calc.py passes.
+      - users_needed rounds up and handles several requests per iteration.
+      - response_time_from refuses inconsistent inputs instead of returning a negative time.
+      - max_closed_throughput uses the slower of pacing and iteration time.
+    solution: |
+      Everything comes from N = X(R + Z); the care is in rounding up, units, and refusing inconsistent inputs.
+
+  - id: little-check-code
+    type: coding
+    concept: perf-little-law
+    skill: analysis
+    title: Check Little's law on a real run
+    prompt: |
+      In `exercises/fundamentals/little_check.py`, implement `time_average_in_system`, `throughput`,
+      `mean_residence` and `littles_law_report` for a list of `(start, end)` intervals. One test runs a real
+      four-user closed loop against the SandPay practice API and expects the whole-run report to agree to within
+      1e-9; another expects a 25/175 relative error for a window cut through busy requests.
+    project: perf
+    files:
+      - exercises/fundamentals/little_check.py
+    test: tests/fundamentals/test_little_check.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_little_check.py
+    hints:
+      - Clip each interval to the window - min(end, t1) - max(start, t0), never below zero - and sum.
+      - Throughput and mean residence count only requests that completed inside the window.
+      - Without a window, use the first start and the last end - the system is empty there.
+    modelAnswer: |
+      ```python
+      def time_average_in_system(intervals, t0, t1):
+          _check(intervals, t0, t1)
+          area = sum(max(0.0, min(end, t1) - max(start, t0)) for start, end in intervals)
+          return area / (t1 - t0)
+
+      def throughput(intervals, t0, t1):
+          _check(intervals, t0, t1)
+          return sum(1 for _, end in intervals if t0 <= end <= t1) / (t1 - t0)
+
+      def littles_law_report(intervals, t0=None, t1=None):
+          t0 = min(s for s, _ in intervals) if t0 is None else t0
+          t1 = max(e for _, e in intervals) if t1 is None else t1
+          big_l = time_average_in_system(intervals, t0, t1)
+          x, r = throughput(intervals, t0, t1), mean_residence(intervals, t0, t1)
+          return {"L": big_l, "X": x, "R": r, "XR": x * r, "relative_error": abs(big_l - x * r) / big_l}
+      ```
+
+      Over a window that starts and ends empty, X·R = (C/T)(W/C) = W/T = L exactly - the area proof in code.
+    rubric:
+      - Every test in tests/fundamentals/test_little_check.py passes.
+      - The area clips intervals to the window instead of dropping or counting them whole.
+      - Throughput and residence use only completions inside the window.
+      - Can explain why the cut window disagrees and how a long steady-state window fixes it.
+    solution: |
+      L is area over time; X and R come from completions. Over an empty-to-empty window the law is exact; elsewhere
+      end effects show up.
+
+  - id: little-paced-code
+    type: coding
+    concept: perf-little-pacing
+    skill: application
+    title: Pace a Locust user to a target rate
+    prompt: |
+      Complete `exercises/fundamentals/little_paced_locustfile.py` so 5 users send 20 `GET /v1/payments?limit=1`
+      requests per second to the practice API, each user getting a token once in `on_start`. The tests run Locust
+      headless for 3 s against a 20 ms server (expect roughly 20 per second) and a 500 ms server (expect well under
+      it - pacing cannot beat a slow server).
+    project: perf
+    files:
+      - exercises/fundamentals/little_paced_locustfile.py
+    test: tests/fundamentals/test_little_paced_locustfile.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_little_paced_locustfile.py
+    hints:
+      - constant_throughput takes task runs per second per user.
+      - Keep the token request out of the paced task - on_start runs once per user.
+      - Put the token on self.client.headers so every later request carries it.
+    modelAnswer: |
+      ```python
+      class PacedMerchant(HttpUser):
+          wait_time = constant_throughput(TARGET_RPS / USERS)
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"},
+                                   name="POST /auth/token")
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=1", name="GET /v1/payments")
+      ```
+
+      One request per task means 4 tasks per second per user = 4 requests; 5 users make 20. With 500 ms responses
+      the pacing wait drops to zero and the rate is capped at about 5 / 0.5 = 10.
+    rubric:
+      - Every test in tests/fundamentals/test_little_paced_locustfile.py passes.
+      - The wait time is computed from the target and user count, not hard-coded by trial.
+      - The token is fetched once per user and not counted in the paced rate.
+      - Can explain why the slow-server run falls short with no errors.
+    solution: |
+      Pacing holds the rate down while the server keeps up; it can never push it up. Check the achieved rate.
+
+placement:
+  - id: little-place-law
+    type: mcq
+    concept: perf-little-law
+    skill: application
+    title: Does the report add up?
+    prompt: |
+      A load test report says: 300 users, think time 4 s, throughput 50 requests per second, average response time
+      0.2 s. What do you conclude?
+    options:
+      - id: inconsistent
+        text: The numbers are inconsistent - 50 × (0.2 + 4) = 210, not 300, so some measurement or setting is wrong
+        feedback: Correct - the response time law needs N = X(R + Z); 90 users are unaccounted for.
+      - id: fine
+        text: They are fine - users and throughput are independent settings
+        feedback: In a closed loop they are tied together by N = X(R + Z).
+      - id: slow
+        text: The server is too slow for 300 users
+        feedback: A slow server would raise R; here R is small and the arithmetic still fails.
+      - id: need-dist
+        text: You can't tell without the response time distribution
+        feedback: Little's law needs only averages.
+    correct: [inconsistent]
+    hints:
+      - Apply N = X(R + Z).
+    solution: |
+      50 × 4.2 = 210 users would explain the throughput. Look for users that never ran, a different measurement
+      window, longer real think time or an overloaded generator.
+
+  - id: little-place-model
+    type: mcq
+    concept: perf-little-open-closed
+    skill: analysis
+    title: Slower server, same test
+    prompt: |
+      A closed-loop test (fixed users, no think time) and an open-model test (fixed arrival rate) both run against a
+      server that becomes five times slower. Which pair of outcomes is right?
+    options:
+      - id: right
+        text: Closed - throughput drops and in-flight stays at the user count; open - throughput holds and in-flight grows
+        feedback: Correct - the closed loop throttles itself; the open schedule does not.
+      - id: swap
+        text: Closed - throughput holds; open - throughput drops
+        feedback: Reversed - arrivals in an open model don't depend on completions.
+      - id: both-drop
+        text: Both drop throughput by five times
+        feedback: Only the closed loop's sending depends on the replies.
+      - id: both-hold
+        text: Both hold throughput; only response times change
+        feedback: A closed loop can't hold throughput when each user waits five times longer per request.
+    correct: [right]
+    hints:
+      - What triggers each new request in each model?
+    solution: |
+      Closed: X = N/(R + Z) falls as R rises. Open: λ is fixed, so L = λW grows with W.
+
+  - id: little-place-pacing
+    type: debug
+    concept: perf-little-pacing
+    skill: analysis
+    title: The rate that never arrived
+    prompt: |
+      This JMeter-style plan should deliver 100 requests per second. The server answers in about 400 ms. Which line
+      explains why the run reached only about 50 per second?
+    language: plaintext
+    code: |
+      Thread Group: number of threads = 20, ramp-up = 10 s, loop forever
+        HTTP Request: GET /v1/payments?limit=10
+        Constant Throughput Timer: target throughput = 6000 samples per minute
+                                   calculate based on = all active threads in current thread group
+      Listener: Simple Data Writer -> results.jtl
+    correctLines: [1]
+    lineNotes:
+      - line: 3
+        note: 6000 samples per minute is exactly 100 per second - the target is right.
+      - line: 4
+        note: Sharing the target across the group is a valid choice.
+    hints:
+      - How many requests per second can 20 threads make at 400 ms each?
+    solution: |
+      20 threads ÷ 0.4 s = 50 per second at most; the timer "does not generate threads". 100 per second at 0.4 s needs
+      at least 40 threads - more for headroom.
+
+recall:
+  - id: little-recall-law
+    concept: perf-little-law
+    prompt: State Little's law in words and symbols.
+    answer: The average number in a system equals its throughput times the average time each request spends there - L = λW (N = XR).
+  - id: little-recall-rtl
+    concept: perf-little-law
+    prompt: What is the response time law?
+    answer: For a closed loop of N users with think time Z, N = X(R + Z), so R = N/X - Z.
+  - id: little-recall-exact
+    concept: perf-little-law
+    prompt: When is L = X·R exact for measured data?
+    answer: When the observation window starts and ends with the system empty; otherwise end effects make them differ slightly - so use a long steady-state window.
+  - id: little-recall-models
+    concept: perf-little-open-closed
+    prompt: Define the closed and the open workload model.
+    answer: Closed - new arrivals are triggered only by completions (plus think time), with a fixed population. Open - new arrivals come independently of completions, at a rate.
+  - id: little-recall-slowdown
+    concept: perf-little-open-closed
+    prompt: What does each model do when the server slows down?
+    answer: Closed - sends less, in-flight stays at the user count. Open - keeps sending, in-flight grows (λW).
+  - id: little-recall-users
+    concept: perf-little-pacing
+    prompt: How many users for target rate T with k requests per iteration, response time R and think time Z?
+    answer: N = (T / k) · (k·R + Z), rounded up, plus headroom for R rising under load.
+  - id: little-recall-wait
+    concept: perf-little-pacing
+    prompt: What can a Locust wait_time or a JMeter throughput timer not do?
+    answer: Start new users or threads - they only delay, so too few users or a slow server keeps throughput below target.
+
+next:
+  - performance-requirements-and-slos
+  - workload-modelling-from-production
+  - jmeter-thread-groups-and-timers
+  - locust-fundamentals
+  - locust-load-shapes

@@ -505,6 +505,8 @@ def make_app(fixed: set[str] | frozenset[str] | tuple[str, ...] = ()) -> App:
 def _handler_for(app: App) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Headers and body go out as separate writes; without this, Nagle + delayed ACK add ~40 ms per keep-alive request.
+        disable_nagle_algorithm = True
 
         def _serve(self) -> None:
             split = urllib.parse.urlsplit(self.path)

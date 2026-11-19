@@ -1,0 +1,1322 @@
+id: performance-test-environments-and-data
+title: Test environments and test data
+subject: performance-testing
+module: perf-fundamentals
+level: intermediate
+status: published
+estimatedMinutes: 130
+summary: Make a load test measure the system you meant to measure - an environment whose differences from production are known, a load generator that is not the bottleneck, test data that is unique and big enough (no shared idempotency keys, no shared accounts), state reset between runs, and results taken only from the steady state after warm-up. Every number shown was produced on this machine by the code shown, against local SandPay practice servers, with real JMeter 5.6.3 and Locust 2.47.0.
+tags:
+  [
+    performance testing,
+    load testing,
+    test environment,
+    environment parity,
+    production-like,
+    load generator,
+    generator bottleneck,
+    JMeter CLI mode,
+    JMeter heap,
+    listeners,
+    Locust workers,
+    Locust processes,
+    GIL,
+    ephemeral ports,
+    noisy neighbour,
+    isolation,
+    test data,
+    data volume,
+    unique test data,
+    idempotency keys,
+    state reset,
+    warm-up,
+    steady state,
+    ramp-up,
+    reset-stats,
+    run checklist,
+    coordinated omission,
+    SandPay,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/perf/.venv` with Locust 2.47.0 and pytest 9.2.0; Apache JMeter
+    5.6.3 (downloaded by `practice/perf/scripts/get-jmeter.sh`, SHA-512 checked) on OpenJDK 17.0.21; Linux,
+    14 CPU cores. Every output in this lesson was printed by the code shown, run on 18 November 2026; the
+    idempotency-key comparison was re-run on 19 November 2026 after the practice target's keep-alive fix. Timings
+    depend on the machine and its load: the **shape** (cold phase then fast phase, replay versus creation)
+    repeats, the exact milliseconds do not.
+  - **Targets:** `practice/perf/support/sandpay_target.py` (the SandPay practice API: tokens, payments with
+    `Idempotency-Key`, configurable service time) and `practice/perf/support/env_fixture.py` (a server that is
+    slow for its first 200 requests, to imitate a cold deployment). Both bind to `127.0.0.1` only. The code run
+    is the reference solutions of this lesson's exercises in `practice/perf/solutions/fundamentals/`.
+  - **Synthetic data:** SandPay is a fictional payments company. Clients `merchant-1` .. `merchant-50`, their
+    secrets, payment ids and the hosts `perf.sandpay.example` / `api.sandpay.example` are invented.
+  - **Apache JMeter user manual, as documented on 18 November 2026:** [Getting
+    Started](https://jmeter.apache.org/usermanual/get-started.html) (1.0.2 "Don't run load test using GUI
+    mode !", 1.4.4 CLI mode and its options, the `HEAP` variable and its default `-Xms1g -Xmx1g
+    -XX:MaxMetaspaceSize=256m`) and [Best Practices](https://jmeter.apache.org/usermanual/best-practices.html)
+    (16.2 "Use the correct Number of Threads", 16.7 "Reducing resource requirements"). The `HEAP` default was
+    also read from `bin/jmeter` of the 5.6.3 release.
+  - **Locust documentation (2.47.0), as documented on 18 November 2026:** [Distributed load
+    generation](https://docs.locust.io/en/2.47.0/running-distributed.html) (master, workers, `--processes`, one
+    worker per core because of the GIL) and [Increase performance with a more efficient HTTP
+    client](https://docs.locust.io/en/stable/increase-performance.html) (the CPU warning, FastHttpUser). The
+    CPU warning text and its 90 % threshold were read from `locust/runners.py` of 2.47.0; `--reset-stats` and
+    `--csv-full-history` from `locust --help`.
+  - **Linux:** the ephemeral port range shown (`32768 60999`) is this machine's
+    `/proc/sys/net/ipv4/ip_local_port_range`; check your own generator, it is configurable.
+  - **What is guidance, not a standard:** parity checklists, the 20 % generator headroom, the warm-up
+    detection rule and the run checklist in this lesson are working practice, labelled as such - no standard
+    fixes these numbers. Agree them with your team and write them into the test plan.
+  - **Not repeated here:** test types - [Types of performance testing](#/lesson/performance-testing-types);
+    percentiles - [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles);
+    concurrency from arrival rate - [Little's law and workload models](#/lesson/littles-law-and-workload-models);
+    what an idempotency key is - [Idempotency keys](#/lesson/idempotency-keys).
+
+prerequisites:
+  - performance-testing-types
+  - performance-metrics-and-percentiles
+  - littles-law-and-workload-models
+  - idempotency-keys
+
+concepts:
+  - id: perf-env-parity
+    name: Environment parity, isolation and the load generator
+    summary: A load test result describes the environment it ran in, the load generator included. Know and write down every difference from production (instance sizes and counts, data volume, configuration, versions, network, dependencies and their stubs); results do not scale linearly to a bigger or smaller environment. Run in an isolated environment so neighbours do not add noise, run the generator in CLI or headless mode without heavy listeners, keep headroom on its CPU (Locust - one worker per core; JMeter - enough heap, few listeners) and monitor it, otherwise you measure the generator instead of the system.
+  - id: perf-env-test-data
+    name: Test data volume, uniqueness and state
+    summary: Test data decides which code paths run. Each virtual user needs its own account or card when the real users would have their own; each create request needs its own idempotency key - unique per run, user and iteration - or the server replays a stored response, which is fast and writes nothing. Data volume must be production-like, because query plans, indexes and caches behave differently on small tables. Reset or refresh state before every run, since servers remember keys, sessions and created records between runs.
+  - id: perf-env-warmup-steady
+    name: Warm-up and the steady-state window
+    summary: A freshly started system is slow at first - empty caches, pools still opening, code not yet compiled - and every ramp-up mixes load levels. Report only the steady state, the window after warm-up where the level of the metrics stays within an agreed tolerance at the target load. Find it from the time series (bucket raw samples, compare each bucket with the final level), exclude the warm-up explicitly (Locust --reset-stats, filtering JTL rows by time) and make the steady window long enough for the requirement.
+
+objectives:
+  - List the differences between a test environment and production that change load test results, and explain why results cannot be scaled linearly.
+  - Diagnose a load generator bottleneck from its symptoms and fix it - CLI mode, listeners and heap for JMeter, worker processes for Locust, headroom and monitoring for both.
+  - Generate unique test data per virtual user, iteration and run, and prove with the server's replay signal that no request was a replay.
+  - Explain how data volume and leftover state change results, and plan the reset before each run.
+  - Find the warm-up and the steady-state window in a real JMeter run from its raw samples, and report only the steady window.
+  - Write and automate a pre-run checklist that stops a run whose results would be misleading.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: The idea in plain language
+    body: |
+      Imagine timing a new checkout lane at a supermarket. You would not time it at 6 a.m. in an empty shop with
+      one cashier who just arrived and has not logged in yet, using a single customer who buys the same loaf of
+      bread fifty times. The lane would look either terribly slow (the cashier is still warming up) or
+      impossibly fast (the till remembers the loaf and skips the scan). Neither number tells you how the lane
+      copes on Saturday afternoon.
+
+      A load test has the same traps:
+
+      - **The shop** - the test environment. If it has half the servers, a tiny database and a stubbed payment
+        provider, it is a different shop. You can still learn a lot from it, but only if you know exactly how it
+        differs and stop pretending its numbers are production's.
+      - **The stopwatch** - the load generator. If the person with the stopwatch is also carrying all the
+        shopping, they time their own tiredness. A JMeter or Locust machine that runs out of CPU slows down its
+        own requests and reports that as slow server responses.
+      - **The customers** - the test data. Fifty identical customers buying the same thing exercise one path.
+        For SandPay, fifty virtual users sharing one account and one `Idempotency-Key` create **one** payment and
+        get forty-nine stored replays.
+      - **The first minutes** - warm-up. Caches fill, connection pools open, code gets compiled. Averaging the
+        cold start into the result describes a system nobody runs.
+
+      This lesson is about making those four things deliberate - and checking them before every run, because
+      a load test that measured the wrong thing still produces confident-looking charts.
+
+  - id: what
+    kind: what
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Environment parity** | how closely the test environment matches production: hardware and instance sizes, instance counts, data volume, configuration (pool sizes, timeouts, caches), software versions, network path, dependencies |
+      | **Parity gap** | a known, written-down difference from production, with its expected effect on results |
+      | **System under test (SUT)** | what you mean to measure; everything else (generator, stubs, network) should not be the limit |
+      | **Load generator** | the machine(s) and tool (JMeter, Locust) producing the load; it has its own CPU, memory, network and port limits |
+      | **CLI mode** | JMeter without the GUI (`jmeter -n -t plan.jmx -l results.jtl`), "previously called Non-GUI mode" |
+      | **Headless** | Locust without the web UI driving it (`--headless`), configured from the command line |
+      | **Worker process** | one Locust process running users; "you need to run one worker instance per processor core" |
+      | **Isolation** | nothing else loads the environment during the run; a **noisy neighbour** is another workload sharing hosts, databases or network |
+      | **Test data volume** | how many rows the databases hold - affects query plans, index sizes, cache hit rates |
+      | **Unique test data** | accounts, cards, keys and references that are not shared where real users would not share them |
+      | **State reset** | returning the environment to a known state before a run: data restored or regenerated, caches and queues in a known state |
+      | **Warm-up** | the start of a run where the system is not yet at its normal level (cold caches, opening pools, compilation) |
+      | **Ramp-up** | the period in which the generator adds users up to the target load |
+      | **Steady state** | the window at the target load where the metrics stay at a stable level; the only part you report against the requirement |
+      | **Run checklist** | the checks done (ideally automatically) before a run is allowed to start |
+
+  - id: why
+    kind: why
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Why results lie when the setup is wrong
+    body: |
+      A load test produces numbers whatever you feed it. The danger is not a crash - it is a plausible chart of
+      the wrong thing. Each setup mistake bends the result in a predictable direction:
+
+      | Setup mistake | What the result shows | Direction |
+      | --- | --- | --- |
+      | Shared `Idempotency-Key` on payment creation | the replay cache, not payment creation | far too fast |
+      | Tiny database | queries that fit in memory and skip slow plans | too fast |
+      | Stubbed dependency with zero latency | a system without its slowest call | too fast |
+      | Warm-up included in the result | the cold start averaged in | too slow, especially high percentiles |
+      | Overloaded load generator | the generator's own delays | too slow, and too little load sent |
+      | Noisy neighbour | someone else's batch job | random, run to run |
+      | Leftover state from the last run | a different data set every run | drifting |
+
+      You can see the first row in this lesson's practice target. The same 100 payment requests, against the
+      same server, with one shared key and then with unique keys (real run, `env-demo/demo.py`):
+
+      ```plaintext
+      one shared key  requests=100 replayed= 99 distinct payments=  1 wall time=0.16 s
+      unique keys     requests=100 replayed=  0 distinct payments=100 wall time=2.28 s
+      ```
+
+      The shared-key run looks about fourteen times faster. It created one payment. Nothing about the server changed -
+      only the test data.
+
+      JMeter's own manual names the generator problem: "As with any Load Testing tool, if you don't correctly
+      size the number of threads, you will face the 'Coordinated Omission' problem which can give you wrong or
+      inaccurate results." (Best Practices 16.2.) A generator that cannot keep up sends requests late and then
+      times only the late requests - the waiting it caused is missing from the data.
+
+  - id: internals-generator
+    kind: internals
+    concepts: [perf-env-parity]
+    title: The load generator is part of the environment
+    body: |
+      Every request is created, sent, received and recorded by the generator. Each step costs it CPU, memory,
+      sockets and bandwidth. When any of these runs out, the generator becomes the bottleneck and the numbers
+      describe it instead of the system under test.
+
+      **JMeter (from the user manual):**
+
+      - Run load in CLI mode: "Don't run load test using GUI mode !" and, in 1.4.4, "For load testing, you must
+        run JMeter in this mode (Without the GUI) to get the optimal results from it."
+      - Keep listeners out of the run: "Use as few Listeners as possible; if using the -l flag as above they can
+        all be deleted or disabled. Don't use 'View Results Tree' or 'View Results in Table' listeners during the
+        load test, use them only during scripting phase to debug your scripts." (16.7)
+      - Also from 16.7: "Use CSV output rather than XML", "Only save the data that you need", "Use as few
+        Assertions as possible".
+      - Memory: the `HEAP` variable sets JMeter's JVM memory; the 5.6.3 start script defaults it to
+        `-Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m`. A plan with many threads or big responses needs more, set
+        with `HEAP` in the environment (or `JVM_ARGS`).
+      - Beyond one machine: "If you need large-scale load testing, consider running multiple CLI JMeter instances
+        on multiple machines using distributed mode (or not)." (16.2)
+
+      **Locust (from the 2.47.0 docs and source):**
+
+      - One process uses one core: "Because Python cannot fully utilize more than one core per process (see
+        GIL), you need to run one worker instance per processor core in order to have access to all your
+        computing power."
+      - `--processes` "will launch a master process and the specified number of worker processes"; "The master
+        instance doesn't run any Users itself."
+      - Locust watches itself: above 90 % CPU (`CPU_WARNING_THRESHOLD = 90` in `runners.py`) it logs "CPU usage
+        above 90%! This may constrain your throughput and may even give inconsistent response time
+        measurements!"
+      - The client matters: FastHttpUser "uses significantly less CPU time, sometimes increasing the maximum
+        number of requests per second on a given hardware by as much as 5x-6x" - and "It is impossible to say
+        how many requests Locust can do on your particular hardware, using your particular test plan, so you'll
+        need to test it out."
+
+      **The operating system:** each outgoing connection uses a local port. On this machine the ephemeral
+      range is:
+
+      ```bash
+      $ cat /proc/sys/net/ipv4/ip_local_port_range
+      32768	60999
+      ```
+
+      About 28,000 ports per destination address. A plan that opens a new connection per request (keep-alive
+      off) and closes it leaves each port in TIME_WAIT for a while, so a fast enough test can run out of ports
+      and report connection errors that production users would never see. Keep-alive on, and watch the
+      generator's connection errors.
+
+      **The rule that follows:** calibrate. Run the plan against a fast target with the real generator, find
+      the request rate one process sustains below about 80 % CPU (a working rule, not a standard), and size the
+      generator from that number with headroom. Then monitor the generator during every run - its CPU, memory,
+      network and errors are evidence, like the server's.
+
+  - id: internals-warmup
+    kind: internals
+    concepts: [perf-env-warmup-steady]
+    title: Why systems warm up - and what it looks like in the data
+    body: |
+      A service that has just started is not yet the service users meet at noon:
+
+      - **Caches** are empty: every lookup goes to the database until the working set is cached.
+      - **Connection pools** open connections on demand; the first requests pay for the TCP and TLS handshakes
+        and for authenticating to the database.
+      - **Runtimes compile hot code** while running (the JVM's JIT compiler, for example), so the first
+        executions of a path are slower than later ones.
+      - **Autoscalers and load balancers** may still be adding instances or shifting traffic.
+
+      The practice fixture `env_fixture.serve_cold_start` imitates this simply: its first 200 requests take
+      40 ms, later ones 5 ms. A real JMeter 5.6.3 run, 4 threads x 250 loops, bucketed into 250 ms slices by
+      this lesson's `env_steady_state.py`:
+
+      ```plaintext
+        bucket  0  samples=  20  median= 42.0 ms
+        bucket  1  samples=  24  median= 42.0 ms
+        bucket  2  samples=  24  median= 43.0 ms
+        bucket  3  samples=  20  median= 43.0 ms
+        bucket  4  samples=  24  median= 43.0 ms
+        bucket  5  samples=  24  median= 42.0 ms
+        bucket  6  samples=  24  median= 43.0 ms
+        bucket  7  samples=  20  median= 42.0 ms
+        bucket  8  samples=  36  median= 41.0 ms
+        bucket  9  samples= 140  median=  7.0 ms
+        bucket 10  samples= 140  median=  7.0 ms
+        bucket 11  samples= 149  median=  6.0 ms
+        bucket 12  samples= 162  median=  6.0 ms
+        bucket 13  samples= 165  median=  6.0 ms
+        bucket 14  samples=  28  median=  6.0 ms
+      steady_start position: 9 -> bucket index 9
+      whole run: samples 1000 median 6.0 ms; p90 42 ms
+      steady window: (784, 6.0)
+      ```
+
+      Read it twice. Throughput also changes - 20-24 samples per slice when cold, 140-165 when warm - because
+      with a fixed number of threads (a closed model) slow responses mean fewer requests. And the whole-run
+      **p90 is 42 ms** while the steady state's median is 6 ms: the warm-up sits entirely in the high
+      percentiles, exactly where requirements usually live. Report the whole run and the p90 "fails"; the system
+      at steady state is seven times faster.
+
+      Real warm-ups are rarely this clean. That is why the detection rule compares a **window** of buckets with
+      the final level instead of trusting one fast bucket - a single lucky slice in the middle of a warm-up is
+      not a steady state.
+
+  - id: when
+    kind: when
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Which environment for which question
+    body: |
+      Production-like is expensive. Not every question needs it - but every question needs you to know what the
+      environment can and cannot answer.
+
+      | Question | Where it can be answered | What to watch |
+      | --- | --- | --- |
+      | Did this change make the endpoint slower? (regression) | a smaller, **stable** environment, same every run | keep it identical between runs; compare against a baseline, not against production |
+      | Does it meet the production SLO at peak load? | production-like size, data volume and configuration | every parity gap written down; stubs with realistic latency |
+      | How many users before it breaks? (capacity) | production-like, isolated | generator headroom; dependency limits (provider sandboxes often have rate limits) |
+      | Does memory leak over hours? (soak) | any environment that runs the same code for long | isolation for the whole duration; state that grows (queues, tables) |
+      | Is the first minute after deploy acceptable? | an environment you can restart | here the warm-up **is** the result - measure it, do not exclude it |
+      | Can we test in production? | production, carefully | approval, synthetic accounts, kill switch, off-peak, no real money - a separate decision with the owners |
+
+      **What a smaller environment does not let you do:** multiply. Half the instances does not mean half the
+      capacity - shared parts (one database, one cache, one provider connection pool) do not halve, and queues
+      grow non-linearly near saturation. Use a smaller environment to compare **versions** of the system with
+      each other, not to predict production's absolute numbers.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-env-test-data, perf-env-warmup-steady]
+    title: The life of one run
+    body: |
+      ```mermaid
+      flowchart LR
+        A["Checklist passes"] --> B["Reset state and seed data"]
+        B --> C["Start monitoring: SUT and generator"]
+        C --> D["Ramp-up"]
+        D --> E["Warm-up at target load"]
+        E --> F["Steady state: the measured window"]
+        F --> G["Stop and collect results"]
+        G --> H["Check the generator was not the limit"]
+        H --> I["Report the steady window only"]
+        H -- "generator saturated" --> A
+      ```
+
+      Notice where the measurement is: one box out of nine. Everything before it decides whether that box means
+      anything, and the check after it decides whether you may report it.
+
+  - id: code-commands
+    kind: code
+    concepts: [perf-env-parity, perf-env-warmup-steady]
+    title: Commands that keep the generator out of the way
+    body: |
+      **JMeter in CLI mode** with a bigger heap, properties for the run and a CSV results file (options from the
+      user manual, 1.4.4: `-n` CLI mode, `-t` plan, `-l` results file, `-j` run log; `-J` sets a JMeter
+      property):
+
+      ```bash
+      HEAP="-Xms2g -Xmx2g -XX:MaxMetaspaceSize=256m" \
+        tools/apache-jmeter-5.6.3/bin/jmeter -n -t plans/checkout.jmx \
+        -l results/run-0118.jtl -j results/run-0118.log \
+        -Jport=8090 -Jthreads=200 -Jloops=-1 -Jduration=2100
+      ```
+
+      **Locust headless** with one worker per core, the warm-up excluded from the totals and the per-second
+      history kept (flags from `locust --help`, 2.47.0):
+
+      ```bash
+      .venv/bin/locust -f locustfiles/checkout.py --headless \
+        --processes 4 -u 200 -r 10 -t 35m --host http://127.0.0.1:8090 \
+        --reset-stats --csv results/run-0118 --csv-full-history
+      ```
+
+      ```plaintext
+        --reset-stats         Reset statistics once spawning has been completed.
+                              Should be set on both master and workers when running
+                              in distributed mode
+        --csv-full-history    Store each stats entry in CSV format to
+                              _stats_history.csv file. You must also specify the '--
+                              csv' argument to enable this.
+      ```
+
+      `--reset-stats` drops what was collected during **spawning** (the ramp-up) - not a warm-up that continues
+      after all users have started. If the system keeps warming up after the ramp, you still need the time
+      series to find the steady window.
+
+      **The run plan as data** - kept next to the test, checked by a script before every run (this lesson's
+      first exercise):
+
+      ```python
+      plan = {
+          "tool": "jmeter", "gui": False, "listeners": ["Summary Report", "View Results Tree"],
+          "target_host": "perf.sandpay.example", "approved_hosts": ["perf.sandpay.example"],
+          "generator_cores": 4, "processes": 1, "expected_rps": 900, "rps_per_process": 1000,
+          "virtual_users": 200, "unique_data_rows": 50, "warmup_s": 0, "duration_s": 1800,
+          "min_steady_s": 1800, "state_reset": False, "generator_monitored": True,
+      }
+      print(check_run_plan(plan))
+      ```
+
+      ```plaintext
+      ['heavy-listeners', 'generator-capacity', 'data-volume', 'no-warm-up', 'state-not-reset']
+      ```
+
+      Five reasons not to start. Every one of them would have produced a result - just not a true one.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-env-test-data]
+    title: Unique test data, line by line
+    body: |
+      The core of `env_test_data.py` (the second exercise):
+
+      ```python
+      def assign_credentials(virtual_users: int, pool_size: int = POOL_SIZE) -> list[tuple[str, str]]:
+          if virtual_users < 1:
+              raise ValueError("virtual_users must be at least 1")
+          if virtual_users > pool_size:
+              raise ValueError(f"{virtual_users} virtual users but only {pool_size} unique accounts")
+          return [(f"merchant-{n}", f"secret-{n}") for n in range(1, virtual_users + 1)]
+
+
+      def idempotency_key(run_id: str, user: int, iteration: int) -> str:
+          if not run_id:
+              raise ValueError("run_id must not be empty")
+          if user < 0 or iteration < 0:
+              raise ValueError("user and iteration must not be negative")
+          key = f"{run_id}-u{user}-i{iteration}"
+          if len(key) > MAX_KEY_LENGTH:
+              raise ValueError("idempotency key longer than 255 characters")
+          return key
+      ```
+
+      - **`virtual_users > pool_size` raises** instead of wrapping round. Silently giving two virtual users the
+        same account changes the workload: shared sessions, per-account locks and per-account rate limits. If you
+        decide to share accounts (real merchants do run several terminals), make it a parameter, not an accident.
+      - **The key has three parts.** The **run id** makes it unique across runs - the server remembers keys, so
+        a second run with the same keys is a replay test, not a load test. The **user** and **iteration** make
+        it unique inside the run.
+      - **Deterministic, not random.** `uuid4()` would also be unique, but a deterministic key lets you find the
+        exact request in the server logs from the JTL row, and lets you **repeat** a key on purpose when you do
+        want to test replay behaviour.
+      - **The length check** exists because servers limit key length (the practice target accepts any; check
+        your API's documentation for its limit) - a key built from a long run name must fail in the generator,
+        not as 400 responses in the middle of a run.
+
+      Proving it worked uses the server's own signal. The practice target marks replays with
+      `Idempotent-Replayed: true`, and `create_payments` counts them. After the shared-key demo above (which used
+      keys `run-0118-u0-i0` .. `run-0118-u0-i99` for `merchant-1`), a real rerun with the same run id, then a new
+      one:
+
+      ```plaintext
+      create_payments run-0118 (again): CreateResult(created=8, replayed=4, distinct_ids=12)
+      create_payments run-0119: CreateResult(created=12, replayed=0, distinct_ids=12)
+      ```
+
+      User 0 (`merchant-1`) hit its four keys from the earlier run and got replays; users 1 and 2 had never used
+      `run-0118` keys under their own accounts, so theirs were new. A fresh run id fixes it. Always assert
+      **zero replays** after a run that should create data - it costs one counter.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Preparing a run, step by step
+    body: |
+      1. **Write down the parity gaps.** For each difference from production (instance size and count, data
+         volume, configuration, versions, stubs, network), note the expected effect on results. Agree it with the
+         people who will read the report.
+      2. **Confirm scope and isolation.** The target host is in the written approval; nothing else is scheduled
+         on the environment (batch jobs, other teams' tests, deployments) for the run window.
+      3. **Calibrate the generator.** Run the plan against a fast target, find what one process sustains, size the
+         generator with headroom: CLI mode, CSV results, no heavy listeners, heap for JMeter; one Locust worker
+         per core.
+      4. **Prepare the data.** Enough unique accounts for the virtual users; keys and references unique per run;
+         production-like volume in the databases.
+      5. **Reset state.** Restore or regenerate data, clear what the last run left (queues, created records,
+         caches if the test starts cold on purpose).
+      6. **Start monitoring** of the system under test **and** the generator (CPU, memory, network, errors).
+      7. **Run the checklist** (the first exercise). Any problem stops the run.
+      8. **Run**: ramp-up, warm-up, then a steady window at least as long as the requirement asks for.
+      9. **Check validity before reading results**: generator CPU below the limit, no generator errors, zero
+         unexpected replays, no neighbour activity in the window.
+      10. **Report the steady window** - say where it starts, how it was found, and list the parity gaps next to
+          the numbers.
+
+  - id: example
+    kind: example
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: "Example: the payment API that got slower after it got faster"
+    body: |
+      SandPay's team ran a load test of `POST /v1/payments` before a release. The first report looked great: p95
+      of 30 ms at 400 requests per second, far below the 300 ms SLO. Two weeks later, in production, p95 at the
+      same rate was 260 ms. A tester was asked to explain the gap. Here is what they checked, and the evidence
+      for each:
+
+      | Check | Evidence | Finding |
+      | --- | --- | --- |
+      | Replays | the API's replay header in the results; server count of payments created versus requests sent | 95 % replays: the plan used one hard-coded `Idempotency-Key` per thread |
+      | Data volume | row counts in the test and production databases | 20,000 payments in test, tens of millions in production; the merchant-history query ran from memory in test |
+      | Dependencies | stub configuration | the acquirer stub answered in 1 ms; the real acquirer sandbox averaged around 150 ms |
+      | Generator | JMeter log, generator CPU graph | CPU at 98 % for the whole run with "View Results Tree" enabled - the 400 rps was barely reached |
+      | Warm-up | per-second response times | the first two minutes after the deployment had p95 near 900 ms and were included in one run, excluded in another - the runs disagreed |
+
+      The tester's rerun plan: one key per run, user and iteration (and an assertion of zero replays); a
+      database restored from a masked production-sized snapshot; the stub given a realistic latency
+      distribution; CLI mode, no heavy listeners, two generator machines with monitoring; a 10-minute warm-up and
+      a 30-minute steady window, found from the time series. The new result: p95 of 240 ms at 400 rps - close to
+      production, and still inside the SLO. The first report was not "optimistic"; it measured a different
+      system.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Checks that make a run valid
+    body: |
+      Treat the run's setup like code under test: positive checks that it is right, negative checks that a
+      broken setup is caught.
+
+      | # | Check | Type | Expected result | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Plan passes the checklist | positive | `check_run_plan` returns `[]` | checklist output saved with the results |
+      | 2 | Shared key detected | negative | a plan with one key per thread produces replays; the zero-replay assertion fails | replay count, server count of created records |
+      | 3 | Unique keys | positive | zero replays; distinct ids = requests | `CreateResult(created=N, replayed=0, distinct_ids=N)` |
+      | 4 | Too few accounts | negative | `assign_credentials(51)` raises before the run | the error message |
+      | 5 | GUI mode or heavy listener | negative | checklist returns `cli-mode` / `heavy-listeners` | checklist output |
+      | 6 | Generator headroom | positive | generator CPU stays below the agreed limit for the steady window | generator CPU graph; no Locust CPU warning in the log |
+      | 7 | Warm-up excluded | positive | the steady window starts after the cold phase | bucketed time series; the steady start in the report |
+      | 8 | Run never settles | negative | `steady_start` raises; the run is reported as unstable, not averaged | the time series |
+      | 9 | Isolation | positive | no other jobs on the environment during the window | scheduler and deployment logs for the window |
+      | 10 | State reset | positive | row counts and queues equal the known baseline before the run | counts captured before the run |
+
+      Checks 2 and 8 matter most: a setup check that cannot fail checks nothing.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Scaling the result.** "Test has a quarter of production's servers, so production handles four times
+        the load." Shared parts do not scale with instance count, and queues grow non-linearly near saturation.
+      - **Hard-coded test data.** One account, one card, one `Idempotency-Key`, copied from the recording. The
+        test exercises a cache.
+      - **Reusing a run's data in the next run.** The server remembers keys, sessions and created records; the
+        second run differs from the first for reasons that have nothing to do with the code.
+      - **A toy database.** Thousands of rows instead of millions; every query is an in-memory lookup.
+      - **Zero-latency stubs.** The slowest dependency disappears from the result.
+      - **Debugging listeners left on.** "View Results Tree" during a load run - JMeter's manual says to use it
+        only while scripting.
+      - **One Locust process on a many-core machine.** Python uses one core per process; the generator saturates
+        long before the system.
+      - **Averaging the warm-up in** - or the opposite, cutting a fixed "first 60 seconds" without looking at the
+        data.
+      - **Not monitoring the generator.** Without its CPU and error graphs you cannot tell server slowness from
+        generator slowness.
+      - **Sharing the environment.** Another team's test or a nightly batch in the window; results jump between
+        runs.
+
+      **Debugging method - when a result surprises you, suspect the setup first:**
+
+      1. **Was the load actually sent?** Compare the requests the generator reports with the server's own count
+         for the same window. A gap means the generator, the network or a proxy.
+      2. **Was the generator healthy?** CPU, memory, connection errors, Locust's CPU warning, JMeter's log.
+      3. **Was the data what you think?** Replay count, created records, distinct accounts in the logs.
+      4. **Was the window steady?** Plot the time series; find the warm-up; check nothing else ran.
+      5. Only then: **what is the system doing?** - the bottleneck analysis of later lessons.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Trade-offs and alternatives
+    body: |
+      - **Production-like versus affordable.** A full-size copy of production is expensive to run and keep
+        current. Many teams keep a smaller stable environment for regression runs (compare versions) and borrow
+        a production-sized one before big releases (check the SLO). Both are honest if the report says which.
+      - **Testing in production** removes the parity problem and adds others: real customers share the system,
+        so the test needs approval, synthetic accounts that never move real money, rate limits, a kill switch and
+        off-peak timing. It is an option for read paths and for carefully isolated write paths, decided with the
+        system's owners - not a shortcut.
+      - **Masked production data versus generated data.** A masked snapshot has realistic volumes and skew
+        (some merchants with millions of payments, most with few) but needs a masking process and governance;
+        generated data is safe and repeatable but often too uniform. Many teams generate data with distributions
+        taken from production statistics.
+      - **Stubs versus real dependencies.** Real provider sandboxes are realistic but usually rate-limited and
+        not built for load; stubs are controllable. Give stubs a latency distribution measured from the real
+        dependency, and say so in the report.
+      - **Excluding warm-up versus measuring it.** For SLO checks exclude it; for "what happens after a deploy"
+        it is the result. Decide per question.
+      - **Fixed warm-up time versus detection.** A fixed "first 10 minutes" is simple and comparable between runs;
+        detection from the data adapts but needs a rule everyone agrees on. A common compromise: a fixed warm-up
+        that is checked against the time series in every run.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-env-parity, perf-env-test-data, perf-env-warmup-steady]
+    title: Quick reference
+    body: |
+      - A result describes **the environment it ran in, generator included**. Write down every parity gap; do
+        not scale results linearly.
+      - JMeter: **CLI mode** (`-n -t -l`), CSV results, no "View Results Tree" / "View Results in Table" in load
+        runs, `HEAP` sized for the plan (5.6.3 default `-Xms1g -Xmx1g`).
+      - Locust: **one worker per core** (`--processes`), headless, watch for "CPU usage above 90%!".
+      - Calibrate the generator, keep headroom, **monitor it** during every run.
+      - Test data: **unique per user, iteration and run**; one account per virtual user unless sharing is a
+        decision; production-like **volume**; assert **zero replays**.
+      - **Reset state** before every run; servers remember keys and records.
+      - **Isolate** the run; check for neighbours in the window.
+      - Report only the **steady state**: find it from the time series, exclude warm-up explicitly
+        (`--reset-stats` covers spawning only), make the window long enough.
+      - Run a **checklist** before every run; a check that cannot fail checks nothing.
+
+exercises:
+  - id: parity-gap-list
+    type: mcq
+    concept: perf-env-parity
+    skill: application
+    title: Which difference matters most?
+    prompt: |
+      SandPay's performance environment differs from production in four ways. The test is about the p95 of
+      `GET /v1/merchants/{id}/payments` (a merchant's payment history) at peak load. Which difference is most
+      likely to make the result wrong?
+    options:
+      - id: volume
+        text: The payments table holds 30,000 rows in test and about 40 million in production
+        feedback: Correct - the history query's plan, index size and cache hit rate all depend on table size; this is the endpoint's main cost.
+      - id: logging
+        text: The test environment logs at DEBUG level, production at INFO
+        feedback: It adds some cost and is worth fixing, but it affects every endpoint a little; the data volume changes this query's work by orders of magnitude.
+      - id: hostname
+        text: The test hosts are called perf-app-1 and perf-app-2
+        feedback: Names do not change performance.
+      - id: region
+        text: The test environment runs in a different region of the same cloud provider
+        feedback: That changes the generator-to-server network time somewhat, which you can measure and subtract; it does not change the query's work.
+    correct: [volume]
+    hints:
+      - What does this endpoint spend its time on?
+      - Which difference changes that work most?
+    solution: |
+      The endpoint reads a merchant's payment history, so its cost is the database query. With 30,000 rows the
+      table and index fit in memory and the plan may differ; production's 40 million rows do not. Load the test
+      database with production-like volume and distribution (some merchants with many payments) before trusting
+      the p95.
+
+  - id: half-size-extrapolate
+    type: mcq
+    concept: perf-env-parity
+    skill: analysis
+    title: Twice the servers, twice the capacity?
+    prompt: |
+      The test environment has 2 application servers and 1 database; production has 4 application servers and
+      the same database size. The test reached 600 requests per second before p95 broke the SLO. What can you
+      say about production's capacity?
+    options:
+      - id: unknown
+        text: Not 1,200 by default - the shared database may be the limit; the test shows where this environment saturates, and production needs its own test or a model of the shared parts
+        feedback: Correct - only the application tier doubles; the database is shared and does not.
+      - id: double
+        text: About 1,200 requests per second, since capacity scales with servers
+        feedback: Only if the application servers were the bottleneck and nothing shared limits it - an assumption, not a result.
+      - id: same
+        text: Exactly 600, because the database is the same
+        feedback: Also an assumption; if the application tier was the limit, production may do more.
+      - id: less
+        text: Less than 600, because production has more servers competing
+        feedback: More servers do not make each request slower by themselves; the question is which resource saturates first.
+    correct: [unknown]
+    hints:
+      - Which parts of the system change between the two environments, and which do not?
+      - What saturated in the test - do you know?
+    solution: |
+      Capacity is set by the first resource to saturate. Doubling the application servers helps only if they
+      were that resource. Find the bottleneck in the test (CPU, pools, database) before predicting; if the
+      database was busy at 600 rps, production may barely improve.
+
+  - id: locust-cpu-warning
+    type: mcq
+    concept: perf-env-parity
+    skill: analysis
+    title: The warning in the Locust log
+    prompt: |
+      A headless Locust run on an 8-core machine, started with no `--processes` option, logs "CPU usage above
+      90%! This may constrain your throughput and may even give inconsistent response time measurements!" The
+      report shows p95 of 800 ms. What should you do first?
+    options:
+      - id: workers
+        text: Treat the run as invalid, run one worker per core (for example --processes 8 or separate workers) or use FastHttpUser, and repeat
+        feedback: Correct - a saturated generator delays its own requests and timings; fix the generator, then measure again.
+      - id: report
+        text: Report the 800 ms; the warning only affects throughput
+        feedback: The warning itself says it "may even give inconsistent response time measurements".
+      - id: users
+        text: Add more users so the server is loaded harder
+        feedback: More users on a saturated generator make its delays worse.
+      - id: server
+        text: Scale up the server, which is clearly too slow
+        feedback: You do not know that yet - the generator was the first resource to saturate.
+    correct: [workers]
+    hints:
+      - How many cores can one Python process use?
+      - Which machine does the warning come from?
+    solution: |
+      Python cannot use more than one core per process, so one Locust process saturated one core of eight. Run
+      one worker per core, keep headroom, monitor the generator, and only then read response times.
+
+  - id: jmeter-listeners
+    type: mcq
+    concept: perf-env-parity
+    skill: recall
+    title: JMeter in a load run
+    prompt: Which setup does the JMeter user manual recommend for the load run itself?
+    options:
+      - id: cli
+        text: CLI mode (jmeter -n -t plan.jmx -l results.jtl), as few listeners as possible, CSV results
+        feedback: Correct - "Don't run load test using GUI mode !" and 16.7 "Use as few Listeners as possible", "Use CSV output rather than XML".
+      - id: gui-tree
+        text: GUI mode with View Results Tree, so you can see failures as they happen
+        feedback: The manual says to use View Results Tree "only during scripting phase to debug your scripts".
+      - id: gui-summary
+        text: GUI mode with only the Summary Report listener
+        feedback: GUI mode itself is the problem for load runs; the manual says not to use it.
+      - id: xml
+        text: CLI mode with XML results, which keep more detail
+        feedback: The manual's advice is CSV output rather than XML and "Only save the data that you need".
+    correct: [cli]
+    hints:
+      - The manual has a short, emphatic sentence about GUI mode.
+    solution: |
+      Script and debug in the GUI; run load in CLI mode with results written by `-l` as CSV, few listeners and
+      few assertions, then build reports from the results file.
+
+  - id: noisy-neighbour
+    type: mcq
+    concept: perf-env-parity
+    skill: analysis
+    title: Runs that disagree
+    prompt: |
+      Five identical runs of the same plan on the shared performance environment give p95 values of 210, 205,
+      480, 212 and 470 ms. The two slow runs both started at 02:00. The generator was healthy in all five. What
+      is the most likely explanation, and how do you confirm it?
+    options:
+      - id: neighbour
+        text: Another workload shares the environment at 02:00 - check the scheduler, deployment and database logs for jobs in those windows
+        feedback: Correct - the pattern follows the clock, not the code; find the neighbour and either isolate the runs or move them.
+      - id: leak
+        text: A memory leak that appears after several runs
+        feedback: A leak would worsen run after run; here runs 4 and 5 differ and run 4 is fast.
+      - id: random
+        text: Normal variation; report the median of the five
+        feedback: Doubling p95 is not noise; averaging it away hides a real interference.
+      - id: warmup
+        text: The slow runs included warm-up
+        feedback: Possible in general, but then the slow runs would follow restarts, not the time of day; check the time series to rule it out.
+    correct: [neighbour]
+    hints:
+      - What do the two slow runs have in common?
+    solution: |
+      Correlate the runs with everything else that used the environment: batch jobs, backups, other teams'
+      tests, deployments. Then isolate the run window (or the environment), and keep the evidence in the report.
+
+  - id: shared-key-fast
+    type: mcq
+    concept: perf-env-test-data
+    skill: analysis
+    title: Fourteen times faster
+    prompt: |
+      After a refactor of the load test, `POST /v1/payments` is about fourteen times faster: 100 requests in 0.16 s
+      instead of 2.28 s. The server code did not change. The test now sets the `Idempotency-Key` header in the
+      thread group's setup. What do you check?
+    options:
+      - id: replays
+        text: How many responses were replays - the key is probably set once per thread, so the server returns the stored response
+        feedback: Correct - in this lesson's real run, the shared-key version had 99 replays and created one payment.
+      - id: cache
+        text: Whether the server added a response cache in the meantime
+        feedback: The server code did not change; the test did.
+      - id: network
+        text: Whether the network got faster
+        feedback: A fourteenfold change from the network alone, with only the test changed, is unlikely; look at what the test sends.
+      - id: celebrate
+        text: Nothing - a faster test is good news
+        feedback: A faster result from a test change, with no server change, is a red flag.
+    correct: [replays]
+    hints:
+      - What does a payment API do when it sees an idempotency key again?
+    solution: |
+      Check the replay signal (here `Idempotent-Replayed: true`) and the count of created payments. Generate keys
+      per run, user and iteration, and assert zero replays at the end of every run that should create data.
+
+  - id: data-volume-index
+    type: mcq
+    concept: perf-env-test-data
+    skill: application
+    title: Enough data, the right shape
+    prompt: |
+      You must load the test database for a payment-history test. Production has 40 million payments; 1 % of
+      merchants own 60 % of them. Which data set gives the most trustworthy result?
+    options:
+      - id: skewed
+        text: Tens of millions of payments with the same skew - a few very large merchants, many small ones - and virtual users spread over both
+        feedback: Correct - volume and distribution both change query cost; large merchants are where the slow plans live.
+      - id: uniform
+        text: 40 million payments spread evenly over all merchants
+        feedback: Right volume, wrong shape; nobody has a huge history, so the worst queries never run.
+      - id: small
+        text: 100,000 payments - enough for 200 virtual users
+        feedback: Enough rows to give every user something, not enough to make the database behave like production's.
+      - id: copy
+        text: An unmasked copy of production
+        feedback: Real customer and card data in a test environment is a security and compliance problem; use a masked copy or generated data.
+    correct: [skewed]
+    hints:
+      - Which merchants have the slowest history queries in production?
+    solution: |
+      Match volume and distribution, from production statistics or a masked snapshot, and pick virtual users
+      from both large and small merchants in the production proportions.
+
+  - id: reset-second-run
+    type: mcq
+    concept: perf-env-test-data
+    skill: application
+    title: The second run is different
+    prompt: |
+      Run 1 of a payment-creation test created 12 payments. Run 2, with the same plan, the same run id and no
+      reset, reports `created=8, replayed=4`. Nothing else changed. What is the fix?
+    options:
+      - id: run-id
+        text: Give every run a new run id (and reset or account for the data the last run created)
+        feedback: Correct - the server remembered some keys from before; a new run id makes every key new.
+      - id: retry
+        text: Retry the replayed requests at the end of the run
+        feedback: They would replay again; the keys are already stored.
+      - id: ignore
+        text: Ignore replays; they are only 4 of 12
+        feedback: A third of the requests did not do the work being measured.
+      - id: random
+        text: Use random amounts so the requests differ
+        feedback: Idempotency is decided by the key; a different body with a reused key is either replayed or rejected, depending on the API.
+    correct: [run-id]
+    hints:
+      - What does the server still know from earlier runs?
+    solution: |
+      Servers keep state between runs - keys, sessions, created records. Make keys unique per run (a run id in
+      the key) and reset or regenerate data before each run, then assert zero replays.
+
+  - id: warmup-percentile
+    type: mcq
+    concept: perf-env-warmup-steady
+    skill: analysis
+    title: The p90 that failed
+    prompt: |
+      A 1,000-sample run reports median 6 ms and p90 42 ms. The requirement is p90 under 20 ms. The time series
+      shows 40-43 ms for the first 9 buckets and 6-7 ms afterwards. What do you report?
+    options:
+      - id: steady
+        text: The steady window (here buckets 9 onwards, median 6 ms) against the requirement, plus the warm-up as a separate finding
+        feedback: Correct - the p90 of the whole run is the cold start; the steady state passes, and the warm-up is still worth reporting.
+      - id: fail
+        text: A failure - p90 is 42 ms
+        feedback: That p90 is the warm-up; it describes the first seconds after start, not normal operation.
+      - id: median
+        text: Pass, because the median is 6 ms
+        feedback: The requirement is about p90; switching metrics to pass is not allowed. Recompute p90 for the steady window.
+      - id: rerun
+        text: Rerun until the warm-up disappears
+        feedback: Every fresh start warms up; exclude it by rule and report it, rather than hoping it goes away.
+    correct: [steady]
+    hints:
+      - Where in the run are the slow samples?
+    solution: |
+      The cold phase is about 10 % of the samples, so it sets the p90 of the whole run. Recompute the
+      percentiles over the steady window, report how the window was found, and report the warm-up separately -
+      it matters after every deployment.
+
+  - id: reset-stats-scope
+    type: mcq
+    concept: perf-env-warmup-steady
+    skill: application
+    title: What --reset-stats removes
+    prompt: |
+      A Locust run spawns 200 users at 10 per second and uses `--reset-stats`. The service behind it keeps
+      warming up for three more minutes after all users have started. Which statement is true?
+    options:
+      - id: spawning-only
+        text: Statistics from spawning (the first 20 seconds) are reset; the three minutes of warm-up after it are still in the totals
+        feedback: Correct - "Reset statistics once spawning has been completed." The warm-up after spawning needs its own handling.
+      - id: all-warmup
+        text: The whole warm-up is removed, because Locust detects warm-up
+        feedback: Locust resets once, when spawning completes; it does not look at response times.
+      - id: nothing
+        text: Nothing is removed in headless mode
+        feedback: The option works in headless runs too; in distributed mode it must be set on master and workers.
+      - id: history
+        text: The --csv-full-history file is emptied
+        feedback: The option resets the statistics; keep the history and use it to find the real steady window.
+    correct: [spawning-only]
+    hints:
+      - Read the help text of the option word by word.
+    solution: |
+      `--reset-stats` resets once spawning completes. If the system warms up longer than the ramp, use the
+      per-interval history (`--csv-full-history`) or raw samples to find the steady window, or extend the warm-up
+      before the measured window.
+
+  - id: run-order
+    type: order
+    concept: perf-env-test-data
+    skill: application
+    title: Preparing one run
+    prompt: Put the steps of preparing and running one load test in order.
+    items:
+      - id: gaps
+        text: Write down the parity gaps and confirm scope and isolation for the window
+      - id: calibrate
+        text: Calibrate and size the generator (CLI mode, workers per core, headroom)
+      - id: data
+        text: Reset state and load unique, production-like test data with a new run id
+      - id: monitor
+        text: Start monitoring the system under test and the generator
+      - id: checklist
+        text: Run the pre-run checklist and stop on any problem
+      - id: run
+        text: Ramp up, warm up, then hold the steady window
+      - id: validate
+        text: Check validity - generator healthy, zero replays, no neighbours in the window
+      - id: report
+        text: Report the steady window with the parity gaps next to the numbers
+    hints:
+      - Data must be ready before the checklist can check it.
+      - You check validity before you read the result.
+    solution: |
+      Decide what the environment can answer, make the generator and data right, watch both sides, check, run,
+      prove the run was valid, and only then report - with the gaps beside the numbers.
+
+  - id: debug-locustfile-data
+    type: debug
+    concept: perf-env-test-data
+    skill: analysis
+    title: Two hundred users, one payment
+    prompt: |
+      This locustfile runs 200 users against the SandPay practice API. The run shows thousands of requests,
+      almost all replays, and one created payment per run. Select the lines that cause it.
+    language: python
+    code: |
+      import uuid
+
+      from locust import HttpUser, between, task
+
+
+      class Merchant(HttpUser):
+          wait_time = between(1, 2)
+          idempotency_key = str(uuid.uuid4())
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+              self.headers = {"Authorization": "Bearer " + r.json()["access_token"]}
+
+          @task
+          def create_payment(self):
+              self.client.post("/v1/payments", json={"amount_minor": 1000, "currency": "EUR"},
+                               headers={**self.headers, "Idempotency-Key": self.idempotency_key})
+    correctLines: [8, 11]
+    lineNotes:
+      - line: 7
+        note: A random wait between requests is fine for a closed workload; it does not cause replays.
+      - line: 17
+        note: Sending the key as a header is right; the problem is which key - it was created once, on line 8.
+    hints:
+      - When does a class attribute get its value - once per user, or once per class?
+      - How many different merchants do the 200 users log in as?
+    solution: |
+      Line 8 runs once, when the class is defined, so every request of every user sends the same key. Line 11
+      logs every user in as `merchant-1`. Create the key per request (from the run id, the user and an iteration
+      counter) and give each user its own account, for example from a per-user index assigned in `on_start`.
+
+  - id: steady-window-length
+    type: short
+    concept: perf-env-warmup-steady
+    skill: analysis
+    title: How long is long enough?
+    prompt: |
+      A team runs 5-minute load tests and finds the steady state starts after 3 minutes. The SLO is "p99 under
+      400 ms over any 30-minute period at peak". Explain what is wrong with the current runs and what you would
+      change.
+    modelAnswer: |
+      Two minutes of steady state cannot show a 30-minute p99: there are too few samples in the tail, and slow
+      effects (cache churn, garbage collection, connection recycling, queues that grow slowly) do not appear in
+      two minutes. The run must include warm-up plus a steady window of at least 30 minutes at peak load, so
+      the run is at least 33 minutes - in practice longer, to leave margin. Find the steady start from the time
+      series every time rather than assuming 3 minutes, compute p99 only over the steady window, and report the
+      sample count with the percentile.
+    rubric:
+      - Says the steady window (2 minutes) is shorter than the requirement's period (30 minutes).
+      - Mentions too few samples for a stable p99 and slow effects that need time to appear.
+      - Proposes warm-up plus at least 30 minutes of steady state at peak load.
+      - Says to compute the percentile over the steady window only and report sample counts.
+    hints:
+      - How many samples does a p99 need to be meaningful?
+    solution: |
+      The steady window must be at least as long as the period in the requirement, plus warm-up, with the
+      percentile computed over that window only.
+
+  - id: run-validity-testdesign
+    type: testdesign
+    concept: perf-env-parity
+    skill: application
+    title: Prove the run was valid
+    prompt: |
+      Design five checks that decide whether a load test run of SandPay's payment API may be reported. Include
+      at least two negative checks (a broken setup that must be caught). For each give preconditions, steps, the
+      expected result and the evidence.
+    modelAnswer: |
+      1. **Generator headroom** - Preconditions: generator monitoring on. Steps: run; read generator CPU for the
+         steady window. Expected: below the agreed limit (for example 80 %), no Locust CPU warning or JMeter
+         out-of-memory in the log. Evidence: CPU graph, generator log.
+      2. **Load actually sent** - Preconditions: server request counter reset before the run. Steps: compare the
+         generator's request count with the server's for the steady window. Expected: equal within a small
+         tolerance. Evidence: both counts.
+      3. **No replays (negative check of the data)** - Preconditions: a deliberately broken plan with one key per
+         thread. Steps: run it briefly. Expected: the zero-replay assertion fails. Then run the real plan:
+         replays = 0, created = requests. Evidence: replay counts from both runs.
+      4. **Checklist catches bad setup (negative)** - Preconditions: a plan copy with GUI mode and too few data
+         rows. Steps: run the checklist. Expected: `cli-mode` and `data-volume` reported, run refused. Evidence:
+         checklist output.
+      5. **Steady window found and long enough** - Preconditions: raw samples saved. Steps: bucket them, find the
+         steady start, compare the window length with the requirement. Expected: steady start after the cold
+         phase; window at least the required length; otherwise the run is unstable and not reported. Evidence:
+         the bucket table and steady start.
+    rubric:
+      - Each check has preconditions, steps, an expected result and evidence.
+      - Includes a generator check and a sent-versus-received load check.
+      - Includes at least two negative checks that prove a broken setup is caught.
+      - Includes a data check (replays or created records) and a steady-window check.
+    hints:
+      - How would you know the generator, the data and the window were all right?
+      - A check you never saw fail might not work.
+    solution: |
+      Check the generator, the load actually received, the data (zero replays), the checklist and the steady
+      window - and prove at least two of those checks fail on a broken setup.
+
+  - id: interview-parity
+    type: interview
+    concept: perf-env-parity
+    skill: analysis
+    title: "Interview: our performance environment is half the size of production"
+    prompt: |
+      "Our performance environment is about half the size of production and uses stubs for the payment
+      provider. How do you make the load test results meaningful?"
+    modelAnswer: |
+      First I'd be clear what this environment can answer. It is good for comparing versions of our system -
+      regression tests against a baseline in the same environment - and for finding the bottleneck at its own
+      size. It cannot give production's capacity by multiplying by two, because shared parts like the database
+      or caches don't halve, and queues grow non-linearly near saturation.
+
+      To make it as meaningful as possible I'd write down every parity gap with its expected effect: instance
+      sizes and counts, data volume (load production-like volume and skew, masked or generated), configuration
+      such as pool sizes and timeouts, versions, and the stubs. The provider stub gets a latency distribution
+      measured from the real sandbox, otherwise the slowest dependency disappears.
+
+      Then I make sure each run is valid: isolated, generator in CLI or headless mode with headroom and
+      monitoring, unique test data per run, user and iteration - with a zero-replay check for idempotent
+      endpoints - state reset, and results only from the steady state after warm-up.
+
+      For the SLO question at production scale I'd plan a run in a production-sized environment before major
+      releases, or a carefully controlled test in production agreed with the owners. The report always lists the
+      gaps next to the numbers.
+    rubric:
+      - Says a smaller environment is good for comparison and bottleneck finding, not for linear extrapolation.
+      - Lists concrete parity gaps, including data volume and stub latency.
+      - Covers run validity - isolation, generator health, unique data, state reset, steady state.
+      - Proposes how to answer production-scale questions (production-sized run or controlled production test).
+      - Says the report shows the gaps next to the results.
+    followUps:
+      - How would you choose the latency of the provider stub?
+      - What would make you stop a run halfway through?
+      - How do you know the load generator was not the bottleneck?
+    hints:
+      - Separate what this environment can answer from what it cannot.
+    solution: |
+      Use it for comparisons and bottlenecks, not multiplication; close and document the gaps; prove each run
+      valid; answer production-scale questions in a production-sized environment.
+
+  - id: checklist-code
+    type: coding
+    concept: perf-env-parity
+    skill: application
+    title: A pre-run checklist
+    prompt: |
+      In `env_checklist.py`, implement `check_run_plan(plan)`: return the codes of `CHECKS` that fail, in the
+      order of `CHECKS` (scope, CLI mode, heavy JMeter listeners, too many processes, generator capacity with
+      20 % headroom, data volume, warm-up, steady-state length, state reset, generator monitoring). The rule for
+      each code is in the comment next to it.
+    project: perf
+    files:
+      - exercises/fundamentals/env_checklist.py
+    test: tests/fundamentals/test_env_checklist.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_env_checklist.py
+    hints:
+      - Build the list by checking in the order of CHECKS, appending a code when its rule fails.
+      - "Capacity: expected_rps > rps_per_process * processes * HEADROOM - the boundary (exactly 80 %) is allowed."
+      - Heavy listeners only matter when the tool is JMeter.
+    modelAnswer: |
+      ```python
+      def check_run_plan(plan: dict) -> list[str]:
+          problems: list[str] = []
+          if plan["target_host"] not in plan["approved_hosts"]:
+              problems.append("scope")
+          if plan["gui"]:
+              problems.append("cli-mode")
+          if plan["tool"] == "jmeter" and any(name in HEAVY_LISTENERS for name in plan["listeners"]):
+              problems.append("heavy-listeners")
+          if plan["processes"] > plan["generator_cores"]:
+              problems.append("too-many-processes")
+          if plan["expected_rps"] > plan["rps_per_process"] * plan["processes"] * HEADROOM:
+              problems.append("generator-capacity")
+          if plan["unique_data_rows"] < plan["virtual_users"]:
+              problems.append("data-volume")
+          if plan["warmup_s"] <= 0:
+              problems.append("no-warm-up")
+          if plan["duration_s"] - plan["warmup_s"] < plan["min_steady_s"]:
+              problems.append("steady-state-too-short")
+          if not plan["state_reset"]:
+              problems.append("state-not-reset")
+          if not plan["generator_monitored"]:
+              problems.append("generator-not-monitored")
+          return problems
+      ```
+
+      The checks run in a fixed order so reports and tests are stable. `rps_per_process` comes from a
+      calibration run on the real generator - the checklist is only as good as that number.
+    rubric:
+      - Every test in tests/fundamentals/test_env_checklist.py passes.
+      - Codes come back in the order of CHECKS, and only failing checks appear.
+      - The capacity rule keeps 20 % headroom and allows the exact boundary.
+      - You can explain where rps_per_process comes from and why the generator needs monitoring anyway.
+    solution: |
+      One rule per check, in the order of CHECKS; an empty list means the run may start.
+
+  - id: test-data-code
+    type: coding
+    concept: perf-env-test-data
+    skill: application
+    title: Unique credentials and idempotency keys, proven against the server
+    prompt: |
+      In `env_test_data.py`, implement `assign_credentials` (one SandPay client per virtual user, refusing more
+      users than accounts), `idempotency_key` (unique per run, user and iteration, at most 255 characters) and
+      `create_payments`, which creates payments against the practice API and counts created responses,
+      replays (`Idempotent-Replayed: true`) and distinct payment ids. The tests start the practice target and
+      check that a rerun with the same run id only replays.
+    project: perf
+    files:
+      - exercises/fundamentals/env_test_data.py
+    test: tests/fundamentals/test_env_test_data.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_env_test_data.py
+    hints:
+      - "The key format the tests expect: <run_id>-u<user>-i<iteration>."
+      - "_post is already written: it returns (status, headers, json body)."
+      - Get a token per user with POST /auth/token, then send it as Authorization - Bearer <token>.
+    modelAnswer: |
+      ```python
+      def create_payments(base_url, virtual_users, iterations, run_id):
+          created = replayed = 0
+          ids: set[str] = set()
+          for user, (client_id, secret) in enumerate(assign_credentials(virtual_users)):
+              _, _, tok = _post(f"{base_url}/auth/token", {"client_id": client_id, "client_secret": secret}, {})
+              auth = {"Authorization": f"Bearer {tok['access_token']}"}
+              for i in range(iterations):
+                  _, headers, payment = _post(f"{base_url}/v1/payments", {"amount_minor": 1000, "currency": "EUR"},
+                                              {**auth, "Idempotency-Key": idempotency_key(run_id, user, i)})
+                  if headers.get("Idempotent-Replayed") == "true":
+                      replayed += 1
+                  else:
+                      created += 1
+                  ids.add(payment["id"])
+          return CreateResult(created, replayed, len(ids))
+      ```
+
+      The proof is the server's own replay signal: a load test that should create data must end with zero
+      replays and as many distinct ids as requests.
+    rubric:
+      - Every test in tests/fundamentals/test_env_test_data.py passes.
+      - Keys include the run id, so a new run never replays an old one.
+      - Too many virtual users for the account pool is an error, not a silent wrap-around.
+      - You can explain why a reused key makes a load test look fast.
+    solution: |
+      Unique data per run, user and iteration, and a replay count that proves it.
+
+  - id: steady-state-code
+    type: coding
+    concept: perf-env-warmup-steady
+    skill: application
+    title: Find the steady state in a real JMeter run
+    prompt: |
+      In `env_steady_state.py`, implement the four steps in the module docstring: `load_samples` (successful
+      JTL rows as integer pairs, sorted), `bucket` (group by time slices from the first sample, median per
+      bucket), `steady_start` (the first window of buckets within tolerance of the final level, with errors for
+      too few buckets or a run that never settled) and `summarise`. The last test runs real JMeter against the
+      cold-start fixture and checks that you skip its warm-up.
+    project: perf
+    files:
+      - exercises/fundamentals/env_steady_state.py
+    test: tests/fundamentals/test_env_steady_state.py
+    command: .venv/bin/python -m pytest tests/fundamentals/test_env_steady_state.py
+    hints:
+      - The reference level is the median of the medians of the last `window` buckets.
+      - Check every bucket in a window, not just the first one - a single fast bucket inside the warm-up is not settled.
+      - If no window qualifies, raise ValueError rather than returning a guess.
+    modelAnswer: |
+      ```python
+      def steady_start(buckets, window=3, tolerance=0.5):
+          if len(buckets) < window:
+              raise ValueError(f"need at least {window} buckets, got {len(buckets)}")
+          reference = statistics.median(b.median_ms for b in buckets[-window:])
+          for pos in range(len(buckets) - window + 1):
+              if all(abs(b.median_ms - reference) <= tolerance * reference for b in buckets[pos:pos + window]):
+                  return pos
+          raise ValueError("the run never settled: no window of buckets agrees with the final level")
+      ```
+
+      On the real run in this lesson, the steady state starts at bucket 9; the whole-run p90 of 42 ms becomes a
+      steady median of 6 ms over 784 samples.
+    rubric:
+      - Every test in tests/fundamentals/test_env_steady_state.py passes, including the real JMeter run.
+      - A window, not a single bucket, decides the steady start.
+      - A run that never settles raises instead of being reported.
+      - You can explain why the warm-up lands in the high percentiles of the whole run.
+    solution: |
+      Bucket raw samples by time, compare windows with the final level, report only from the first settled
+      window - and refuse to report a run that never settled.
+
+placement:
+  - id: place-parity
+    type: mcq
+    concept: perf-env-parity
+    skill: analysis
+    title: Generator or server?
+    prompt: |
+      A JMeter test in GUI mode with View Results Tree enabled shows response times rising from 50 ms to 900 ms
+      as threads go from 50 to 400. The server's CPU stays at 30 % and its own access log shows 40 ms per
+      request throughout. What is the most likely cause?
+    options:
+      - id: generator
+        text: The load generator - GUI mode and a heavy listener saturate JMeter, which delays its own requests and timings
+        feedback: Correct - the server's own timings did not change; the extra time is on the generator side.
+      - id: server
+        text: The server saturates at 400 threads
+        feedback: Its CPU is at 30 % and its own log shows 40 ms throughout.
+      - id: network
+        text: The network is too slow
+        feedback: Possible in general, but the run uses GUI mode with View Results Tree - check the generator first.
+      - id: database
+        text: The database locks under load
+        feedback: The server's own per-request time stayed at 40 ms, so the server was not waiting longer.
+    correct: [generator]
+    solution: |
+      When the server's own timings stay flat while the client's rise, look at the client. Rerun in CLI mode
+      without heavy listeners, monitor the generator, and compare again.
+
+  - id: place-data
+    type: mcq
+    concept: perf-env-test-data
+    skill: application
+    title: Keys for a load test
+    prompt: Which idempotency key scheme fits a load test of payment creation?
+    options:
+      - id: per-request
+        text: One key per run, virtual user and iteration, for example run-0119-u17-i42
+        feedback: Correct - unique inside the run and across runs, and traceable in server logs.
+      - id: per-user
+        text: One key per virtual user, created in on_start
+        feedback: Every request after the first from that user is a replay.
+      - id: fixed
+        text: The key from the recorded request, so the test matches the recording
+        feedback: Every request after the first is a replay.
+      - id: none
+        text: No key at all, so nothing is replayed
+        feedback: The API requires the key (400 without it), and real clients send one; the test must too.
+    correct: [per-request]
+    solution: |
+      Make keys unique per run, user and iteration, and check zero replays after the run.
+
+  - id: place-warmup
+    type: mcq
+    concept: perf-env-warmup-steady
+    skill: analysis
+    title: Which part to report
+    prompt: |
+      A run's per-minute p95 is 900, 600, 320, 250, 240, 255, 245, 250 ms (eight minutes at full load). The SLO is
+      p95 under 300 ms. What is the right conclusion?
+    options:
+      - id: steady
+        text: From minute 4 the run is steady at about 250 ms, which meets the SLO; the first three minutes are warm-up, reported separately
+        feedback: Correct - report the steady window against the SLO, and the warm-up as its own finding.
+      - id: whole
+        text: The run fails, because the p95 of the whole run is above 300 ms
+        feedback: The whole-run p95 is pulled up by the warm-up minutes; that is not normal operation.
+      - id: first
+        text: The run fails, because the first minute is 900 ms
+        feedback: One warm-up minute does not describe the steady state; it does deserve a separate note.
+      - id: short
+        text: Pass, and five steady minutes are enough for any SLO
+        feedback: The window must be as long as the requirement asks for; five minutes may be too short.
+    correct: [steady]
+    solution: |
+      Find the steady window from the time series, compare it with the SLO, and check its length against the
+      requirement's period before calling it a pass.
+
+recall:
+  - id: recall-parity
+    concept: perf-env-parity
+    prompt: Why can't you double the result of an environment half the size of production?
+    answer: Shared parts (database, caches, provider connections) do not halve, the first resource to saturate may differ, and queues grow non-linearly near saturation. Use a smaller environment to compare versions, not to predict production's absolute capacity.
+  - id: recall-jmeter-cli
+    concept: perf-env-parity
+    prompt: How does the JMeter manual say load runs should be executed?
+    answer: In CLI mode (jmeter -n -t plan.jmx -l results.jtl) - "Don't run load test using GUI mode !" - with as few listeners as possible, no View Results Tree or View Results in Table, CSV output, and enough heap (HEAP).
+  - id: recall-locust-cores
+    concept: perf-env-parity
+    prompt: How many Locust worker processes should run on a generator machine, and why?
+    answer: About one per core, because a Python process cannot fully use more than one core (the GIL). Watch for "CPU usage above 90%!" in the log.
+  - id: recall-keys
+    concept: perf-env-test-data
+    prompt: What makes an idempotency key right for a load test?
+    answer: Unique per run, virtual user and iteration (for example run-0119-u17-i42), so no request is a replay; then assert zero replays after the run.
+  - id: recall-reset
+    concept: perf-env-test-data
+    prompt: Why reset state before every run?
+    answer: Servers remember keys, sessions and created records, and data grows; without a reset each run tests a different data set and keys from earlier runs replay.
+  - id: recall-steady
+    concept: perf-env-warmup-steady
+    prompt: What is the steady state, and what does --reset-stats in Locust remove?
+    answer: The window at target load where metrics stay at a stable level - the only part you report against the requirement. --reset-stats resets statistics once spawning completes; warm-up that continues after spawning is still included.
+
+next:
+  - jmeter-architecture-and-test-plans
+  - locust-fundamentals
+  - reading-load-test-results
