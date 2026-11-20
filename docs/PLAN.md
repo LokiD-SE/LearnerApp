@@ -247,11 +247,24 @@ owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberate
       vulnerable SandPay portal bound to loopback only, with 17 flaws (OWASP Top 10:2021 and API Top 10:2023),
       each closable with `make_app(fixed=...)`; `tests/support` proves every flaw is present and fixable;
       `SEC_TARGET=solutions`.
-- [ ] Track K lessons, in batches of about 6. Sources: the Apache JMeter user manual and component reference,
-      the Locust documentation, Little's law, Google SRE books, the USE and RED methods, web.dev.
-- [ ] Track L lessons, in batches of about 6. Sources: OWASP WSTG, ASVS, Top 10:2021, API Security Top 10:2023,
-      MASVS/MASTG, cheat sheets and ZAP docs; PortSwigger Web Security Academy; RFCs (JWT, OAuth); FIRST
-      CVSS v4.0; PCI DSS v4.0.1. ZAP, Burp, Semgrep and similar tools are quoted from their docs, not installed.
+- [ ] Track K lessons, in batches of about 6 - 12 of 31 published (2026-11-20). Done: the fundamentals
+      module (6) and JMeter part 1 (architecture, thread groups and timers, HTTP samplers, correlation,
+      assertions and listeners, parameterisation). Next: JMeter part 2 (logic controllers, JSR223/Groovy, HTML
+      dashboard and CI, distributed testing), then the Locust module (6), then analysis, CI and the capstone (9).
+      Sources: the Apache JMeter user manual and component reference, the Locust documentation, Little's law
+      (Lazowska et al.), Google SRE books, the USE and RED methods, web.dev.
+- [ ] Track L lessons, in batches of about 6 - 12 of 30 published (2026-11-20). Done: foundations (6) and
+      web vulnerabilities part 1 (authentication, sessions, access control/IDOR, SQL injection, XSS, CSRF and
+      clickjacking). Next: web part 2 (SSRF and open redirects, file handling and path traversal, security
+      misconfiguration, cryptography and data exposure), then API security (4), DevSecOps (5), and mobile,
+      payments, reporting, capstone and mock interview (5). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10,
+      API Security Top 10:2023, MASVS/MASTG, cheat sheets and ZAP docs; RFCs (JWT, OAuth); FIRST CVSS v4.0;
+      PCI DSS v4.0.1. ZAP, Burp, Semgrep and similar tools are quoted from their docs, not installed.
+- Lesson forks follow a shared brief (kept outside the repo); the hard-won rules are: quote YAML values with
+  `: `, `order` items as `{id, text}`, a `solution` and hints on every exercise, no `null`/`true` ids, quoted
+  mermaid labels, no 13-19 digit runs (elide JMeter epoch-ms), Locust totals from `--json-file` not
+  `_stats.csv`, rates over the active span, never `import locust` in pytest, probes that find the flaw and stay
+  quiet when it is fixed.
 - [ ] Interview question bank entries for both tracks.
 
 ## Next increments
