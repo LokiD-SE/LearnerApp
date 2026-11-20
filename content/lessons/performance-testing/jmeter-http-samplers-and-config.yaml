@@ -1,0 +1,1353 @@
+id: jmeter-http-samplers-and-config
+title: HTTP samplers and configuration elements
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Configure JMeter's HTTP Request sampler and the elements around it - HTTP Request Defaults, Header Managers that merge by scope, the Cookie and Cache Managers - so a test plan sends exactly the requests you meant. Then watch connection reuse from the server's side, and find out why "Use KeepAlive" alone does not decide how many connections a load test opens.
+tags:
+  [
+    JMeter,
+    HTTP Request,
+    HTTP sampler,
+    HTTP Request Defaults,
+    HTTP Header Manager,
+    HTTP Cookie Manager,
+    HTTP Cache Manager,
+    configuration elements,
+    scoping rules,
+    keep-alive,
+    persistent connections,
+    connection reuse,
+    HttpClient4,
+    Body Data,
+    Content-Type,
+    Idempotency-Key,
+    redirects,
+    timeouts,
+    same user on each iteration,
+    jmeter.properties,
+    load testing,
+  ]
+
+environment: |
+  - **Tools:** Apache JMeter 5.6.3 (non-GUI mode) on JDK 17.0.21, Linux. Python 3.12.3 with pytest 9.2.0 for
+    the exercises in `practice/perf`. Every output in this lesson was printed by real runs on 19 and 20 November
+    2026 against servers on the loopback interface; timings are from one laptop and will differ on yours - the
+    request counts, headers, response codes and connection counts will not.
+  - **Practice servers:** `support/sandpay_target.py` (the SandPay practice API) and
+    `support/jm_http_fixture.py`, a small server written for this lesson that records which TCP connection carried
+    each request, and has cookie, cache, redirect and slow endpoints. SandPay is fictional; tokens, session ids
+    and UUIDs in the outputs are random per run and are shown shortened or replaced by placeholders.
+  - **JMeter documentation, as documented on 20 November 2026** (the same text ships with the 5.6.3 binary in
+    `printable_docs/usermanual/component_reference.html`): [Component Reference 18.1.2 HTTP
+    Request](https://jmeter.apache.org/usermanual/component_reference.html#HTTP_Request), [18.4.5 HTTP Cache
+    Manager](https://jmeter.apache.org/usermanual/component_reference.html#HTTP_Cache_Manager), [18.4.6 HTTP
+    Cookie Manager](https://jmeter.apache.org/usermanual/component_reference.html#HTTP_Cookie_Manager), [18.4.7
+    HTTP Request Defaults](https://jmeter.apache.org/usermanual/component_reference.html#HTTP_Request_Defaults),
+    [18.4.8 HTTP Header
+    Manager](https://jmeter.apache.org/usermanual/component_reference.html#HTTP_Header_Manager) and the [Thread
+    Group](https://jmeter.apache.org/usermanual/component_reference.html#Thread_Group) ("Same user on each
+    iteration"); the comments in `bin/jmeter.properties` of 5.6.3 (`jmeter.httpsampler`,
+    `httpclient4.*`, `httpclient.reset_state_on_thread_group_iteration`, `cache_manager.cached_resource_mode`,
+    `jmeter.save.saveservice.*`). Quotations are from those texts.
+  - **Read from the JMeter 5.6.3 jars, not from the manual:** the `.jmx` property names used in the exercises
+    (`HTTPSampler.implementation`, `HTTPSampler.connect_timeout`, `HTTPSampler.response_timeout`,
+    `HTTPSampler.use_keepalive`, `HTTPSampler.auto_redirects`, `HTTPSampler.image_parser`, the Cache Manager's
+    `clearEachIteration`, `useExpires`, `maxSize`, and `ThreadGroup.same_user_on_next_iteration`). The other
+    element and property names are copied from the `.jmx` templates in `bin/templates`.
+  - **HTTP:** [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112) section 9.3 (Persistence) and section 9.6
+    (the "close" connection option).
+  - **A documentation inconsistency, labelled where it appears:** the HTTP Request Defaults page says that without
+    `jmeter.httpsampler` "the Java implementation is used"; the HTTP Request page and the comment in
+    `jmeter.properties` ("currently HttpClient4") say HttpClient4. The runs here, with no implementation set,
+    sent `User-Agent: Apache-HttpClient/4.5.14`, which agrees with the latter.
+  - **Not repeated here:** the anatomy of an HTTP request - [HTTP request and response
+    anatomy](#/lesson/http-request-response-anatomy); idempotency keys - [Idempotency
+    keys](#/lesson/idempotency-keys); cookies and their attributes from a security angle - [HTTP security for
+    testers](#/lesson/http-security-for-testers); extracting the token from a response - [Correlation and
+    extractors in JMeter](#/lesson/jmeter-correlation-and-extractors).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - http-request-response-anatomy
+  - idempotency-keys
+
+concepts:
+  - id: perf-jmhttp-sampler
+    name: The HTTP Request sampler
+    summary: What each field of the HTTP Request sampler sends - server, path, method, parameters or Body Data, redirects, timeouts, embedded resources - and which implementation sends it.
+  - id: perf-jmhttp-config-scope
+    name: Configuration elements and their scope
+    summary: HTTP Request Defaults, Header Managers that merge nearest-first, and the Cookie and Cache Managers - each applying to the samplers in its scope.
+  - id: perf-jmhttp-connections
+    name: Connection reuse in JMeter
+    summary: How keep-alive, "Same user on each iteration" and httpclient.reset_state_on_thread_group_iteration decide how many TCP connections a load test opens.
+
+objectives:
+  - Configure an HTTP Request sampler that sends a JSON body with the right method, headers and timeouts, and explain each field you set.
+  - Factor server, port, protocol and timeouts into HTTP Request Defaults and predict which value a sampler uses.
+  - Place Header Managers so each header reaches exactly the requests that need it, and read the merged headers from a results file.
+  - Explain what the Cookie Manager and Cache Manager emulate, and recognise the samples they change or remove.
+  - Predict, then measure from the server's side, how many connections a plan opens with keep-alive on or off and with "Same user on each iteration" on or off.
+  - Audit a .jmx file for configuration mistakes that distort a load test.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: The idea in plain language
+    body: |
+      A JMeter **HTTP Request** sampler is a form you fill in once and JMeter posts a thousand times: where to
+      send it, which method, which path, what body. The **configuration elements** around it are the standing
+      orders that apply to every form in a drawer: "all of these go to 127.0.0.1 on port 8090", "every one of
+      these carries `Content-Type: application/json`", "keep the cookies the server gives you, like a browser
+      would".
+
+      The drawer is the part that trips people up. A configuration element applies to the samplers **in its
+      scope** - the ones beside it and below it in the test plan tree. Put the `Authorization` header at the top of
+      the plan and the sign-in request sends a token it does not have yet; put the `Idempotency-Key` header beside
+      every sampler and your "list payments" calls carry a key they do not need. Put it in the right drawer and
+      each request carries exactly what a real client would send.
+
+      Underneath every request is a **TCP connection**. A browser opens a few and keeps them; a script that opens
+      a new one for every request measures connection set-up, not your API - and can run a server out of sockets
+      long before it runs out of capacity. Whether JMeter reuses connections depends on more than the "Use
+      KeepAlive" box, and the only honest way to know is to count connections on the server. This lesson does
+      exactly that against a SandPay practice server, then shows a real payment plan whose headers, body and
+      connections you can check line by line.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Terms you need
+    body: |
+      | Term | Meaning (JMeter 5.6.3) |
+      | --- | --- |
+      | **HTTP Request** | the sampler that "lets you send an HTTP/HTTPS request to a web server"; one sample per request (plus sub-samples for followed redirects and embedded resources) |
+      | **Implementation** | the client library that sends the request: `HttpClient4` (Apache HttpComponents 4.x) or `Java` (the JVM's own); "Blank Value" defers to HTTP Request Defaults or the `jmeter.httpsampler` property |
+      | **Parameters / Body Data** | named parameters become a query string (GET, DELETE) or a form body (POST); **Body Data** sends the text you type as the body, for JSON or XML APIs |
+      | **Connect Timeout / Response Timeout** | milliseconds to wait for a connection to open / for a response; empty means no timeout |
+      | **Follow Redirects / Redirect Automatically** | follow a 3xx in JMeter (each hop is a sub-sample) / let the HTTP client follow it invisibly |
+      | **Use KeepAlive** | JMeter "sets the `Connection: keep-alive` header" and, with HttpClient4, keeps the connection for the next request |
+      | **Configuration element** | an element that sets up requests rather than sending them: Defaults, Header, Cookie, Cache Manager... |
+      | **Scope** | the samplers a configuration element applies to: those in the same branch of the tree and below it |
+      | **HTTP Request Defaults** | default values (server, port, protocol, timeouts, implementation...) for every HTTP Request in its scope that leaves the field empty |
+      | **HTTP Header Manager** | adds or overrides request headers; several in scope are **merged** |
+      | **HTTP Cookie Manager** | "stores and sends cookies just like a web browser", one cookie store per thread |
+      | **HTTP Cache Manager** | emulates a browser cache per thread: conditional requests, and skipping requests that are still fresh |
+      | **Same user on each iteration** | Thread Group option: whether the next loop iteration is the same virtual user (same cookies, cache and connections) |
+      | **Persistent connection** | an HTTP/1.1 connection that carries several requests; RFC 9112 makes it the default |
+      | **JTL** | JMeter's results file (CSV by default, or XML), one row or element per sample |
+
+  - id: why
+    kind: why
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Why configuration decides what your load test measures
+    body: |
+      A load test is only evidence about the requests it actually sent. Small configuration slips change those
+      requests without any error on the screen:
+
+      - **No timeouts.** Both timeout fields are optional and empty by default. Against a server that stops
+        answering, a thread with no response timeout simply waits; the "load" quietly drops to zero while the
+        plan still looks busy.
+      - **A missing `Content-Type`.** JMeter's manual is explicit: "GET, DELETE, PUT and PATCH require a
+        Content-Type. If not using a file, attach a Header Manager to the sampler and define the Content-Type
+        there." An API that rejects the request with `415` turns your capacity test into an error-rate test.
+      - **A header in the wrong scope.** The SandPay practice API replays the first payment for a repeated
+        `Idempotency-Key`. Give every request the same key and 600 "payments" create one payment and 599 cheap
+        replays - a test of a cache, not of payment creation (the [environments
+        lesson](#/lesson/performance-test-environments-and-data) measured exactly this).
+      - **Connections.** With keep-alive off, every request pays for a new TCP connection (and, over HTTPS, a new
+        TLS handshake). That is not how browsers and API clients behave, so response times are inflated and the
+        server's socket and connection-tracking limits are hit long before its real capacity.
+      - **Browser features you did not ask for.** "Retrieve All Embedded Resources" multiplies the requests of
+        an HTML page; a Cache Manager **removes** samples that a browser would have served from its cache. Both
+        are right for a web-page journey and wrong for an API benchmark.
+
+      None of these fail the run. They change what the numbers mean - which is why a tester reads the plan's
+      configuration as carefully as its results.
+
+  - id: sampler-fields
+    kind: internals
+    concepts: [perf-jmhttp-sampler]
+    title: The HTTP Request sampler, field by field
+    body: |
+      The fields that matter for API load tests, with the manual's words:
+
+      | Field | What it does | Notes |
+      | --- | --- | --- |
+      | Server, Port, Protocol | where to send | "Do not include the http:// prefix." Server is required "unless it is provided by HTTP Request Defaults" (or the Path is a full URL) |
+      | Method | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, ... | `PATCH` is "not supported for JAVA implementation" |
+      | Path | the resource, e.g. `/v1/payments` | "the path is not encoded - apart from replacing spaces with %20" |
+      | Parameters | name/value pairs | appended to the URL for GET and DELETE; sent "separately" (as the body) for POST and PUT |
+      | Body Data | the raw body | "each line will be sent with CRLF appended, apart from the last line" |
+      | Connect / Response Timeout | ms to wait | the response timeout "applies to each wait for a response", so a chunked reply can take longer overall |
+      | Follow Redirects | JMeter follows a 3xx | "The initial redirect and further responses will appear as additional samples" |
+      | Redirect Automatically | the client follows a 3xx | "Should only be used for GET and HEAD requests. The HttpClient sampler will reject attempts to use it for POST or PUT." |
+      | Use KeepAlive | persistent connections | "does not work properly with the default HTTP implementation" - meaning Java - "It does work with the Apache HttpComponents HttpClient implementations." |
+      | Retrieve All Embedded Resources | parse HTML, fetch images, CSS, scripts | for web pages; leave it off for APIs |
+      | Implementation | `HttpClient4` or `Java` | Java: "There is no control over how connections are re-used" |
+
+      **Which implementation, when it is left blank?** The HTTP Request page says the default "depends on the
+      value of the JMeter property `jmeter.httpsampler`, failing that, the HttpClient4 implementation is used",
+      and `jmeter.properties` agrees ("currently HttpClient4"). The HTTP Request Defaults page says "failing that,
+      the Java implementation is used" - an inconsistency in the manual. The runs in this lesson left it blank on
+      the samplers and sent `User-Agent: Apache-HttpClient/4.5.14`, so HttpClient4 it was. Setting it explicitly
+      in HTTP Request Defaults removes the question.
+
+      **Retries.** "By default retry has been set to 0 for both HttpClient4 and Java implementations". You can
+      raise `httpclient4.retrycount`, and with `httpclient4.request_sent_retry_enabled=true` it "will retry
+      Idempotent and non Idempotent requests". For a payment `POST` that is dangerous - a retried request the
+      server already processed is a second payment unless the API is idempotent - and hidden retries also hide
+      errors from your results. Leave both at their defaults unless you are reproducing a client that retries.
+
+  - id: scope-and-merging
+    kind: internals
+    concepts: [perf-jmhttp-config-scope]
+    title: Scope, defaults and how headers merge
+    body: |
+      **Scope.** A configuration element applies to every sampler in the branch where it sits: its siblings and
+      everything below them. A Header Manager that is a **child of a sampler** applies to that sampler only; one
+      inside a controller applies to the samplers in that controller; one at the top of the test plan applies to
+      every sampler.
+
+      **HTTP Request Defaults** fill in what a sampler leaves empty. "Leave the Server Name or IP field empty. The
+      controllers will inherit this field value from the HTTP Request Defaults element." Two catches from the
+      manual:
+
+      - The Path in Defaults "is the default for the full path, not a prefix" - it does not prepend `/v1` to your
+        samplers' paths.
+      - Check boxes "only have two states - on or off", so "if the button is off, then a later element can set it
+        on, but if the button is on, a later element cannot set it off."
+
+      **Header Managers merge.** "The header entries are merged to form the list for the sampler. If an entry to
+      be merged matches an existing header name, it replaces the previous entry. This allows one to set up a
+      default set of headers, and apply adjustments to particular samplers." The real request below came from the
+      exercise's reference plan: the `Idempotency-Key` from the sampler's own Header Manager comes first, then the
+      `Authorization` from the controller, then the plan-wide JSON headers - nearest first.
+
+      ```plaintext
+      Connection: keep-alive
+      Idempotency-Key: <uuid>
+      Authorization: Bearer <token>
+      Content-Type: application/json
+      Accept: application/json
+      Content-Length: 41
+      Host: 127.0.0.1:<port>
+      User-Agent: Apache-HttpClient/4.5.14 (Java/17.0.21.0.3)
+      ```
+
+      Note what the manual does **not** offer: "an empty value for a header does not remove an existing header, it
+      just replaces its value." To keep a header away from a request, keep the Header Manager out of its scope.
+
+      **Cookie Manager.** It "stores and sends cookies just like a web browser", and "Each JMeter thread has its
+      own cookie storage area", so each virtual user has its own session. Two warnings from the manual: "If there
+      is more than one Cookie Manager in the scope of a Sampler, there is currently no way to specify which one is
+      to be used", and a cookie you add by hand "will be shared by all JMeter threads". "Clear Cookies each
+      Iteration" clears server-set cookies at each loop of the Thread Group.
+
+      **Cache Manager.** It saves `Last-Modified` and `ETag` from successful responses and sends `If-Modified-Since`
+      and `If-None-Match` next time. With "Use Cache-Control/Expires header" on, a GET that is still fresh "returns
+      immediately, without requesting the URL" - and, since JMeter 2.12, the default
+      `cache_manager.cached_resource_mode=RETURN_NO_SAMPLE` means such a cache hit produces **no sample at all**.
+
+  - id: connection-reuse
+    kind: internals
+    concepts: [perf-jmhttp-connections]
+    title: Connections - what really decides reuse
+    body: |
+      HTTP/1.1 "defaults to the use of persistent connections, allowing multiple requests and responses to be
+      carried over a single connection" (RFC 9112 section 9.3); a `close` connection option ends that after the
+      current response. With **Use KeepAlive** on, JMeter's HttpClient4 sends `Connection: keep-alive` and keeps the
+      connection; off, it sends `Connection: close`.
+
+      Two more settings decide what happens **between loop iterations**:
+
+      - **Same user on each iteration** (Thread Group): "If not selected, a new connection will be opened between
+        iterations which will result in increased response times and consume more resources (memory and cpu)."
+        In the `.jmx` it is `ThreadGroup.same_user_on_next_iteration`.
+      - **`httpclient.reset_state_on_thread_group_iteration`** (JMeter property, default `true`): "Reset HTTP
+        State when starting a new Thread Group iteration", which involves "Closing opened connection" and
+        "resetting SSL State".
+
+      What the server saw, for 2 threads x 3 iterations x 3 requests (18 requests), counting distinct client
+      ports - `tests/jmeter/fixtures/jm_http_conn.jmx` against `support/jm_http_fixture.py`:
+
+      | Keep-alive | Same user on each iteration | reset_state property | Connections | Requests per connection | `Connection` header sent |
+      | --- | --- | --- | --- | --- | --- |
+      | on | on (also when the property is absent from the `.jmx`) | default | 2 | 9, 9 | keep-alive (18) |
+      | off | on | default | 18 | 1 each | close (18) |
+      | on | **off** | default (`true`) | 6 | 3 each | keep-alive |
+      | on | off | **`false`** | 2 | 9, 9 | keep-alive |
+
+      Read the third and fourth rows together: a new connection per iteration needs "Same user" **off** and the
+      reset property left at `true`; setting `-Jhttpclient.reset_state_on_thread_group_iteration=false` overrides
+      the Thread Group. Keep-alive alone did not decide it. Neither did the JTL's `Connect` column, which was `0`
+      for most samples in every run - on loopback, opening a connection takes well under a millisecond, so
+      **count connections on the server** (or in its access log) when the question is reuse.
+
+      Related `httpclient4` properties in `jmeter.properties` (defaults shown commented out):
+      `httpclient4.idletimeout=0` ("Idle connection timeout ... to apply if the server does not send Keep-Alive
+      headers"), `httpclient4.validate_after_inactivity=4900` and `httpclient4.time_to_live=60000` ("the
+      connection will not be re-used beyond its TTL").
+
+  - id: when
+    kind: when
+    concepts: [perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Which settings for which test
+    body: |
+      | You are testing | Keep-alive | Same user on each iteration | Cookie Manager | Cache Manager | Embedded resources |
+      | --- | --- | --- | --- | --- | --- |
+      | an API used by a few long-lived clients (servers, mobile apps) | on | on | only if the API uses cookies | no | off |
+      | a website where each iteration is a new visitor | on | **off** (new user, new connection, empty cache) | yes, "Clear cookies each iteration" | yes, "Clear cache each iteration" | on, with "URLs must match" limited to your own domains |
+      | returning visitors | on | on | yes | yes, with Cache-Control/Expires | on |
+      | connection set-up cost itself (TLS termination, a load balancer) | **off**, deliberately | either | as the site needs | no | off |
+
+      **What these elements do not replace:** a Header Manager does not correlate - a token from a response needs
+      an extractor ([Correlation and extractors](#/lesson/jmeter-correlation-and-extractors)). The Cache Manager does
+      not test your CDN or reverse proxy cache; it emulates one browser's cache. And no configuration makes one
+      load generator machine behave like thousands of distinct client networks.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmhttp-config-scope]
+    title: Which configuration reaches which request
+    body: |
+      The exercise's reference plan. Each dotted arrow is "applies to". Notice that the sign-in request receives
+      the plan-wide JSON headers but **not** the bearer token, and only the payment creation gets an
+      `Idempotency-Key`.
+
+      ```mermaid
+      flowchart TB
+        D["HTTP Request Defaults: 127.0.0.1, port property, timeouts"]
+        J["Header Manager: Content-Type and Accept JSON"]
+        subgraph TG["Thread Group: Merchants"]
+          subgraph ONCE["Once Only Controller"]
+            L["POST /auth/token"]
+          end
+          subgraph API["Simple Controller: Merchant API"]
+            B["Header Manager: Authorization Bearer token"]
+            P["POST /v1/payments"]
+            K["Header Manager (child): Idempotency-Key UUID"]
+            G["GET /v1/payments"]
+          end
+        end
+        D -.-> L
+        D -.-> P
+        D -.-> G
+        J -.-> L
+        J -.-> P
+        J -.-> G
+        B -.-> P
+        B -.-> G
+        K -.-> P
+      ```
+
+  - id: payment-plan
+    kind: code
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope]
+    title: "The payment plan: defaults, headers and a JSON body"
+    collapsed: true
+    body: |
+      The parts of `solutions/jmeter/jm_http_payment.jmx` this lesson is about (the sign-in, its JSON extractor
+      and the controllers are given in the exercise). In the GUI these are form fields; in the file they are
+      properties.
+
+      ```xml
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP Request Defaults">
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.domain">127.0.0.1</stringProp>
+        <stringProp name="HTTPSampler.port">${__P(port,8090)}</stringProp>
+        <stringProp name="HTTPSampler.protocol">http</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">2000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">5000</stringProp>
+        <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+      </ConfigTestElement>
+      ...
+      <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /v1/payments">
+        <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments">
+            <elementProp name="" elementType="HTTPArgument">
+              <boolProp name="HTTPArgument.always_encode">false</boolProp>
+              <stringProp name="Argument.value">{"amount_minor": 1250, "currency": "EUR"}</stringProp>
+              <stringProp name="Argument.metadata">=</stringProp>
+            </elementProp>
+          </collectionProp>
+        </elementProp>
+        <stringProp name="HTTPSampler.path">/v1/payments</stringProp>
+        <stringProp name="HTTPSampler.method">POST</stringProp>
+        <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Idempotency-Key">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Idempotency-Key</stringProp>
+              <stringProp name="Header.value">${__UUID()}</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      Run against the practice API (2 threads, 3 loops), the console summary was (the start and end epoch
+      timestamps are elided):
+
+      ```plaintext
+      Created the tree successfully using solutions/jmeter/jm_http_payment.jmx
+      Starting standalone test @ 2026 Nov 20 07:10:30 IST ((epoch ms elided))
+      summary +      1 in 00:00:00 =    4.2/s Avg:    47 Min:    47 Max:    47 Err:     0 (0.00%) Active: 2 Started: 2 Finished: 0
+      summary +     13 in 00:00:00 =  149.4/s Avg:    13 Min:     7 Max:    47 Err:     0 (0.00%) Active: 0 Started: 2 Finished: 2
+      summary =     14 in 00:00:00 =   42.8/s Avg:    15 Min:     7 Max:    47 Err:     0 (0.00%)
+      ```
+
+      14 samples: 2 sign-ins (once per thread) plus 2 x 3 iterations x 2 API calls. To see the headers and bodies
+      JMeter really sent, the run switched the results file to XML and saved them with documented properties:
+
+      ```bash
+      jmeter -n -t solutions/jmeter/jm_http_payment.jmx -l payments.jtl -Jport=8090 -Jthreads=2 -Jloops=3 \
+        -Jjmeter.save.saveservice.output_format=xml \
+        -Jjmeter.save.saveservice.requestHeaders=true \
+        -Jjmeter.save.saveservice.samplerData=true
+      ```
+
+      Each `httpSample` element then holds a `requestHeader` (shown in the section above) and the body in
+      `queryString`: `{"amount_minor": 1250, "currency": "EUR"}` with response code `201`. The sign-in's headers
+      were `Connection: keep-alive | Content-Type: application/json | Accept: application/json | ...` - no
+      `Authorization`, because that Header Manager is not in its scope.
+
+  - id: config-demos
+    kind: code
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope]
+    title: Cookies, cache, redirects and timeouts - real runs
+    collapsed: true
+    body: |
+      One thread, one iteration, against `support/jm_http_fixture.py`. Each block: the JTL rows (label, code,
+      success, message), then what the server received.
+
+      ```plaintext
+      --- no cookie manager
+      POST /login            200     true  OK
+      GET /account           401     false Unauthorized
+      server saw: POST /login {}, GET /account {}
+
+      --- with cookie manager
+      POST /login            200     true  OK
+      GET /account           200     true  OK
+      server saw: POST /login {}, GET /account {'Cookie': 'sid=3548c7a8...'}
+
+      --- cache manager, useExpires=false
+      GET /rates 1           200     true  OK
+      GET /rates 2           304     true  Not Modified
+      server saw: GET /rates {}, GET /rates {'If-Modified-Since': 'Wed, 18 Nov 2026 09:00:00 GMT', 'If-None-Match': '"rates-v7"'}
+
+      --- cache manager, useExpires=true      (the response said Cache-Control: max-age=60)
+      GET /rates 1           200     true  OK
+      server saw: GET /rates {}
+
+      --- cache manager, useExpires=true, -Jcache_manager.cached_resource_mode=RETURN_200_CACHE
+      GET /rates 1           200     true  OK
+      GET /rates 2           200     true  (ex cache)
+      server saw: GET /rates {}
+
+      --- Follow Redirects (GET /old-path answers 302 to /conn)
+      GET /old-path          200     true  OK
+      GET /old-path-0        302     true  Found
+      GET /old-path-1        200     true  OK
+      server saw: GET /old-path, GET /conn
+
+      --- Redirect Automatically
+      GET /old-path          200     true  OK
+      server saw: GET /old-path, GET /conn
+
+      --- neither
+      GET /old-path          302     true  Found
+
+      --- response timeout 200 ms, server answers after 500 ms
+      GET /slow              Non HTTP response code: java.net.SocketTimeoutException  false  Non HTTP response message: Read timed out
+      ```
+
+      Four lessons in twenty lines: without a Cookie Manager the session is lost; a Cache Manager turns the second
+      request into a conditional `304`, or - with Cache-Control honoured - **removes it from the results**; Follow
+      Redirects records each hop as a sub-sample while Redirect Automatically hides the hop; and a response
+      timeout turns a slow answer into a failed sample with a `Non HTTP response code`, instead of a thread that
+      waits forever.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope]
+    title: The payment plan, line by line
+    body: |
+      - `HTTPSampler.domain` **127.0.0.1** in Defaults, and empty in every sampler: change the target in one place.
+        A sampler with its own server overrides the defaults, which is how "one request goes to the wrong host"
+        bugs are born.
+      - `HTTPSampler.port` **`${__P(port,8090)}`**: a property with a default, so `-Jport=...` points the same plan
+        at another environment without editing it.
+      - `connect_timeout` **2000** and `response_timeout` **5000**: a hung server now produces failed samples you
+        can count, not threads that wait. Choose values above your SLO's threshold, so a slow-but-valid response is
+        measured rather than cut off.
+      - `implementation` **HttpClient4**: explicit, so the manual's inconsistency about the blank default never
+        matters, and keep-alive works as described.
+      - `postBodyRaw` **true** with one unnamed argument: this is the Body Data tab. The value is sent as is - the
+        JSON document, not a form.
+      - The plan-level Header Manager sets `Content-Type: application/json`: every request with a body declares
+        it, as the manual requires for PUT and PATCH and as JSON APIs expect for POST.
+      - The `Authorization: Bearer ${token}` Header Manager sits **inside** the "Merchant API" controller, so the
+        sign-in request - which runs before `token` exists - does not send a literal `Bearer ${token}`.
+      - `Idempotency-Key` **`${__UUID()}`** is a **child** of `POST /v1/payments`: a new key for every payment
+        request, and no key on the GET.
+      - `use_keepalive` **true** on every sampler: one connection per thread for the whole run, as an API client
+        would.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Configuring HTTP for a new plan, step by step
+    body: |
+      1. Add **HTTP Request Defaults** at the top of the plan: protocol, server and port (from properties),
+         connect and response timeouts, implementation `HttpClient4`.
+      2. Add a plan-level **Header Manager** for headers every request needs (`Content-Type`, `Accept`, a fixed
+         `User-Agent` if the system routes on it).
+      3. Decide which headers belong to a subset - tokens, idempotency keys, tenant ids - and put their Header
+         Managers in a controller or as children of the samplers that need them.
+      4. Add one **Cookie Manager** per Thread Group if the system uses cookies; never two in the same scope.
+      5. Decide whether each iteration is the same user: set **Same user on each iteration**, Clear cookies and
+         Clear cache to match the real users you are modelling.
+      6. Write each sampler with only what is specific to it: method, path, parameters or Body Data. Leave server,
+         port and timeouts empty.
+      7. Run once with the XML results file and `requestHeaders`/`samplerData` saved, and read a few samples:
+         are the headers, bodies and response codes what you meant?
+      8. Count connections on the server (or in its access log) during a short run, and compare with what you
+         expected.
+      9. Switch the results file back to the default CSV for the real run: saving headers and bodies for every
+         sample costs disk and CPU on the load generator.
+
+  - id: example
+    kind: example
+    concepts: [perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: "Example: the load test that created one payment"
+    body: |
+      A team load-tested SandPay's `POST /v1/payments` at 50 requests per second and reported a p95 of 4 ms - far
+      better than production. A tester reviewing the plan found two things.
+
+      **The evidence.** The plan had one Header Manager at the top of the Thread Group with
+      `Idempotency-Key: ${uuid}`, where `uuid` was a User Defined Variable set once with `${__UUID()}`. User
+      Defined Variables are evaluated once, so every request sent the same key. The API's ledger showed **one**
+      new payment after 30,000 requests; the responses carried `Idempotent-Replayed: true`. The test had
+      measured the replay path, which returns a stored response without touching the acquirer.
+
+      **The second finding.** "Same user on each iteration" was off and the plan ran 10,000 short iterations: the
+      server's access log showed a new client port for every iteration - 10,000 TCP connections where the real
+      client (a merchant's back end) keeps a handful open.
+
+      **What the tester checked after the fix:** a Header Manager as a child of the payment sampler with
+      `${__UUID()}` evaluated per request; a short run with headers saved to an XML JTL showing distinct keys;
+      the ledger count equal to the sample count; and the server's connection count equal to the thread count.
+      The corrected p95 was an order of magnitude higher - and, for the first time, a measurement of creating
+      payments.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Checking a plan's HTTP configuration
+    body: |
+      | Check | How | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | Every sampler reaches the right host | run with `-Jport` pointing at a practice server; audit the `.jmx` for samplers with their own server | no sampler hard-codes a host | audit output; server access log |
+      | Headers reach exactly the intended requests | one short run, XML JTL with `requestHeaders=true` | `Authorization` on API calls only; `Idempotency-Key` on POSTs only, unique | `requestHeader` of each sample |
+      | Bodies are what the API expects | XML JTL with `samplerData=true` | the JSON document, valid | `queryString` of each sample; `201` codes |
+      | Unique keys create real work | count objects created after the run | count = number of POST samples | API listing or database count |
+      | Timeouts are set | point one sampler at a slow endpoint (or audit) | failed samples with `SocketTimeoutException`, not stuck threads | JTL response codes and messages |
+      | Connection reuse matches the model | count distinct client ports on the server | threads (same user) or threads x iterations (new user) | server log |
+      | No samples silently removed | compare sample count with the plan's expected count | equal, or explained by the Cache Manager | JTL row count |
+
+      Negative checks are as important: remove the Cookie Manager and the authenticated page must fail with `401`;
+      repeat an `Idempotency-Key` and the API must replay, not create.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Common mistakes and a debugging method
+    body: |
+      | Symptom | Likely cause | Confirm by |
+      | --- | --- | --- |
+      | `Non HTTP response message: URI does not specify a valid host name: http:/auth/token` | no server in the sampler and no HTTP Request Defaults in scope (this is the unsolved exercise's error) | the sampler's effective server is empty |
+      | `415` or `400` on POST/PUT/PATCH | no `Content-Type`, or Parameters sent instead of Body Data | the sample's `requestHeader` and `queryString` |
+      | Sign-in sends `Authorization: Bearer ${token}` | the token Header Manager is in the sign-in's scope; an unset variable is sent literally | the sign-in's `requestHeader` |
+      | Far fewer objects created than requests sent | the same idempotency key on every request | distinct keys in the XML JTL; the API's replay header |
+      | Fewer samples than expected, no errors | Cache Manager with Cache-Control/Expires and `RETURN_NO_SAMPLE` | the server's request count vs the JTL's |
+      | Extra samples labelled `-0`, `-1` | Follow Redirects recording each hop | the `302` sub-sample |
+      | Threads stop producing samples against a slow system | no response timeout | thread dump or active-thread count; set a timeout and re-run |
+      | Response times much higher than clients see; servers short of sockets | keep-alive off, or a new user (and connection) every iteration | distinct client ports on the server |
+      | Cookies "randomly" missing | two Cookie Managers in scope, or a hand-added cookie shared by all threads | the plan tree; the sample's `cookies` |
+
+      **Method:** run one thread for one iteration with the XML results file and headers and bodies saved. Read
+      each sample as the server would: method, URL, headers, body. Then compare the server's view - access log,
+      created objects, connection count - with what you expected. Most HTTP configuration bugs are visible in
+      the first sample; you only need to look.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-connections]
+    title: Trade-offs and alternatives
+    body: |
+      - **Realism vs. load-generator cost.** Embedded resources, the Cache Manager and saving headers and bodies
+        all make results more faithful or more inspectable, and all cost CPU, memory and disk on the load
+        generator. Use them deliberately: full fidelity in a short verification run, lean configuration in the
+        long run.
+      - **Keep-alive is not always "right".** Real mobile clients on flaky networks reconnect often; a test of a
+        TLS-terminating load balancer may need new connections on purpose. Model the clients you have.
+      - **HttpClient4 vs Java.** HttpClient4 gives control over reuse, retries and timeouts; the Java
+        implementation is simpler but, per the manual, has "no control over how connections are re-used". There
+        is little reason to choose Java for a load test.
+      - **Defaults vs explicit samplers.** Defaults reduce repetition but hide values: a reader of one sampler
+        cannot see its timeout. An audit (this lesson's exercise) or a quick review of the Defaults element keeps
+        that honest.
+      - **Other tools.** Locust sets headers and bodies in Python code, with `requests` sessions keeping
+        connections and cookies per user ([Locust fundamentals](#/lesson/locust-fundamentals)); the questions -
+        what is sent, to whom, over how many connections - are the same.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmhttp-sampler, perf-jmhttp-config-scope, perf-jmhttp-connections]
+    title: Quick reference
+    body: |
+      - Put server, port (from `${__P(port,...)}`), protocol, both timeouts and `HttpClient4` in **HTTP Request
+        Defaults**; leave samplers' fields empty.
+      - JSON APIs: **Body Data** (`postBodyRaw`) plus a Header Manager with `Content-Type: application/json`.
+      - Header Managers **merge**, nearest first; scope decides which requests get which header. An empty value
+        does not remove a header.
+      - Per-request values (idempotency keys) go in a Header Manager that is a **child** of the sampler, using
+        `${__UUID()}`.
+      - One **Cookie Manager** per Thread Group; never two in scope.
+      - The **Cache Manager** sends conditional requests and, with Cache-Control/Expires, drops fresh hits from the
+        results (`RETURN_NO_SAMPLE`).
+      - **Follow Redirects** shows each hop; **Redirect Automatically** hides it and is for GET/HEAD only.
+      - Connections: keep-alive on -> one per thread; "Same user on each iteration" off -> one per iteration
+        (unless `httpclient.reset_state_on_thread_group_iteration=false`); keep-alive off -> one per request.
+      - To see what JMeter sent: `-Jjmeter.save.saveservice.output_format=xml -Jjmeter.save.saveservice.requestHeaders=true -Jjmeter.save.saveservice.samplerData=true`
+        on a short run.
+      - Count connections on the server, not from the `Connect` column.
+
+exercises:
+  - id: defaults-field
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: application
+    title: Where does this sampler send its request?
+    prompt: |
+      HTTP Request Defaults at plan level has server `127.0.0.1`, port `${__P(port,8090)}` and path `/v1`. A sampler
+      in the Thread Group has an empty server, port 8443, protocol `https` and path `/payments`. The plan runs with
+      `-Jport=9000`. Where does the sampler send its request?
+    options:
+      - id: right
+        text: https://127.0.0.1:8443/payments
+        feedback: Correct - the sampler's own non-empty fields win; only the empty server is taken from the defaults. The path in Defaults is a default, not a prefix.
+      - id: prefix
+        text: https://127.0.0.1:8443/v1/payments
+        feedback: The manual says the Defaults path "is the default for the full path, not a prefix" - it is only used when the sampler's path is empty.
+      - id: property
+        text: https://127.0.0.1:9000/payments
+        feedback: The port property only reaches the Defaults' port field, and the sampler's own port 8443 overrides it.
+      - id: defaults-win
+        text: http://127.0.0.1:9000/v1
+        feedback: Defaults fill in what the sampler leaves empty; they never override a value the sampler sets.
+    correct: [right]
+    hints:
+      - Which of the sampler's fields are empty?
+      - Is the Defaults path joined to the sampler's path?
+    solution: |
+      Defaults only supply empty fields: server comes from Defaults; port, protocol and path come from the
+      sampler. The Defaults path is a whole default path, not a prefix.
+
+  - id: content-type-header
+    type: mcq
+    concept: perf-jmhttp-sampler
+    skill: application
+    title: The 415 on every payment
+    prompt: |
+      Every `POST /v1/payments` in a new plan fails with `415 Unsupported Media Type`. The sampler uses the Body
+      Data tab with a valid JSON document; the XML results file shows
+      `Content-Type: text/plain; charset=UTF-8`. What do you change?
+    options:
+      - id: header
+        text: Add a Header Manager in the sampler's scope with Content-Type set to application/json
+        feedback: Correct - the manual says to "attach a Header Manager to the sampler and define the Content-Type there"; Body Data does not set a JSON type for you.
+      - id: params
+        text: Move the JSON into the Parameters tab with the name "body"
+        feedback: Named parameters are sent as a form (name=value), which is not the JSON document the API expects.
+      - id: encoding
+        text: Set Content Encoding to application/json
+        feedback: '"Content Encoding" is the character encoding (for example UTF-8) and "is not related to the Content-Encoding HTTP header" - nor to Content-Type.'
+      - id: multipart
+        text: Tick "Use multipart/form-data"
+        feedback: That sends a multipart form, which a JSON API will reject too.
+    correct: [header]
+    hints:
+      - Which header tells the server the body's media type?
+      - Which element adds headers?
+    solution: |
+      Declare the body's type with a Header Manager in scope: `Content-Type: application/json`. Then confirm it in
+      the sample's `requestHeader`.
+
+  - id: header-merge
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: analysis
+    title: Two Header Managers, one header name
+    prompt: |
+      A plan-level Header Manager sets `Accept: application/json` and `User-Agent: sandpay-loadtest`. A Header
+      Manager that is a child of `GET /v1/reports/settlement` sets `Accept: text/csv`. What does the report request
+      send?
+    options:
+      - id: merged
+        text: "Accept: text/csv and User-Agent: sandpay-loadtest"
+        feedback: Correct - entries are merged, and a matching name "replaces the previous entry", so the nearer Accept wins and User-Agent stays.
+      - id: both
+        text: Two Accept headers, application/json and text/csv
+        feedback: The manual says a matching entry replaces the previous one; headers with the same name are not duplicated.
+      - id: only-child
+        text: "Only Accept: text/csv - the child manager replaces the whole plan-level list"
+        feedback: Managers merge entry by entry; the User-Agent from the plan level is still sent.
+      - id: plan-wins
+        text: "Accept: application/json, because the plan level is applied last"
+        feedback: The nearest manager wins - that is what lets you "apply adjustments to particular samplers".
+    correct: [merged]
+    hints:
+      - Are Header Managers combined or is one chosen?
+      - What happens when two entries have the same name?
+    solution: |
+      Header Managers merge; same-name entries are replaced by the nearer one. Result: `Accept: text/csv` plus
+      the plan-level `User-Agent`.
+
+  - id: remove-header
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: application
+    title: Keep the token off the sign-in request
+    prompt: |
+      The `Authorization: Bearer ${token}` Header Manager is at plan level, so the sign-in request sends a literal
+      `Bearer ${token}` before `token` exists. A colleague adds a Header Manager as a child of the sign-in sampler
+      with `Authorization` and an empty value. What happens, and what is the right fix?
+    options:
+      - id: move
+        text: The sign-in still sends an Authorization header (empty value); move the token's Header Manager into a controller that holds only the API calls
+        feedback: Correct - "an empty value for a header does not remove an existing header, it just replaces its value". Scope is how you keep a header off a request.
+      - id: removed
+        text: The empty value removes the header, so the fix works
+        feedback: The manual says the opposite - an empty value replaces the value but the header is still sent.
+      - id: harmless
+        text: Nothing needs fixing - servers ignore Authorization on sign-in
+        feedback: Some do, some reject a malformed Authorization header with 400 or 401. Send what a real client sends.
+      - id: disable
+        text: Disable the plan-level Header Manager for the first iteration only
+        feedback: An element is enabled or disabled for the whole run; scope, not timing, is the tool.
+    correct: [move]
+    hints:
+      - Can a Header Manager delete a header another manager added?
+      - Which samplers does a Header Manager inside a controller reach?
+    solution: |
+      Empty values do not delete headers. Put the token's Header Manager where only the API calls are in scope -
+      a controller around them, as in the exercise plan.
+
+  - id: unique-key
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: analysis
+    title: One payment from 30,000 requests
+    prompt: |
+      A plan sets `Idempotency-Key: ${key}` in a Thread Group Header Manager, where `key` is a User Defined
+      Variable with the value `${__UUID()}`. After 30,000 `201` responses the API holds one new payment. Why?
+    options:
+      - id: once
+        text: User Defined Variables are evaluated once, so every request sent the same key and the API replayed the first payment
+        feedback: Correct - put `${__UUID()}` directly in a Header Manager that is a child of the payment sampler, so it is evaluated per request.
+      - id: cache
+        text: The Cache Manager served the POST from cache
+        feedback: The Cache Manager only skips GET requests; and 30,000 responses arrived from the server.
+      - id: cookie
+        text: The Cookie Manager reused one session for all threads
+        feedback: Each thread has its own cookie store; and the API keys payments by Idempotency-Key, not by cookie.
+      - id: keepalive
+        text: Keep-alive sent every request on one connection, so the server merged them
+        feedback: Connections carry many independent requests; reuse does not merge them.
+    correct: [once]
+    hints:
+      - When is a User Defined Variable's value computed?
+      - What does the API do with a repeated key?
+    solution: |
+      Evaluate per-request values per request: `${__UUID()}` in the sampler's own Header Manager. Verify with
+      distinct keys in the XML JTL and the API's created-object count.
+
+  - id: redirect-post
+    type: mcq
+    concept: perf-jmhttp-sampler
+    skill: recall
+    title: Redirects on a POST
+    prompt: |
+      A `POST /v1/refunds` answers `303` with a `Location` header. Which setting records the redirect and the
+      follow-up request as separate sub-samples?
+    options:
+      - id: follow
+        text: Follow Redirects
+        feedback: Correct - "The initial redirect and further responses will appear as additional samples".
+      - id: auto
+        text: Redirect Automatically
+        feedback: Redirects followed automatically "are not seen by JMeter", and the manual says the HttpClient sampler "will reject attempts to use it for POST or PUT".
+      - id: keepalive
+        text: Use KeepAlive
+        feedback: Keep-alive is about connection reuse, not redirects.
+      - id: none
+        text: Neither - JMeter cannot follow a redirect from a POST
+        feedback: Follow Redirects handles it, and records each hop.
+    correct: [follow]
+    hints:
+      - Which option is handled by JMeter, and which by the HTTP client?
+    solution: |
+      Follow Redirects: JMeter follows the 3xx and records each hop. Redirect Automatically hides hops and is for
+      GET and HEAD only.
+
+  - id: cache-missing-samples
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: analysis
+    title: Where did the samples go?
+    prompt: |
+      A website journey runs 100 iterations of 5 GET requests per thread, yet the results file has 140 rows for
+      `GET /static/rates.json` instead of 500, all successful. The plan has an HTTP Cache Manager with "Use
+      Cache-Control/Expires header" ticked, and the file is served with `Cache-Control: max-age=600`. Explain.
+    options:
+      - id: no-sample
+        text: Fresh cache hits are not requested and, with the default cached_resource_mode=RETURN_NO_SAMPLE, produce no sample
+        feedback: Correct - the sampler "returns immediately" and, since JMeter 2.12, no sample result is created for a cached resource by default.
+      - id: errors
+        text: 360 requests failed and failed samples are not written to the JTL
+        feedback: Failed samples are written (with success=false); this file has none.
+      - id: dropped
+        text: JMeter dropped samples because the load generator was overloaded
+        feedback: JMeter does not drop samples silently under load; it slows down.
+      - id: conditional
+        text: The Cache Manager sent conditional requests and 304s are not recorded
+        feedback: Conditional requests and their 304 responses are recorded as samples (the lesson's run shows one); only fresh hits disappear.
+    correct: [no-sample]
+    hints:
+      - What does the Cache Manager do with a GET that is still fresh?
+      - What does jmeter.properties say about samples for cached resources?
+    solution: |
+      Fresh hits are served from the emulated cache and, by default, create no sample. Use
+      `cache_manager.cached_resource_mode=RETURN_200_CACHE` if you need to see them, and count server requests.
+
+  - id: connections-new-user
+    type: mcq
+    concept: perf-jmhttp-connections
+    skill: application
+    title: How many connections?
+    prompt: |
+      10 threads run 50 iterations each with keep-alive on, "Same user on each iteration" **off**, and no change
+      to `jmeter.properties`. Each iteration sends 4 requests. How many TCP connections does the server see?
+    options:
+      - id: per-iteration
+        text: About 500 - one per thread per iteration
+        feedback: Correct - with "Same user" off, "a new connection will be opened between iterations" (httpclient.reset_state_on_thread_group_iteration defaults to true).
+      - id: per-thread
+        text: About 10 - one per thread
+        feedback: That is the "Same user on each iteration" on case, or reset_state set to false.
+      - id: per-request
+        text: About 2,000 - one per request
+        feedback: Keep-alive is on, so the 4 requests of an iteration share a connection.
+      - id: one
+        text: 1 - keep-alive shares one connection across threads
+        feedback: Each thread has its own connections.
+    correct: [per-iteration]
+    hints:
+      - Within an iteration, does keep-alive reuse the connection?
+      - What does "Same user" off do between iterations?
+    solution: |
+      Keep-alive reuses the connection within an iteration; "Same user" off opens a new one per iteration: 10 x 50
+      = 500. The lesson's run showed 6 connections for 2 threads x 3 iterations.
+
+  - id: connect-column
+    type: mcq
+    concept: perf-jmhttp-connections
+    skill: analysis
+    title: The Connect column says 0
+    prompt: |
+      To prove a plan reuses connections, a colleague points at the JTL: the `Connect` column is 0 for nearly
+      every sample. The plan targets a server on the same machine. Is that proof?
+    options:
+      - id: no
+        text: No - on loopback a new connection can open in under a millisecond, so 0 ms does not mean reused; count connections on the server
+        feedback: Correct - the lesson's keep-alive-off run, with 18 new connections, also had mostly 0 in Connect.
+      - id: yes
+        text: Yes - a new connection would always show a connect time of at least 1 ms
+        feedback: Times are whole milliseconds and a loopback connect is far below one.
+      - id: header
+        text: Yes, if the requests also carried Connection keep-alive
+        feedback: The header is a request to keep the connection, not proof that it was reused.
+      - id: threads
+        text: Only if the Thread Group has one thread
+        feedback: The number of threads does not change what the column can resolve.
+    correct: [no]
+    hints:
+      - What is the resolution of the Connect column?
+      - Where can you see connections directly?
+    solution: |
+      Millisecond connect times cannot distinguish a fast new connection from a reused one on a fast network.
+      Count distinct client connections on the server or in its access log.
+
+  - id: retries-post
+    type: mcq
+    concept: perf-jmhttp-sampler
+    skill: analysis
+    title: Should the payment test retry?
+    prompt: |
+      To "reduce noise" a colleague sets `httpclient4.retrycount=3` and
+      `httpclient4.request_sent_retry_enabled=true` for the payment load test. What is the main risk?
+    options:
+      - id: duplicate
+        text: A POST the server already processed may be sent again - a second payment unless the API is idempotent - and the retries hide errors from the results
+        feedback: Correct - the property "will retry Idempotent and non Idempotent requests"; a retried sample looks like one success.
+      - id: slower
+        text: Retries make JMeter slower to start
+        feedback: Retry settings do not affect start-up.
+      - id: none
+        text: None - HttpClient4 only retries GET requests whatever the settings
+        feedback: With request_sent_retry_enabled=true it retries non-idempotent requests too.
+      - id: memory
+        text: Retries use more heap on the load generator
+        feedback: Negligible next to duplicate payments and hidden errors.
+    correct: [duplicate]
+    hints:
+      - Which HTTP methods are safe to send twice?
+      - Would a retried request appear as a failure in the JTL?
+    solution: |
+      Keep retries at 0 for load tests: a retry can duplicate non-idempotent work and turns a failure into a
+      success in your results.
+
+  - id: config-order
+    type: order
+    concept: perf-jmhttp-config-scope
+    skill: application
+    title: Set up HTTP for a new plan
+    prompt: Put the steps for configuring HTTP in a new JMeter plan in a sensible order.
+    items:
+      - id: defaults
+        text: Add HTTP Request Defaults with server, port property, protocol, timeouts and HttpClient4
+      - id: plan-headers
+        text: Add a plan-level Header Manager for headers every request needs
+      - id: scoped-headers
+        text: Add scoped Header Managers for tokens and per-request keys
+      - id: samplers
+        text: Write the samplers with only method, path and parameters or Body Data
+      - id: verify
+        text: Run one thread once with an XML JTL saving request headers and bodies, and read the samples
+      - id: connections
+        text: Count connections on the server during a short run and compare with the model
+    hints:
+      - Shared settings first, sampler specifics after.
+      - Verify before you scale up.
+    solution: |
+      Defaults, shared headers, scoped headers, samplers, then verify what was sent, then verify connections -
+      before the real run, with the results file back to CSV.
+
+  - id: debug-header-scope
+    type: debug
+    concept: perf-jmhttp-config-scope
+    skill: analysis
+    title: Which line sends the wrong headers?
+    prompt: |
+      In this plan outline, the sign-in sends `Authorization: Bearer ${token}` and the payment list sends an
+      `Idempotency-Key`. Pick the lines that cause both problems.
+    language: plaintext
+    code: |
+      Test Plan
+        HTTP Request Defaults (127.0.0.1, ${__P(port,8090)}, timeouts)
+        HTTP Header Manager: Content-Type application/json
+        Thread Group: Merchants
+          HTTP Header Manager: Authorization Bearer ${token}
+          HTTP Header Manager: Idempotency-Key ${__UUID()}
+          Once Only Controller
+            POST /auth/token
+              JSON Extractor: token
+          POST /v1/payments
+          GET /v1/payments
+    correctLines: [5, 6]
+    lineNotes:
+      - line: 3
+        note: Content-Type on every request is correct here - every request with a body is JSON.
+      - line: 2
+        note: The defaults are fine; they apply to every sampler that leaves the fields empty.
+    hints:
+      - Which samplers are in the scope of each Header Manager in the Thread Group?
+      - Where would each one need to be to reach only its intended requests?
+    solution: |
+      Lines 5 and 6 put both Header Managers in the whole Thread Group's scope. Move the token's into a controller
+      around the API calls and make the key's a child of `POST /v1/payments`.
+
+  - id: why-defaults
+    type: short
+    concept: perf-jmhttp-config-scope
+    skill: analysis
+    title: Defaults or explicit fields?
+    prompt: |
+      A reviewer objects to HTTP Request Defaults: "When I open a sampler I can't see its timeout or host. Put
+      everything in every sampler." Answer in a few sentences: what do you gain and lose either way, and how do
+      you keep the plan reviewable?
+    modelAnswer: |
+      Defaults put the target, port, protocol, timeouts and implementation in one place, so pointing the plan at
+      another environment or changing a timeout is one edit and samplers cannot drift apart; fields set per
+      sampler are visible where you read them but get copied, and one forgotten copy sends a request to the wrong
+      host or without a timeout. The cost of defaults is that values are inherited invisibly - and a sampler's own
+      value silently overrides them. Keep it reviewable by leaving those fields empty in samplers (so the
+      override is the exception), naming the Defaults element clearly, and running an audit that reports
+      hard-coded hosts and missing effective timeouts, plus a short run with request headers saved.
+    rubric:
+      - Names the single point of change and consistency as the gain.
+      - Names the hidden inheritance and silent override as the cost.
+      - Proposes a way to make the effective values checkable (audit, review, saved request data).
+    hints:
+      - What happens when the environment changes?
+      - What does a sampler's own value do to the default?
+    solution: |
+      Defaults for shared values, empty sampler fields, and an audit or a verification run to see effective
+      values.
+
+  - id: test-design-http
+    type: testdesign
+    concept: perf-jmhttp-connections
+    skill: application
+    title: Prove the plan models the clients
+    prompt: |
+      SandPay's merchants call the payments API from their servers through a few long-lived connections each. A
+      new JMeter plan will load-test `POST /v1/payments` at 40 requests per second with 20 threads. Design the
+      checks you would run **before** the load test to prove the plan's HTTP configuration models those clients.
+      Give preconditions, steps, expected results and evidence.
+    modelAnswer: |
+      Preconditions: a practice or staging copy of the API you are allowed to load; access to its access log or a
+      connection count; the plan with Defaults, scoped Header Managers and `${__UUID()}` keys.
+
+      1. **Requests are well formed.** One thread, one iteration, XML JTL with `requestHeaders` and `samplerData`.
+         Expected: `Content-Type: application/json`, `Authorization` on API calls only, an `Idempotency-Key` on the
+         POST only, the JSON body, `201`. Evidence: the `requestHeader` and `queryString` elements.
+      2. **Keys are unique per request.** 2 threads x 20 iterations. Expected: 40 distinct keys in the JTL and 40
+         payments created. Evidence: the JTL; the API listing for the test merchant.
+      3. **Connections match the clients.** 20 threads x 50 iterations with keep-alive on and "Same user on each
+         iteration" on. Expected: about 20 connections on the server. Evidence: distinct client ports in the
+         access log or a connection count.
+      4. **Negative: new user per iteration.** Same run with "Same user" off. Expected: about 1,000 connections -
+         proves the check can tell the difference. Evidence: the same count.
+      5. **Timeouts are effective.** Point one run at a slow endpoint above the response timeout. Expected: failed
+         samples with `SocketTimeoutException`. Evidence: JTL codes and messages.
+      6. **No hidden retries or samples.** Expected: `httpclient4.retrycount` at 0 and sample count equal to
+         requests on the server. Evidence: the properties used and both counts.
+    rubric:
+      - Each check has a precondition or setup, steps, an expected result and concrete evidence.
+      - Checks headers, bodies and per-request keys from saved request data, not by assumption.
+      - Counts connections on the server, with a negative case that shows the check discriminates.
+      - Includes timeouts and hidden retries or removed samples.
+    hints:
+      - Which settings decide the connection count?
+      - How can you see what JMeter actually sent?
+    solution: |
+      Verify requests from saved request data, uniqueness from created objects, connections from the server's
+      count (with a negative case), timeouts with a slow endpoint, and that no retries or cache hide samples.
+
+  - id: interview-keepalive
+    type: interview
+    concept: perf-jmhttp-connections
+    skill: analysis
+    title: "Interview: keep-alive in a load test"
+    prompt: |
+      "Our JMeter test shows much higher response times than our monitoring shows for real clients, and the load
+      balancer ran out of connections during the test. Talk me through what you'd look at in the plan."
+    modelAnswer: |
+      I'd suspect connection handling before the system. Real API clients keep persistent connections - HTTP/1.1
+      makes them the default - so if the plan opens a new TCP (and TLS) connection per request or per iteration,
+      every sample pays set-up cost and the load balancer sees far more connections than production. In the plan
+      I'd check four things: Use KeepAlive on every sampler; the implementation is HttpClient4, because the Java
+      one gives no control over reuse; the Thread Group's "Same user on each iteration", because with it off
+      JMeter opens a new connection every iteration unless `httpclient.reset_state_on_thread_group_iteration` is
+      false; and any retry or connection properties in `jmeter.properties` or `user.properties`. Then I'd prove
+      it: a short run while counting distinct client connections at the server or load balancer - not the JTL's
+      Connect column, which can't resolve fast connects. Fix the model to match the clients - a few long-lived
+      connections per client for server-to-server traffic, new users per iteration for web visitors - and rerun.
+    rubric:
+      - Connects the symptoms to connection set-up and per-connection limits.
+      - Names keep-alive, the implementation and "Same user on each iteration" (with the reset property).
+      - Verifies by counting connections on the server rather than trusting settings or the Connect column.
+      - Ties the right setting to the real clients being modelled.
+    followUps:
+      - How would TLS change the cost of a new connection?
+      - When would you deliberately turn keep-alive off?
+      - How would you check the same thing in Locust?
+    hints:
+      - What does each new connection cost the client and the load balancer?
+      - Which settings decide reuse between iterations?
+    solution: |
+      Check keep-alive, HttpClient4, "Same user on each iteration" and the reset property; prove reuse by counting
+      connections at the server; model the real clients.
+
+  - id: payment-plan-code
+    type: coding
+    concept: perf-jmhttp-config-scope
+    skill: application
+    title: Configure the payment plan
+    prompt: |
+      Complete `exercises/jmeter/jm_http_payment.jmx` (the TODO comment at its top lists five steps): HTTP Request
+      Defaults with server, port property and timeouts; a plan-wide JSON `Content-Type`; a scoped
+      `Authorization: Bearer ${token}`; the JSON body of `POST /v1/payments`; and a per-request
+      `Idempotency-Key`. The test runs the plan with real JMeter against the practice API, saves request headers
+      and bodies in an XML results file, and checks each request and the payments the API holds afterwards. Edit
+      in the JMeter GUI (`tools/apache-jmeter-5.6.3/bin/jmeter`, open the file, save) or in a text editor.
+    project: perf
+    files:
+      - exercises/jmeter/jm_http_payment.jmx
+    test: tests/jmeter/test_jm_http_payment.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_http_payment.py
+    hints:
+      - Without a server, every request fails with "URI does not specify a valid host name" - start with the Defaults.
+      - A Header Manager's entries are elementProp elements of type Header with Header.name and Header.value.
+      - The Idempotency-Key manager goes inside the payment sampler's own hashTree.
+    modelAnswer: |
+      The Defaults get `127.0.0.1`, `${__P(port,8090)}`, `2000` and `5000`; the "JSON headers" manager gets
+      `Content-Type: application/json` (and `Accept`); the "Bearer token" manager inside "Merchant API" gets
+      `Authorization: Bearer ${token}`; the payment sampler's unnamed argument becomes
+      `{"amount_minor": 1250, "currency": "EUR"}`; and its hashTree gains:
+
+      ```xml
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Idempotency-Key">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Idempotency-Key</stringProp>
+            <stringProp name="Header.value">${__UUID()}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+      ```
+
+      Scope does the work: the token never reaches the sign-in, the key never reaches the GET, and every payment
+      request gets a new key, so the API holds exactly threads x loops new payments.
+    rubric:
+      - Every test in tests/jmeter/test_jm_http_payment.py passes.
+      - No sampler sets its own server; timeouts come from the Defaults.
+      - Each header is placed in the narrowest scope that covers the requests needing it.
+    solution: |
+      Shared values in Defaults and a plan-level Header Manager; the token in a controller's Header Manager; the
+      key in the payment sampler's own Header Manager.
+
+  - id: audit-code
+    type: coding
+    concept: perf-jmhttp-sampler
+    skill: application
+    title: Audit a .jmx for HTTP mistakes
+    prompt: |
+      In `exercises/jmeter/jm_http_audit.py`, implement `effective` (the value a sampler really uses: its own,
+      else the nearest HTTP Request Defaults in scope) and `audit`, which reports nine rules: `no-defaults`,
+      `hard-coded-host`, `no-timeouts`, `java-implementation`, `keepalive-off`, `auto-redirect-on-post`,
+      `embedded-resources`, `missing-content-type` (a body without a Content-Type Header Manager in scope) and
+      `several-cookie-managers`. The scope walker `plan_scopes` is given. Running the solution on a recorded plan
+      with every mistake printed:
+
+      ```plaintext
+      no-defaults              plan               no HTTP Request Defaults - server, port and timeouts are repeated in (or missing from) every sampler
+      hard-coded-host          POST /v1/payments  server 'staging.sandpay.example' is hard-coded in the sampler
+      no-timeouts              POST /v1/payments  no connect_timeout - a hung server blocks the thread
+      no-timeouts              POST /v1/payments  no response_timeout - a hung server blocks the thread
+      keepalive-off            POST /v1/payments  Use KeepAlive is off - a new connection per request
+      auto-redirect-on-post    POST /v1/payments  Redirect Automatically on POST
+      missing-content-type     POST /v1/payments  POST with a body and no Content-Type
+      several-cookie-managers  POST /v1/payments  2 Cookie Managers in scope - JMeter cannot say which is used
+      ```
+    project: perf
+    files:
+      - exercises/jmeter/jm_http_audit.py
+    test: tests/jmeter/test_jm_http_audit.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_http_audit.py
+    hints:
+      - "`effective`: the sampler's own value if it is not blank, else walk `scope.config` (nearest first) for an `is_defaults` element with a non-blank value."
+      - A missing boolean property means the GUI default - keep-alive on, redirects and embedded resources off - and a missing method means GET.
+      - "`missing-content-type` only applies to POST, PUT and PATCH with `has_body(...)`; look for `content-type` in `header_names` of the HeaderManagers in `scope.config`."
+    modelAnswer: |
+      ```python
+      def effective(scope, name):
+          own = props(scope.sampler).get(name, "")
+          if own.strip():
+              return own
+          for element in scope.config:
+              if is_defaults(element) and props(element).get(name, "").strip():
+                  return props(element)[name]
+          return ""
+      ```
+
+      `audit` adds one plan-level finding when no Defaults exist, then per sampler: a literal server (no `${`), a
+      blank effective connect or response timeout, an effective implementation of `Java`, keep-alive `false`,
+      `auto_redirects` on a body method, `image_parser` on, a body without a Content-Type in scope, and more than
+      one Cookie Manager in scope.
+    rubric:
+      - Every test in tests/jmeter/test_jm_http_audit.py passes.
+      - Uses the effective value (sampler, then nearest Defaults) for timeouts and implementation.
+      - Content-Type is checked against Header Managers in the sampler's scope only, ignoring disabled elements.
+    solution: |
+      Effective values come from the sampler, then the nearest Defaults; scope-aware checks use `scope.config`.
+
+  - id: connections-code
+    type: coding
+    concept: perf-jmhttp-connections
+    skill: analysis
+    title: Read connection reuse from the server's log
+    prompt: |
+      In `exercises/jmeter/jm_http_connections.py`, implement `requests_per_connection`,
+      `connection_header_values` and `reuse_pattern` ("per-request", "per-iteration", "per-thread" or "mixed").
+      The test then runs the real plan `tests/jmeter/fixtures/jm_http_conn.jmx` four times against a server that
+      records which connection carried each request: keep-alive on, keep-alive off, "Same user on each iteration"
+      off, and "Same user" off with `-Jhttpclient.reset_state_on_thread_group_iteration=false`.
+    project: perf
+    files:
+      - exercises/jmeter/jm_http_connections.py
+    test: tests/jmeter/test_jm_http_connections.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_http_connections.py
+    hints:
+      - A Counter over hit.connection answers the first function.
+      - Header names are case-insensitive; a request without a Connection header counts as "(none)".
+      - Compare the number of distinct connections with len(log), threads * loops and threads, in that order.
+    modelAnswer: |
+      ```python
+      def reuse_pattern(log, threads, loops):
+          log = list(log)
+          if not log:
+              raise ValueError("no requests in the log")
+          connections = len(requests_per_connection(log))
+          if connections == len(log):
+              return "per-request"
+          if connections == threads * loops:
+              return "per-iteration"
+          if connections == threads:
+              return "per-thread"
+          return "mixed"
+      ```
+
+      The real runs give per-thread (2 connections, 9 requests each), per-request (18, with `Connection: close`),
+      per-iteration (6, 3 requests each) and per-thread again when the reset property is false.
+    rubric:
+      - Every test in tests/jmeter/test_jm_http_connections.py passes.
+      - The pattern is decided from connections seen by the server, not from timings.
+      - You can explain why the third and fourth runs differ.
+    solution: |
+      Count distinct client connections in the server log and compare with requests, threads x iterations and
+      threads.
+
+placement:
+  - id: place-scope
+    type: mcq
+    concept: perf-jmhttp-config-scope
+    skill: application
+    title: Only the refund request needs it
+    prompt: |
+      Only `POST /v1/refunds` must send `X-Approval: four-eyes`; the other 12 samplers in the Thread Group must not.
+      Where do you put the Header Manager?
+    options:
+      - id: child
+        text: As a child of the POST /v1/refunds sampler
+        feedback: Correct - a configuration element that is a child of a sampler applies to that sampler only.
+      - id: group
+        text: At the top of the Thread Group, with the value empty for the other samplers
+        feedback: Every sampler in the Thread Group would be in scope, and an empty value still sends the header.
+      - id: plan
+        text: At plan level, after the samplers
+        feedback: Order does not limit scope; a plan-level manager reaches every sampler.
+      - id: defaults
+        text: In HTTP Request Defaults
+        feedback: Defaults hold server, port, timeouts and the like - headers come from Header Managers.
+    correct: [child]
+    solution: |
+      Scope, not order, decides which samplers a configuration element reaches. A child of the sampler is the
+      narrowest scope.
+
+  - id: place-body
+    type: mcq
+    concept: perf-jmhttp-sampler
+    skill: application
+    title: Sending a JSON document
+    prompt: |
+      Which configuration sends `{"amount_minor": 1250, "currency": "EUR"}` as the body of a POST that a JSON API
+      accepts?
+    options:
+      - id: right
+        text: Body Data with the JSON document, and a Header Manager in scope with Content-Type application/json
+        feedback: Correct - Body Data sends the text as the body; the Header Manager declares its media type.
+      - id: params
+        text: Two named parameters, amount_minor and currency
+        feedback: Named parameters are sent as a form (amount_minor=1250&currency=EUR), not JSON.
+      - id: encoding
+        text: Body Data with Content Encoding set to application/json
+        feedback: Content Encoding is the character set, not the media type.
+      - id: path
+        text: The JSON appended to the path as a query string
+        feedback: That is not a body at all, and the path is not encoded.
+    correct: [right]
+    solution: |
+      Body Data for the document plus `Content-Type: application/json` from a Header Manager.
+
+  - id: place-connections
+    type: mcq
+    concept: perf-jmhttp-connections
+    skill: analysis
+    title: Connections per thread
+    prompt: |
+      Keep-alive is on and the Thread Group's "Same user on each iteration" is on. 5 threads run 20 iterations of
+      3 requests. How many connections does the server see, and what would raise it to about 100?
+    options:
+      - id: right
+        text: About 5; turning "Same user on each iteration" off would raise it to about 100
+        feedback: Correct - one connection per thread; a new user per iteration means a new connection per iteration.
+      - id: per-request
+        text: About 300, one per request; nothing raises it further
+        feedback: With keep-alive on, requests share their thread's connection.
+      - id: keepalive
+        text: About 5; turning keep-alive off would raise it to about 100
+        feedback: Keep-alive off gives one connection per request - about 300.
+      - id: one
+        text: 1; adding threads would raise it
+        feedback: Threads do not share connections.
+    correct: [right]
+    solution: |
+      Same user + keep-alive: one connection per thread. "Same user" off: one per iteration (5 x 20 = 100).
+      Keep-alive off: one per request (300).
+
+recall:
+  - id: recall-defaults
+    concept: perf-jmhttp-config-scope
+    prompt: What does HTTP Request Defaults do, and what does a sampler's own value do to it?
+    answer: It supplies values for fields a sampler in its scope leaves empty (server, port, protocol, timeouts, implementation...). A non-empty value in the sampler overrides the default; the Defaults path is a whole default path, not a prefix.
+  - id: recall-merge
+    concept: perf-jmhttp-config-scope
+    prompt: How do several Header Managers combine for one sampler?
+    answer: Their entries are merged; an entry with the same name replaces the previous one, so the nearest manager wins. An empty value does not remove a header.
+  - id: recall-body
+    concept: perf-jmhttp-sampler
+    prompt: How do you send a JSON body with an HTTP Request sampler?
+    answer: Use the Body Data tab (postBodyRaw) for the document, and a Header Manager in scope with Content-Type application/json.
+  - id: recall-redirects
+    concept: perf-jmhttp-sampler
+    prompt: Follow Redirects or Redirect Automatically - what is the difference?
+    answer: Follow Redirects is done by JMeter and records each hop as a sub-sample; Redirect Automatically is done by the HTTP client, hides the hops and is for GET and HEAD only.
+  - id: recall-cache
+    concept: perf-jmhttp-config-scope
+    prompt: Why can a Cache Manager reduce the number of samples in the results?
+    answer: With Cache-Control/Expires honoured, a fresh GET is not sent, and the default cache_manager.cached_resource_mode=RETURN_NO_SAMPLE creates no sample for it.
+  - id: recall-connections
+    concept: perf-jmhttp-connections
+    prompt: Which settings decide how many TCP connections a JMeter plan opens?
+    answer: Use KeepAlive (off = one per request), the Thread Group's "Same user on each iteration" (off = one per iteration) and the property httpclient.reset_state_on_thread_group_iteration (false keeps connections across iterations). Count them on the server.
+
+next:
+  - jmeter-correlation-and-extractors
+  - jmeter-assertions-and-listeners
+  - jmeter-parameterisation-and-data

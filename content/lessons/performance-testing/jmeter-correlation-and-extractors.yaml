@@ -1,0 +1,1239 @@
+id: jmeter-correlation-and-extractors
+title: Correlation and extractors in JMeter
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: A load script that replays yesterday's token, payment ids and cursors tests nothing but the server's error path. Learn to correlate - capture each dynamic value from a response with JMeter's JSON, Regular Expression and Boundary extractors and send it in the next request - using match numbers, default values and per-thread variables, and prove it with real JMeter 5.6.3 runs that page through the SandPay practice API.
+tags:
+  [
+    JMeter,
+    correlation,
+    dynamic values,
+    extractor,
+    post-processor,
+    JSON Extractor,
+    JSONPath,
+    Jayway JsonPath,
+    Regular Expression Extractor,
+    regex,
+    template,
+    match number,
+    Boundary Extractor,
+    CSS Selector Extractor,
+    XPath2 Extractor,
+    default value,
+    matchNr,
+    JMeter variables,
+    thread scope,
+    scoping rules,
+    bearer token,
+    cursor pagination,
+    starting_after,
+    Debug Sampler,
+    recorded script,
+    JTL,
+  ]
+
+environment: |
+  - **Runtime:** Apache JMeter 5.6.3 (non-GUI mode) on OpenJDK 17.0.21, Python 3.12.3 in `practice/perf/.venv`,
+    Linux. Every JMeter output in this lesson was printed by the plans shown, run on 19-20 November 2026 against
+    `support/sandpay_target.py` on the loopback interface. Response codes, URLs and extracted variables repeat
+    on any machine; the access token is random on every run.
+  - **Target:** the SandPay practice API (`practice/perf/support/sandpay_target.py`) - fictional, synthetic data.
+    Merchants `merchant-1` .. `merchant-3` each have 250 seeded payments; `GET /v1/payments` is cursor-paginated
+    with `limit` and `starting_after` and returns `{"data": [...], "has_more": true|false}`.
+  - **Sources, as documented on 20 November 2026:** the Apache JMeter user manual -
+    [Component Reference](https://jmeter.apache.org/usermanual/component_reference.html) sections 18.8
+    Post-Processors (Regular Expression Extractor, CSS Selector Extractor, XPath2 Extractor, JSON Extractor,
+    Boundary Extractor) and Debug Sampler; [Elements of a Test
+    Plan](https://jmeter.apache.org/usermanual/test_plan.html) (Execution order, Scoping Rules, 3.11 Properties
+    and Variables); [Functions and Variables](https://jmeter.apache.org/usermanual/functions.html);
+    [Best Practices](https://jmeter.apache.org/usermanual/best-practices.html) 16.7. Quotations are from those
+    pages.
+  - **JSONPath:** JMeter 5.6.3 ships Jayway JsonPath 2.8.0 (`lib/json-path-2.8.0.jar`); the syntax, including
+    negative indexes such as `$..book[-2]` ("The second to last book"), is from the [Jayway JsonPath
+    README](https://github.com/json-path/JsonPath). RFC 9535 standardises JSONPath, but JMeter's extractor uses
+    the Jayway dialect - check that README, not the RFC, when an expression behaves unexpectedly.
+  - **Observed, not documented:** the `_matchNr` variable that the JSON Extractor sets even for match number 1
+    (`token_matchNr=1`), and `refName_n_g` in negative mode of the Regular Expression Extractor, were seen in
+    the Debug Sampler output of the runs here; the manual does not list them.
+  - **Python emulation:** `exercises/jmeter/jm_corr_regex.py` follows the manual's rules with Python's `re`;
+    JMeter uses Java ("Perl-type") regular expressions, which agree on everything the exercise uses.
+  - **Not repeated here:** what a sampler, thread group and HTTP Request Defaults are (the earlier JMeter
+    lessons), bearer tokens ([Sessions, cookies and tokens](#/lesson/sessions-cookies-and-tokens)) and why a
+    payment creation carries an idempotency key ([Idempotency keys](#/lesson/idempotency-keys)).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - jmeter-http-samplers-and-config
+  - http-request-response-anatomy
+
+concepts:
+  - id: perf-corr-dynamic-values
+    name: Correlation of dynamic values
+    summary: A response often contains a value the next request must send back - a session or bearer token, an id the server just created, a pagination cursor, a CSRF token. Correlation means capturing that value from the response at run time and using it in the next request. A recorded or hard-coded value is stale on the next run, so the requests fail (401, 400, 404) or all hit the same cached object, and the load test measures the error path instead of the real one.
+  - id: perf-corr-extractors
+    name: Choosing and configuring extractors
+    summary: JMeter's post-processors extract values - the JSON Extractor with JSONPath for JSON, the Regular Expression Extractor (regex, template, match number), the Boundary Extractor (left and right boundaries) and the CSS Selector and XPath2 extractors for HTML and XML. Match number N takes the N-th match, 0 a random one and a negative number all of them (refName_1 .. refName_N and refName_matchNr). A default value makes a failed extraction visible.
+  - id: perf-corr-scope-and-failure
+    name: Extractor scope, thread variables and failing visibly
+    summary: Post-processors apply to every sampler in their scope and run after the sampler, so an extractor belongs as a child of the one sampler whose response holds the value. JMeter variables are local to each thread, so every virtual user correlates its own token and cursor. A distinctive default (TOKEN_NOT_FOUND) travels into the next request and turns a broken extraction into an obvious error instead of a silently wrong test.
+
+objectives:
+  - Identify the dynamic values in a recorded API flow - tokens, created ids, cursors - and explain what goes wrong when they are replayed.
+  - Configure JSON, Regular Expression and Boundary extractors with the right expression, match number and default value for a given response.
+  - Predict the JMeter variables an extractor sets for positive, zero and negative match numbers, including refName_matchNr and refName_gN.
+  - Place each extractor where its scope applies it to exactly one sampler, and explain why variables do not leak between threads.
+  - Diagnose a broken correlation from JTL evidence - 401s, a default value in a URL, repeated cursors - and fix it.
+  - Scan a JMeter plan for hard-coded tokens, literal ids, unset variables and extractors without defaults.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-corr-dynamic-values]
+    title: The idea in plain language
+    body: |
+      You record yourself using SandPay's merchant API: sign in, list payments, open page 2. The recording is a
+      perfect copy of **that** session - including the bearer token the server gave you at 10:02 and the cursor
+      `pay_100005` it told you to send for page 2. Replay it tomorrow with 200 virtual users and every one of
+      them sends the same expired token. The server answers `401 Unauthorized` in a millisecond, the report shows
+      a wonderfully fast API, and you have load-tested the error path.
+
+      It is like a cloakroom. You hand over your coat and get ticket 47. Tomorrow you can't walk in with
+      yesterday's ticket 47 and expect your coat - you have to read the number on **today's** ticket and hand
+      that one back. A load script must do the same: **read** the value the server just gave it, **keep** it,
+      and **hand it back** in the next request. That is **correlation**.
+
+      JMeter does the reading with **extractors** - post-processors that run after a sampler, pull a value out
+      of its response and store it in a **variable** such as `token`. Later requests write `${token}` where the
+      recorded value used to be. Each virtual user (each JMeter thread) has its own copy of the variables, so
+      200 users hold 200 different tokens and walk through 200 different sets of pages.
+
+  - id: what
+    kind: what
+    concepts: [perf-corr-dynamic-values, perf-corr-extractors, perf-corr-scope-and-failure]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Dynamic value** | a value the server generates per session or per request and expects back: a token, a created id, a cursor, a CSRF token, a nonce |
+      | **Correlation** | capturing a dynamic value from a response and sending it in a later request |
+      | **Post-Processor** | an element that runs after a sampler; the manual: "Post-Processors are applied after samplers" |
+      | **Extractor** | a post-processor that stores part of a response in a JMeter variable |
+      | **JSON Extractor** | "extract data from JSON responses using JSON-PATH syntax"; several semicolon-separated expressions and variable names at once |
+      | **JSONPath** | a query language for JSON: `$` is the root, `$.data[*].id` every id, `$.data[-1].id` the last one (Jayway dialect in JMeter) |
+      | **Regular Expression Extractor** | applies "a Perl-type regular expression" and builds the value from a **template** such as `$1$` (group 1) |
+      | **Boundary Extractor** | extracts the text between a **left** and a **right** boundary - no regular expression |
+      | **CSS Selector / XPath2 Extractor** | extract from HTML (CSS selector syntax) or XML/(X)HTML (XPath2) |
+      | **Match number** | which match to use: N > 0 the N-th, 0 random, negative all of them |
+      | **Default value** | what the variable is set to when nothing matches; the manual calls it "No, but recommended" |
+      | **JMeter variable** | a named value **local to each thread**, referenced as `${name}` |
+      | **JMeter property** | global to JMeter (`${__P(port,8090)}` reads one); not for per-user values |
+      | **Debug Sampler** | a sampler whose response is the current values of all variables - for scripting, not for load runs |
+
+      SandPay names used in the examples: `POST /auth/token` returns `{"access_token": "...", "token_type":
+      "Bearer", "expires_in": 3600}`; `GET /v1/payments?limit=5&starting_after=<id>` returns the next five of the
+      merchant's payments and `has_more`.
+
+  - id: why
+    kind: why
+    concepts: [perf-corr-dynamic-values]
+    title: Why a load test without correlation is worse than no load test
+    body: |
+      An uncorrelated script does not just fail - it **fails fast and quietly in the wrong place**, and the
+      numbers look good. These are the real results of the exercise plan before any extractor is added: one
+      user signs in, then requests three pages with the literal text `${token}` as its bearer token.
+
+      ```plaintext
+      POST /auth/token  200  /auth/token
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=
+      ```
+
+      What each kind of stale value does to a test:
+
+      | Stale value | Server's answer | What the "load test" really measured |
+      | --- | --- | --- |
+      | bearer or session token | 401 / redirect to login | the authentication filter rejecting requests - usually the cheapest path in the system |
+      | created id (`pay_100003` from the recording) | 404, or the **same** payment read by every user | a cache hit on one row instead of reads spread over the data |
+      | pagination cursor | 400 "unknown starting_after", or page 2 forever | one page, never the deep pages that are slow |
+      | CSRF or one-time token | 403 | the CSRF check |
+      | idempotency key reused | the stored response replayed ([Idempotency keys](#/lesson/idempotency-keys)) | a lookup, not a payment |
+
+      If you look only at the average response time, every row of that table is a **pass**. That is why
+      correlation is the first thing to fix in any recorded script, and why the checks in this lesson look at
+      **response codes and the values actually sent**, not at speed.
+
+  - id: internals-order
+    kind: internals
+    concepts: [perf-corr-scope-and-failure]
+    title: When an extractor runs, what it sees and who sees the variable
+    body: |
+      **Execution order.** For each sampler, JMeter's manual lists the order:
+
+      ```plaintext
+      Configuration elements
+      Pre-Processors
+      Timers
+      Sampler
+      Post-Processors (unless SampleResult is null)
+      Assertions (unless SampleResult is null)
+      Listeners (unless SampleResult is null)
+      ```
+
+      So an extractor sees the response of the sampler that just ran, and its variable is ready for the **next**
+      sampler. "Post-Processors are run before Assertions", so an assertion can check a value the extractor just
+      stored - but an extractor cannot see whether an assertion failed.
+
+      **Scope.** Post-processors are hierarchical: "they are applied to all the samplers in the same scope, so to
+      ensure that a post-processor is applied only to a particular sampler, add it as a child of the sampler."
+      This matters more than it looks. We moved the token extractor from under `POST /auth/token` up to the
+      Thread Group, and ran the plan:
+
+      ```plaintext
+      POST /auth/token  200  /auth/token
+      GET /v1/payments  200  /v1/payments?limit=5&starting_after=
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=pay_100005
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=CURSOR_NOT_FOUND
+      ```
+
+      Page 1 works. Then the token extractor - now in scope for **every** sampler - runs on page 1's response,
+      finds no `access_token` there and sets `token` to its default `TOKEN_NOT_FOUND`. Page 2 sends that and gets
+      401; page 2's 401 body has no `data`, so the cursor falls back to its default too.
+
+      **Variables are per thread.** From the manual (3.11): "JMeter variables are local to each thread. The values
+      may be the same for each thread, or they may be different. If a variable is updated by a thread, only the
+      thread copy of the variable is changed." Two threads that each extract `token` hold two tokens; no locking,
+      no sharing. **Properties** are the opposite - "Properties are global to jmeter ... but cannot be used for
+      thread-specific values" - so never store a token in a property.
+
+      **Start values.** "The values defined by the Test Plan and the User Defined Variables configuration element
+      are made available to the whole test plan at startup." The plan here defines `after` as an empty string on
+      the Test Plan, so page 1 is requested with `starting_after=` (the practice API ignores an empty cursor).
+
+  - id: internals-match
+    kind: internals
+    concepts: [perf-corr-extractors]
+    title: Match numbers, groups and the variables an extractor sets
+    body: |
+      The Regular Expression Extractor's rules, from the Component Reference:
+
+      | Match No. | Found | Variables set |
+      | --- | --- | --- |
+      | N > 0 | yes | `refName` = the template; `refName_gN` = group N (`_g0` is the whole match); `refName_g` = number of groups |
+      | N > 0 | no | `refName` = the default "unless this is absent"; `refName_g0`, `refName_g1`, `refName_g` are **removed** |
+      | 0 | yes | as N > 0, for a match chosen at random |
+      | negative | any | `refName_matchNr` = number of matches ("could be 0"); `refName_n` = the template for match n; `refName_n_gm` = group m of match n; `refName` "always set to the default value" |
+
+      The **template** turns a match into a string: "`$1$` to refer to group 1, `$2$` to refer to group 2, etc.
+      `$0$` refers to whatever the entire expression matches." The expression "must contain at least one set of
+      parentheses ... unless using the group `$0$`".
+
+      The real Debug Sampler output after the first page, for the Regular Expression Extractor `page_id` with
+      `"id": "(pay_\d+)"`, template `$1$`, match number `-1` and default `ID_NOT_FOUND` (shortened to 2 of 5
+      matches; JMeter writes the quotes as `&quot;` in the XML results file):
+
+      ```plaintext
+      page_id=ID_NOT_FOUND
+      page_id_1=pay_100001
+      page_id_1_g=1
+      page_id_1_g0=&quot;id&quot;: &quot;pay_100001&quot;
+      page_id_1_g1=pay_100001
+      page_id_2=pay_100002
+      ...
+      page_id_matchNr=5
+      ```
+
+      `page_id` itself holds the default even though five ids matched - exactly as documented for negative match
+      numbers. Use `page_id_1` .. `page_id_${page_id_matchNr}` (or a ForEach Controller) instead.
+
+      The **JSON Extractor** takes semicolon-separated lists - names, expressions, defaults, match numbers -
+      that "must match" in length. Its match numbers: "0 : means random (Default Value)", "-1 means extract all
+      results, they will be named as `<variable name>_N`", and "X : means extract the Xth result. If this Xth is
+      greater than number of matches, then nothing is returned. Default value will be used". The default match
+      number is **0 - random**: leave the field empty for `$.data[*].id` and every run picks a different id. In
+      the runs here it also set `token_matchNr=1` for a single match (observed, not in the manual).
+
+      The **Boundary Extractor** has the same match-number rules and stores `refName` (no groups): the text
+      between the first occurrence of the left boundary and the next right boundary.
+
+  - id: when
+    kind: when
+    concepts: [perf-corr-extractors]
+    title: Which extractor for which response
+    body: |
+      | Response | First choice | Why |
+      | --- | --- | --- |
+      | JSON API (`application/json`) | **JSON Extractor** | addresses fields by structure: `$.access_token` does not care about spacing or field order |
+      | a value in a response **header** (`Location`, a cookie) | Regular Expression or Boundary Extractor with **Field to check = Response Headers** | the JSON Extractor reads the body only |
+      | HTML form (CSRF token in a hidden input) | **CSS Selector Extractor** (`input[name=csrf]`, attribute `value`) | selectors survive markup changes a regex would not |
+      | XML / SOAP | **XPath2 Extractor** | namespaces and structure |
+      | a short value between fixed markers in any text | **Boundary Extractor** | no regular expression to get wrong |
+      | several values from one pattern, or a value built from groups | **Regular Expression Extractor** | groups and templates (`$1$-$2$`) |
+
+      When **not** to extract: values the script can compute itself - a unique idempotency key
+      (`${__UUID()}`), a timestamp, the merchant's own id from a CSV row. Extracting what you already know adds a
+      dependency on the response format for nothing.
+
+      Correlation does **not** validate the response. An extractor that finds `pay_100005` in a page tells you
+      nothing about whether the page was correct - that is an assertion's job (the next JMeter lesson).
+
+  - id: visual
+    kind: visual
+    concepts: [perf-corr-dynamic-values, perf-corr-scope-and-failure]
+    title: One virtual user, correlated
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant T as Thread 1 (merchant-1)
+        participant API as SandPay practice API
+        T->>API: POST /auth/token
+        API-->>T: 200 with access_token
+        Note over T: JSON Extractor sets token
+        loop Pages
+          T->>API: GET /v1/payments?limit=5&starting_after=after
+          API-->>T: 200 with data and has_more
+          Note over T: JSON Extractor sets after to the last id
+        end
+      ```
+
+      Notice what never crosses between threads: thread 2 runs the same diagram with **its own** `token` and
+      `after`, because variables are local to each thread.
+
+  - id: code
+    kind: code
+    concepts: [perf-corr-extractors]
+    title: The correlated plan
+    body: |
+      The extractors of `solutions/jmeter/jm_corr_paging.jmx` (the sampler and header elements are as in the
+      earlier JMeter lessons; the `Authorization` header is `Bearer ${token}` and the page sampler's path is
+      `/v1/payments?limit=5&starting_after=${after}`):
+
+      ```xml
+      <!-- child of POST /auth/token -->
+      <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="token">
+        <stringProp name="JSONPostProcessor.referenceNames">token</stringProp>
+        <stringProp name="JSONPostProcessor.jsonPathExprs">$.access_token</stringProp>
+        <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
+        <stringProp name="JSONPostProcessor.defaultValues">TOKEN_NOT_FOUND</stringProp>
+      </JSONPostProcessor>
+
+      <!-- children of GET /v1/payments, inside the Pages loop -->
+      <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="cursor">
+        <stringProp name="JSONPostProcessor.referenceNames">after</stringProp>
+        <stringProp name="JSONPostProcessor.jsonPathExprs">$.data[-1].id</stringProp>
+        <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
+        <stringProp name="JSONPostProcessor.defaultValues">CURSOR_NOT_FOUND</stringProp>
+      </JSONPostProcessor>
+      <BoundaryExtractor guiclass="BoundaryExtractorGui" testclass="BoundaryExtractor" testname="has_more">
+        <stringProp name="BoundaryExtractor.useHeaders">false</stringProp>
+        <stringProp name="BoundaryExtractor.refname">has_more</stringProp>
+        <stringProp name="BoundaryExtractor.lboundary">"has_more": </stringProp>
+        <stringProp name="BoundaryExtractor.rboundary">}</stringProp>
+        <stringProp name="BoundaryExtractor.default">HAS_MORE_NOT_FOUND</stringProp>
+        <stringProp name="BoundaryExtractor.match_number">1</stringProp>
+      </BoundaryExtractor>
+      <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="page ids">
+        <stringProp name="RegexExtractor.useHeaders">false</stringProp>
+        <stringProp name="RegexExtractor.refname">page_id</stringProp>
+        <stringProp name="RegexExtractor.regex">"id": "(pay_\d+)"</stringProp>
+        <stringProp name="RegexExtractor.template">$1$</stringProp>
+        <stringProp name="RegexExtractor.default">ID_NOT_FOUND</stringProp>
+        <stringProp name="RegexExtractor.match_number">-1</stringProp>
+      </RegexExtractor>
+      ```
+
+      Run headless with the page URLs saved in the results file (`jmeter.save.saveservice.url` is a standard
+      JMeter results property; `-J` sets it for this run):
+
+      ```bash
+      tools/apache-jmeter-5.6.3/bin/jmeter -n -t solutions/jmeter/jm_corr_paging.jmx -l results.jtl \
+        -Jport=8090 -Jthreads=2 -Jpages=3 -Jjmeter.save.saveservice.url=true
+      ```
+
+      Two merchants, three pages each - the real rows (thread, label, code, URL):
+
+      ```plaintext
+      Merchants 1-1 POST /auth/token 200 /auth/token
+      Merchants 1-2 POST /auth/token 200 /auth/token
+      Merchants 1-1 GET /v1/payments 200 /v1/payments?limit=5&starting_after=
+      Merchants 1-2 GET /v1/payments 200 /v1/payments?limit=5&starting_after=
+      Merchants 1-1 GET /v1/payments 200 /v1/payments?limit=5&starting_after=pay_100005
+      Merchants 1-2 GET /v1/payments 200 /v1/payments?limit=5&starting_after=pay_100255
+      Merchants 1-2 GET /v1/payments 200 /v1/payments?limit=5&starting_after=pay_100260
+      Merchants 1-1 GET /v1/payments 200 /v1/payments?limit=5&starting_after=pay_100010
+      ```
+
+      Each thread pages through **its own** merchant's payments (`pay_1000xx` for merchant-1, `pay_1002xx` for
+      merchant-2) - per-thread variables at work.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-corr-extractors, perf-corr-scope-and-failure]
+    title: Why the important lines are written that way
+    body: |
+      - **`<!-- child of POST /auth/token -->`** - the extractor sits in that sampler's `hashTree`, so its scope
+        is that one sampler. One level up it would also run on every page and overwrite the token (the
+        internals section shows the 401s).
+      - **`$.access_token`** - a JSONPath to a named field: robust to field order and whitespace, unlike
+        `"access_token":"(.+?)"`, which breaks when the server adds a space after the colon.
+      - **`match_numbers` = `1`** - explicit. The JSON Extractor's default is 0, **random**; for a single field
+        it makes no difference, for `$.data[*].id` it would pick a different id each time.
+      - **`TOKEN_NOT_FOUND`** - a default nobody could mistake for a real value. When extraction fails, the next
+        request carries `Bearer TOKEN_NOT_FOUND`, gets a 401 and the URL or header in the results file says
+        exactly which extractor failed.
+      - **`$.data[-1].id`** - the last id of the page; Jayway JsonPath supports negative indexes
+        (`$..book[-2]` is "The second to last book" in its README). That id is the `starting_after` cursor of
+        the next page, the same contract the API documents.
+      - **`"has_more": ` and `}`** - the Boundary Extractor's left boundary includes the space the practice API
+        writes after the colon; the right boundary is the object's closing brace. Boundaries are literal text:
+        a server that writes `"has_more":true` breaks it, which is why JSON Extractor is the first choice for
+        JSON and the boundary version is here to show the element.
+      - **`match_number` `-1` on `page_id`** - extract every id on the page (`page_id_1` .. `page_id_5`,
+        `page_id_matchNr=5`), for a ForEach Controller that opens each payment.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-corr-dynamic-values, perf-corr-extractors]
+    title: Correlating a recorded script, step by step
+    body: |
+      1. **Run the recorded flow twice** (or record it twice) and compare the requests. Every value that differs
+         between the two recordings - and was not typed by you - is dynamic: tokens, ids, cursors, CSRF tokens.
+      2. **Find where each value first appears.** Search the earlier responses (body **and** headers) for it.
+         The first response that contains it is the one to extract from.
+      3. **Choose the extractor** from the response type (JSON, header, HTML, XML) - see the table above.
+      4. **Add it as a child of that sampler**, with a variable name that says what it is (`token`, `after`)
+         and a default that cannot be mistaken for data (`TOKEN_NOT_FOUND`). Set the match number explicitly.
+      5. **Replace every literal occurrence** of the value in later requests - headers, paths, bodies - with
+         `${variable}`. A scan of the `.jmx` for leftovers (the third coding exercise) catches the ones you miss.
+      6. **Debug with one thread**: add a Debug Sampler after the sampler, run, read the variables, then
+         **disable** it - the Debug Sampler is a sampler, so its rows go into the results file (they did in the
+         runs here, labelled `vars after page`), and Best Practices 16.7 says to save only the data you need.
+      7. **Prove it with evidence, not speed**: run with two or more threads, save URLs
+         (`-Jjmeter.save.saveservice.url=true`) and check that every request is 2xx, the cursors advance and the
+         threads do not share values.
+
+  - id: example
+    kind: example
+    concepts: [perf-corr-scope-and-failure, perf-corr-dynamic-values]
+    title: "Example: three broken plans and what the results file says"
+    body: |
+      A tester gets a SandPay plan that "works on my machine". Three variants, three real runs (one thread):
+
+      **A - no extractors (the exercise as given).** Every page 401, the cursor stays empty: correlation was never
+      done. Evidence: `POST /auth/token 200` followed only by 401s.
+
+      **B - a typo in the JSONPath** (`$.token` instead of `$.access_token`):
+
+      ```plaintext
+      POST /auth/token  200  /auth/token
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=CURSOR_NOT_FOUND
+      GET /v1/payments  401  /v1/payments?limit=5&starting_after=CURSOR_NOT_FOUND
+      ```
+
+      The default **is** the diagnosis: `CURSOR_NOT_FOUND` in the URL says the cursor extractor ran and found
+      nothing - because the 401 body had no `data` - which sends you back one step to the token.
+
+      **C - the plan is right, but runs past the end.** Merchant 1 has 250 payments; 52 pages of 5 were requested:
+
+      ```plaintext
+      49 200 /v1/payments?limit=5&starting_after=pay_100240 729
+      50 200 /v1/payments?limit=5&starting_after=pay_100245 732
+      51 200 /v1/payments?limit=5&starting_after=pay_100250 175
+      52 400 /v1/payments?limit=5&starting_after=CURSOR_NOT_FOUND 188
+      ```
+
+      (the last column is the response size in bytes, headers included). Page 51 is the empty last page - its body is
+      just `"data": []` and `has_more` false, so it is the smallest response;
+      `$.data[-1].id` finds nothing, the default goes into page 52, and the API rejects it. Not a server bug: the
+      script ignored `has_more`. The fix is a controller that stops when `${has_more}` is `false` (logic
+      controllers come in a later lesson) - and the extracted `has_more` is already there for it.
+
+      What the tester checks before trusting any run: no 401/403, no default values in URLs or bodies, distinct
+      cursors per thread, and a request count that matches the plan.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-corr-dynamic-values, perf-corr-scope-and-failure]
+    title: Testing a correlated script
+    body: |
+      | # | Check | How | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | sign-in works per user | 2 threads | 2 × `POST /auth/token` 200 | JTL `responseCode` |
+      | 2 | the token is used | same run | every `GET /v1/payments` 200, none 401 | JTL codes by label |
+      | 3 | the cursor advances | save URLs | page n+1's `starting_after` = last id of page n; no repeats | `URL` column per `threadName` |
+      | 4 | threads are independent | 2 merchants | no cursor appears in both threads | URL sets per thread intersect empty |
+      | 5 | failure is visible | break the JSONPath on purpose | the default appears in the next request; codes 4xx | URL/header shows `*_NOT_FOUND` |
+      | 6 | end of data | more pages than exist | either stops on `has_more` or fails visibly (400 with the default), never repeats page 1 | last rows of the JTL |
+      | 7 | nothing hard-coded | scan the `.jmx` | no literal tokens or `pay_` ids; every `${var}` is set somewhere | scanner findings empty |
+
+      Checks 1-4 are what `tests/jmeter/test_jm_corr_paging.py` runs against your plan; check 7 is the scanner
+      exercise. None of them looks at response times - a correlation bug makes a run **faster**.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-corr-scope-and-failure, perf-corr-extractors]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Extractor in the wrong scope.** At Thread Group level it runs after every sampler and overwrites the
+        variable with its default (the internals run: 200, then 401s). Put it under the one sampler.
+      - **No default value.** The manual: "If no default is provided, then it is difficult to tell whether the
+        regular expression did not match, or the RE element was not processed or maybe the wrong variable is
+        being used." Without one, the next request sends the literal text `${token}`.
+      - **JSON Extractor match number left empty** for a multi-valued path - it means random. Fine for "any
+        payment", wrong for "the last one".
+      - **Reading `refName` after a negative match number** - it holds the default, not a value. Use
+        `refName_1`, `refName_matchNr`.
+      - **Greedy regular expressions.** `"id": "(.+)"` runs to the last quote on the line; use `"(pay_\d+)"` or
+        `"([^"]+)"`.
+      - **Extracting from the wrong field.** A `Location` header or a `Set-Cookie` needs **Field to check =
+        Response Headers**; the default field is the body.
+      - **"Body (unescaped)" or "Body as a Document" by default** - the manual warns both options can impact
+        performance; use plain Body unless the value really is HTML-escaped.
+      - **Storing a per-user value in a property** (`__setProperty`) - properties are global; every thread
+        overwrites the others.
+      - **Leaving the Debug Sampler on** for the load run - it adds samples to the results.
+
+      **Method.** Read the results file **in order** for one thread. Find the first request that fails; the
+      request just before it produced the value it needed. Check: does that response contain the value (look at
+      it - the API may have changed)? Is the extractor a child of that sampler? Does the expression match (test
+      it on the saved response)? Does the next request reference the right variable name? The default value in
+      the failing request tells you which extractor to look at.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-corr-extractors]
+    title: Trade-offs and alternatives
+    body: |
+      - **JSON Extractor vs regex on JSON.** JSONPath follows the structure and survives formatting changes; a
+        regex is format-sensitive but can also read headers and non-JSON text. For JSON bodies, JSONPath.
+      - **Boundary vs regex.** Boundaries are plain text - easy to read, nothing to escape - but cannot express
+        "digits only" or several groups. A regex can, at the cost of being easy to get wrong.
+      - **Extract everything vs only what you use.** Every extractor runs on every response in its scope;
+        "Use as few Assertions as possible" (Best Practices 16.7) is the same reasoning for post-processors -
+        extract what the next request needs.
+      - **Correlate vs generate.** If the script can create the value (an idempotency key with `${__UUID()}`, a
+        merchant id from a CSV file), generating it is simpler and faster than extracting it.
+      - **Locust does it in code.** In Locust, correlation is ordinary Python: `token = r.json()["access_token"]`
+        stored on the user object (a later lesson). The ideas - extract after the response, per user, fail
+        visibly - are the same.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-corr-dynamic-values, perf-corr-extractors, perf-corr-scope-and-failure]
+    title: Quick reference
+    body: |
+      - **Correlate** every value the server generates and expects back: tokens, created ids, cursors, CSRF.
+        Uncorrelated scripts measure the error path and look fast.
+      - **JSON** → JSON Extractor (`$.access_token`, `$.data[-1].id`); **headers / any text** → Regex or Boundary
+        with the right *Field to check*; **HTML** → CSS Selector; **XML** → XPath2.
+      - **Match number:** N = N-th, 0 = random (JSON Extractor's default!), negative = all → `ref_1..ref_N`,
+        `ref_matchNr`, and `ref` = default.
+      - **Template:** `$1$` group 1, `$0$` whole match; `ref_gN` holds the groups.
+      - **Default value:** always, and distinctive (`TOKEN_NOT_FOUND`) - it shows up in the next request.
+      - **Scope:** make the extractor a **child of the sampler** whose response holds the value.
+      - **Variables are per thread**; properties are global - never put a token in a property.
+      - **Prove it:** save URLs, check codes, cursors and per-thread independence; scan the `.jmx` for leftovers.
+
+exercises:
+  - id: why-401-fast
+    type: mcq
+    concept: perf-corr-dynamic-values
+    skill: analysis
+    title: The fastest API in the company
+    prompt: |
+      A recorded SandPay plan runs at 400 req/s with a p95 of 3 ms - ten times better than production. The JTL
+      shows `POST /auth/token` 200 and every `GET /v1/payments` 401. What does the run tell you about the API's
+      performance?
+    options:
+      - id: nothing
+        text: Almost nothing - it measured the authentication filter rejecting a stale token, not listing payments
+        feedback: Correct. A 401 is the cheapest response in most systems; the plan needs correlation before any number means anything.
+      - id: fast
+        text: The API is fast; the 401s are a functional bug to report separately
+        feedback: The 401s are the plan's bug (a replayed token), and they are also why it is fast.
+      - id: upper
+        text: It is an upper bound - real traffic will be at most ten times slower
+        feedback: A run of a different code path bounds nothing about the real one.
+      - id: errors-only
+        text: The error rate is the only valid result
+        feedback: Even the error rate is the script's, not the server's.
+    correct: [nothing]
+    hints:
+      - Which code path did each GET take on the server?
+    solution: |
+      Uncorrelated requests hit the error path. The run is evidence of a script defect, not of server
+      performance; fix correlation, then measure.
+
+  - id: which-values
+    type: mcq
+    concept: perf-corr-dynamic-values
+    skill: application
+    title: Which values need correlation?
+    prompt: |
+      A recorded flow: `POST /auth/token` with `client_id=merchant-1` → response `access_token=Xy7...`;
+      `POST /v1/payments` with header `Idempotency-Key: 4b1c...` → response `"id": "pay_100251"`;
+      `GET /v1/payments/pay_100251`. Which values must be **extracted** from a response?
+    options:
+      - id: token-id
+        text: The access token and the created payment id
+        feedback: Correct - both are generated by the server and sent back later.
+      - id: all
+        text: The access token, the payment id, the client id and the idempotency key
+        feedback: The client id is test data (from a CSV), and the idempotency key is generated by the client - extract only server-generated values.
+      - id: token
+        text: Only the access token; ids can stay as recorded
+        feedback: A recorded id points at the recording's payment - every user would read the same row (or a 404).
+      - id: key
+        text: The idempotency key, so the server sees the same key
+        feedback: A reused key makes the server replay the stored response - the opposite of what a payment load test wants.
+    correct: [token-id]
+    hints:
+      - Who created each value - the server or the client?
+    solution: |
+      Extract what the server generates and expects back (token, created id). Generate client-side values
+      (idempotency keys) and read test data (client ids) from a data file.
+
+  - id: jsonpath-last
+    type: mcq
+    concept: perf-corr-extractors
+    skill: application
+    title: The cursor expression
+    prompt: |
+      A page looks like `{"data": [{"id": "pay_100006"}, ..., {"id": "pay_100010"}], "has_more": true}`. The next
+      page needs the **last** id. Which JSON Extractor settings do it in JMeter 5.6.3?
+    options:
+      - id: neg
+        text: "JSON Path `$.data[-1].id`, match number 1"
+        feedback: Correct - Jayway JsonPath supports negative indexes, and match 1 takes the single result.
+      - id: star-empty
+        text: "JSON Path `$.data[*].id`, match number left empty"
+        feedback: Empty means 0 - a random id from the page; the next page would start in a random place.
+      - id: star-minus1
+        text: "JSON Path `$.data[*].id`, match number -1, variable `after`"
+        feedback: With -1 the values go to `after_1` .. `after_5`; `after` itself gets the default.
+      - id: first
+        text: "JSON Path `$.data[0].id`, match number 1"
+        feedback: That is the first id - the next page would overlap this one.
+    correct: [neg]
+    hints:
+      - What does an empty match number mean for the JSON Extractor?
+    solution: |
+      `$.data[-1].id` with match 1. Remember the JSON Extractor's default match number is 0 (random), and a
+      negative number fills `_N` variables, not the base name.
+
+  - id: negative-match
+    type: mcq
+    concept: perf-corr-extractors
+    skill: recall
+    title: After match number -1
+    prompt: |
+      A Regular Expression Extractor with reference name `page_id`, default `ID_NOT_FOUND` and match number -1
+      finds five ids. What is `${page_id}`?
+    options:
+      - id: default
+        text: ID_NOT_FOUND
+        feedback: Correct - in negative mode "refName - always set to the default value"; the matches are in page_id_1 .. page_id_5.
+      - id: first
+        text: The first id
+        feedback: That would be match number 1. The real Debug Sampler output shows page_id=ID_NOT_FOUND.
+      - id: last
+        text: The last id
+        feedback: No - nothing writes the base name in negative mode except the default.
+      - id: list
+        text: All five ids separated by commas
+        feedback: That is the JSON Extractor's optional `_ALL` variable ("Compute concatenation var"), not the regex extractor.
+    correct: [default]
+    hints:
+      - The manual lists the variables for negative match numbers separately.
+    solution: |
+      Negative match numbers set `ref_matchNr`, `ref_1..ref_N` (and their groups) and put the default in `ref`.
+
+  - id: template-groups
+    type: mcq
+    concept: perf-corr-extractors
+    skill: application
+    title: Two groups, one template
+    prompt: |
+      Regex `"id": "(pay_\d+)", "amount_minor": (\d+)`, template `$1$:$2$`, match number 2, on a page whose
+      second payment is `pay_100002` for 990. What is the variable's value?
+    options:
+      - id: both
+        text: "pay_100002:990"
+        feedback: Correct - the template joins group 1 and group 2 of the second match.
+      - id: whole
+        text: 'The whole text "id": "pay_100002", "amount_minor": 990'
+        feedback: That is group 0 ($0$), stored in refName_g0.
+      - id: first-match
+        text: "pay_100001:2500"
+        feedback: That is match 1.
+      - id: literal
+        text: "$1$:$2$"
+        feedback: The template is filled in; only the colon is literal text.
+    correct: [both]
+    hints:
+      - "$N$ refers to group N of the chosen match."
+    solution: |
+      Match 2, then the template: group 1 `pay_100002`, a literal colon, group 2 `990`.
+
+  - id: scope-401
+    type: mcq
+    concept: perf-corr-scope-and-failure
+    skill: analysis
+    title: Page 1 works, page 2 does not
+    prompt: |
+      Results: `POST /auth/token` 200, page 1 200, page 2 401, page 3 401 with `starting_after=CURSOR_NOT_FOUND`.
+      The token JSON Extractor (default `TOKEN_NOT_FOUND`) is a direct child of the Thread Group. Why does page 1
+      work and page 2 not?
+    options:
+      - id: scope
+        text: The extractor runs after every sampler in its scope; after page 1 it finds no access_token and sets token to the default
+        feedback: Correct - exactly what the real run in this lesson shows. Make it a child of POST /auth/token.
+      - id: expiry
+        text: The token expires after the first request
+        feedback: The practice API's tokens last 3600 s; and the evidence (CURSOR_NOT_FOUND) points at extraction.
+      - id: threads
+        text: Another thread overwrote the token
+        feedback: Variables are local to each thread - another thread cannot change this one's token.
+      - id: order
+        text: Post-processors run before samplers, so page 1 used a token from the previous iteration
+        feedback: Post-processors run after the sampler; page 1 used the token from the sign-in response.
+    correct: [scope]
+    hints:
+      - Which samplers is a post-processor applied to when it sits at Thread Group level?
+    solution: |
+      Scope. A post-processor applies to all samplers in its scope; the sign-in extractor ran again on page 1 and
+      reset the token to its default. Put it under the sign-in sampler.
+
+  - id: threads-share
+    type: mcq
+    concept: perf-corr-scope-and-failure
+    skill: recall
+    title: Two users, one variable name
+    prompt: |
+      Threads 1 and 2 both run a JSON Extractor that sets `token`. What does thread 1 send after thread 2 signs
+      in?
+    options:
+      - id: own
+        text: Its own token - JMeter variables are local to each thread
+        feedback: Correct - "If a variable is updated by a thread, only the thread copy of the variable is changed."
+      - id: last
+        text: Whichever token was extracted last by any thread
+        feedback: That is how a property would behave, not a variable.
+      - id: first
+        text: The first token extracted in the test
+        feedback: There is no shared value to be first.
+      - id: random
+        text: It depends on thread timing
+        feedback: Per-thread copies make it deterministic.
+    correct: [own]
+    hints:
+      - Variables or properties?
+    solution: |
+      Variables are per thread; properties are global. Per-user values belong in variables.
+
+  - id: default-why
+    type: mcq
+    concept: perf-corr-scope-and-failure
+    skill: analysis
+    title: Why TOKEN_NOT_FOUND and not empty?
+    prompt: |
+      Why does this lesson set the token extractor's default to `TOKEN_NOT_FOUND` instead of leaving it empty?
+    options:
+      - id: visible
+        text: The default travels into the next request, so the results show which extraction failed
+        feedback: Correct - a distinctive marker in a URL or header is a diagnosis; the manual calls defaults "particularly useful for debugging tests".
+      - id: retry
+        text: JMeter retries the sampler when the variable equals a value ending in NOT_FOUND
+        feedback: No such feature - a default is just a value.
+      - id: assert
+        text: JMeter fails the sample automatically when a default is used
+        feedback: It does not; you need an assertion for that. The default only makes the failure visible downstream.
+      - id: required
+        text: The JSON Extractor refuses to run without a default
+        feedback: Default values are optional ("No, but recommended" for the regex extractor).
+    correct: [visible]
+    hints:
+      - Without a default, what does `${token}` expand to when nothing matched?
+    solution: |
+      Without a default the variable may be unset and `${token}` is sent literally, or keeps an old value. A
+      distinctive default makes the failure obvious in the next request.
+
+  - id: end-of-pages
+    type: mcq
+    concept: perf-corr-dynamic-values
+    skill: analysis
+    title: The 400 on page 52
+    prompt: |
+      The correlated plan ran 52 pages for a merchant with 250 payments (5 per page). Pages 1-51 returned 200;
+      page 51 was 175 bytes; page 52 returned 400 with `starting_after=CURSOR_NOT_FOUND`. What should you report?
+    options:
+      - id: script
+        text: A script defect - it ignored has_more and requested past the last page
+        feedback: Correct - page 51 was the empty last page; the cursor default exposed it. Stop on has_more.
+      - id: server
+        text: A server bug - the API should accept any cursor
+        feedback: Rejecting an unknown cursor with 400 is correct API behaviour.
+      - id: flaky
+        text: A flaky run - re-run and it will pass
+        feedback: 'It is deterministic: 250 / 5 = 50 full pages, then an empty one.'
+      - id: extractor
+        text: The JSONPath is wrong
+        feedback: It worked for 50 pages; it found nothing only because page 51 had no data.
+    correct: [script]
+    hints:
+      - How many full pages does 250 payments make at 5 per page?
+    solution: |
+      The plan must stop when `has_more` is false. The default value in the URL pinpointed the cause in one line.
+
+  - id: header-field
+    type: mcq
+    concept: perf-corr-extractors
+    skill: application
+    title: A value in a header
+    prompt: |
+      A payment creation returns `201` with header `Location: /v1/payments/pay_100251` and an empty body. How do
+      you extract the id?
+    options:
+      - id: regex-headers
+        text: "Regular Expression Extractor, Field to check = Response Headers, regex `Location: /v1/payments/(pay_\\d+)`"
+        feedback: Correct - the value is in a header, so check the headers.
+      - id: json
+        text: "JSON Extractor with `$.id`"
+        feedback: The JSON Extractor reads the body, which is empty here.
+      - id: css
+        text: "CSS Selector Extractor on the Location element"
+        feedback: CSS selectors are for HTML documents, not headers.
+      - id: body-regex
+        text: "Regular Expression Extractor on the Body with the same regex"
+        feedback: The Body field excludes headers ("the body of the response ... (excluding headers)").
+    correct: [regex-headers]
+    hints:
+      - Which "Field to check" options does the manual list?
+    solution: |
+      Headers need a regex or boundary extractor with Field to check = Response Headers.
+
+  - id: correlate-order
+    type: order
+    concept: perf-corr-dynamic-values
+    skill: application
+    title: Correlate a recorded script
+    prompt: Put the steps of correlating a recorded script in order.
+    items:
+      - id: diff
+        text: Record or run the flow twice and list the values that differ between the runs
+      - id: source
+        text: For each value, find the first response (body or headers) that contains it
+      - id: add
+        text: Add the right extractor as a child of that sampler, with a distinctive default
+      - id: replace
+        text: Replace every literal occurrence in later requests with the variable
+      - id: debug
+        text: Run one thread with a Debug Sampler and check the variables, then disable it
+      - id: prove
+        text: Run several threads, save URLs and check codes, cursors and per-thread values
+    hints:
+      - You can only extract a value once you know which response it comes from.
+    solution: |
+      Find, locate, extract, substitute, debug, prove. The proof uses response codes and the values sent, not
+      response times.
+
+  - id: debug-plan
+    type: debug
+    concept: perf-corr-scope-and-failure
+    skill: analysis
+    title: Three reasons this plan pages badly
+    prompt: |
+      A tester's outline of a page loop (indentation = children). Two threads should each page through their own
+      merchant's payments. Click **every** line that is a defect.
+    language: plaintext
+    code: |
+      Thread Group (2 threads)
+        HTTP Header Manager: Authorization = Bearer ${token}
+        JSON Extractor: token = $.access_token, default TOKEN_NOT_FOUND
+        POST /auth/token
+        Loop Controller (3)
+          GET /v1/payments?limit=5&starting_after=${after}
+            JSON Extractor: after = $.data[*].id, match number (empty), default CURSOR_NOT_FOUND
+            Debug Sampler
+          Response Assertion: response code 200
+      Test Plan property: __setProperty(token, ...) after sign-in
+    correctLines: [3, 7, 8, 10]
+    lineNotes:
+      - line: 2
+        note: A Header Manager at thread level using ${token} is fine - the header is built per request.
+      - line: 6
+        note: The path with ${after} is right.
+      - line: 9
+        note: An assertion on the code is fine (and in scope for the loop's samplers).
+    hints:
+      - What is the scope of each post-processor?
+      - What does an empty JSON Extractor match number mean?
+      - Can a sampler be a child of a sampler?
+      - What is shared between threads?
+    solution: |
+      Line 3: the token extractor is in scope for every sampler and resets the token after each page. Line 7:
+      an empty match number is random - use `$.data[-1].id` with 1. Line 8: a sampler nested under a sampler is
+      not run (we had to move it in this lesson's plan); put it in the loop - and disable it for load runs.
+      Line 10: a property is global - two threads would overwrite each other's token.
+
+  - id: short-random
+    type: short
+    concept: perf-corr-extractors
+    skill: analysis
+    title: Random pages
+    prompt: |
+      A colleague's plan extracts `$.data[*].id` into `after` with the match number left empty. "It works - every
+      run is 200." Explain what the plan actually does and why "200" does not prove it is right.
+    modelAnswer: |
+      An empty match number means 0, which the JSON Extractor treats as random. Each page picks a random id from
+      the five and uses it as the next cursor, so pages overlap and skip unpredictably - the test reads a
+      different set of payments every run and may never reach the deep pages it was meant to load. Every
+      response is still a valid page, so the codes are all 200: response codes prove the token works, not that
+      the cursor logic is right. Check the cursors themselves (save URLs; each should be the previous page's last
+      id) and set `$.data[-1].id` with match number 1.
+    rubric:
+      - States that an empty JSON Extractor match number means random (0).
+      - Explains the effect - overlapping or skipped pages, a different data set each run.
+      - Explains why 200 codes do not prove correct correlation.
+      - Proposes checking the cursor values (saved URLs) and the right expression.
+    hints:
+      - Read the JSON Extractor's "Match Numbers" description.
+    solution: |
+      Empty = random. Valid-but-wrong cursors still return 200, so verify the values sent, not just the codes.
+
+  - id: testdesign-corr
+    type: testdesign
+    concept: perf-corr-scope-and-failure
+    skill: application
+    title: Test plan for a correlated payment flow
+    prompt: |
+      Design test cases that prove a JMeter plan correctly correlates SandPay's flow: sign in, create a payment
+      (server returns its id), read that payment, list pages with the cursor. Give preconditions, steps, the
+      expected result and the evidence for each.
+    modelAnswer: |
+      Preconditions: practice API running; 2 threads mapped to merchant-1 and merchant-2; URLs and response codes
+      saved in the JTL (`-Jjmeter.save.saveservice.url=true`); every extractor has a distinctive default.
+
+      1. **Sign-in per user** - run. Expected: one 200 per thread. Evidence: JTL rows for `POST /auth/token`.
+      2. **Token used** - same run. Expected: no 401/403 on any later sampler. Evidence: codes by label.
+      3. **Created id used** - expected: `GET /v1/payments/<id>` URL contains the id returned by that thread's
+         own `POST /v1/payments`, and returns 200. Evidence: URL column per thread; a Debug Sampler while scripting.
+      4. **Cursor advances** - expected: page n+1's `starting_after` is the last id of page n; no repeats.
+         Evidence: ordered URLs per thread.
+      5. **Threads independent** - expected: ids and cursors of thread 1 never appear in thread 2. Evidence:
+         set intersection of URLs is empty.
+      6. **Failure visible** - break one JSONPath on purpose. Expected: the default appears in the next request
+         and it fails. Evidence: `*_NOT_FOUND` in the URL or header.
+      7. **End of data** - request more pages than exist. Expected: stops on `has_more` or fails visibly, never
+         loops back. Evidence: last JTL rows.
+      8. **Static scan** - expected: no literal tokens or `pay_` ids in the .jmx; every `${var}` is set. Evidence:
+         scanner output.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Covers token use, created-id use and cursor advance.
+      - Checks per-thread independence with two users.
+      - Includes a deliberate-failure case proving defaults make failures visible.
+      - Uses response codes and values sent as evidence - not response times.
+    hints:
+      - Which column of the results file shows the values a request sent?
+    solution: |
+      Prove each correlated value with the values actually sent (URLs, headers) and the codes, per thread, plus a
+      deliberate failure and a static scan.
+
+  - id: interview-corr
+    type: interview
+    concept: perf-corr-dynamic-values
+    skill: analysis
+    title: "Interview: what is correlation in JMeter?"
+    prompt: |
+      "You recorded a script with the HTTP(S) Test Script Recorder. It replays fine for one user and fails for
+      50. What is going on, and how do you fix it?"
+    modelAnswer: |
+      Almost certainly correlation. The recording contains values the server generated for that one session -
+      a session or bearer token, CSRF tokens, ids of objects created during recording, pagination cursors. One
+      user may still get away with it (the token has not expired yet, the object exists), but 50 users replaying
+      the same values collide - the same session, the same object, expired or one-time tokens - and get 401, 403,
+      409 or 404.
+
+      I find the dynamic values by recording twice and diffing, locate the response that first contains each,
+      and add an extractor as a child of that sampler: JSON Extractor for JSON bodies, Regular Expression or
+      Boundary Extractor for headers and text, CSS Selector for HTML forms. Each gets an explicit match number
+      and a distinctive default. I replace the literals with `${var}` and generate client-side values such as
+      idempotency keys instead of extracting them. Variables are per thread, so each user correlates its own.
+
+      To prove it, I run with a few threads, save URLs, and check there are no auth errors, no default values in
+      requests and no shared values across threads - I do not judge it by response time, because an
+      uncorrelated script is usually faster.
+    rubric:
+      - Identifies correlation (stale dynamic values) as the cause.
+      - Names typical dynamic values - tokens, CSRF, created ids, cursors.
+      - Describes extractor choice, placement as a child of the sampler, match number and default.
+      - Mentions per-thread variables and generating client-side values.
+      - Explains how to verify with codes and values sent, not speed.
+    followUps:
+      - Where would you extract a value that is only in the Location header?
+      - What does match number -1 give you, and what is left in the base variable?
+      - How would you do the same in Locust?
+    hints:
+      - Start from what differs between two recordings of the same flow.
+    solution: |
+      Stale recorded values; extract each server-generated value from the first response that has it, per thread,
+      with a default; prove it with codes and the values sent.
+
+  - id: paging-code
+    type: coding
+    concept: perf-corr-extractors
+    skill: application
+    title: Correlate the paging plan
+    prompt: |
+      `exercises/jmeter/jm_corr_paging.jmx` signs in and pages through `/v1/payments`, but nothing is correlated:
+      every page gets 401. Add (in the GUI or by editing the XML) the three post-processors described in the
+      file's comment: a JSON Extractor for `token` under `POST /auth/token`, and under `GET /v1/payments` a JSON
+      Extractor for the cursor `after` (the **last** id of the page) and a Boundary Extractor for `has_more` -
+      each with a default value. The test runs your plan with real JMeter against the practice API (2 threads,
+      3 pages) and checks the codes, the cursors and that threads do not share them.
+    project: perf
+    files:
+      - exercises/jmeter/jm_corr_paging.jmx
+    test: tests/jmeter/test_jm_corr_paging.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_corr_paging.py
+    hints:
+      - Copy the structure of an element from the code section; each extractor goes inside the sampler's `<hashTree>`.
+      - "The cursor is `$.data[-1].id` with match number 1."
+      - The Boundary Extractor's left boundary includes the space after the colon.
+    modelAnswer: |
+      Under `POST /auth/token`:
+
+      ```xml
+      <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="token">
+        <stringProp name="JSONPostProcessor.referenceNames">token</stringProp>
+        <stringProp name="JSONPostProcessor.jsonPathExprs">$.access_token</stringProp>
+        <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
+        <stringProp name="JSONPostProcessor.defaultValues">TOKEN_NOT_FOUND</stringProp>
+      </JSONPostProcessor>
+      <hashTree/>
+      ```
+
+      Under `GET /v1/payments`: the `cursor` JSON Extractor (`after`, `$.data[-1].id`, match 1,
+      `CURSOR_NOT_FOUND`) and the `has_more` Boundary Extractor (left `"has_more": `, right `}`, default
+      `HAS_MORE_NOT_FOUND`), exactly as in `solutions/jmeter/jm_corr_paging.jmx`. Each is a child of its sampler,
+      so each runs only on the response that holds its value.
+    rubric:
+      - Every test in tests/jmeter/test_jm_corr_paging.py passes.
+      - Each extractor is a child of the sampler whose response holds the value.
+      - Every extractor has an explicit match number and a distinctive default.
+      - You can explain why a Thread Group-level token extractor would break page 2.
+    solution: |
+      Three extractors, each a child of its sampler, with explicit match numbers and defaults; verified by codes,
+      cursors and per-thread values in a real run.
+
+  - id: regex-code
+    type: coding
+    concept: perf-corr-extractors
+    skill: application
+    title: Emulate the Regular Expression Extractor
+    prompt: |
+      Implement `render_template` and `extract` in `exercises/jmeter/jm_corr_regex.py` so that a SandPay page
+      produces the same variables JMeter 5.6.3 sets - match numbers positive, zero (with the given random
+      generator) and negative, defaults, removed group variables, `_matchNr`, `_g` and `_gN`. One test compares
+      your output with the Debug Sampler output shown in this lesson.
+    project: perf
+    files:
+      - exercises/jmeter/jm_corr_regex.py
+    test: tests/jmeter/test_jm_corr_regex.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_corr_regex.py
+    hints:
+      - "`re.finditer` gives every match; `pattern.groups` the number of groups."
+      - The template substitution is itself a regex - `\$(\d+)\$`.
+      - Copy the input dict first; the function must not change it.
+    modelAnswer: |
+      ```python
+      def render_template(template, match):
+          return re.sub(r"\$(\d+)\$", lambda m: match.group(int(m.group(1))) or "", template)
+
+      def extract(variables, text, ref, regex, template="$1$", match_no=1, default=None, rng=None):
+          out = dict(variables)
+          pattern = re.compile(regex)
+          matches = list(pattern.finditer(text))
+          if match_no < 0:
+              out[f"{ref}_matchNr"] = str(len(matches))
+              for n, m in enumerate(matches, start=1):
+                  out[f"{ref}_{n}"] = render_template(template, m)
+                  out[f"{ref}_{n}_g"] = str(pattern.groups)
+                  for g in range(pattern.groups + 1):
+                      out[f"{ref}_{n}_g{g}"] = m.group(g) or ""
+              if default is not None:
+                  out[ref] = default
+              return out
+          if match_no == 0:
+              chosen = (rng or random.Random()).choice(matches) if matches else None
+          else:
+              chosen = matches[match_no - 1] if match_no <= len(matches) else None
+          if chosen is None:
+              if default is not None:
+                  out[ref] = default
+              for k in [k for k in out if k == f"{ref}_g" or re.fullmatch(re.escape(ref) + r"_g\d+", k)]:
+                  del out[k]
+              return out
+          out[ref] = render_template(template, chosen)
+          out[f"{ref}_g"] = str(pattern.groups)
+          for g in range(pattern.groups + 1):
+              out[f"{ref}_g{g}"] = chosen.group(g) or ""
+          return out
+      ```
+
+      The three branches are the manual's three cases; the no-match branch both sets the default and removes
+      stale group variables from an earlier match.
+    rubric:
+      - Every test in tests/jmeter/test_jm_corr_regex.py passes.
+      - The input dict is not mutated.
+      - You can say what refName holds after a negative match number, and why.
+    solution: |
+      Three cases - negative (all matches, base = default), no match (default, groups removed), match (template and
+      groups) - exactly as the Component Reference lists them.
+
+  - id: scan-code
+    type: coding
+    concept: perf-corr-dynamic-values
+    skill: analysis
+    title: Find uncorrelated values in a plan
+    prompt: |
+      Implement `defined_variables` and `scan` in `exercises/jmeter/jm_corr_scan.py`. Given a `.jmx`, report
+      `hardcoded-token` (an Authorization header without `${...}`), `hardcoded-id` (a literal `pay_` id in a path
+      or argument), `never-set` (a `${var}` nothing sets - functions like `${__threadNum}` excluded) and
+      `no-default` (an extractor without a default for every variable). The tests use a recorded plan with all
+      four problems, and finally scan **your** paging plan - so this exercise passes completely only when the
+      paging exercise is correlated too.
+    project: perf
+    files:
+      - exercises/jmeter/jm_corr_scan.py
+    test: tests/jmeter/test_jm_corr_scan.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_corr_scan.py
+    hints:
+      - "`xml.etree.ElementTree` - `root.iter(\"HeaderManager\")`, then the `Header` elementProps inside."
+      - Variables are set by extractors (their reference-name properties), User Defined Variables (Argument.name) and CSV Data Sets (variableNames).
+      - Use a set of findings and return it sorted.
+    modelAnswer: |
+      Collect what is **defined** first (extractor reference names split on `;`, `Argument.name` of
+      `elementType="Argument"`, CSV `variableNames` split on `,`), then walk headers and samplers: flag literal
+      Authorization values, `pay_\d+` literals, and `${name}` references (regex `\$\{(?!__)(\w+)\}`, so functions
+      are skipped) that are not defined. Finally check each extractor's default property covers every variable
+      it sets. The full reference is `solutions/jmeter/jm_corr_scan.py`.
+    rubric:
+      - Every test in tests/jmeter/test_jm_corr_scan.py passes.
+      - Functions (${__...}) are not reported as unset variables.
+      - You can explain why a never-set variable is worse than a missing default.
+    solution: |
+      A static check catches stale literals and unset variables before any run - cheaper than discovering them as
+      401s in a load test.
+
+placement:
+  - id: place-scope
+    type: mcq
+    concept: perf-corr-scope-and-failure
+    skill: analysis
+    title: Where does the token extractor go?
+    prompt: |
+      A plan signs in once, then loops over five GET requests. Where should the JSON Extractor for the access
+      token be?
+    options:
+      - id: child
+        text: As a child of the sign-in sampler
+        feedback: Correct - its scope is then that one sampler.
+      - id: thread
+        text: At Thread Group level so every sampler can use the token
+        feedback: Variables are visible to the whole thread anyway; at this level the extractor runs after every GET and resets the token to its default.
+      - id: plan
+        text: On the Test Plan so all threads share it
+        feedback: Threads must not share tokens; and the scope problem is the same.
+      - id: loop
+        text: Inside the loop, before the GET
+        feedback: Then it is in scope for the GETs, not the sign-in.
+    correct: [child]
+    solution: |
+      Make an extractor a child of the sampler whose response contains the value; variables set there are
+      available to the rest of that thread.
+
+  - id: place-match
+    type: mcq
+    concept: perf-corr-extractors
+    skill: application
+    title: The JSON Extractor's default match number
+    prompt: |
+      A JSON Extractor uses `$.data[*].id` and leaves the match number empty. What does the variable hold after a
+      page of five payments?
+    options:
+      - id: random
+        text: One of the five ids, chosen at random
+        feedback: Correct - empty means 0, "random (Default Value)".
+      - id: first
+        text: The first id
+        feedback: That needs match number 1.
+      - id: all
+        text: All five, in variables id_1 .. id_5
+        feedback: That needs -1.
+      - id: default
+        text: The default value, because there is more than one match
+        feedback: Multiple matches are fine; the match number picks one.
+    correct: [random]
+    solution: |
+      The JSON Extractor's match number defaults to 0 = random. Set it explicitly.
+
+  - id: place-stale
+    type: order
+    concept: perf-corr-dynamic-values
+    skill: application
+    title: From a recorded token to a correlated one
+    prompt: Order the changes that turn a recorded bearer token into a correlated one.
+    items:
+      - id: find
+        text: Find the response that returns the token (the sign-in)
+      - id: extract
+        text: Add an extractor under that sampler, storing it in a variable with a default
+      - id: replace
+        text: Replace the recorded token in the Authorization header with the variable
+      - id: verify
+        text: Run several threads and confirm no request gets 401
+    solution: |
+      Locate, extract, substitute, verify - with evidence from response codes.
+
+recall:
+  - id: recall-what
+    concept: perf-corr-dynamic-values
+    prompt: What is correlation in a load test script?
+    answer: Capturing a value the server generated (token, created id, cursor, CSRF token) from a response at run time and sending it in later requests instead of the recorded value.
+  - id: recall-symptoms
+    concept: perf-corr-dynamic-values
+    prompt: Name three symptoms of a missing correlation in a results file.
+    answer: 401/403 after a successful sign-in, 400/404 on ids or cursors, the same page or object requested by every user - and suspiciously fast response times.
+  - id: recall-match
+    concept: perf-corr-extractors
+    prompt: What do match numbers N, 0 and -1 mean, and which is the JSON Extractor's default?
+    answer: N = the N-th match, 0 = a random match, negative = all matches (ref_1..ref_N and ref_matchNr; ref = default). The JSON Extractor defaults to 0 - random.
+  - id: recall-template
+    concept: perf-corr-extractors
+    prompt: In a Regular Expression Extractor template, what are $0$ and $1$?
+    answer: $0$ is the whole match and $1$ is group 1; the groups are also stored as ref_g0, ref_g1, and ref_g holds the number of groups.
+  - id: recall-scope
+    concept: perf-corr-scope-and-failure
+    prompt: Where should an extractor go, and why?
+    answer: As a child of the sampler whose response holds the value - post-processors apply to every sampler in their scope, so higher up it runs (and resets the variable) after other samplers too.
+  - id: recall-thread
+    concept: perf-corr-scope-and-failure
+    prompt: Are JMeter variables shared between threads?
+    answer: No - variables are local to each thread; properties are global and must not hold per-user values.
+  - id: recall-default
+    concept: perf-corr-scope-and-failure
+    prompt: Why give every extractor a distinctive default value?
+    answer: It travels into the next request, so a failed extraction shows up as an obvious error (and in the URL or header) instead of a literal ${var} or a stale value.
+
+next:
+  - jmeter-assertions-and-listeners
+  - jmeter-parameterisation-and-data
+  - jmeter-logic-controllers
+  - locust-http-validation-and-grouping

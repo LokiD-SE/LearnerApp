@@ -21,7 +21,7 @@ Endpoints (JSON):
 | GET    | /v1/payments/<id>            | ``404`` if unknown                                                     |
 | POST   | /v1/payments                 | ``Idempotency-Key`` header required; same key -> same response          |
 | GET    | /v1/reports/settlement       | slow report: 10x the service time                                      |
-| GET    | /metrics                     | server-side counters (requests, in_flight, max_in_flight, statuses)   |
+| GET    | /metrics                     | counters: requests, in_flight, statuses, payments_created, replays   |
 | POST   | /metrics/reset               | zero the counters between runs                                         |
 
 Synthetic clients: ``merchant-1`` .. ``merchant-50``, secret ``secret-<n>`` (for example ``merchant-7`` /
@@ -79,6 +79,8 @@ class State:
     order: list[str] = field(default_factory=list)
     idempotency: dict[tuple[str, str], tuple[int, dict]] = field(default_factory=dict)
     next_id: int = 100000
+    created: int = 0  # payments really created by POST /v1/payments
+    replays: int = 0  # idempotent replays (same key again) - also answered 201
 
     def __post_init__(self) -> None:
         self.rng = random.Random(self.config.seed)
@@ -125,12 +127,14 @@ def handle(state: State, method: str, path: str, query: dict[str, str], headers:
             return 200, {"in_flight": state.in_flight, "max_in_flight": state.max_in_flight,
                          "waiting": state.waiting, "requests": sum(state.statuses.values()),
                          "statuses": {str(k): v for k, v in sorted(state.statuses.items())},
-                         "routes": dict(sorted(state.routes.items()))}, []
+                         "routes": dict(sorted(state.routes.items())),
+                         "payments_created": state.created, "idempotent_replays": state.replays}, []
     if path == "/metrics/reset" and method == "POST":
         with state.lock:
             state.statuses.clear()
             state.routes.clear()
             state.max_in_flight = state.in_flight
+            state.created = state.replays = 0
         return 200, {"status": "reset"}, []
 
     c = state.config
@@ -207,6 +211,8 @@ def _route(state: State, method: str, path: str, query: dict[str, str], headers:
         with state.lock:
             seen = state.idempotency.get((client, key))
         if seen:
+            with state.lock:
+                state.replays += 1
             return seen[0], seen[1], [("Idempotent-Replayed", "true")]
         _service(state, 2.0)
         amount, currency = data.get("amount_minor"), data.get("currency")
@@ -219,6 +225,7 @@ def _route(state: State, method: str, path: str, query: dict[str, str], headers:
         with state.lock:
             p = state._add_payment(client, amount, currency)
             state.idempotency[(client, key)] = (201, p)
+            state.created += 1
         return 201, p, []
     if path == "/v1/reports/settlement" and method == "GET":
         _client(state, headers)

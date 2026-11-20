@@ -1,0 +1,1297 @@
+id: jmeter-thread-groups-and-timers
+title: Thread groups, ramp-up and timers
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Control how many virtual users JMeter starts, when each one starts and how fast each one goes. Thread Group settings (threads, ramp-up, loops, duration, setUp and tearDown groups), the scoping rules that decide which timers run before which sampler and why several timers add up, and the throughput timers that hold a target rate - all checked against real JMeter 5.6.3 runs on the SandPay practice API, where the same plan produced about 2,100, 40 or 10 samples a second depending on one timer setting.
+tags:
+  [
+    JMeter,
+    Thread Group,
+    ramp-up,
+    loop count,
+    scheduler,
+    duration,
+    startup delay,
+    setUp Thread Group,
+    tearDown Thread Group,
+    Open Model Thread Group,
+    timers,
+    Constant Timer,
+    Uniform Random Timer,
+    Gaussian Random Timer,
+    Constant Throughput Timer,
+    Precise Throughput Timer,
+    think time,
+    scoping rules,
+    calcMode,
+    throughput,
+    virtual users,
+    load testing,
+  ]
+
+environment: |
+  - **Runs:** Linux, Apache JMeter 5.6.3 on OpenJDK 17.0.21 in non-GUI mode (`jmeter -n`), Python 3.12.3 for the
+    analysis, all on one machine against `practice/perf/support/sandpay_target.py`, the SandPay practice API on
+    the loopback interface. Every output shown was printed by the plans and code shown, on 20 November 2026.
+    Rates and milliseconds depend on the machine; what transfers is the shape - which setting multiplies the rate
+    by four, which pause is 250 ms rather than 100 ms.
+  - **Elided output:** JMeter's console prints 13-digit epoch-millisecond timestamps in brackets after each date;
+    they are shown here as `(epoch ms elided)`. Nothing else in the console output is changed.
+  - **SandPay is fictional.** The practice API and its data are synthetic. Never point a load test at a system you
+    do not own or have written permission to test.
+  - **JMeter documentation, as documented on 19 November 2026:** the [Component
+    Reference](https://jmeter.apache.org/usermanual/component_reference.html) - Thread Group, setUp Thread Group,
+    tearDown Thread Group, Open Model Thread Group (marked "experimental" in the manual), section 18.6 Timers,
+    Constant Timer, Uniform Random Timer, Gaussian Random Timer, Constant Throughput Timer and Precise Throughput
+    Timer; and [Elements of a Test Plan](https://jmeter.apache.org/usermanual/test_plan.html) - 3.1 Thread Group,
+    3.4 Timers, 3.9 Execution order and 3.10 Scoping Rules. Quotations are from those pages.
+  - **From the JMeter 5.6.3 jar, not the manual:** the `.jmx` property names of the Constant Throughput Timer
+    (`throughput`, `calcMode`) and the order of its calculation modes, read from
+    `ApacheJMeter_components.jar` (`ConstantThroughputTimerResources.properties` and the `Mode` enum). A saved plan
+    stores `calcMode` as the position in that order, starting at 0; the run below with `calcMode` 0 and 2 confirms
+    which mode is which.
+  - **Not repeated here:** the open and closed workload models, the Open Model Thread Group's schedule language and
+    the users-for-a-target-rate arithmetic - [Little's law and workload
+    models](#/lesson/littles-law-and-workload-models); percentiles and averages - [Performance metrics and
+    percentiles](#/lesson/performance-metrics-and-percentiles); the test plan tree and non-GUI runs in general -
+    [JMeter architecture and test plans](#/lesson/jmeter-architecture-and-test-plans).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-jmtg-thread-groups
+    name: Thread Group settings and the ramp-up schedule
+    summary: A Thread Group is a pool of virtual users. Number of Threads sets how many; Ramp-up Period spreads their starts evenly (thread i starts i × ramp-up / threads seconds in, so the last one starts one step before the ramp-up ends); Loop Count, or the scheduler's Duration and Startup delay, decide how long each runs - whichever end condition comes first, checked only between samples. setUp and tearDown Thread Groups run before and after the regular groups, for preparation and clean-up.
+  - id: perf-jmtg-timer-scope
+    name: Timer scope and cumulative pauses
+    summary: A timer runs before each sampler in its scope - the samplers below its parent - regardless of where it sits among its siblings, and only when there is a sampler to apply to. Several timers in scope all run, so the pause is their sum. Constant, Uniform Random and Gaussian Random timers model think time; their means add up to the iteration time that, with the thread count, fixes a closed test's throughput.
+  - id: perf-jmtg-throughput-timers
+    name: Throughput timers - holding a target rate
+    summary: The Constant Throughput Timer pauses threads to keep throughput near a target given in samples per minute; its calcMode decides whether each thread or the whole group (or all groups) shares that target, which changes the result by the thread count. The Precise Throughput Timer schedules Poisson-like arrivals for a target count per period. Both only add delay - they can lower throughput to a target but never raise it above what the threads can produce.
+
+objectives:
+  - Calculate when each thread of a Thread Group starts from its thread count and ramp-up, and verify the schedule from a JTL file.
+  - Choose between Loop Count and the scheduler's Duration, and explain when the end condition is checked.
+  - Use setUp and tearDown Thread Groups for preparation and clean-up, and keep their samples out of the measured results.
+  - Work out which timers apply to a sampler from the test plan tree, and the total pause they cause.
+  - Configure a Constant Throughput Timer with the right calculation mode for a group-wide target, and predict the rate the wrong mode produces.
+  - Design checks that prove a run delivered the ramp-up and rate the test plan promised.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: The idea in plain language
+    body: |
+      Picture a call centre that SandPay hires to test its merchant API by hand. You decide three things:
+
+      - **How many agents, and how fast they arrive.** Ten agents all starting at 9:00 sharp hit the system with a
+        burst nobody will see in real life; ten agents arriving one every minute let you watch the load build.
+        That is a **Thread Group**: the number of threads (agents) and the ramp-up (how long until all have
+        arrived).
+      - **How long each agent pauses between calls.** A real merchant reads the screen before clicking again. An
+        agent with no pause dials as fast as the phone allows. Those pauses are **timers**, and a pause rule pinned
+        to the whole office applies to every call, while a rule pinned to "refund calls" applies to those only.
+        If two rules apply to the same call, the agent waits for both, one after the other.
+      - **A target pace for the whole office.** "Ten calls a minute, all of you together" is different from "ten
+        calls a minute each". JMeter's **Constant Throughput Timer** makes exactly that distinction with one
+        setting - and on the SandPay practice API the same plan sent 10 or 40 samples a second depending on it.
+
+      Everything in this lesson is about making the load you send the load you meant to send. A Thread Group with
+      the wrong ramp-up or a timer in the wrong place still produces a report - just of a different test.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Terms you need, from the JMeter manual
+    body: |
+      | Term | Meaning (quoted from the JMeter user manual or Component Reference where marked) |
+      | --- | --- |
+      | **Thread Group** | "A Thread Group defines a pool of users that will execute a particular test case against your server." Each thread "will execute the test plan in its entirety and completely independently of other test threads." |
+      | **Number of Threads** | "Number of users to simulate." |
+      | **Ramp-up Period** | "How long JMeter should take to get all the threads started." |
+      | **Loop Count** | "Number of times to perform the test case." Infinite runs until stopped or until the thread lifetime ends. |
+      | **Thread lifetime** (scheduler) | **Duration (seconds)** and **Startup delay (seconds)**: wait the delay, then run for the duration. |
+      | **Same user on each iteration** | If selected, cookie and cache data from the first response are reused (with a Cookie / Cache Manager); if not, a new connection is opened between iterations. |
+      | **Delay Thread creation until needed** | Create each thread only when its ramp-up moment arrives, instead of creating all at the start and pausing them. |
+      | **Action to be taken after a Sampler error** | Continue, Start Next Thread Loop, Stop Thread, Stop Test or Stop Test Now. |
+      | **setUp / tearDown Thread Group** | Special Thread Groups that run "before the test proceeds to the executing of regular Thread Groups" / "after the test has finished executing its regular Thread Groups". |
+      | **Timer** | "A timer will cause JMeter to delay a certain amount of time before each sampler which is in its scope." |
+      | **Constant Timer** | Thread Delay: "Number of milliseconds to pause." |
+      | **Uniform Random Timer** | "The total delay is the sum of the random value and the offset value"; the random part is up to Random Delay Maximum. |
+      | **Gaussian Random Timer** | "The total delay is the sum of the Gaussian distributed value (with mean 0.0 and standard deviation 1.0) times the deviation value you specify, and the offset value." |
+      | **Constant Throughput Timer** | "introduces variable pauses, calculated to keep the total throughput (in terms of samples per minute) as close as possible to a given figure." |
+      | **Precise Throughput Timer** | Variable pauses for a target count per period; it "models Poisson arrivals schedule". |
+      | **Open Model Thread Group** | An experimental group that starts users on an arrival-rate schedule - see [Little's law and workload models](#/lesson/littles-law-and-workload-models). |
+
+      In a saved `.jmx` file the Thread Group's fields are properties such as `ThreadGroup.num_threads`,
+      `ThreadGroup.ramp_time`, `LoopController.loops`, `ThreadGroup.scheduler` and `ThreadGroup.duration`; the
+      timers' are `ConstantTimer.delay`, `RandomTimer.range` and, for the Constant Throughput Timer, `throughput`
+      and `calcMode`.
+
+  - id: why
+    kind: why
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Why these settings decide what your test means
+    body: |
+      A load test's conclusions are only as good as the load it actually sent. Three problems come from these
+      settings more than from anything else:
+
+      - **A start-up spike that is not in the requirement.** The manual's Precise Throughput Timer page puts it
+        plainly: "if you configure Thread Group to have 100 threads, and set Ramp-up Period to 0 (or to a small
+        number), then all the threads would start at the same time, and it would produce an unwanted spike of the
+        load." Connection pools, caches and auto-scalers react to that spike, and the first minute of your report
+        describes the spike, not the steady load.
+      - **No think time, so far more load than real users send.** "By default, a JMeter thread executes samplers in
+        sequence without pausing", and the manual warns: "If you do not add a delay, JMeter could overwhelm your
+        server by making too many requests in a very short amount of time." On the practice API, four threads with
+        no timer sent about 2,100 requests a second; four real merchants send a few a minute.
+      - **The wrong rate from the right-looking timer.** A Constant Throughput Timer set to 600 samples per minute
+        produced 10 a second with one calculation mode and 40 a second with another, in the same plan. A report
+        that says "we tested at 600 per minute" is then wrong by a factor of four.
+
+      The settings are cheap to get right and expensive to get wrong, because the mistake is invisible in the
+      results: JMeter reports whatever it was told to send.
+
+  - id: ramp-internals
+    kind: internals
+    concepts: [perf-jmtg-thread-groups]
+    title: How ramp-up, loops and duration play out
+    body: |
+      **The ramp-up schedule.** The Component Reference gives the rule with an example: "If there are 10 threads and
+      a ramp-up time of 100 seconds, then each thread will begin 10 seconds after the previous thread started, for a
+      total time of 100 seconds to get the test fully up to speed." And the detail people miss: "The first thread
+      will always start directly, so if you configured one thread, the ramp-up time is effectively zero. For the
+      same reason, the tenth thread in the above example will actually be started after 90 seconds and not 100
+      seconds."
+
+      So thread *i* (counting from 0) starts at *i* × ramp-up ÷ threads. For 5 threads and a 2-second ramp-up that is
+      0, 0.4, 0.8, 1.2 and 1.6 seconds. The manual's advice for choosing it: ramp-up "needs to be long enough to avoid
+      too large a work-load at the start of a test, and short enough that the last threads start running before the
+      first ones finish (unless one wants that to happen). Start with Ramp-up = number of threads and adjust up or
+      down as needed."
+
+      **Loops versus duration.** Loop Count says how many times each thread runs the test case; the scheduler's
+      Duration says how long. With both set, "JMeter runs the thread group until either the number of loops is
+      reached or the duration/end-time is reached - whichever occurs first." Two consequences for testers:
+
+      - "the condition is only checked between samples; when the end condition is reached, that thread will stop."
+      - "JMeter does not interrupt samplers which are waiting for a response, so the end time may be delayed
+        arbitrarily." A 300-second test against a server that hangs can run much longer.
+
+      **Thread creation.** By default all threads are created when the test starts and then "pause for the
+      appropriate proportion of the ramp-up time". With **Delay Thread creation until needed**, "threads are created
+      only when the appropriate proportion of the ramp-up time has elapsed", which the manual calls most appropriate
+      when ramp-up is much longer than one thread's work - where "earlier threads finish before later ones start".
+
+      **setUp and tearDown.** A setUp Thread Group's threads behave "exactly like a normal Thread Group element" but run
+      before the regular groups; a tearDown group runs after them. Note the manual's caveat: "by default it won't run
+      if Test is gracefully shutdown" unless "Run tearDown Thread Groups after shutdown of main threads" is checked on
+      the Test Plan, and "If Test Plan is stopped, tearDown will not run even if option is checked."
+
+      **What the JTL shows.** Each sample row has `timeStamp` (the sample's start, in epoch milliseconds) and
+      `threadName`, which for a normal group is `"<group name> <group number>-<thread number>"` - for example
+      `Merchants 1-3`. The first sample of each thread starts as soon as the thread does when no timer delays it, so
+      the first `timeStamp` per thread measures the ramp-up you actually got.
+
+  - id: timer-internals
+    kind: internals
+    concepts: [perf-jmtg-timer-scope]
+    title: When timers run, and which ones
+    body: |
+      **Order inside one sampler's turn.** The manual's "Execution order" lists, for each sampler: configuration
+      elements, Pre-Processors, **Timers**, the Sampler, then Post-Processors, Assertions and Listeners. So a timer's
+      pause comes *before* its sampler is sent - the manual's Timers section adds: "To apply a timer after a sampler,
+      either add it to the next sampler, or add it as the child of a Flow Control Action Sampler."
+
+      **Scope.** Timers are hierarchical elements. The rule from "Scoping Rules": an element whose parent is a request
+      applies to that request; one whose parent is a controller "affects all requests that are descendants of that
+      Controller". In the manual's timer example, "Timer #1 will apply to Requests Two, Three, and Four (notice how
+      order is irrelevant for hierarchical elements)". Two more rules from section 18.6:
+
+      - "Timers are only processed in conjunction with a sampler. A timer which is not in the same scope as a sampler
+        will not be processed at all."
+      - "if there are several timers in the same scope, all the timers will be processed before each sampler."
+
+      **They add up.** From the user manual's Timers section: "If you choose to add more than one timer to a Thread
+      Group, JMeter takes the sum of the timers and pauses for that amount of time before executing the samplers to
+      which the timers apply." A 100 ms Constant Timer and a Uniform Random Timer with a 150 ms offset and no random
+      range, side by side in a Thread Group, pause each thread 250 ms before every sampler - the real run below
+      measured 251-256 ms.
+
+      **The random timers' arithmetic.** Uniform: offset plus a value between 0 and the maximum, so mean offset +
+      maximum ÷ 2 and bounds [offset, offset + maximum]. Gaussian: offset plus a standard normal value times the
+      deviation, so its mean is the offset and it has no fixed upper bound - about 95% of values fall within two
+      deviations (a property of the normal distribution, not a JMeter setting).
+
+      **Random factor.** Since JMeter 3.1 the manual describes a beta feature: setting the property `timer.factor`
+      multiplies the delays of the Gaussian, Poisson and Uniform random timers - handy for scaling all think times
+      at once from the command line.
+
+  - id: throughput-internals
+    kind: internals
+    concepts: [perf-jmtg-throughput-timers]
+    title: Throughput timers - pacing to a target
+    body: |
+      **Constant Throughput Timer.** Its Target Throughput is in samples **per minute** ("Throughput we want the timer
+      to try to generate"), and the manual is clear that it can only slow things down: "Of course the throughput
+      will be lower if the server is not capable of handling it, or if other timers or time-consuming test elements
+      prevent it." Its **Calculate Throughput based on** setting (`calcMode` in the `.jmx`) decides who shares the
+      target:
+
+      | Mode (manual wording) | `calcMode` in 5.6.3 | Effect with 4 threads, target 600/min |
+      | --- | --- | --- |
+      | "this thread only - each thread will try to maintain the target throughput. The overall throughput will be proportional to the number of active threads." | 0 | each thread 600/min, about 2,400/min in total |
+      | "all active threads - the target throughput is divided amongst all the active threads in all Thread Groups" | 1 | 600/min across every group (each group needs the same timer) |
+      | "all active threads in current thread group - the target throughput is divided amongst all the active threads in the group" | 2 | 600/min for this group |
+      | "all active threads (shared)" | 3 | as 1, but each thread is delayed based on when *any* thread last ran |
+      | "all active threads in current thread group (shared)" | 4 | as 2, shared |
+
+      The manual compares the two families: "The shared algorithm should generate a more accurate overall transaction
+      rate. The non-shared algorithm should generate a more even spread of transactions across threads." The target
+      can be a variable or function call - which is how the exercise reads it from a property with
+      `${__P(per_minute,600)}` - but "the throughput value should not be changed too often during a test - it will
+      take a while for the new value to take effect."
+
+      **Precise Throughput Timer.** Configured as a count per period (the manual's example: "Target throughput
+      (samples): 60, Throughput period (seconds): 3600, Test duration (seconds): 3600" for exactly 60 per hour). It
+      "models Poisson arrivals schedule", whereas the Constant Throughput Timer "converges to the specified rate,
+      however it tends to produce samples at even intervals". Because it randomises the schedule itself, the manual
+      recommends "to set both Ramp-up Period and Delay to 0", and notes: "The timer does not generate threads" and
+      "in many cases, Open Model Thread Group would be a better choice for generating the desired load profile".
+
+      **Neither can add threads.** A throughput timer is still a timer: it delays samplers. If four threads with
+      200 ms responses can manage at most 20 samples a second, no timer setting gets you 30 - you need more threads,
+      or an open model. The sizing arithmetic is in [Little's law and workload
+      models](#/lesson/littles-law-and-workload-models).
+
+  - id: when
+    kind: when
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Which tool for which requirement
+    body: |
+      | The requirement says... | Use | Why |
+      | --- | --- | --- |
+      | "500 concurrent users, each thinking about 10 s between pages" | Thread Group (500 threads) + Uniform or Gaussian Random Timer around 10 s | the users and their think time are the requirement |
+      | "hold 50 payments per second for an hour" | enough threads + Constant Throughput Timer (group mode, 3000/min), or Precise Throughput Timer | the rate is the requirement; threads are only the means |
+      | "60 settlement reports per hour, exactly" | Precise Throughput Timer (60 per 3600 s, test duration 3600 s) | an exact count per period |
+      | "arrivals keep coming even when the server slows down" | Open Model Thread Group | a closed thread pool throttles itself - see the Little's law lesson |
+      | "create 1,000 merchants before the test, delete them after" | setUp and tearDown Thread Groups | preparation and clean-up outside the measured load |
+      | "ramp to peak over 15 minutes and hold for an hour" | Thread Group with ramp-up 900 s and Duration 4500 s | the start-up shape is part of the requirement |
+
+      **When not to rely on these alone.** Timers make a closed test gentler; they do not turn it into an open one.
+      If the question is how the system behaves when demand exceeds capacity, a fixed pool of threads with timers
+      will quietly send less as the server slows - use an open model. And a timer placed for convenience under the
+      Test Plan applies to every sampler in every group, which is rarely what a requirement means.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmtg-timer-scope]
+    title: Which timers run before which sampler
+    body: |
+      ```mermaid
+      flowchart TD
+        TG["Thread Group - Merchants"] --> TT["Constant Timer 300 ms (think)"]
+        TG --> S1["GET /v1/payments"]
+        TG --> C["Checkout controller"]
+        C --> S2["POST /auth/token"]
+        C --> S3["POST /v1/payments"]
+        S3 --> TP["Constant Timer 200 ms (pay pause)"]
+        C --> TJ["Uniform Random Timer 100 ms + up to 400 ms"]
+        TG --> R["Reports controller"]
+        R --> S4["GET /v1/reports/settlement"]
+        R --> TG2["Gaussian Random Timer 1000 ms, deviation 250 ms"]
+      ```
+
+      Read each sampler's path up to the Thread Group and collect every timer hanging off that path. `GET
+      /v1/payments` gets only the 300 ms think time. `POST /auth/token` gets think time and the checkout jitter -
+      even though the jitter timer is drawn *after* it. `POST /v1/payments` gets all three of its timers: 300 + 200
+      + a mean of 300 = 800 ms on average. The Gaussian timer never runs before a sampler outside Reports.
+
+  - id: code-plans
+    kind: code
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-throughput-timers]
+    title: The plans in .jmx form, and how they are run
+    collapsed: true
+    body: |
+      A Thread Group whose settings come from JMeter properties, so one plan serves many runs (from
+      `practice/perf/tests/jmeter/fixtures/jm_threads_ramp.jmx`). Fields that hold an expression are saved as
+      `stringProp`:
+
+      ```xml
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Merchants">
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,5)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(ramp,2)}</stringProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">${__P(loops,3)}</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      ```
+
+      The same file starts with a **setUp Thread Group** called `Warm-up` that sends one request. Its job is
+      practical: the very first HTTP request of a JMeter run pays for class loading and the first connection (in
+      the timer run below, the first sample took 56 ms and the rest 2-3 ms), and without the warm-up that cost
+      lands on `Merchants 1-1` and distorts the measured ramp-up.
+
+      Two timers side by side in a Thread Group (from `jm_threads_two_timers.jmx`):
+
+      ```xml
+      <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="Think time 100 ms">
+        <stringProp name="ConstantTimer.delay">100</stringProp>
+      </ConstantTimer>
+      <hashTree/>
+      <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Uniform 150 + up to 0 ms">
+        <stringProp name="ConstantTimer.delay">150</stringProp>
+        <stringProp name="RandomTimer.range">0</stringProp>
+      </UniformRandomTimer>
+      <hashTree/>
+      ```
+
+      The Uniform Random Timer stores its offset in `ConstantTimer.delay` and its maximum in `RandomTimer.range` -
+      the names come from the class it extends, and are the same in the templates shipped with JMeter 5.6.3.
+
+      Running the ramp-up plan in non-GUI mode, with properties on the command line:
+
+      ```bash
+      jmeter -n -t tests/jmeter/fixtures/jm_threads_ramp.jmx -l ramp.jtl -Jport=8090 -Jthreads=5 -Jramp=2 -Jloops=3
+      ```
+
+      ```plaintext
+      Creating summariser <summary>
+      Created the tree successfully using tests/jmeter/fixtures/jm_threads_ramp.jmx
+      Starting standalone test @ 2026 Nov 20 07:09:47 IST (epoch ms elided)
+      Waiting for possible Shutdown/StopTestNow/HeapDump/ThreadDump message on port 4445
+      summary =     16 in 00:00:02 =    8.6/s Avg:     5 Min:     1 Max:    47 Err:     0 (0.00%)
+      Tidying up ...    @ 2026 Nov 20 07:09:49 IST (epoch ms elided)
+      ... end of run
+      ```
+
+      Sixteen samples: one from the setUp group and five threads × three loops. (The console also printed four
+      log4j `WARN StatusConsoleListener ... package scanning` lines at start-up; they are about JMeter's logging
+      set-up, not the test.)
+
+  - id: ramp-run
+    kind: example
+    concepts: [perf-jmtg-thread-groups]
+    title: "Example: did we get the ramp-up we asked for?"
+    body: |
+      The JTL from that run, reduced to each thread's first sample relative to the earliest one, with the reference
+      solution of this lesson's first exercise (`jm_threads_schedule.py`):
+
+      ```python
+      print("expected s:", start_offsets(5, 2))
+      print("all groups ms:", observed_offsets(rows))
+      print("Merchants ms:", observed_offsets(rows, "Merchants"))
+      print("check_ramp:", check_ramp(rows, 5, 2, group="Merchants"))
+      ```
+
+      ```plaintext
+      expected s: [0.0, 0.4, 0.8, 1.2, 1.6]
+      all groups ms: {1: 0, 2: 483, 3: 881, 4: 1283, 5: 1683}
+      Merchants ms: {1: 0, 2: 402, 3: 800, 4: 1202, 5: 1602}
+      check_ramp: []
+      ```
+
+      Filtered to the `Merchants` group, the threads started within 2 ms of the documented schedule. Unfiltered,
+      every offset is about 80 ms too long: the warm-up thread is also called "thread 1" (`Warm-up 1-1`), its
+      sample ran first, and it moved the origin. A ramp-up check must look at one group at a time - and a tester
+      who sees "thread 2 started 483 ms in" should ask which thread 1 it was measured from.
+
+      What this check is worth in practice: on a real test with 200 threads and a 600-second ramp-up, the same
+      comparison catches a load generator that cannot create threads fast enough, a ramp-up typed in minutes
+      instead of seconds, or a plan where someone ticked "Delay Thread creation until needed" and then put a
+      long-running setUp step in the regular group.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmtg-throughput-timers]
+    title: The throughput exercise's plan - line by line
+    body: |
+      The reference solution, `practice/perf/solutions/jmeter/jm_threads_throughput.jmx` (the Thread Group part):
+
+      ```xml
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Merchants">
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,4)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">0</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,5)}</stringProp>
+        <stringProp name="ThreadGroup.delay">0</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" ...>
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <ConstantThroughputTimer guiclass="TestBeanGUI" testclass="ConstantThroughputTimer" testname="Hold ${__P(per_minute,600)} samples per minute (whole group)">
+          <stringProp name="throughput">${__P(per_minute,600)}</stringProp>
+          <intProp name="calcMode">2</intProp>
+        </ConstantThroughputTimer>
+        <hashTree/>
+        <HTTPSamplerProxy ... testname="GET /health"> ... </HTTPSamplerProxy>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      - `LoopController.loops` `-1` with the scheduler on: loop forever, stop on **Duration**. The rate is the
+        requirement, so the test is defined by time, not by iterations.
+      - `ramp_time` `0`: all four threads start at once. With a throughput timer that is acceptable for a short
+        check; for a real test you would ramp up or use the Precise Throughput Timer, which the manual says is best
+        with ramp-up 0 because it randomises arrivals itself.
+      - The timer is a **child of the Thread Group** (inside its `hashTree`), so it is in scope for every sampler
+        of the group - and for none outside it.
+      - `throughput` reads the JMeter property `per_minute` with a default of 600, so `-Jper_minute=900` changes
+        the target without editing the plan. It is a `stringProp` because it holds an expression.
+      - `calcMode` `2`: "all active threads in current thread group" - the 600 per minute is the whole group's
+        target, divided among its active threads. The test of this exercise accepts 2 or 4 (the shared variant).
+
+      What three variants of this plan did on the practice API, 4 threads, target 600/min (10 per second), 5 s
+      runs:
+
+      ```plaintext
+      === no-timer: samples 10263 span 4.84s rate 2120.9/s per-thread {'Merchants 1-1': 2546, 'Merchants 1-2': 2580, 'Merchants 1-3': 2569, 'Merchants 1-4': 2568}
+      === mode0: samples 196 span 4.76s rate 40.3/s per-thread {'Merchants 1-1': 49, 'Merchants 1-2': 49, 'Merchants 1-3': 49, 'Merchants 1-4': 49}
+      === mode2: samples 52 span 4.63s rate 10.4/s per-thread {'Merchants 1-1': 13, 'Merchants 1-2': 13, 'Merchants 1-3': 13, 'Merchants 1-4': 13}
+      ```
+
+      The rate here is (samples − threads) ÷ span, where the span runs from the first sample to the last: every
+      thread's first sample opens the span, so those four are fence posts, not intervals. `calcMode` 0 ("this
+      thread only") gave each thread the full 10 per second - four times the target. JMeter's own summary line for
+      the `mode2` run agreed: `summary =     52 in 00:00:05 =   10.5/s`.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Setting up the load model, step by step
+    body: |
+      1. **Read the requirement for its shape.** Users and think time, or a rate? A ramp to peak? A hold time? Write
+         it as numbers: "200 merchants, ramp 10 minutes, hold 60 minutes, about 30 payments per second in total".
+      2. **Size the threads** for the rate with N = X(R + Z) from [Little's
+         law](#/lesson/littles-law-and-workload-models), using the response time you expect at peak, and add
+         headroom. Timers only slow threads down.
+      3. **Set the Thread Group**: threads, ramp-up in seconds (thread *i* starts at *i* × ramp-up ÷ threads),
+         Loop Count infinite and the scheduler's Duration for a time-based test, or a loop count for a
+         fixed-iteration one. Pick the sampler-error action deliberately - "Continue" keeps load constant when
+         errors appear.
+      4. **Put preparation and clean-up in setUp and tearDown groups**, and remember that tearDown does not run
+         after a stop unless the Test Plan option is ticked.
+      5. **Place timers by scope.** Think time for every request goes under the Thread Group; a pause for one
+         request goes under that sampler; nothing goes under the Test Plan unless it truly applies to every group.
+      6. **Choose a throughput timer for a rate requirement**, and set its mode on purpose: group-wide (2 or 4) for
+         "N per minute in total", "this thread only" only when the requirement is per user.
+      7. **Make the numbers properties** (`${__P(threads,4)}`) so CI and the command line can change them without
+         editing the plan.
+      8. **Run, then verify the shape from the JTL**: thread start times against the schedule, the achieved rate
+         over the active span, pauses between samples - before you read a single response time.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Checks that prove the plan sent what it promised
+    body: |
+      | # | Check | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Ramp-up schedule (5 threads, 2 s) | each group thread's first sample at 0, 0.4, 0.8, 1.2, 1.6 s, within 100 ms | first `timeStamp` per `threadName` in the JTL, filtered to the group |
+      | 2 | One thread, any ramp-up | starts at once | the JTL; the manual: "the ramp-up time is effectively zero" |
+      | 3 | Two timers in scope (100 ms + 150 ms) | pause before each sample at least 250 ms, median near 250 ms | next `timeStamp` minus this `timeStamp` minus `elapsed` - measured 251-256 ms |
+      | 4 | Timer under one sampler | only that sampler is delayed | pauses before the other samplers stay at their own timers' values |
+      | 5 | Group-wide target 900/min, 4 threads | 15 per second ± 30% over the active span | sample count and first/last `timeStamp` |
+      | 6 | Negative - throughput timer in "this thread only" mode | about 4× the target | the same calculation - the exercise's structure test rejects this mode before you run |
+      | 7 | Negative - target above capacity (slow target, few threads) | rate stays below target | rate over the span, compared with N ÷ (R + Z) |
+      | 8 | setUp group present | its samples appear in the JTL under their own `threadName` and are excluded from the measured results | `threadName` values in the JTL |
+      | 9 | Duration with a hung server | the test ends later than Duration, because samplers are not interrupted | wall-clock end versus Duration; a sampler timeout in the HTTP Request fixes it |
+
+      Check 3 against real JMeter (from the timers exercise's test):
+
+      ```plaintext
+      === TIMERS === elapsed: [56, 2, 2, 3, 3, 2] pauses: [256, 252, 251, 251, 252]
+      ```
+
+      The first sample's 56 ms is the warm-up cost described above; the pauses are the two timers' 250 ms plus a
+      millisecond or two of scheduling.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Common mistakes and how to debug them
+    body: |
+      - **Ramp-up 0 with hundreds of threads.** Every thread starts at once - the "unwanted spike" the manual warns
+        about. Fix: a ramp-up sized to the system's warm-up, or an arrival-rate model.
+      - **Expecting the last thread at the full ramp-up.** With 10 threads and 100 s it starts at 90 s; checks that
+        expect 100 s report a false failure.
+      - **A timer meant for one request placed beside it.** As a sibling it applies to every sampler under the
+        parent. Put it *under* the request.
+      - **Thinking tree position after a sampler means "pause after".** Order is irrelevant for timers; they all run
+        before each sampler in scope. Use a Flow Control Action Sampler for a pause at one place.
+      - **Two think-time timers left in the plan.** They add up - 3 s + 3 s is 6 s of think time and half the load.
+      - **Constant Throughput Timer in the wrong mode.** "this thread only" multiplies the target by the thread count;
+        the per-thread counts in the JTL (49, 49, 49, 49 instead of 13 each) give it away.
+      - **Target in samples per second.** The Constant Throughput Timer's target is per **minute**; 10 means one
+        sample every six seconds for the whole group.
+      - **Too few threads for the target.** The timer can only delay; if the achieved rate is below target and the
+        threads are never idle, add threads.
+      - **Measuring ramp-up across groups.** A setUp or second group's "thread 1" moves the origin (the 80 ms shift in
+        the example). Filter by group.
+      - **A Duration that never ends.** Samplers waiting for a response are not interrupted; set connect and
+        response timeouts on the HTTP Request.
+
+      **Debugging method.** When a run's load looks wrong, before looking at response times: (1) count samples per
+      `threadName` - are all threads there and equally busy? (2) compute each thread's first sample time - is the
+      ramp-up right? (3) compute pauses (next start − start − elapsed) - do they match the timers you think are in
+      scope? (4) compute the rate over the active span - is it the target, and if not, is it capped by threads or
+      multiplied by a mode? JMeter's **Validate** option runs a group "with one thread, one iteration, no timers" -
+      useful for checking requests, useless for checking load.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-throughput-timers]
+    title: Trade-offs and alternatives
+    body: |
+      - **Thread Group + think-time timers** (closed model): simple, matches "N users who read and click", and
+        protects the system from runaway load - but it sends less when the server slows down, which can hide the
+        problem you are testing for.
+      - **Constant Throughput Timer**: an easy target rate on a closed pool; converges to the target and "tends to
+        produce samples at even intervals" - unrealistically regular arrivals, and its rate is capped by threads.
+      - **Precise Throughput Timer**: Poisson-like arrivals and exact counts per period; needs its own settings
+        (period, duration) and, by the manual's own advice, ramp-up 0.
+      - **Open Model Thread Group**: true arrival-rate load that keeps arriving when the server slows down; marked
+        experimental in the manual, and it needs care with how many threads it may create. See [Little's law and
+        workload models](#/lesson/littles-law-and-workload-models).
+      - **Locust** expresses the same ideas in Python - `wait_time` with `constant`, `between`, `constant_throughput`
+        and `constant_pacing` - see [Locust fundamentals](#/lesson/locust-fundamentals).
+      - **Delay Thread creation until needed** saves memory on long ramp-ups where early threads finish before late
+        ones start; it changes nothing for tests where all threads run throughout.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmtg-thread-groups, perf-jmtg-timer-scope, perf-jmtg-throughput-timers]
+    title: Quick reference
+    body: |
+      - Thread *i* (from 0) starts at *i* × ramp-up ÷ threads; the first starts at once and the last one step before
+        the ramp-up ends.
+      - Loops and Duration together: whichever comes first, checked only between samples; samplers are not
+        interrupted.
+      - setUp runs before the regular groups, tearDown after (not after a stop unless the Test Plan option is set).
+      - Timers run **before** each sampler in their scope (below their parent), in any tree position, only if a
+        sampler is in scope; several timers **add up**.
+      - Uniform mean = offset + maximum ÷ 2; Gaussian mean = offset, unbounded.
+      - Constant Throughput Timer: samples **per minute**; mode decides per thread (0), group (2, 4) or all groups
+        (1, 3). Precise Throughput Timer: count per period, Poisson-like, ramp-up 0.
+      - Timers only delay - too few threads cap the rate.
+      - Verify the shape from the JTL: starts per thread, pauses, rate over the active span, one group at a time.
+
+exercises:
+  - id: jmtg-ramp-last-thread
+    type: mcq
+    concept: perf-jmtg-thread-groups
+    skill: application
+    title: When does the last thread start?
+    prompt: |
+      A Thread Group has 20 threads and a Ramp-up Period of 60 seconds. When does the 20th thread start, counted from
+      the start of the group?
+    options:
+      - id: s57
+        text: After 57 seconds
+        feedback: Correct - threads start 3 s apart (60 / 20) and the first starts at once, so the 20th starts at 19 × 3 = 57 s.
+      - id: s60
+        text: After 60 seconds
+        feedback: The manual's own example says the tenth of ten threads over 100 s starts after 90 s, not 100 s - the first thread starts at zero.
+      - id: s3
+        text: After 3 seconds
+        feedback: 3 seconds is the gap between consecutive threads, not the last thread's start.
+      - id: s0
+        text: Immediately - ramp-up only applies to the loops
+        feedback: Ramp-up is how long JMeter takes to start all the threads; loops are not involved.
+    correct: [s57]
+    hints:
+      - What is the gap between two consecutive thread starts?
+      - The first thread starts at 0.
+    solution: |
+      Gap = ramp-up ÷ threads = 3 s; thread *i* (from 0) starts at 3*i* s, so the 20th (i = 19) starts at 57 s.
+
+  - id: jmtg-loops-duration
+    type: mcq
+    concept: perf-jmtg-thread-groups
+    skill: application
+    title: Loops or duration?
+    prompt: |
+      A Thread Group has Loop Count 100 and the scheduler on with Duration 60 s. Each iteration takes about 1 s.
+      What happens?
+    options:
+      - id: sixty
+        text: Each thread stops after about 60 seconds, having run about 60 iterations
+        feedback: Correct - "whichever occurs first"; the duration ends before the 100th loop.
+      - id: hundred
+        text: Each thread runs all 100 iterations, then stops
+        feedback: The scheduler's end condition applies too, and 60 s comes first.
+      - id: both
+        text: Each thread runs 100 iterations within 60 seconds by speeding up
+        feedback: JMeter does not speed threads up; it stops them at whichever limit is reached first.
+      - id: error
+        text: JMeter refuses to start because both are set
+        feedback: Both may be set; the manual says it runs until either is reached.
+    correct: [sixty]
+    hints:
+      - The manual's rule is "whichever occurs first".
+    solution: |
+      With both a loop count and a duration, JMeter stops at whichever limit comes first - here the 60-second
+      duration, after about 60 iterations.
+
+  - id: jmtg-duration-overrun
+    type: mcq
+    concept: perf-jmtg-thread-groups
+    skill: analysis
+    title: Why did the 5-minute test take 12 minutes?
+    prompt: |
+      A soak test was set to Duration 300 s. The SandPay staging API started hanging on some requests half way
+      through, and the JMeter run ended after about 12 minutes. The HTTP Request samplers have no timeouts set. Why?
+    options:
+      - id: not-interrupted
+        text: JMeter checks the end condition only between samples and does not interrupt samplers waiting for a response
+        feedback: Correct - the manual says the end time "may be delayed arbitrarily"; set connect and response timeouts.
+      - id: bug
+        text: A JMeter bug - Duration should be exact
+        feedback: This is documented behaviour, not a bug.
+      - id: ramp
+        text: The ramp-up was added to the duration
+        feedback: Ramp-up happens within the run; it would not add seven minutes.
+      - id: loops
+        text: The loop count overrode the duration
+        feedback: With both set, the run stops at the first limit reached; loops cannot extend a duration.
+    correct: [not-interrupted]
+    hints:
+      - When does JMeter check whether the duration is over?
+    solution: |
+      The condition is checked between samples, and samplers waiting for a response are not interrupted. Without a
+      response timeout a hung request keeps its thread - and the test - running.
+
+  - id: jmtg-setup-teardown
+    type: mcq
+    concept: perf-jmtg-thread-groups
+    skill: application
+    title: Where do test merchants get created?
+    prompt: |
+      Before a load test you must create 50 test merchants through the API, and afterwards delete them. The creation
+      and deletion requests must not count in the measured results. Where do they go?
+    options:
+      - id: setup-teardown
+        text: In a setUp Thread Group and a tearDown Thread Group, with the tearDown option on the Test Plan considered
+        feedback: Correct - setUp runs before the regular groups and tearDown after; exclude their threadName from the analysis.
+      - id: first-sampler
+        text: As the first and last samplers of the main Thread Group
+        feedback: Then every thread creates and deletes merchants on every iteration, inside the measured load.
+      - id: once-only
+        text: In the main group, under a Once Only Controller
+        feedback: Each thread would still run them once, during the ramp-up, inside the measured load.
+      - id: separate-plan
+        text: Only in a separate test plan - JMeter cannot do this in one plan
+        feedback: setUp and tearDown Thread Groups exist exactly for this.
+    correct: [setup-teardown]
+    hints:
+      - JMeter has special Thread Groups that run before and after the regular ones.
+    solution: |
+      setUp and tearDown Thread Groups run before and after the regular groups. Remember that tearDown does not run
+      after a stop, and after a graceful shutdown only if the Test Plan option is ticked.
+
+  - id: jmtg-scope-which
+    type: mcq
+    concept: perf-jmtg-timer-scope
+    skill: application
+    title: Which samplers wait?
+    prompt: |
+      A Thread Group contains, in this order: sampler A, a Simple Controller holding samplers B and C and then a
+      Constant Timer of 500 ms, and sampler D. Before which samplers does the 500 ms pause happen?
+    options:
+      - id: bc
+        text: Before B and C only
+        feedback: Correct - the timer's parent is the controller, so it applies to the controller's samplers, wherever it sits among them.
+      - id: d
+        text: Before D only, because the timer comes after B and C
+        feedback: Tree position among siblings is irrelevant for timers; D is outside the controller.
+      - id: all
+        text: Before A, B, C and D
+        feedback: Only a timer whose parent is the Thread Group applies to every sampler in the group.
+      - id: none
+        text: Before none, because a timer must be first in its controller
+        feedback: There is no such rule; "order is irrelevant for hierarchical elements".
+    correct: [bc]
+    hints:
+      - Which element is the timer's parent?
+    solution: |
+      A timer applies to the samplers below its parent - here the Simple Controller's B and C - regardless of its
+      position among them.
+
+  - id: jmtg-scope-sum
+    type: mcq
+    concept: perf-jmtg-timer-scope
+    skill: application
+    title: How long is the pause?
+    prompt: |
+      Before `POST /v1/payments`, these timers are in scope: a Constant Timer of 1,000 ms under the Thread Group, a
+      Uniform Random Timer with offset 500 ms and maximum 1,000 ms under the same Thread Group, and a Constant Timer
+      of 200 ms under the sampler itself. What is the mean pause before the sampler?
+    options:
+      - id: m2200
+        text: 2,200 ms
+        feedback: Correct - all timers in scope run and add up - 1,000 + (500 + 1,000 ÷ 2) + 200.
+      - id: m1000
+        text: 1,000 ms - only the longest timer counts
+        feedback: JMeter takes the sum of the timers in scope, not the maximum.
+      - id: m200
+        text: 200 ms - the sampler's own timer overrides the others
+        feedback: Timers do not override each other; all in scope are processed.
+      - id: m2700
+        text: 2,700 ms
+        feedback: That uses the Uniform timer's maximum, not its mean - its mean is offset + maximum ÷ 2.
+    correct: [m2200]
+    hints:
+      - Do timers in scope replace each other or add up?
+      - What is the mean of a Uniform Random Timer?
+    solution: |
+      All three apply and add: 1,000 + 1,000 + 200 = 2,200 ms on average, between 1,700 and 2,700 ms.
+
+  - id: jmtg-gaussian
+    type: mcq
+    concept: perf-jmtg-timer-scope
+    skill: recall
+    title: Gaussian Random Timer
+    prompt: |
+      A Gaussian Random Timer has Constant Delay Offset 3,000 ms and Deviation 500 ms. Which statement is right?
+    options:
+      - id: mean-offset
+        text: The mean pause is 3,000 ms and there is no fixed upper bound
+        feedback: Correct - the Gaussian value has mean 0, so the mean is the offset; the normal distribution is unbounded.
+      - id: max
+        text: The pause is always between 2,500 and 3,500 ms
+        feedback: About 68% of values fall within one deviation; the rest fall outside it.
+      - id: mean-sum
+        text: The mean pause is 3,500 ms
+        feedback: The Gaussian part has mean 0.0, so it adds nothing on average.
+      - id: dev-only
+        text: The pause is a Gaussian value with mean 500 ms
+        feedback: The deviation scales the random part; the offset is added to it.
+    correct: [mean-offset]
+    hints:
+      - The manual says the Gaussian value has mean 0.0 and standard deviation 1.0.
+    solution: |
+      Delay = offset + N(0, 1) × deviation: mean 3,000 ms, about 95% between 2,000 and 4,000 ms, no hard limit.
+
+  - id: jmtg-ctt-mode
+    type: mcq
+    concept: perf-jmtg-throughput-timers
+    skill: analysis
+    title: Four times the target
+    prompt: |
+      A plan with 4 threads has a Constant Throughput Timer with Target Throughput 600. The run's JTL shows 196
+      samples in about 4.8 seconds, 49 from each thread - about 40 per second. Which setting explains it?
+    options:
+      - id: this-thread
+        text: Calculate Throughput based on "this thread only"
+        feedback: Correct - each thread holds 600/min (10/s) on its own, so 4 threads produce about 40/s.
+      - id: per-second
+        text: The target is in samples per second, so 600 should be 10
+        feedback: The target is per minute; 600 per minute is 10 per second, and the run produced 40.
+      - id: ramp
+        text: The ramp-up was 0
+        feedback: Ramp-up changes the start, not the steady rate a throughput timer holds.
+      - id: server
+        text: The server is too fast for the timer
+        feedback: A throughput timer adds pauses to slow fast threads down; a fast server is exactly what it handles.
+    correct: [this-thread]
+    hints:
+      - The rate is exactly the thread count times the target.
+    solution: |
+      "this thread only" makes every thread maintain the target; for a group-wide 600/min use "all active threads in
+      current thread group" (calcMode 2) or its shared variant (4).
+
+  - id: jmtg-ctt-capacity
+    type: mcq
+    concept: perf-jmtg-throughput-timers
+    skill: analysis
+    title: The timer that cannot keep up
+    prompt: |
+      A group of 10 threads has a Constant Throughput Timer set to 3,600 per minute (60 per second) in group mode. The
+      API answers in about 400 ms and there are no other timers. The run reaches about 25 per second. What should you
+      change?
+    options:
+      - id: threads
+        text: Add threads - 10 closed-loop threads at 0.4 s each can send at most 25 per second
+        feedback: Correct - 10 ÷ 0.4 = 25; a timer can only delay, so more threads are needed (or an open model).
+      - id: raise
+        text: Raise the target to 7,200 per minute so it pushes harder
+        feedback: The timer is already adding no delay; a higher target changes nothing.
+      - id: mode
+        text: Switch to "this thread only" mode
+        feedback: That raises each thread's target but the threads are already at full speed.
+      - id: remove
+        text: Remove the timer - it is slowing the threads
+        feedback: At 25 per second the timer is not pausing at all; removing it gives the same 25 per second.
+    correct: [threads]
+    hints:
+      - How many requests per second can one thread send if each takes 0.4 s?
+    solution: |
+      Maximum closed-loop throughput is threads ÷ response time = 10 ÷ 0.4 = 25 per second. Size threads with
+      N = X × R (plus think time) and headroom.
+
+  - id: jmtg-precise
+    type: mcq
+    concept: perf-jmtg-throughput-timers
+    skill: recall
+    title: Exactly 60 an hour
+    prompt: |
+      The requirement is "exactly 60 settlement reports per hour, arriving at random times". Which configuration does
+      the JMeter manual describe for this?
+    options:
+      - id: precise
+        text: Precise Throughput Timer with target 60, period 3600 s and test duration 3600 s, ramp-up 0
+        feedback: Correct - that is the manual's own example, and it recommends ramp-up and delay 0 for this timer.
+      - id: ctt
+        text: Constant Throughput Timer with target 1
+        feedback: It converges to a rate but "tends to produce samples at even intervals" and does not promise an exact count.
+      - id: constant
+        text: A Constant Timer of 60,000 ms
+        feedback: That gives even, fixed gaps per thread, not random arrivals, and the count depends on the response times.
+      - id: loops
+        text: A Thread Group with 60 threads and a 3,600 s ramp-up, one loop each
+        feedback: That gives evenly spaced arrivals, not random ones.
+    correct: [precise]
+    hints:
+      - One timer models Poisson arrivals.
+    solution: |
+      The Precise Throughput Timer schedules Poisson-like arrivals for an exact count per period; the manual's example
+      for 60 per hour is target 60, period 3600 s, duration 3600 s.
+
+  - id: jmtg-order
+    type: order
+    concept: perf-jmtg-timer-scope
+    skill: recall
+    title: One sampler's turn
+    prompt: |
+      Put what JMeter does for one sampler in order (from the manual's "Execution order").
+    items:
+      - id: config
+        text: Apply configuration elements
+      - id: pre
+        text: Run Pre-Processors
+      - id: timers
+        text: Run every timer in scope (their pauses add up)
+      - id: sampler
+        text: Send the sample
+      - id: post
+        text: Run Post-Processors
+      - id: assert
+        text: Run Assertions
+      - id: listen
+        text: Pass the result to Listeners
+    hints:
+      - Timers delay the sampler, so they must come before it.
+    solution: |
+      Configuration elements, Pre-Processors, Timers, Sampler, then Post-Processors, Assertions and Listeners (the
+      last three only when there is a result).
+
+  - id: jmtg-debug-ramp
+    type: debug
+    concept: perf-jmtg-thread-groups
+    skill: analysis
+    title: The ramp-up check that blames the wrong thread
+    prompt: |
+      This function should report how many milliseconds after the group's first sample each thread of the
+      `Merchants` group started. On a plan with a setUp Thread Group it reports every thread about 80 ms late. Which
+      line is the defect?
+    language: python
+    code: |
+      def offsets(rows):
+          first = {}
+          for row in rows:
+              n = int(row["threadName"].rsplit("-", 1)[1])
+              ts = int(row["timeStamp"])
+              if n not in first or ts < first[n]:
+                  first[n] = ts
+          origin = min(first.values())
+          return {n: first[n] - origin for n in sorted(first)}
+    correctLines: [3]
+    lineNotes:
+      - line: 4
+        note: Parsing the number after the last hyphen is fine for names like "Merchants 1-3".
+      - line: 8
+        note: Taking the earliest first sample as the origin is right - once only the group's rows are counted.
+    hints:
+      - What is the threadName of the setUp group's thread?
+      - Which rows should the loop look at?
+    solution: |
+      Line 3 loops over every row, so `Warm-up 1-1` is counted as thread 1 and moves the origin. Filter first:
+      `for row in (r for r in rows if r["threadName"].startswith("Merchants "))`.
+
+  - id: jmtg-short-think
+    type: short
+    concept: perf-jmtg-timer-scope
+    skill: analysis
+    title: Half the load
+    prompt: |
+      A colleague's test of 100 users was meant to send about 30 requests per second but sent about 15. Response
+      times were fine. The plan has a Gaussian Random Timer (offset 3,000 ms) under the Thread Group, and a Constant
+      Timer of 3,000 ms that someone added under the Test Plan "to be safe". Explain what happened and how you would
+      prove it from the JTL.
+    modelAnswer: |
+      Both timers are in scope for every sampler - the Test Plan timer applies to all groups - and JMeter adds the
+      timers in scope, so each thread waits about 6 s instead of 3 s between requests. With 100 closed-loop threads,
+      halving the request rate per thread halves the total: about 15 per second.
+
+      Proof from the JTL: for consecutive samples of the same thread compute next `timeStamp` − `timeStamp` −
+      `elapsed`; the median pause will be about 6,000 ms, not 3,000. Remove the Test Plan timer (or move it into the
+      scope it was meant for) and re-run; the median pause and the rate should return to about 3 s and 30 per second.
+    rubric:
+      - Says timers in scope add up rather than replace each other.
+      - Notes that a timer under the Test Plan applies to every sampler in every group.
+      - Connects double think time to half the rate for a closed test.
+      - Proposes measuring the pauses from timeStamp and elapsed in the JTL.
+    hints:
+      - Which samplers does a timer under the Test Plan apply to?
+    solution: |
+      Two timers in scope add up to about 6 s of think time, halving a closed test's rate; the pauses in the JTL
+      prove it.
+
+  - id: jmtg-testdesign
+    type: testdesign
+    concept: perf-jmtg-throughput-timers
+    skill: application
+    title: Prove the plan delivers its load model
+    prompt: |
+      The SandPay checkout load test is specified as: 120 threads, ramp-up 600 s, hold until 3,600 s, think time
+      about 5 s per request, and a group-wide cap of 1,200 payments per minute through a Constant Throughput Timer.
+      Design the checks you would run on a short version of the plan before trusting the full run. For each, give
+      preconditions, steps, the expected result and the evidence.
+    modelAnswer: |
+      Preconditions: plan parameterised with properties; practice or staging target you are allowed to load; a JTL
+      in CSV with `timeStamp`, `elapsed`, `threadName`, `label`, `responseCode`.
+
+      1. **Ramp-up shape** - run 12 threads with ramp-up 60 s (same ratio). Expected: thread *i* starts at 5*i* s
+         ± a small tolerance. Evidence: first `timeStamp` per `threadName`, filtered to the group.
+      2. **Think time in scope** - one thread, 10 iterations. Expected: pauses between samples ≈ 5 s, not 10 (no
+         duplicate timers). Evidence: next start − start − elapsed per thread.
+      3. **Timer placement** - check the tree: the payment cap is under the payments sampler or its controller and no
+         timer sits under the Test Plan. Evidence: the `.jmx` (or a structure test like the exercise's).
+      4. **Cap mode** - run with a low cap (for example 60/min) and 4 threads. Expected: about 1/s in total, not
+         4/s. Evidence: payment samples ÷ active span.
+      5. **Capacity** - expected throughput from N ÷ (R + Z) with measured R; if below the cap, more threads are
+         needed. Evidence: calculation next to the measured rate.
+      6. **End condition** - short duration with a deliberately slow endpoint and response timeouts set. Expected:
+         the run ends close to the duration. Evidence: wall-clock start and end.
+      7. **Negative** - set the cap mode to "this thread only" on purpose. Expected: rate × thread count. Evidence:
+         the same rate calculation; it proves the check can fail.
+    rubric:
+      - Each check has preconditions, steps, an expected result and concrete evidence from the JTL or the plan.
+      - Verifies the ramp-up schedule per thread and the pauses between samples.
+      - Verifies the throughput timer's mode and the achieved rate over the active span.
+      - Includes a capacity check (threads versus target) and an end-condition check.
+      - Includes at least one negative check that proves a check can fail.
+    hints:
+      - What could make the load differ from the specification without any error appearing?
+      - Which JTL columns let you measure starts, pauses and rates?
+    solution: |
+      Check the ramp-up, pauses, timer placement, the cap's mode and the capacity on a short run, each from the JTL,
+      before trusting the full test.
+
+  - id: jmtg-interview
+    type: interview
+    concept: perf-jmtg-throughput-timers
+    skill: analysis
+    title: "Interview: how do you get JMeter to a target rate?"
+    prompt: |
+      "Our requirement is 50 payment requests per second. Walk me through how you would configure JMeter to produce
+      that, and how you would know it did."
+    modelAnswer: |
+      First I size the threads, because JMeter's timers can only slow threads down. With a response time of, say,
+      200 ms at peak and no think time, one thread manages about 5 per second, so I need at least 10, and I'd use 20
+      for headroom (Little's law, N = X × R, plus think time if the journey has any).
+
+      Then I add a Constant Throughput Timer under the payments sampler or its Thread Group with a target of 3,000
+      per minute - it's per minute - and set Calculate Throughput based on to "all active threads in current thread
+      group" so the 3,000 is shared, not per thread. If arrivals should be random rather than evenly spaced, or I
+      need an exact count per period, the Precise Throughput Timer; if the system's behaviour under overload matters,
+      an Open Model Thread Group, because a closed pool sends less when the server slows down.
+
+      I ramp up rather than starting all threads at once, run in non-GUI mode, and verify from the JTL before reading
+      response times: samples per thread (all threads busy?), the rate over the active span (≈ 50/s?), and whether
+      the threads were ever idle. If the rate is low and the threads are never idle, I add threads; if it's a
+      multiple of the target, the timer mode is wrong.
+    rubric:
+      - Sizes threads first and explains that timers only delay.
+      - Uses the Constant Throughput Timer per minute with a group-wide calculation mode.
+      - Mentions the Precise Throughput Timer or Open Model Thread Group and when to prefer them.
+      - Verifies the achieved rate from the results before interpreting response times.
+      - Diagnoses low rate (too few threads) versus multiplied rate (wrong mode).
+    followUps:
+      - What happens to your rate if the server slows from 200 ms to 2 s?
+      - Why might you prefer an open model for a Black Friday test?
+      - How do you check that a timer isn't applying to samplers it shouldn't?
+    hints:
+      - Start with how many threads you need, then how you cap them.
+    solution: |
+      Size threads with Little's law, cap with a group-wide throughput timer (per minute), consider Precise or open
+      model, and verify the achieved rate from the JTL.
+
+  - id: jmtg-code-schedule
+    type: coding
+    concept: perf-jmtg-thread-groups
+    skill: application
+    title: Verify a ramp-up from a real JTL
+    prompt: |
+      In `exercises/jmeter/jm_threads_schedule.py`, implement `start_offsets` (when each thread should start),
+      `thread_number` (from names such as `Merchants 1-3`), `observed_offsets` (each thread's first sample relative
+      to the earliest, optionally for one group only) and `check_ramp` (a list of problems, empty when the run
+      matched). The tests include the manual's examples, a setUp group whose thread 1 must not move the origin, and
+      a real JMeter run of 5 threads with a 2-second ramp-up against the practice API.
+    project: perf
+    files:
+      - exercises/jmeter/jm_threads_schedule.py
+    test: tests/jmeter/test_jm_threads_schedule.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_threads_schedule.py
+    modelAnswer: |
+      ```python
+      def start_offsets(threads, ramp_up_s):
+          if threads < 1:
+              raise ValueError("threads must be at least 1")
+          if ramp_up_s < 0:
+              raise ValueError("ramp-up cannot be negative")
+          step = ramp_up_s / threads
+          return [round(i * step, 6) for i in range(threads)]
+
+      def observed_offsets(rows, group=None):
+          if group is not None:
+              rows = [r for r in rows if r["threadName"].startswith(group + " ")]
+          if not rows:
+              raise ValueError("no samples")
+          first = {}
+          for row in rows:
+              n = thread_number(row["threadName"])
+              ts = int(row["timeStamp"])
+              if n not in first or ts < first[n]:
+                  first[n] = ts
+          origin = min(first.values())
+          return {n: first[n] - origin for n in sorted(first)}
+      ```
+
+      The schedule is thread *i* at *i* × ramp-up ÷ threads - the first at zero, the last one step before the
+      ramp-up ends. The group filter matters because thread numbers restart in every group: `Warm-up 1-1` and
+      `Merchants 1-1` are both "thread 1".
+    rubric:
+      - Every test in tests/jmeter/test_jm_threads_schedule.py passes.
+      - The schedule starts the first thread at zero and the last one step before the ramp-up ends.
+      - Rows are filtered by group before the origin is chosen.
+      - Problems name the thread and the expected and observed offsets.
+    hints:
+      - Use the manual's example - 10 threads, 100 s - as your first test case.
+      - Thread numbers repeat across groups; what must you do before taking the minimum timestamp?
+    solution: |
+      Thread *i* starts at *i* × ramp-up ÷ threads; measure each thread's first sample within one group only.
+
+  - id: jmtg-code-timers
+    type: coding
+    concept: perf-jmtg-timer-scope
+    skill: application
+    title: Model timer scope and pauses
+    prompt: |
+      In `exercises/jmeter/jm_threads_timers.py`, implement `timers_in_scope`, `expected_delay_ms`,
+      `delay_bounds_ms`, `samplers`, `iteration_ms` and `throughput_per_minute` for test plans written as nested
+      dicts (the module docstring describes the format). The tests cover timers under a sampler, under a controller
+      and after the samplers in the tree, Gaussian timers with no upper bound, and a check of your model against a
+      real JMeter run with two timers side by side.
+    project: perf
+    files:
+      - exercises/jmeter/jm_threads_timers.py
+    test: tests/jmeter/test_jm_threads_timers.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_threads_timers.py
+    modelAnswer: |
+      ```python
+      def timers_in_scope(plan, sampler):
+          path = _path_to(plan, sampler, [])          # the sampler and its ancestors, from the root
+          if path is None:
+              raise KeyError(f"no sampler named {sampler!r}")
+          return [c for node in path for c in node.get("children", []) if c.get("type") in TIMER_TYPES]
+
+      def expected_delay_ms(plan, sampler):
+          return sum(_mean(t) for t in timers_in_scope(plan, sampler))
+      ```
+
+      A timer's scope is the subtree under its parent, so the timers for a sampler are the timer children of every
+      node on the path from the root to the sampler - position among siblings does not matter. The pause is the sum
+      of their means (Uniform: offset + maximum ÷ 2; Gaussian: the offset). Iteration time is every sampler's pause
+      plus its response time, and closed-loop throughput is threads × samplers per iteration ÷ iteration time.
+    rubric:
+      - Every test in tests/jmeter/test_jm_threads_timers.py passes.
+      - Scope follows the parent chain, not the order of siblings.
+      - Pauses add up across all timers in scope; Gaussian timers make the bounds unknown.
+      - The model's 250 ms matches the real JMeter run's pauses.
+    hints:
+      - Find the path from the Thread Group to the sampler first.
+      - Which nodes' timer children apply - the path's nodes, or every node in the tree?
+    solution: |
+      Collect timer children of every node on the root-to-sampler path and sum their means.
+
+  - id: jmtg-code-throughput
+    type: coding
+    concept: perf-jmtg-throughput-timers
+    skill: application
+    title: Hold a group-wide rate with a Constant Throughput Timer
+    prompt: |
+      `exercises/jmeter/jm_threads_throughput.jmx` runs 4 threads with no pause, which floods the practice API with
+      thousands of requests a second. Add a Constant Throughput Timer where the comment says, so that the **whole
+      group** produces `${__P(per_minute,600)}` samples per minute. The structure test checks there is exactly one
+      enabled timer in the Thread Group, that its target reads the `per_minute` property and that its mode is
+      group-wide; the run test executes your plan with real JMeter at 900 per minute and measures the rate.
+    project: perf
+    files:
+      - exercises/jmeter/jm_threads_throughput.jmx
+    test: tests/jmeter/test_jm_threads_throughput.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_threads_throughput.py
+    modelAnswer: |
+      ```xml
+      <ConstantThroughputTimer guiclass="TestBeanGUI" testclass="ConstantThroughputTimer" testname="Hold ${__P(per_minute,600)} samples per minute (whole group)">
+        <stringProp name="throughput">${__P(per_minute,600)}</stringProp>
+        <intProp name="calcMode">2</intProp>
+      </ConstantThroughputTimer>
+      <hashTree/>
+      ```
+
+      Placed inside the Thread Group's `hashTree`, it applies to every sampler of the group. `calcMode` 2 is "all
+      active threads in current thread group", so the target is divided among the four threads; 0 ("this thread
+      only") would make each thread hold the full target and the group four times it. The target is per minute and
+      reads a property, so `-Jper_minute=900` gives 15 per second.
+    rubric:
+      - Every test in tests/jmeter/test_jm_threads_throughput.py passes.
+      - The timer is inside the Thread Group's scope and is the only throughput timer.
+      - The mode divides the target among the group's threads (2 or 4), and the target is per minute from a property.
+      - You can explain what the run's rate would have been in "this thread only" mode.
+    hints:
+      - In a .jmx, an element's children are in the hashTree that follows it.
+      - Which calcMode value is "all active threads in current thread group"? The lesson's table lists them.
+    solution: |
+      A ConstantThroughputTimer in the Thread Group with `throughput` `${__P(per_minute,600)}` and `calcMode` 2 (or 4)
+      holds the group-wide rate.
+
+placement:
+  - id: jmtg-place-ramp
+    type: mcq
+    concept: perf-jmtg-thread-groups
+    skill: application
+    title: Thread starts
+    prompt: |
+      8 threads, ramp-up 40 seconds. When does the 5th thread start?
+    options:
+      - id: s20
+        text: After 20 seconds
+        feedback: Correct - threads start 5 s apart from 0, so the 5th (index 4) starts at 20 s.
+      - id: s25
+        text: After 25 seconds
+        feedback: That counts the first thread as starting at 5 s; the first starts at once.
+      - id: s40
+        text: After 40 seconds
+        feedback: 40 s is the whole ramp-up; even the last thread starts at 35 s.
+      - id: s5
+        text: After 5 seconds
+        feedback: 5 s is the gap between threads, which is when the 2nd thread starts.
+    correct: [s20]
+    hints:
+      - Gap = ramp-up ÷ threads; the first starts at 0.
+    solution: |
+      Gap 5 s; thread *i* from 0 starts at 5*i*; the 5th is *i* = 4, so 20 s.
+
+  - id: jmtg-place-scope
+    type: mcq
+    concept: perf-jmtg-timer-scope
+    skill: application
+    title: Two timers, one sampler
+    prompt: |
+      A Constant Timer of 2,000 ms sits under the Thread Group and a Constant Timer of 500 ms sits under the login
+      sampler. How long does a thread pause before the login sampler?
+    options:
+      - id: m2500
+        text: 2,500 ms
+        feedback: Correct - both are in scope for the login sampler and timers in scope add up.
+      - id: m500
+        text: 500 ms - the sampler's own timer wins
+        feedback: Timers do not override each other; all timers in scope run.
+      - id: m2000
+        text: 2,000 ms - the outer timer wins
+        feedback: Both apply; JMeter takes the sum.
+      - id: m0
+        text: No pause - timers apply after a sampler
+        feedback: Timers run before each sampler in their scope.
+    correct: [m2500]
+    hints:
+      - Is the Thread Group's timer in scope for the login sampler?
+    solution: |
+      Both timers are in scope and JMeter pauses for their sum: 2,500 ms before login (2,000 ms before the others).
+
+  - id: jmtg-place-ctt
+    type: mcq
+    concept: perf-jmtg-throughput-timers
+    skill: analysis
+    title: Ten threads, one target
+    prompt: |
+      10 threads share a Constant Throughput Timer with target 1,200 and calculation mode "this thread only". The
+      server keeps up easily. About what total rate will the run reach?
+    options:
+      - id: s200
+        text: About 200 per second
+        feedback: Correct - each thread holds 1,200 per minute (20 per second), times 10 threads.
+      - id: s20
+        text: About 20 per second
+        feedback: That is the group-wide result; "this thread only" gives each thread the full target.
+      - id: s1200
+        text: About 1,200 per second
+        feedback: The target is per minute, not per second.
+      - id: s2
+        text: About 2 per second
+        feedback: 1,200 per minute is 20 per second for each thread, not 2 for the group.
+    correct: [s200]
+    hints:
+      - Is the target per second or per minute, and per thread or per group in this mode?
+    solution: |
+      1,200 per minute = 20 per second per thread; "this thread only" multiplies it by the 10 threads, about 200 per
+      second.
+
+recall:
+  - id: jmtg-recall-ramp
+    concept: perf-jmtg-thread-groups
+    prompt: When does thread i (from 0) of a Thread Group start?
+    answer: At i × ramp-up ÷ threads - the first at once, the last one step before the ramp-up ends (10 threads over 100 s - the tenth at 90 s).
+  - id: jmtg-recall-end
+    concept: perf-jmtg-thread-groups
+    prompt: With both Loop Count and Duration set, when does a thread stop?
+    answer: At whichever comes first - checked only between samples; a sampler waiting for a response is not interrupted.
+  - id: jmtg-recall-setup
+    concept: perf-jmtg-thread-groups
+    prompt: What are setUp and tearDown Thread Groups for, and when does tearDown not run?
+    answer: Preparation before and clean-up after the regular groups. tearDown does not run after a stop, and after a graceful shutdown only if the Test Plan option is ticked.
+  - id: jmtg-recall-scope
+    concept: perf-jmtg-timer-scope
+    prompt: Which samplers does a timer apply to, and when?
+    answer: Every sampler below its parent, before each one, whatever its position among its siblings - and only if a sampler is in scope.
+  - id: jmtg-recall-sum
+    concept: perf-jmtg-timer-scope
+    prompt: What happens when several timers are in scope for a sampler?
+    answer: All of them run and JMeter pauses for their sum.
+  - id: jmtg-recall-ctt
+    concept: perf-jmtg-throughput-timers
+    prompt: What unit and which mode for a group-wide Constant Throughput Timer target?
+    answer: Samples per minute; "all active threads in current thread group" (calcMode 2) or its shared variant (4). "this thread only" multiplies the target by the thread count.
+  - id: jmtg-recall-limit
+    concept: perf-jmtg-throughput-timers
+    prompt: Why can a throughput timer miss its target on the low side?
+    answer: It only adds delay; if the threads are already busy all the time (too few for the response time), nothing makes them faster - add threads or use an open model.
+
+next:
+  - jmeter-http-samplers-and-config
+  - jmeter-correlation-and-extractors
+  - jmeter-logic-controllers
+  - locust-fundamentals
+  - reading-load-test-results

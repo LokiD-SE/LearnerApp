@@ -1,0 +1,1412 @@
+id: jmeter-assertions-and-listeners
+title: Assertions, listeners and results files
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Make a JMeter load test fail for the right reasons and keep the evidence cheap. Response, JSON, Duration and Size Assertions turn wrong answers - a 200 with an error body, a 201 for a declined payment, a slow report - into failed samples with a readable failureMessage; scope decides which samplers each assertion checks. Listeners cost memory and CPU, so a load test runs in CLI mode and writes one JTL whose columns you choose with the save service properties. Every run shown is real JMeter 5.6.3 against a local SandPay practice API whose failures are deterministic.
+tags:
+  [
+    JMeter,
+    assertions,
+    Response Assertion,
+    JSON Assertion,
+    Duration Assertion,
+    Size Assertion,
+    assertion scope,
+    failureMessage,
+    listeners,
+    View Results Tree,
+    Simple Data Writer,
+    Backend Listener,
+    JTL,
+    CSV,
+    XML,
+    save service,
+    jmeter.properties,
+    CLI mode,
+    soft errors,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Apache JMeter 5.6.3 (`practice/perf/tools/apache-jmeter-5.6.3`, fetched by `scripts/get-jmeter.sh`)
+    on OpenJDK 17, run in CLI mode with `-n -t ... -l ...`; Python 3.12.3 and pytest 9.2.0 in
+    `practice/perf/.venv` for the exercises. Every JMeter output in this lesson was produced on Linux on
+    20 November 2026.
+  - **Target:** `practice/perf/support/jm_assert_fixture.py`, a SandPay practice API on 127.0.0.1 whose failures
+    come from a request counter, not from chance: every 4th `GET /v1/payments` is a `200` whose body is an error,
+    every 5th `POST /v1/payments` is a `500`, every 7th that is not a 5th is a `201` with `"status": "declined"`,
+    and `GET /v1/reports/settlement` always takes about 150 ms. With 2 threads x 10 loops the counts are therefore
+    exact on every machine (5 soft errors, 4 server errors, 2 declined, 20 slow reports); the **timings** (elapsed,
+    latency, throughput) depend on the machine.
+  - **Output edits:** JMeter's console lines and the XML `ts` attribute contain 13-digit epoch-millisecond
+    timestamps; they are shown as `(epoch ms elided)` / `ts="(epoch ms elided)"`. CSV runs use
+    `-Jjmeter.save.saveservice.timestamp_format=HH:mm:ss.SSS`, so no edit is needed there. The plugin-scanning
+    `WARN StatusConsoleListener` lines JMeter 5.6.3 prints at start-up are left out.
+  - **Synthetic data:** SandPay is a fictional payments company; `merchant-1`, `merchant-2`, their secrets, tokens
+    and payment ids are invented for this practice project.
+  - **Sources, as documented on 20 November 2026:** Apache JMeter User Manual -
+    [Elements of a Test Plan](https://jmeter.apache.org/usermanual/test_plan.html) (3.5 Assertions, 3.9 Execution
+    order, 3.10 Scoping Rules), [Listeners](https://jmeter.apache.org/usermanual/listeners.html) (12.1 Default
+    Configuration, 12.2 CLI mode, 12.3 Resource usage, 12.4 CSV Log format, 12.5 XML Log format),
+    [Best Practices](https://jmeter.apache.org/usermanual/best-practices.html) (16.7 Reducing resource
+    requirements), [Real-time results](https://jmeter.apache.org/usermanual/realtime-results.html) and the
+    [Component Reference](https://jmeter.apache.org/usermanual/component_reference.html) (18.5 Assertions -
+    Response, Duration, Size and JSON Assertion; View Results Tree; Simple Data Writer; Backend Listener).
+    Quotations are from those pages.
+  - **Read from JMeter 5.6.3 itself, not from the manual:** the default `bin/jmeter.properties`, the CSV column
+    order (real runs with every column switched on), and the `.jmx` property names and constants of the four
+    assertions (the `ApacheJMeter_components.jar` classes, read with `javap`), because the plan in this lesson is
+    written by hand rather than saved from the GUI. Where 5.6.3 differs from the manual, the lesson says so.
+  - **Not repeated here:** percentiles, error rates and Apdex -
+    [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles); judging a run against
+    SLOs - [Performance requirements and SLOs](#/lesson/performance-requirements-and-slos); extracting a token
+    with a JSON Extractor - [Correlation and extractors in JMeter](#/lesson/jmeter-correlation-and-extractors).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - jmeter-http-samplers-and-config
+  - performance-metrics-and-percentiles
+
+concepts:
+  - id: perf-jmassert-assertions
+    name: Assertions turn wrong answers into failed samples
+    summary: JMeter marks an HTTP sample failed on its own only for transport errors and 4xx/5xx statuses - and then with an empty failureMessage. A 200 whose body is an error, a 201 for a declined payment or a slow answer all count as successes until an assertion says otherwise. Response Assertion checks a field (body, code, message, headers, URL) with Contains, Matches, Equals or Substring patterns, optional NOT/OR and a custom failure message; JSON Assertion checks that a JSONPath exists and optionally its value; Duration Assertion fails samples slower than N ms; Size Assertion compares the response size in bytes. A failed assertion sets success=false and writes its message to the results.
+  - id: perf-jmassert-scope
+    name: Scope and execution order
+    summary: Assertions are hierarchical - one that is the child of a sampler checks only that sampler, one under a controller or thread group checks every sampler below it. For each sampler JMeter runs configuration elements, pre-processors, timers, the sampler, post-processors, assertions and then listeners, so an assertion can check a variable a post-processor just extracted. Ignore status forces the sample to success before checking and cancels earlier assertion failures, so it belongs only on the first assertion. Every assertion costs CPU for every sample in its scope.
+  - id: perf-jmassert-results
+    name: Listeners and the results file (JTL)
+    summary: Listeners keep and display results and cost memory and CPU - the manual says View Results Tree "MUST NOT BE USED during load test". A load test runs in CLI mode with -l, which writes one JTL; jmeter.save.saveservice.* properties choose its format and columns. CSV is compact (about 180 bytes per sample in this lesson's run) but keeps only one failureMessage per sample and no line breaks; XML keeps every assertion result and is about three times larger. Simple Data Writer records to a file without the GUI; the Backend Listener sends metrics asynchronously to Graphite or InfluxDB for live dashboards and does not replace the JTL.
+
+objectives:
+  - Explain which wrong responses JMeter already marks as failed and which it reports as successes until an assertion checks them.
+  - Write Response, JSON, Duration and Size Assertions in a test plan, choose the field and pattern rule, and give each a failure message someone can act on.
+  - Place each assertion so its scope is exactly the samplers it should check, and trace the execution order of extractors, assertions and listeners for one sampler.
+  - Remove listeners from a load test, run it in CLI mode, and choose the JTL format and columns with the save service properties.
+  - Analyse a JTL by label and failure message, and spot failed samples that no assertion explains.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmassert-assertions, perf-jmassert-results]
+    title: The idea in plain language
+    body: |
+      Picture a call centre that measures itself only by "calls answered". A caller who hears "sorry, the system
+      is down" was *answered*. A caller who waited twenty minutes was *answered*. The dashboard is green, the
+      customers are furious.
+
+      A JMeter load test without assertions is that call centre. It counts a request as a success when the server
+      answered with a status below 400. It does not read the answer. So a SandPay payment API that returns
+      `200 {"error": "ledger read timeout"}` (a **soft error**), or `201` for a payment that was **declined**, or a
+      settlement report that takes 150 ms against a 100 ms budget, looks perfect in the summary.
+
+      **Assertions** are the quality check on each answer: "the body must contain a `data` array", "the status
+      must be `captured`", "it must arrive within 100 ms". When one fails, JMeter marks that sample as failed and
+      writes *why* into the results.
+
+      The second half of the story is the **notebook**. Listeners are JMeter's way of keeping and showing results;
+      some keep every response in memory to display it, which is fine while you write a script and ruinous during
+      a load test. In a load test JMeter writes one results file (a **JTL**) and nothing else, and you decide which
+      columns it holds - enough to explain every failure, no more.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope, perf-jmassert-results]
+    title: Terms you need
+    body: |
+      | Term | Meaning (JMeter 5.6.3 user manual and component reference) |
+      | --- | --- |
+      | **Sample / sample result** | one execution of a sampler - one HTTP request and its response, with its time, code and `success` flag |
+      | **Assertion** | "used to perform additional checks on samplers, and are processed after every sampler in the same scope" |
+      | **Response Assertion** | compares "pattern strings ... against various fields of the request or response": the body (Text Response), Response Code, Response Message, Response Headers, Request Headers, URL sampled, request data |
+      | **Pattern matching rules** | **Contains** and **Matches** use regular expressions (Matches = the whole text); **Equals** and **Substring** use plain, case-sensitive strings; **NOT** inverts; **OR** passes if any pattern matches |
+      | **Ignore status** | "the Response status is forced to successful before evaluating the Assertion" - so a 404 can be expected - and it clears earlier assertion failures |
+      | **Custom failure message** | replaces the generated message in the results |
+      | **JSON Assertion** | parses the body as JSON, looks up a JSONPath ("syntax from Jayway JsonPath"), fails if the path is missing, and optionally compares the value (or a regex, or null) |
+      | **Duration Assertion** | "Any response that takes longer than the given number of milliseconds ... is marked as a failed response" |
+      | **Size Assertion** | the response must be equal to, greater than, less than or not equal to a number of bytes |
+      | **Scope** | which samplers an element applies to: the samplers below its parent in the test tree |
+      | **failureMessage** | the CSV column that holds the failed assertion's message (empty if none failed) |
+      | **Listener** | an element that receives every sample result to show, aggregate or save it (View Results Tree, Summary Report, Simple Data Writer, Backend Listener ...) |
+      | **JTL** | JMeter's results file - CSV (default) or XML - written by `-l` in CLI mode or by a file-writing listener |
+      | **Save service properties** | `jmeter.save.saveservice.*` in `jmeter.properties` / `user.properties` (or `-J` on the command line): the format and which fields each sample saves |
+      | **Simple Data Writer** | "can record results to a file but not to the UI" |
+      | **Backend Listener** | "an Asynchronous listener" that sends metrics to a backend such as Graphite or InfluxDB |
+
+  - id: why
+    kind: why
+    concepts: [perf-jmassert-assertions]
+    title: Why the error rate without assertions is a lie
+    body: |
+      Here is the same plan run twice against the practice API: 2 merchant threads, 10 iterations each, every
+      iteration listing payments, creating one and fetching the settlement report (62 samples, including the two
+      token requests). First **without** assertions, then **with** the four this lesson builds. Real console output
+      (start-up warnings left out, timestamps elided):
+
+      ```plaintext
+      $ jmeter -n -t exercises/jmeter/jm_assert_plan.jmx -l before.jtl -Jport=...      # no assertions
+      Creating summariser <summary>
+      Created the tree successfully using exercises/jmeter/jm_assert_plan.jmx
+      Starting standalone test @ 2026 Nov 20 07:11:17 IST (epoch ms elided)
+      Waiting for possible Shutdown/StopTestNow/HeapDump/ThreadDump message on port 4445
+      summary =     62 in 00:00:02 =   33.6/s Avg:    52 Min:     1 Max:   153 Err:     4 (6.45%)
+      Tidying up ...    @ 2026 Nov 20 07:11:19 IST (epoch ms elided)
+      ... end of run
+
+      $ jmeter -n -t solutions/jmeter/jm_assert_plan.jmx -l after.jtl -Jport=...       # four assertions
+      summary =     62 in 00:00:02 =   33.0/s Avg:    52 Min:     1 Max:   153 Err:    31 (50.00%)
+      ```
+
+      Same server, same requests, same timings - and the error rate goes from **6.45 %** to **50 %**. What the
+      first run counted as success:
+
+      | What happened | Samples | Without assertions | With assertions |
+      | --- | --- | --- | --- |
+      | `POST /v1/payments` answered `500` | 4 | failed, `failureMessage` **empty** | failed: `payment not created: expected HTTP 201` |
+      | `GET /v1/payments` answered `200 {"error": "ledger read timeout"}` | 5 | **success** | failed: `No results for path: $['data']` |
+      | `POST /v1/payments` answered `201` with `"status": "declined"` | 2 | **success** | failed: `Value in json path '$.status' expected to be 'captured', but found 'declined'` |
+      | `GET /v1/reports/settlement` took about 152 ms (budget 100 ms) | 20 | **success** | failed: `The operation lasted too long: It took 152 milliseconds, but should not have lasted longer than 100 milliseconds.` |
+
+      Only the four `500`s were failures before, because JMeter treats "HTTP Responses with statuses in the 4xx and
+      5xx ranges" as unsuccessful by itself - but even those carried no message. Everything else was a wrong answer
+      reported as a right one. A load test exists to say whether the system **works** under load; without
+      assertions it can only say that the system **answered**.
+
+      Two consequences for a tester:
+
+      1. **Throughput is inflated** by fast wrong answers. A soft error is often the quickest response the server
+         gives (no database work), so it improves response times and requests per second exactly when the system
+         is broken.
+      2. **Failures need explanations.** "Err: 4" is a fact; "4 x payment not created: expected HTTP 201" is
+         evidence a developer can act on.
+
+  - id: internals-assertions
+    kind: internals
+    concepts: [perf-jmassert-assertions]
+    title: How each assertion decides
+    body: |
+      **Response Assertion.** Pick a *field to test* and a *pattern rule*, then list patterns. "Each pattern is
+      tested separately. If a pattern fails, then further patterns are not checked." With **OR** ticked one
+      matching pattern is enough. **Contains** and **Matches** are regular expressions (the manual's warning:
+      write `Price: \d+`, not `/Price: \d+/`, and the default is multi-line mode, where `.` does not match a new
+      line); **Equals** and **Substring** are plain, case-sensitive strings - the safe choice for status codes and
+      fixed text. A JMeter Variable can be tested instead of the response.
+
+      **JSON Assertion.** Three steps, in the manual's words: it "will parse the JSON and fail if the data is not
+      JSON", then "search for specified path ... If the path is not found, it will fail", then, if a value was
+      requested, compare it. An array result passes if the expected value is *one of* its elements. And a trap
+      that changed in 5.5: with an *indefinite* path (one that can return a list, such as `$..status`), "the
+      assertion will fail, if an indefinite path is given, an empty list is extracted and no assertion value is
+      set" - before 5.5 such an assertion could pass on nothing.
+
+      **Duration Assertion.** One number: the maximum milliseconds for each response. It compares the sample's
+      elapsed time - the same number JMeter reports as `elapsed` - so it measures the client's view, including the
+      network and any time the load generator itself was slow.
+
+      **Size Assertion.** A number of bytes and a comparison: `=`, `!=`, `>`, `<`, `>=`, `<=`. "An empty response
+      is treated as being 0 bytes rather than reported as an error." It is a cheap guard against truncated or
+      unexpectedly huge pages (a list endpoint that suddenly returns 10 000 rows).
+
+      **What a failure writes.** Each assertion adds an *assertion result* (name, failure, error, message) to the
+      sample and sets `success=false` if it fails. The CSV results file has room for **one** message per sample;
+      the XML file keeps every assertion result. You will see both below.
+
+      **What it costs.** Assertions run in the load generator, for every sample in their scope. Best Practices
+      16.7 lists "Use as few Assertions as possible" next to "Use CSV output rather than XML". Check what proves
+      the answer is right - status and one key field - not every byte.
+
+  - id: internals-scope
+    kind: internals
+    concepts: [perf-jmassert-scope]
+    title: Scope and execution order
+    body: |
+      The manual's execution order for each sampler (3.9):
+
+      1. Configuration elements
+      2. Pre-Processors
+      3. Timers
+      4. **Sampler**
+      5. Post-Processors (unless SampleResult is null)
+      6. **Assertions** (unless SampleResult is null)
+      7. **Listeners** (unless SampleResult is null)
+
+      Two things follow. Assertions run **after** post-processors, so an assertion can check a variable that a JSON
+      Extractor just set (Response Assertion's "JMeter Variable Name to use"). And listeners run **after**
+      assertions, so whatever a listener saves already includes the assertion verdict.
+
+      Scope (3.10): "An Assertion, for instance, is hierarchical in the test tree. If its parent is a request, then
+      it is applied to that request. If its parent is a Controller, then it affects all requests that are
+      descendants of that Controller." The component reference says the same thing as advice: "To ensure that an
+      Assertion is applied only to a particular sampler, add it as a child of the sampler."
+
+      The classic mistake is a Duration Assertion of 100 ms placed directly under the Thread Group "for all
+      requests". It then also checks the token request (often the slowest - the first request on a new
+      connection), so the error rate rises for a reason nobody intended, and the slow report's failures are mixed
+      with noise.
+
+      **Ignore status** is the other scope-like trap. It forces the sample to success *before* the assertion runs
+      and "will have the effect of clearing any previous assertion failures, so make sure that this is only set on
+      the first assertion". Use it when a non-2xx code is the *expected* answer - for example a test that asserts
+      `404` for an unknown payment id: Ignore status, then Response Code Equals `404`.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmassert-scope, perf-jmassert-results]
+    title: One sample, from request to results file
+    body: |
+      ```mermaid
+      flowchart LR
+        S["Sampler: POST /v1/payments"] --> P["Post-processors (extractors)"]
+        P --> A1["Response Assertion: code Equals 201"]
+        A1 --> A2["JSON Assertion: status equals captured"]
+        A2 --> R{"Any assertion failed?"}
+        R -- "yes" --> F["success=false and failureMessage"]
+        R -- "no" --> T["success=true"]
+        F --> L["Listeners and the -l results file"]
+        T --> L
+        L --> CSV["CSV JTL: one message per sample"]
+        L --> XML["XML JTL: every assertion result"]
+      ```
+
+      Notice where the verdict is made: after the sampler and the extractors, before anything is written. A
+      listener cannot "fix" a missing assertion afterwards - if no assertion ran, the results file only knows the
+      status code.
+
+  - id: code-plan
+    kind: code
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope]
+    title: The four assertions in the test plan
+    body: |
+      The practice plan (`practice/perf/solutions/jmeter/jm_assert_plan.jmx`) is written by hand, so the element
+      and property names below were read from the JMeter 5.6.3 classes rather than guessed. In a `.jmx` file every
+      element is followed by a `<hashTree>` that holds its children - that is how an assertion becomes the child of
+      one sampler.
+
+      A **JSON Assertion** under `GET /v1/payments` - the path must exist, no value is compared:
+
+      ```xml
+      <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /v1/payments">
+        <stringProp name="HTTPSampler.path">/v1/payments?limit=10</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <JSONPathAssertion guiclass="JSONPathAssertionGui" testclass="JSONPathAssertion" testname="Has a data array">
+          <stringProp name="JSON_PATH">$.data</stringProp>
+          <stringProp name="EXPECTED_VALUE"></stringProp>
+          <boolProp name="JSONVALIDATION">false</boolProp>
+          <boolProp name="EXPECT_NULL">false</boolProp>
+          <boolProp name="INVERT">false</boolProp>
+          <boolProp name="ISREGEX">false</boolProp>
+        </JSONPathAssertion>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      Two assertions under `POST /v1/payments` - a **Response Assertion** on the code with a custom message, then a
+      **JSON Assertion** that compares a value (`JSONVALIDATION` true):
+
+      ```xml
+      <hashTree>
+        <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="Created (201)">
+          <collectionProp name="Asserion.test_strings">
+            <stringProp name="49587">201</stringProp>
+          </collectionProp>
+          <stringProp name="Assertion.custom_message">payment not created: expected HTTP 201</stringProp>
+          <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          <boolProp name="Assertion.assume_success">false</boolProp>
+          <intProp name="Assertion.test_type">8</intProp>
+        </ResponseAssertion>
+        <hashTree/>
+        <JSONPathAssertion guiclass="JSONPathAssertionGui" testclass="JSONPathAssertion" testname="Status is captured">
+          <stringProp name="JSON_PATH">$.status</stringProp>
+          <stringProp name="EXPECTED_VALUE">captured</stringProp>
+          <boolProp name="JSONVALIDATION">true</boolProp>
+          <boolProp name="EXPECT_NULL">false</boolProp>
+          <boolProp name="INVERT">false</boolProp>
+          <boolProp name="ISREGEX">false</boolProp>
+        </JSONPathAssertion>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      A **Duration Assertion** under `GET /v1/reports/settlement`, with the budget as a property so a run can
+      change it (`-Jreport_ms=200`):
+
+      ```xml
+      <hashTree>
+        <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion" testname="Report within budget">
+          <stringProp name="DurationAssertion.duration">${__P(report_ms,100)}</stringProp>
+        </DurationAssertion>
+        <hashTree/>
+      </hashTree>
+      ```
+
+      And, for reference (not in the practice plan), a **Size Assertion** that fails list pages over 5000 bytes -
+      operator 6 is `<=` in the 5.6.3 class (`EQUAL=1, NOTEQUAL=2, GREATERTHAN=3, LESSTHAN=4, GREATERTHANEQUAL=5,
+      LESSTHANEQUAL=6`):
+
+      ```xml
+      <SizeAssertion guiclass="SizeAssertionGui" testclass="SizeAssertion" testname="List page at most 5000 bytes">
+        <stringProp name="Assertion.test_field">SizeAssertion.response_network_size</stringProp>
+        <stringProp name="SizeAssertion.size">5000</stringProp>
+        <intProp name="SizeAssertion.operator">6</intProp>
+      </SizeAssertion>
+      ```
+
+      Nothing in the plan is a listener: the run uses `-l`, which "can be used to create a top-level listener for
+      the test run" (12.2).
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope]
+    title: The lines that matter
+    body: |
+      - **`<hashTree>` right after the sampler** - the assertion is the sampler's *child*, so its scope is that one
+        sampler. Move the same element up one level and it checks every sampler in the thread group.
+      - **`Asserion.test_strings`** - yes, misspelt: that is the property name JMeter itself uses. A hand-written
+        `Assertion.test_strings` would be ignored and the assertion would test no pattern.
+      - **`Assertion.test_type` 8** - the pattern rule as a bit field: `MATCH=1`, `CONTAINS=2`, `NOT=4`,
+        `EQUALS=8`, `SUBSTRING=16`, `OR=32` (read from the 5.6.3 class). `12` would be NOT + EQUALS - "the code is
+        *not* 201".
+      - **`Assertion.test_field` = `Assertion.response_code`** - test the status code, not the body. Equals on the
+        code is exact; Contains `20` on the body would match half the internet.
+      - **`Assertion.custom_message`** - the text that reaches the results file. Write what was expected, in words a
+        developer can search for: "payment not created: expected HTTP 201".
+      - **`Assertion.assume_success` false** - this is Ignore status, left off. Turning it on here would make a 500
+        look successful *before* the check.
+      - **`JSONVALIDATION` false vs true** - false means "the path must exist", true means "and must equal
+        `EXPECTED_VALUE`".
+      - **`${__P(report_ms,100)}`** - a property with a default, so the budget is chosen per run without editing the
+        plan.
+
+  - id: code-results
+    kind: code
+    concepts: [perf-jmassert-results]
+    title: What the results file holds - CSV and XML
+    body: |
+      The first lines of the CSV JTL from the run with assertions (`-Jjmeter.save.saveservice.timestamp_format=HH:mm:ss.SSS`;
+      default columns otherwise):
+
+      ```plaintext
+      timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect
+      07:11:22.407,42,POST /auth/token,200,OK,Merchants 1-2,text,true,,202,273,2,2,http://127.0.0.1:42637/auth/token,37,0,29
+      07:11:22.483,4,GET /v1/payments,200,OK,Merchants 1-1,text,true,,215,212,2,2,http://127.0.0.1:42637/v1/payments?limit=10,3,0,0
+      07:11:22.491,2,POST /v1/payments,201,Created,Merchants 1-2,text,false,"Value in json path '$.status' expected to be 'captured', but found 'declined'",230,265,2,2,http://127.0.0.1:42637/v1/payments,2,0,0
+      07:11:22.495,152,GET /v1/reports/settlement,200,OK,Merchants 1-1,text,false,"The operation lasted too long: It took 152 milliseconds, but should not have lasted longer than 100 milliseconds.",180,213,2,2,http://127.0.0.1:42637/v1/reports/settlement,152,0,0
+      ```
+
+      Now one of the `500`s in an **XML** JTL from the same plan (`-Jjmeter.save.saveservice.output_format=xml`).
+      Both assertions failed, and XML records both:
+
+      ```xml
+      <httpSample t="2" it="0" lt="2" ct="0" ts="(epoch ms elided)" s="false" lb="POST /v1/payments" rc="500" rm="Internal Server Error" tn="Merchants 1-1" dt="text" by="192" sby="265" ng="1" na="1">
+        <assertionResult>
+          <name>Created (201)</name>
+          <failure>true</failure>
+          <error>false</error>
+          <failureMessage>payment not created: expected HTTP 201</failureMessage>
+        </assertionResult>
+        <assertionResult>
+          <name>Status is captured</name>
+          <failure>true</failure>
+          <error>false</error>
+          <failureMessage>No results for path: $[&apos;status&apos;]</failureMessage>
+        </assertionResult>
+        <java.net.URL>http://127.0.0.1:45053/v1/payments</java.net.URL>
+      </httpSample>
+      ```
+
+      The CSV row for the same kind of sample says only `payment not created: expected HTTP 201` - the first
+      failing assertion. And the cost of the extra detail, measured on the same 62-sample run:
+
+      | Format | File size | Per sample |
+      | --- | --- | --- |
+      | CSV, default columns | 11 190 bytes | about 180 bytes |
+      | XML, default settings | 32 163 bytes | about 519 bytes |
+      | XML, `assertion_results=all` | 32 270 bytes | about 520 bytes |
+
+      In these 5.6.3 runs the XML file held every assertion result (80 of them) even with the default
+      `assertion_results=none`; they come with `jmeter.save.saveservice.assertions=true`, which is on by default.
+      Treat that as what this version did here and check your own version before relying on it.
+
+  - id: internals-saveservice
+    kind: internals
+    concepts: [perf-jmassert-results]
+    title: Choosing the columns - the save service
+    body: |
+      "The default items to be saved can be defined in the jmeter.properties (or user.properties) file. The
+      properties are used ... for the log file specified by the -l command-line flag" (12.1). Each property
+      switches one column (or a pair) on or off, and they can be passed with `-J` for one run:
+
+      ```bash
+      jmeter -n -t plan.jmx -l run.jtl \
+        -Jjmeter.save.saveservice.response_message=false \
+        -Jjmeter.save.saveservice.thread_name=false \
+        -Jjmeter.save.saveservice.data_type=false \
+        -Jjmeter.save.saveservice.bytes=false \
+        -Jjmeter.save.saveservice.sent_bytes=false \
+        -Jjmeter.save.saveservice.thread_counts=false \
+        -Jjmeter.save.saveservice.url=false \
+        -Jjmeter.save.saveservice.idle_time=false \
+        -Jjmeter.save.saveservice.timestamp_format=none
+      ```
+
+      Real result on the smoke plan:
+
+      ```plaintext
+      elapsed,label,responseCode,success,failureMessage,Latency,Connect
+      37,GET /health,200,true,,32,24
+      2,GET /health,200,true,,2,0
+      ```
+
+      The column order is fixed by JMeter. With **every** column switched on, 5.6.3 wrote:
+
+      ```plaintext
+      timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Filename,Latency,Encoding,SampleCount,ErrorCount,Hostname,IdleTime,Connect
+      ```
+
+      followed by any `sample_variables` you list (as quoted extra columns). Three things in that line differ from
+      what you might read elsewhere, which is why the exercise reads a real header instead of trusting a list:
+
+      - The manual's 12.4 list puts `connect` straight after `latency`; 5.6.3 writes `Connect` **last**.
+      - The manual's property listing shows `#jmeter.save.saveservice.url=false`, but the `bin/jmeter.properties`
+        that ships with 5.6.3 says `#jmeter.save.saveservice.url=true` - and the default run above did include
+        `URL`.
+      - Some properties control **two** columns: `thread_counts` gives `grpThreads` and `allThreads`,
+        `sample_count` gives `SampleCount` and `ErrorCount`.
+
+      Other rules from the manual worth knowing: `assertion_results_failure_message` "only affects CSV output";
+      `timestamp_format` "only affects CSV output files" (the XML `ts` stays in epoch milliseconds, as you saw);
+      "CSV format cannot currently be used to save any items that include line-breaks", so response bodies only go
+      to XML (`response_data`, or `response_data.on_error` for failures only).
+
+  - id: when
+    kind: when
+    concepts: [perf-jmassert-assertions, perf-jmassert-results]
+    title: Which assertion, which listener, when
+    body: |
+      | Need | Use | Not |
+      | --- | --- | --- |
+      | the status code is the expected one | Response Assertion, Response Code, Equals | Contains on the body |
+      | the body says it worked (JSON API) | JSON Assertion on one key field, with a value when it matters | a regex over the whole JSON |
+      | a non-JSON page rendered | Response Assertion, Substring on a short, stable marker | Matches on the whole page |
+      | an expected 4xx (negative test) | Ignore status on the first assertion, then Equals the code | leaving it a failed sample |
+      | "must answer within N ms" as a functional rule | Duration Assertion on that sampler | a Duration Assertion over the whole thread group |
+      | an SLO such as "p95 under 300 ms" | analysis of the JTL afterwards ([SLOs](#/lesson/performance-requirements-and-slos)) | a Duration Assertion of 300 ms (it fails single samples, not percentiles) |
+      | a truncated or runaway response | Size Assertion | comparing the body text |
+      | watch a run live | Backend Listener to Graphite or InfluxDB | View Results Tree |
+      | debug the script | View Results Tree, a few iterations, GUI mode | in the load test |
+      | keep the evidence | `-l` in CLI mode, CSV, the columns you need | many listeners each writing a file |
+
+      A Duration Assertion and an SLO are different tools. The assertion turns each slow sample into an error, so
+      latency shows up in the error rate; an SLO judges a percentile over the run. Use the assertion for hard
+      per-request limits (a timeout a client really applies), and say in the report which errors came from it.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope, perf-jmassert-results]
+    title: Making a plan load-test ready
+    body: |
+      1. **List what "right" means for each sampler** - the code, one field that proves the work was done, any hard
+         time limit. Leave out what does not prove anything.
+      2. **Add the assertions as children of their samplers**, one concern each, with custom messages that say
+         what was expected.
+      3. **Run a few iterations in the GUI with View Results Tree** and check every assertion both passes and fails
+         when it should (point it at a fixture that returns the wrong thing, or invert it for one run).
+      4. **Delete or disable every listener** that shows or keeps results. Best Practices: "if using the -l flag as
+         above they can all be deleted or disabled".
+      5. **Choose the JTL columns**: keep `timeStamp`, `elapsed`, `label`, `responseCode`, `success` and
+         `failureMessage` at least; add `Latency` and `Connect` for analysis; drop what you will not read.
+      6. **Run in CLI mode**: `jmeter -n -t plan.jmx -l run.jtl -j run.log` plus `-J` properties.
+      7. **Read failures by label and message**, and look for failed samples with an **empty** message - those are
+         failures no assertion explains.
+
+  - id: example
+    kind: example
+    concepts: [perf-jmassert-assertions, perf-jmassert-results]
+    title: "Example: the release that was 'all green'"
+    body: |
+      A SandPay team ran its nightly load test before a release: 0.4 % errors, p95 well inside the target. The
+      tester opened the JTL and grouped failures by label and message (exercise 2's `failure_groups`), then
+      noticed that the plan had **no assertions** - the 0.4 % were bare `5xx` codes with empty messages.
+
+      They added one JSON Assertion per endpoint and re-ran. `GET /v1/payments` now failed at a high rate with
+      `No results for path: $['data']`: under load, the ledger's read replica timed out, and the API caught the
+      timeout and answered `200 {"error": "ledger read timeout"}`. Those fast soft errors had also been *improving*
+      the reported response times.
+
+      What the tester checked and reported:
+
+      - **Evidence**: the failure groups before and after, the CSV rows with their `failureMessage`, and one XML
+        sample with the full body (`response_data.on_error=true` on a short re-run).
+      - **Scope**: each new assertion was the child of one sampler; the token request had no failures, which shows
+        nothing leaked up the tree.
+      - **Recommendation**: the API should return `503` (with `Retry-After`) instead of a `200` error body, so
+        clients, monitors and load tests all see the failure - and the load test keeps the JSON Assertion either
+        way.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope, perf-jmassert-results]
+    title: Testing the assertions themselves
+    body: |
+      An assertion that can never fail is worse than none: it suggests a check that is not happening. The practice
+      tests (`tests/jmeter/test_jm_assert_plan.py`) run the plan against a server whose wrong answers are known in
+      advance, and check both directions:
+
+      | Check | Expected | Evidence |
+      | --- | --- | --- |
+      | every soft error fails | 5 of 20 `GET /v1/payments` failed, message mentions `data` | JTL rows |
+      | every `500` carries the custom message | 4 rows, message `payment not created: expected HTTP 201` | JTL rows |
+      | declined payments fail on the value | 2 rows with `201` and a message naming `captured` and `declined` | JTL rows |
+      | right answers pass | 14 `POST /v1/payments` successes | JTL rows |
+      | the time budget bites | all 20 reports failed, message says `100 milliseconds` | JTL rows |
+      | scope is right | the token requests are all successes | JTL rows |
+      | every failure explains itself | no failed row with an empty `failureMessage` | JTL rows |
+
+      The deterministic fixture is what makes exact counts possible: its failures come from a request counter, so
+      20 creates always contain exactly four 5th calls and two 7th calls, whatever order the threads run in. On a
+      real system, test assertions the same way on a short run against a stub or a known-bad build before you
+      trust them in a long one.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope, perf-jmassert-results]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | no assertions | low error rate, fast responses, angry users | at least the code and one key field per sampler |
+      | assertion at Thread Group level | unexpected failures on token or static requests | make it the child of the sampler it is about |
+      | Ignore status on a later assertion | a `500` reported as success | Ignore status only on the first assertion, only for expected non-2xx |
+      | Contains / Matches with an unescaped `.`, `?` or `$` | an assertion that passes on the wrong text | Equals or Substring for fixed strings |
+      | JSON Assertion on an indefinite path with no value | (before 5.5) passes on nothing | assert a value, or a definite path |
+      | Duration Assertion used as the SLO | error rate full of "lasted too long", percentiles never reported | judge percentiles in analysis; keep the assertion for hard limits |
+      | View Results Tree left on in a load test | rising heap use, a slower load generator, lower throughput | delete listeners; use `-l` |
+      | XML JTL for a long run | huge files, slower writes | CSV; a short XML run when you need the detail |
+      | `failureMessage` or `success` column switched off | failures you cannot explain or count | check the header before the long run |
+      | trusting a documented column order | an analysis script reading the wrong column | read the header row; index by name |
+
+      **Debugging method** when the error rate surprises you:
+
+      1. Group failures by label and message (`failure_groups`); the biggest group is where to look first.
+      2. Look for failed samples with an **empty** message (`unexplained_failures`): a status code or connection
+         error that no assertion explains.
+      3. For one sample of each group, get the full response: a short re-run with
+         `-Jjmeter.save.saveservice.output_format=xml -Jjmeter.save.saveservice.response_data.on_error=true`, or the
+         View Results Tree in the GUI for a few iterations.
+      4. Decide whether the **system** or the **script** is wrong before reporting - an assertion on the wrong
+         field, or in the wrong scope, is a script defect.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmassert-assertions, perf-jmassert-results]
+    title: Trade-offs and alternatives
+    body: |
+      - **Depth of checking vs load-generator cost.** Every assertion runs for every sample in scope. A regex over a
+        large body on every request can cost more CPU than the request itself; check the status and one field, and
+        leave deep functional checks to functional tests.
+      - **CSV vs XML.** CSV is about three times smaller here and is what the HTML dashboard reads; XML keeps every
+        assertion result and can keep bodies. A good pattern is CSV for the load test and a short XML run to
+        investigate.
+      - **Assertions vs analysis.** Correctness belongs in assertions (only the load generator sees each response);
+        latency targets mostly belong in analysis of percentiles. Mixing them makes "errors" mean two things.
+      - **Live vs after the fact.** The Backend Listener ("an Asynchronous listener") streams metrics to Graphite or
+        InfluxDB - Graphite "by default", InfluxDB since JMeter 3.2 - for a live dashboard during long runs. It
+        sends aggregated metrics, not every response, so keep the JTL for evidence.
+      - **Simple Data Writer vs `-l`.** Both write a results file without the GUI. `-l` needs no plan change and is
+        the usual choice in CLI mode; a Simple Data Writer is useful when one plan needs a second file (for example
+        only one thread group's samples).
+      - **Other tools.** Locust marks a request failed with `catch_response` and `response.failure(...)`; the idea -
+        check the answer, not only the status - is the same. See
+        [HTTP sessions, validation and request grouping](#/lesson/locust-http-validation-and-grouping).
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmassert-assertions, perf-jmassert-scope, perf-jmassert-results]
+    title: Quick reference
+    body: |
+      - Without assertions JMeter fails only transport errors and 4xx/5xx - with an empty failureMessage. Soft
+        errors, wrong values and slow answers count as success.
+      - Response Assertion - field + rule (Contains, Matches = regex; Equals, Substring = plain) + patterns,
+        NOT/OR, custom message, Ignore status (first assertion only).
+      - JSON Assertion - valid JSON, path exists, optional value/regex/null; indefinite path with no value fails
+        since 5.5.
+      - Duration Assertion - fails each sample slower than N ms; Size Assertion - bytes `=`, `!=`, `>`, `<`, `>=`,
+        `<=`.
+      - Child of a sampler = checks that sampler only. Order per sampler: config, pre-processors, timers, sampler,
+        post-processors, assertions, listeners.
+      - Load test: CLI mode, `-l run.jtl`, no View Results Tree, as few listeners and assertions as possible, CSV.
+      - Save service: `jmeter.save.saveservice.*` (in properties files or `-J`) choose format and columns; read the
+        header, don't trust a list; CSV keeps one failure message, XML all of them.
+      - Analyse by label and message; failed samples with no message are failures nothing explains.
+
+exercises:
+  - id: soft-error-mcq
+    type: mcq
+    concept: perf-jmassert-assertions
+    skill: application
+    title: The 200 that is an error
+    prompt: |
+      Under load, `GET /v1/payments` sometimes answers `200` with the body `{"error": "ledger read timeout"}`. The
+      plan has no assertions. What does the JTL record for those samples, and what is the smallest check that
+      turns them into failures?
+    options:
+      - id: success-json
+        text: '`success=true`; a JSON Assertion that `$.data` exists'
+        feedback: Correct - a status below 400 is a success to JMeter; the missing data array is what proves the answer is wrong.
+      - id: failed-already
+        text: '`success=false`, because the body contains the word error'
+        feedback: JMeter does not read the body unless an assertion tells it to; only 4xx/5xx and transport errors fail on their own.
+      - id: duration
+        text: '`success=true`; a Duration Assertion, because timeouts are slow'
+        feedback: The soft error is usually *fast* - the server gave up and answered quickly. Time does not reveal it; the body does.
+      - id: response-code
+        text: '`success=true`; a Response Assertion that the code equals 200'
+        feedback: The code *is* 200, so that assertion passes. It checks the wrong field.
+    correct: [success-json]
+    hints:
+      - When does JMeter mark an HTTP sample as failed without any assertion?
+      - Which part of this response differs from a good one?
+    solution: |
+      Without assertions only 4xx/5xx and transport errors fail. The soft error differs from a good answer only in
+      the body, so check the field that proves success - the `data` array - with a JSON Assertion. In the lesson's
+      run that turned 5 "successes" into failures with `No results for path: $['data']`.
+
+  - id: empty-message-mcq
+    type: mcq
+    concept: perf-jmassert-assertions
+    skill: analysis
+    title: Failed, but nobody says why
+    prompt: |
+      In a JTL, four `POST /v1/payments` rows have `responseCode` 500, `success` false and an empty
+      `failureMessage`. What does the empty message tell you about the plan?
+    options:
+      - id: no-assertion
+        text: No assertion on that sampler failed - JMeter failed the sample because of the 5xx status alone
+        feedback: Correct - the status made it a failure; a Response Assertion with a custom message would have explained it.
+      - id: csv-bug
+        text: The CSV format cannot store failure messages
+        feedback: CSV stores one failure message per sample (assertion_results_failure_message, on by default) - the lesson's rows show them.
+      - id: ignore-status
+        text: Ignore status is ticked on an assertion
+        feedback: Ignore status would have turned the 500 into a *success* (if the later checks passed), not a failure with no message.
+      - id: server
+        text: The server sent an empty error body
+        feedback: The failureMessage column is written by JMeter's assertions, not copied from the response body.
+    correct: [no-assertion]
+    hints:
+      - Who writes the failureMessage column?
+    solution: |
+      failureMessage comes from failed assertions. A 5xx fails the sample without any assertion, so the message is
+      empty - a sign of a sampler with no assertion explaining its failures. `unexplained_failures` finds these.
+
+  - id: scope-mcq
+    type: mcq
+    concept: perf-jmassert-scope
+    skill: application
+    title: Where does the Duration Assertion go?
+    prompt: |
+      Only the settlement report has a 100 ms budget. A colleague put a Duration Assertion (100 ms) directly under
+      the Thread Group, next to the samplers. Which samplers does it check?
+    options:
+      - id: all
+        text: Every sampler in the thread group, including the token request
+        feedback: Correct - an assertion whose parent is a controller (the thread group) "affects all requests that are descendants" of it.
+      - id: next
+        text: Only the sampler that follows it in the tree
+        feedback: Assertions are hierarchical, not ordered - position among siblings does not limit them to the next sampler.
+      - id: report
+        text: Only the report, because it is the only slow one
+        feedback: The assertion does not know which sampler you meant; it checks every sampler in scope and fails any that are slow.
+      - id: none
+        text: None - assertions only work as children of samplers
+        feedback: They work at any level; the level decides the scope.
+    correct: [all]
+    hints:
+      - Read 3.10 Scoping Rules - "If its parent is a Controller ...".
+    solution: |
+      Scope is the subtree of the parent. Under the thread group it checks every sampler there, so a slow first
+      token request fails too. Make it the child of `GET /v1/reports/settlement`.
+
+  - id: order-of-processing-mcq
+    type: mcq
+    concept: perf-jmassert-scope
+    skill: analysis
+    title: Can the assertion see the extracted id?
+    prompt: |
+      `POST /v1/payments` has two children: a JSON Extractor that saves `$.id` into `${payment_id}`, and a Response
+      Assertion that tests the JMeter Variable `payment_id` (Matches `pay_\d+`). The assertion is listed **before**
+      the extractor in the tree. Does the assertion see the new id?
+    options:
+      - id: yes-after
+        text: Yes - post-processors run before assertions, whatever their order in the tree
+        feedback: Correct - the execution order is sampler, post-processors, assertions, listeners; tree order only matters within a type.
+      - id: no-before
+        text: No - the assertion runs first because it is listed first
+        feedback: Hierarchical elements run by type; "within a type, elements are processed in the order in which they appear in the tree".
+      - id: previous
+        text: It sees the id from the previous iteration
+        feedback: That would only happen if the assertion ran before the extractor - it does not.
+      - id: never
+        text: Assertions cannot read variables
+        feedback: Response Assertion has "JMeter Variable Name to use" for exactly this.
+    correct: [yes-after]
+    hints:
+      - The manual's 3.9 Execution order lists types, not tree positions.
+    solution: |
+      For each sampler JMeter runs config, pre-processors, timers, the sampler, post-processors, assertions and
+      listeners. The extractor (a post-processor) has already set the variable when the assertion runs.
+
+  - id: ignore-status-mcq
+    type: mcq
+    concept: perf-jmassert-scope
+    skill: analysis
+    title: The 500 that passed
+    prompt: |
+      A sampler has two Response Assertions: the first checks Response Code Equals `201`, the second checks the
+      body Contains `"id"` and has **Ignore status** ticked. A `500` comes back whose body happens to contain
+      `"id": null`. What is the sample's result?
+    options:
+      - id: success
+        text: Success - Ignore status on the second assertion cleared the first assertion's failure
+        feedback: Correct - Ignore status forces success before evaluating and clears earlier failures; the second check then passes.
+      - id: failed-first
+        text: Failed - the first assertion already failed
+        feedback: That failure is cancelled by Ignore status on a later assertion - which is why the manual says to set it only on the first.
+      - id: failed-status
+        text: Failed - a 500 always fails
+        feedback: Ignore status exists precisely to override the status-based failure.
+      - id: error
+        text: An error, because two assertions disagree
+        feedback: Assertions do not "disagree"; each one updates the sample in turn.
+    correct: [success]
+    hints:
+      - What does the manual say Ignore status does to "previous assertion failures"?
+    solution: |
+      Ignore status "will have the effect of clearing any previous assertion failures, so make sure that this is
+      only set on the first assertion". Here it hides a server error. Use it only first, only for expected non-2xx.
+
+  - id: vrt-mcq
+    type: mcq
+    concept: perf-jmassert-results
+    skill: recall
+    title: The listener in the load test
+    prompt: What does the JMeter component reference say about View Results Tree?
+    options:
+      - id: must-not
+        text: It must not be used during a load test - use it for functional testing or while debugging the plan
+        feedback: Correct - "View Results Tree MUST NOT BE USED during load test as it consumes a lot of resources (memory and CPU)."
+      - id: cli-fine
+        text: It is fine in CLI mode because nothing is displayed
+        feedback: Listeners that keep samples still keep them; Best Practices says to delete or disable listeners when using -l.
+      - id: sampling
+        text: It is fine if you limit it to errors only
+        feedback: The manual makes no such exception; even filtered, it is a debugging tool.
+      - id: required
+        text: It is required to write the JTL
+        feedback: -l writes the JTL in CLI mode; no listener is needed.
+    correct: [must-not]
+    hints:
+      - Look for the warning in capital letters.
+    solution: |
+      View Results Tree is a debugging tool. In a load test, delete listeners and let `-l` write the results file -
+      Best Practices 16.7.
+
+  - id: csv-xml-mcq
+    type: mcq
+    concept: perf-jmassert-results
+    skill: application
+    title: Two assertions failed - which file shows both?
+    prompt: |
+      A `500` failed both the code assertion and the JSON status assertion. You need both messages for the defect
+      report. Which results format has them?
+    options:
+      - id: xml
+        text: XML - each assertion result is an element with its own failureMessage
+        feedback: Correct - the lesson's XML sample shows both assertion results for one 500.
+      - id: csv
+        text: CSV - failureMessage joins the messages with a separator
+        feedback: The CSV row holds one message - in the lesson's run, only the first failing assertion's.
+      - id: both
+        text: Both, if failureMessage is enabled
+        feedback: Enabling the column gives one message per row, not all of them.
+      - id: neither
+        text: Neither - JMeter keeps only the first failure
+        feedback: XML kept both in the lesson's run.
+    correct: [xml]
+    hints:
+      - Compare the CSV row and the XML sample in "What the results file holds".
+    solution: |
+      CSV has one failureMessage per sample; XML has an assertionResult per assertion. Use CSV for the long run
+      and a short XML run (perhaps with `response_data.on_error=true`) to investigate.
+
+  - id: missing-column-mcq
+    type: mcq
+    concept: perf-jmassert-results
+    skill: analysis
+    title: The JTL with no failureMessage
+    prompt: |
+      A teammate's JTL header is `timeStamp,elapsed,label,responseCode,success,Latency`. The run had 3 % failures.
+      What can you not do with this file, and how do you prevent it next time?
+    options:
+      - id: no-reasons
+        text: You cannot say why samples failed; set `jmeter.save.saveservice.assertion_results_failure_message=true` and check the header on a short run first
+        feedback: Correct - success tells you that a sample failed, failureMessage tells you why.
+      - id: no-rate
+        text: You cannot compute the error rate; turn on Connect
+        feedback: success is there, so the error rate can be computed; Connect is connection time.
+      - id: no-percentiles
+        text: You cannot compute percentiles; switch to XML
+        feedback: elapsed is there, so percentiles can be computed from CSV.
+      - id: rerun-only
+        text: Nothing is lost - failureMessage is in jmeter.log
+        feedback: jmeter.log is JMeter's own log, not a copy of the assertion messages.
+    correct: [no-reasons]
+    hints:
+      - Which column says why a sample failed?
+    solution: |
+      Without failureMessage you know how many samples failed but not why. Choose columns before the run, verify the
+      header on a short run, and read columns by name in analysis.
+
+  - id: backend-mcq
+    type: mcq
+    concept: perf-jmassert-results
+    skill: recognition
+    title: Watching a four-hour soak live
+    prompt: |
+      You want a live dashboard during a four-hour soak test without slowing the load generator. Which JMeter
+      component is designed for this?
+    options:
+      - id: backend
+        text: The Backend Listener sending metrics to Graphite or InfluxDB
+        feedback: Correct - "an Asynchronous listener" for real-time results, with Graphite and InfluxDB clients shipped.
+      - id: vrt
+        text: View Results Tree in GUI mode
+        feedback: It keeps every sample and "MUST NOT BE USED during load test".
+      - id: sdw
+        text: A Simple Data Writer
+        feedback: It writes a file efficiently but shows nothing live.
+      - id: summary
+        text: A second JTL in XML format
+        feedback: A file is evidence for later, not a dashboard - and XML is the heavier format.
+    correct: [backend]
+    hints:
+      - Look for "real-time results" in the user manual.
+    solution: |
+      The Backend Listener streams aggregated metrics asynchronously (Graphite by default; InfluxDB since 3.2). Keep
+      the `-l` JTL as well - it is the per-sample evidence.
+
+  - id: duration-vs-slo-mcq
+    type: mcq
+    concept: perf-jmassert-assertions
+    skill: analysis
+    title: Err 50 % - but is the system broken?
+    prompt: |
+      A run reports `Err: 31 (50.00%)`. Grouping by message shows 20 of the 31 are "The operation lasted too long"
+      from a 100 ms Duration Assertion on the report, and the requirement is "p95 of the report under 200 ms". What
+      is the honest reading?
+    options:
+      - id: separate
+        text: The error rate mixes correctness and latency; report the 11 wrong answers as errors and judge the report's p95 against its SLO separately
+        feedback: Correct - a Duration Assertion fails single samples against a hard limit; an SLO is a percentile, and here the limit is not even the requirement.
+      - id: broken
+        text: Half the requests failed, so the release is blocked
+        feedback: Two thirds of the "errors" are a 100 ms check against a 200 ms p95 requirement.
+      - id: ignore-all
+        text: Duration failures are not real failures, so the error rate is 0
+        feedback: 11 samples are genuinely wrong answers (soft errors, 500s, declined).
+      - id: raise
+        text: Raise the Duration Assertion to 200 ms and re-run
+        feedback: That still judges single samples, not the p95 the requirement names.
+    correct: [separate]
+    hints:
+      - Is the requirement about each sample or about a percentile?
+    solution: |
+      Split "wrong answer" errors from "too slow" verdicts. Wrong answers are defects; latency is judged as a
+      percentile against the SLO ([SLOs](#/lesson/performance-requirements-and-slos)). Say which errors came from
+      a Duration Assertion.
+
+  - id: indefinite-path-mcq
+    type: mcq
+    concept: perf-jmassert-assertions
+    skill: recall
+    title: An indefinite path with no value
+    prompt: |
+      In JMeter 5.6.3 a JSON Assertion uses the path `$..status` (it can match many elements) and no expected
+      value. The body has no `status` anywhere. What happens?
+    options:
+      - id: fails
+        text: The assertion fails - since 5.5 an indefinite path that extracts an empty list with no value set fails
+        feedback: Correct - this was changed in 5.5 because such assertions could pass on nothing.
+      - id: passes
+        text: The assertion passes, because the path is valid syntax
+        feedback: That was the risk before 5.5; the component reference documents the change.
+      - id: error
+        text: JMeter refuses to start the test
+        feedback: The path is checked when the sample is asserted, not at start-up.
+      - id: expect-null
+        text: The assertion passes only if Expect null is ticked
+        feedback: Expect null is about a found value that is null, not about a path that matched nothing.
+    correct: [fails]
+    hints:
+      - The JSON Assertion section mentions "Since JMeter version 5.5".
+    solution: |
+      "Since JMeter version 5.5 the assertion will fail, if an indefinite path is given, an empty list is
+      extracted and no assertion value is set." Prefer a definite path, or assert a value.
+
+  - id: execution-order
+    type: order
+    concept: perf-jmassert-scope
+    skill: recall
+    title: One sampler, in JMeter's order
+    prompt: Put the elements that apply to one sampler in the order JMeter processes them.
+    items:
+      - id: config
+        text: Configuration elements
+      - id: pre
+        text: Pre-Processors
+      - id: timers
+        text: Timers
+      - id: sampler
+        text: The sampler itself
+      - id: post
+        text: Post-Processors
+      - id: assertions
+        text: Assertions
+      - id: listeners
+        text: Listeners
+    hints:
+      - The request has to exist before anything can check it.
+      - Extracted variables are available to the checks that come after them.
+    solution: |
+      Config, pre-processors, timers, sampler, post-processors, assertions, listeners (user manual 3.9). So
+      assertions can use extracted variables, and listeners (and the JTL) record the assertion verdict.
+
+  - id: load-plan-debug
+    type: debug
+    concept: perf-jmassert-scope
+    skill: analysis
+    title: The plan that is not load-test ready
+    prompt: |
+      This test plan tree (indentation = children) is about to run for an hour at 200 threads. The report has a
+      100 ms budget; nothing else does. Click **every** line that is a defect for this load test.
+    language: plaintext
+    code: |
+      Thread Group "Merchants" (200 threads, 1 hour)
+        HTTP Header Manager (Authorization: Bearer ${token})
+        Duration Assertion (100 ms)
+        Once Only Controller
+          POST /auth/token
+            JSON Extractor ($.access_token -> token)
+        GET /v1/payments
+          JSON Assertion ($.data exists)
+        GET /v1/reports/settlement
+        View Results Tree
+    correctLines: [3, 10]
+    lineNotes:
+      - line: 2
+        note: A Header Manager at thread-group level is normal - every request needs the token.
+      - line: 8
+        note: A JSON Assertion as the child of its sampler is exactly right.
+      - line: 9
+        note: The report's budget belongs here as a child Duration Assertion; the missing child is fixed by moving line 3.
+    hints:
+      - Which element's scope is the whole thread group, though it is about one sampler?
+      - Which element keeps every sample in memory?
+    solution: |
+      Line 3 checks every sampler (token, list, report) against 100 ms - move it under the report. Line 10, View
+      Results Tree, "MUST NOT BE USED during load test" - delete it and use `-l`.
+
+  - id: csv-one-message-short
+    type: short
+    concept: perf-jmassert-results
+    skill: analysis
+    title: Why is the second message missing?
+    prompt: |
+      A developer reads your CSV JTL: the 500s show `payment not created: expected HTTP 201`, but you said the plan
+      also checks the payment status. Explain why the status assertion's message is not in the file, and how you
+      would show it.
+    modelAnswer: |
+      The CSV format has one failureMessage column per sample, and JMeter writes one message there - in this run the
+      first failing assertion's (the code check). The status assertion also failed (`No results for path:
+      $['status']`, since a 500 body has no status), but CSV has nowhere to put it. The XML format writes an
+      `assertionResult` per assertion, each with its own failure flag and message, so a short re-run with
+      `-Jjmeter.save.saveservice.output_format=xml` (and `response_data.on_error=true` if the body helps) shows both.
+      For the long load test I keep CSV, which is about three times smaller.
+    rubric:
+      - Says CSV holds one failure message per sample.
+      - Says the second assertion did fail, and why (no status in a 500 body).
+      - Proposes XML (a short run) to see every assertion result.
+      - Keeps CSV for the load test and explains why (size, cost).
+    hints:
+      - Compare the CSV row with the XML sample in the lesson.
+    solution: |
+      One message per CSV row; every assertion result in XML. Investigate with a short XML run, load test with CSV.
+
+  - id: refund-testdesign
+    type: testdesign
+    concept: perf-jmassert-assertions
+    skill: application
+    title: Assertions for the refund endpoint
+    prompt: |
+      SandPay adds `POST /v1/refunds` (body: payment id, amount; answer `201` with `{"id": "rf_...", "status":
+      "pending" | "succeeded", "amount_minor": n}`; `409` if the payment is already fully refunded). Design the
+      assertions for its sampler in a load test, and the short checks you would run to prove the assertions work.
+      For each: preconditions, what you assert, expected result and evidence.
+    modelAnswer: |
+      **Assertions on the refund sampler (children of it):**
+
+      1. Response Assertion - Response Code Equals `201`, custom message "refund not created: expected HTTP 201".
+      2. JSON Assertion - `$.status` matches the regex `pending|succeeded` (a refund in either state is a valid
+         answer under load).
+      3. JSON Assertion - `$.amount_minor` equals the amount sent (`${refund_amount}` from the CSV data), so a
+         wrong amount fails.
+      4. No Duration Assertion unless there is a hard client timeout; the latency SLO is judged in analysis.
+
+      **Negative-path sampler** (separate, for already-refunded payments): Ignore status on the first assertion,
+      then Response Code Equals `409`, message "duplicate refund not rejected".
+
+      **Checks that the assertions work** (short runs against a stub):
+
+      | Precondition | Stub answer | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | valid payment | `201`, status `succeeded`, right amount | success | JTL row `success=true` |
+      | valid payment | `200` with an error body | failed, message names `status` | JTL failureMessage |
+      | valid payment | `201`, amount differs | failed on amount | JTL failureMessage |
+      | valid payment | `500` | failed, custom message | JTL failureMessage |
+      | refunded payment | `409` | success (negative sampler) | JTL row |
+      | refunded payment | `201` | failed "duplicate refund not rejected" | JTL failureMessage |
+
+      Scope check: the token and payment-list samplers show no refund-assertion failures. Evidence for a defect: the
+      CSV rows plus one XML sample with the body.
+    rubric:
+      - Puts each assertion as a child of the refund sampler and gives each a custom message.
+      - Checks the status code and the key fields (status and amount), not the whole body.
+      - Handles the 409 path with Ignore status on the first assertion only.
+      - Keeps latency out of assertions unless there is a hard limit.
+      - Proves each assertion both passes and fails with stub answers, with JTL evidence.
+    hints:
+      - What would a wrong-but-201 answer look like?
+      - How do you test that a 409 is the right answer?
+    solution: |
+      Code + key fields as children of the sampler, the 409 path via Ignore status first, and a stub table proving
+      each assertion passes and fails, with JTL rows as evidence.
+
+  - id: assertions-interview
+    type: interview
+    concept: perf-jmassert-assertions
+    skill: analysis
+    title: 'Interview: can you trust this error rate?'
+    prompt: |
+      "Your JMeter load test reports 0.5 % errors and great response times. How do you know the system actually
+      worked, and how do you set the test up so the results are trustworthy and cheap to collect?"
+    modelAnswer: |
+      First I check what "error" means in that plan. Without assertions JMeter only fails transport errors and
+      4xx/5xx; a 200 with an error body or a 201 for a declined payment counts as success, and those soft errors are
+      often the fastest responses, so they flatter the response times too. I group the JTL failures by label and
+      failureMessage, and look for failed samples with no message - failures nothing explains.
+
+      Then the setup: each sampler gets assertions as its own children - the status code with Equals and a custom
+      message, and one JSON field that proves the work was done (a data array, a captured status). Ignore status only
+      on a first assertion, only for expected 4xx. Hard per-request limits can be Duration Assertions; SLOs are
+      percentiles I judge afterwards, so "errors" don't mix correctness and latency. I prove the assertions fail on a
+      known-bad stub before the long run.
+
+      For cost: CLI mode with `-l`, no View Results Tree (the manual says it must not be used in load tests), as few
+      listeners and assertions as possible, CSV rather than XML, and only the columns I need - at least elapsed,
+      label, responseCode, success and failureMessage - checked on a short run's header. If I need every assertion
+      result or the bodies, I do a short XML run. For live monitoring a Backend Listener to InfluxDB or Graphite.
+    rubric:
+      - Explains which failures JMeter detects without assertions and which it misses (soft errors, wrong values).
+      - Puts assertions as children of samplers, with custom messages and one key field.
+      - Knows Ignore status clears earlier failures.
+      - Separates per-request limits from percentile SLOs.
+      - Runs CLI mode with -l, no View Results Tree, CSV and chosen columns; XML only for investigation.
+    followUps:
+      - What does an empty failureMessage on a failed sample tell you?
+      - How do you check an assertion actually fails when it should?
+      - Why might fixing soft errors make the response times worse?
+    hints:
+      - Start with what JMeter counts as a failure by default.
+    solution: |
+      Assertions decide what "error" means; check the JTL by label and message; keep results lean with CLI mode,
+      no heavy listeners, CSV and chosen columns.
+
+  - id: plan-code
+    type: coding
+    concept: perf-jmassert-assertions
+    skill: application
+    title: Add the four assertions to the plan
+    prompt: |
+      `jmeter/jm_assert_plan.jmx` lists payments, creates one and fetches the settlement report, but every wrong
+      answer counts as a success. Add, at the three TODO comments, each as the **child** of its sampler:
+
+      1. a JSON Assertion that `$.data` exists on `GET /v1/payments`;
+      2. a Response Assertion - Response Code, Equals `201`, custom message
+         `payment not created: expected HTTP 201` - and a JSON Assertion that `$.status` equals `captured` on
+         `POST /v1/payments`;
+      3. a Duration Assertion of `${__P(report_ms,100)}` ms on `GET /v1/reports/settlement`.
+
+      The test runs the plan with real JMeter against a practice API whose wrong answers are known in advance and
+      checks the exact counts and messages in the JTL. You can build the elements in the JMeter GUI and copy them,
+      or write the XML from the lesson.
+    project: perf
+    files:
+      - exercises/jmeter/jm_assert_plan.jmx
+    test: tests/jmeter/test_jm_assert_plan.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_assert_plan.py
+    modelAnswer: |
+      Each assertion goes inside the `<hashTree>` that follows its sampler (see "The four assertions in the test
+      plan"). The details that make the tests pass:
+
+      - `JSONPathAssertion` with `JSON_PATH` `$.data` and `JSONVALIDATION` false (existence only).
+      - `ResponseAssertion` with `Asserion.test_strings` (JMeter's own spelling) holding `201`,
+        `Assertion.test_field` `Assertion.response_code`, `Assertion.test_type` 8 (Equals),
+        `Assertion.custom_message` as given, `Assertion.assume_success` false.
+      - `JSONPathAssertion` with `$.status`, `EXPECTED_VALUE` `captured`, `JSONVALIDATION` true.
+      - `DurationAssertion` with `DurationAssertion.duration` `${__P(report_ms,100)}`.
+
+      Result on the practice API: 5 soft errors, 4 x 500 with the custom message, 2 declined and 20 slow reports
+      fail; 14 creates and both token requests pass; no failure has an empty message.
+    rubric:
+      - Every test in tests/jmeter/test_jm_assert_plan.py passes.
+      - Each assertion is the child of exactly one sampler - none at thread-group level.
+      - The failure message says what was expected.
+      - No listener was added to the plan.
+    hints:
+      - "In a .jmx, an element's children live in the <hashTree> right after it."
+      - The Response Assertion's patterns live in a collectionProp named Asserion.test_strings - JMeter's spelling.
+      - Equals is test_type 8.
+    solution: |
+      Four assertions, each the child of its sampler, with a custom message on the code check - the run's failures
+      then all explain themselves.
+
+  - id: analysis-code
+    type: coding
+    concept: perf-jmassert-results
+    skill: application
+    title: Explain the failures in a JTL
+    prompt: |
+      Implement `jmeter/jm_assert_analysis.py`:
+
+      - `require_columns(rows, needed)` - ValueError naming the missing columns (or for no rows).
+      - `normalise_message(message)` - strip, and replace each run of digits with `<n>`.
+      - `failure_groups(rows)` - failed samples counted by (label, normalised message), most frequent first, then
+        by label and message; an empty message counts as `NO_MESSAGE`.
+      - `label_summary(rows)` - samples, failures and error % (2 decimals) per label.
+      - `unexplained_failures(rows)` - failed samples with an empty message.
+
+      One test runs the reference plan with real JMeter and checks your functions on its JTL.
+    project: perf
+    files:
+      - exercises/jmeter/jm_assert_analysis.py
+    test: tests/jmeter/test_jm_assert_analysis.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_assert_analysis.py
+    modelAnswer: |
+      ```python
+      _NUMBER = re.compile(r"\d+")
+
+      def normalise_message(message):
+          return _NUMBER.sub("<n>", message.strip())
+
+      def failure_groups(rows):
+          require_columns(rows, ["label", "success", "failureMessage"])
+          counts = Counter((r["label"], normalise_message(r["failureMessage"]) or NO_MESSAGE)
+                           for r in rows if r["success"] == "false")
+          return sorted(((label, msg, n) for (label, msg), n in counts.items()),
+                        key=lambda g: (-g[2], g[0], g[1]))
+
+      def unexplained_failures(rows):
+          require_columns(rows, ["success", "failureMessage"])
+          return [r for r in rows if r["success"] == "false" and not r["failureMessage"].strip()]
+      ```
+
+      On the lesson's run `failure_groups` gives 20 "lasted too long" (all timings folded into one group), 5 `No
+      results for path: $['data']`, 4 `payment not created: expected HTTP <n>` and 2 declined; `unexplained_failures`
+      finds the four 500s in the run *without* assertions and none in the run with them.
+    rubric:
+      - Every test in tests/jmeter/test_jm_assert_analysis.py passes.
+      - Columns are read by name and missing ones are reported, not guessed.
+      - Numbers are normalised so timings do not split one failure kind into many.
+      - Failures without a message are reported separately.
+    hints:
+      - "`success` is the string \"true\" or \"false\", not a boolean."
+      - collections.Counter over (label, message) tuples, then sort with a key.
+    solution: |
+      Count failures by label and normalised message, and list failures with no message - the two views that
+      explain an error rate.
+
+  - id: saveservice-code
+    type: coding
+    concept: perf-jmassert-results
+    skill: application
+    title: Choose exactly the JTL columns
+    prompt: |
+      Implement `jmeter/jm_assert_saveservice.py`. First complete `COLUMN_GROUPS` - every CSV column JMeter 5.6.3
+      can write, in its order, with the property that controls it (two pairs share a property). Then:
+
+      - `csv_save_properties(keep, timestamp_format=...)` - the `jmeter.save.saveservice.*` properties for a CSV JTL
+        with a header row and exactly those columns; `timeStamp` is controlled by `timestamp_format` (`"none"`
+        removes it); unknown names raise ValueError.
+      - `expected_header(keep)` - the header JMeter will write.
+      - `missing_columns(header, needed)`.
+
+      One test passes your properties to a real JMeter run and compares the header it writes with
+      `expected_header`.
+    project: perf
+    files:
+      - exercises/jmeter/jm_assert_saveservice.py
+    test: tests/jmeter/test_jm_assert_saveservice.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_assert_saveservice.py
+    modelAnswer: |
+      ```python
+      COLUMN_GROUPS = [
+          (("timeStamp",), "timestamp_format"), (("elapsed",), "time"), (("label",), "label"),
+          (("responseCode",), "response_code"), (("responseMessage",), "response_message"),
+          (("threadName",), "thread_name"), (("dataType",), "data_type"), (("success",), "successful"),
+          (("failureMessage",), "assertion_results_failure_message"), (("bytes",), "bytes"),
+          (("sentBytes",), "sent_bytes"), (("grpThreads", "allThreads"), "thread_counts"), (("URL",), "url"),
+          (("Filename",), "filename"), (("Latency",), "latency"), (("Encoding",), "encoding"),
+          (("SampleCount", "ErrorCount"), "sample_count"), (("Hostname",), "hostname"),
+          (("IdleTime",), "idle_time"), (("Connect",), "connect_time"),
+      ]
+
+      def csv_save_properties(keep, timestamp_format="yyyy/MM/dd HH:mm:ss.SSS"):
+          _check(keep)
+          props = {PREFIX + "output_format": "csv", PREFIX + "print_field_names": "true"}
+          for cols, prop in COLUMN_GROUPS:
+              wanted = any(c in keep for c in cols)
+              if prop == "timestamp_format":
+                  props[PREFIX + prop] = timestamp_format if wanted else "none"
+              else:
+                  props[PREFIX + prop] = "true" if wanted else "false"
+          return props
+      ```
+
+      The order comes from a real header with every column switched on - not from the manual's 12.4 list, which
+      puts `connect` earlier. Setting every property explicitly (true *or* false) means the result does not depend
+      on whatever `user.properties` says on the machine that runs it.
+    rubric:
+      - Every test in tests/jmeter/test_jm_assert_saveservice.py passes.
+      - The column order comes from a real JMeter header, not from memory.
+      - Every column property is set explicitly, so the JTL does not depend on local properties files.
+      - Unknown column names are rejected with a helpful message.
+    hints:
+      - The lesson shows the full 5.6.3 header with every column on.
+      - grpThreads and allThreads come from one property; so do SampleCount and ErrorCount.
+      - "timeStamp has no true/false property: timestamp_format=none removes it."
+    solution: |
+      Map columns to properties in JMeter's real order, set every property explicitly, and verify the header on a
+      short run.
+
+placement:
+  - id: place-soft-error
+    type: mcq
+    concept: perf-jmassert-assertions
+    skill: application
+    title: Green, but wrong
+    prompt: |
+      A load test of a quote API shows 0 % errors. Spot checks show some `200` responses with the body
+      `{"error": "pricing engine unavailable"}` instead of a `quote` object. What is the right fix in the plan?
+    options:
+      - id: json
+        text: A JSON Assertion, as the child of the quote sampler, that `$.quote` exists
+        feedback: Correct - the body is what distinguishes a good answer, and the child position limits it to that sampler.
+      - id: code
+        text: A Response Assertion that the Response Code equals 200
+        feedback: The code is 200 for both good and bad answers.
+      - id: vrt
+        text: Add View Results Tree to see the bodies during the load test
+        feedback: That helps you look, but it does not fail the samples - and it must not be used during a load test.
+      - id: duration
+        text: A Duration Assertion, because the engine is unavailable
+        feedback: The error body is usually fast; time does not reveal it.
+    correct: [json]
+    solution: |
+      JMeter does not read bodies unless told to. Assert the field that proves success, on the sampler it belongs to.
+
+  - id: place-scope
+    type: debug
+    concept: perf-jmassert-scope
+    skill: analysis
+    title: Failures where none were expected
+    prompt: |
+      Only `GET /reports` has a 300 ms limit, but the token request and the list request also fail with "The
+      operation lasted too long". Click the line that causes it.
+    language: plaintext
+    code: |
+      Thread Group "Users"
+        Duration Assertion (300 ms)
+        POST /auth/token
+        GET /payments
+          JSON Assertion ($.data exists)
+        GET /reports
+    correctLines: [2]
+    lineNotes:
+      - line: 5
+        note: A JSON Assertion as the child of its sampler only checks that sampler.
+      - line: 6
+        note: The report sampler is fine; it should be the Duration Assertion's parent.
+    solution: |
+      An assertion under the thread group checks every sampler in it. Move the Duration Assertion to be the child of
+      `GET /reports`.
+
+  - id: place-results
+    type: mcq
+    concept: perf-jmassert-results
+    skill: application
+    title: Setting up the one-hour run
+    prompt: Which setup follows the JMeter user manual's advice for a one-hour load test?
+    options:
+      - id: cli-csv
+        text: 'CLI mode with `-l run.jtl`, listeners removed, CSV with the columns you need'
+        feedback: Correct - Best Practices 16.7 - CLI mode, few listeners, CSV rather than XML, only the data you need.
+      - id: gui-vrt
+        text: GUI mode with View Results Tree, so failures can be inspected live
+        feedback: The manual says View Results Tree must not be used in load tests, and CLI mode is recommended.
+      - id: xml-all
+        text: CLI mode with an XML JTL that saves response data for every sample
+        feedback: XML and response bodies for every sample are the most expensive choice; use them on a short investigation run.
+      - id: many-files
+        text: One Simple Data Writer per sampler, each to its own file
+        feedback: More writers, more cost, and the evidence is split; -l writes one file for the run.
+    correct: [cli-csv]
+    solution: |
+      CLI mode, `-l`, no heavy listeners, CSV, chosen columns. Investigate with a short XML run if you need bodies.
+
+recall:
+  - id: recall-default-failure
+    concept: perf-jmassert-assertions
+    prompt: Without assertions, which HTTP samples does JMeter mark as failed?
+    answer: Transport errors and responses with 4xx or 5xx status - with an empty failureMessage. A 200 with an error body, a wrong value or a slow answer counts as success.
+  - id: recall-response-assertion
+    concept: perf-jmassert-assertions
+    prompt: Response Assertion - which rules are regular expressions, and what does Ignore status do?
+    answer: Contains and Matches are regular expressions (Matches = whole text); Equals and Substring are plain, case-sensitive strings. Ignore status forces the sample to success before checking and clears earlier assertion failures - use it only on the first assertion.
+  - id: recall-scope
+    concept: perf-jmassert-scope
+    prompt: How do you make an assertion check exactly one sampler?
+    answer: Make it the child of that sampler. Under a controller or thread group it checks every sampler below it.
+  - id: recall-order
+    concept: perf-jmassert-scope
+    prompt: The order JMeter processes elements for one sampler?
+    answer: Configuration elements, pre-processors, timers, the sampler, post-processors, assertions, listeners.
+  - id: recall-vrt
+    concept: perf-jmassert-results
+    prompt: What runs and writes results in a load test, according to the manual?
+    answer: CLI mode (`jmeter -n -t plan.jmx -l run.jtl`), listeners deleted or disabled - View Results Tree "MUST NOT BE USED during load test" - CSV rather than XML, only the data you need.
+  - id: recall-csv-xml
+    concept: perf-jmassert-results
+    prompt: CSV versus XML JTL?
+    answer: CSV is compact (about 180 bytes per sample in the lesson's run), holds one failureMessage per sample and no line breaks. XML is about three times larger, keeps every assertion result and can keep response bodies. Columns come from jmeter.save.saveservice.* properties.
+
+next:
+  - jmeter-parameterisation-and-data
+  - jmeter-logic-controllers
+  - jmeter-html-dashboard-and-ci
+  - reading-load-test-results

@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from load_tools import jmeter_home, read_jtl, run_jmeter, run_locust
+from load_tools import jmeter_home, read_jtl, read_locust_stats, run_jmeter, run_locust
 from sandpay_target import TargetConfig, serve
 
 FIX = Path(__file__).parent / "fixtures"
@@ -41,6 +41,8 @@ def test_auth_pagination_idempotency():
         s1, _, p1 = req(base, "POST", "/v1/payments", body, {**t, "Idempotency-Key": "k-1"})
         s2, h2, p2 = req(base, "POST", "/v1/payments", body, {**t, "Idempotency-Key": "k-1"})
         assert (s1, s2) == (201, 201) and p1 == p2 and h2.get("Idempotent-Replayed") == "true"
+        m = req(base, "GET", "/metrics")[2]
+        assert (m["payments_created"], m["idempotent_replays"]) == (1, 1)
 
 
 def test_capacity_queues_and_sheds():
@@ -77,5 +79,5 @@ def test_jmeter_runs_headless(tmp_path):
 def test_locust_runs_headless(tmp_path):
     with serve(TargetConfig(latency_ms=1)) as base:
         prefix = run_locust(FIX / "smoke_locustfile.py", base, users=2, spawn_rate=2, run_time="2s", out_dir=tmp_path)
-    stats = (Path(f"{prefix}_stats.csv")).read_text()
-    assert "/health" in stats
+    stats = read_locust_stats(prefix)  # final totals; _stats.csv may still be a second behind
+    assert stats["/health"]["num_requests"] > 0 and stats["/health"]["num_failures"] == 0
