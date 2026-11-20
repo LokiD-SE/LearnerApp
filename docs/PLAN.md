@@ -255,13 +255,14 @@ owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberate
       CI), then analysis, CI and the capstone (9).
       Sources: the Apache JMeter user manual and component reference, the Locust documentation, Little's law
       (Lazowska et al.), Google SRE books, the USE and RED methods, web.dev.
-- [ ] Track L lessons, in batches of about 6 - 12 of 30 published (2026-11-20). Done: foundations (6) and
-      web vulnerabilities part 1 (authentication, sessions, access control/IDOR, SQL injection, XSS, CSRF and
-      clickjacking). Next: web part 2 (SSRF and open redirects, file handling and path traversal, security
-      misconfiguration, cryptography and data exposure), then API security (4), DevSecOps (5), and mobile,
-      payments, reporting, capstone and mock interview (5). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10,
-      API Security Top 10:2023, MASVS/MASTG, cheat sheets and ZAP docs; RFCs (JWT, OAuth); FIRST CVSS v4.0;
-      PCI DSS v4.0.1. ZAP, Burp, Semgrep and similar tools are quoted from their docs, not installed.
+- [ ] Track L lessons, in batches of about 6 - 18 of 30 published (2026-11-20). Done: foundations (6), web
+      vulnerabilities (authentication, sessions, access control/IDOR, SQL injection, XSS, CSRF and clickjacking,
+      SSRF and open redirects, file handling and path traversal, misconfiguration, cryptography and data
+      exposure) and API security part 1 (OWASP API Top 10, JWT and OAuth). Next: API security part 2 (mass
+      assignment, business logic and rate limits), DevSecOps (5), and mobile, payments, reporting, capstone and
+      mock interview (5). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10, API Security Top 10:2023,
+      MASVS/MASTG, cheat sheets and ZAP docs; RFCs (JWT, OAuth); FIRST CVSS v4.0; PCI DSS v4.0.1. ZAP, Burp,
+      Semgrep and similar tools are quoted from their docs, not installed.
 - Lesson forks follow a shared brief (kept outside the repo); the hard-won rules are: quote YAML values with
   `: `, `order` items as `{id, text}`, a `solution` and hints on every exercise, no `null`/`true` ids, quoted
   mermaid labels, no 13-19 digit runs (elide JMeter epoch-ms), Locust totals from `--json-file` not

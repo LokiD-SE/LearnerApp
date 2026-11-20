@@ -1,0 +1,1538 @@
+id: testing-jwt-and-oauth
+title: Testing JWTs and OAuth 2.0
+subject: security-testing
+module: api-security
+level: advanced
+status: published
+estimatedMinutes: 160
+summary: Test the two things most modern APIs trust blindly - the JSON Web Token in the Authorization header and the OAuth 2.0 flow that issued it. Decode a token and judge what it reveals, probe for the unsigned-token (alg none) flaw and a signature that is never checked, write a validator that enforces algorithm, expiry, issuer and audience, and review an OAuth authorization-code flow for redirect URI, PKCE, state and grant-type weaknesses - with probes that find the flaw in a deliberately vulnerable SandPay portal and stay quiet once it is fixed.
+tags:
+  [
+    JWT,
+    JSON Web Token,
+    JWS,
+    alg none,
+    unsecured JWT,
+    signature verification,
+    HS256,
+    RS256,
+    algorithm confusion,
+    weak HMAC key,
+    kid,
+    jku,
+    jwk,
+    aud,
+    iss,
+    exp,
+    claims validation,
+    OAuth 2.0,
+    authorization code,
+    PKCE,
+    code verifier,
+    redirect URI,
+    state parameter,
+    implicit grant,
+    password grant,
+    token lifetime,
+    refresh token,
+    OWASP WSTG,
+    WSTG-SESS-10,
+    WSTG-ATHZ-05,
+    RFC 7519,
+    RFC 8725,
+    RFC 9700,
+    RFC 7636,
+    API security,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, on Linux. Every
+    output marked as run here was printed by the code shown, on 20 November 2026, against the practice portal on
+    `127.0.0.1`. Tokens differ between runs because their `exp` claim holds the time of issue; the forged token
+    printed with a fixed `exp` is the same every time.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, the **deliberately vulnerable** SandPay
+    merchant portal (flaw id `jwt-none`; `make_app({"jwt-none"})` closes it). It binds to loopback only. It signs its
+    tokens with the synthetic key `sandpay-practice-only-jwt-key` (HS256). SandPay, its users, its keys and every
+    token here are fictional. The portal has **one** JWT flaw, `alg: none`; the other attacks in this lesson are
+    explained from the sources and are labelled "from the docs, not run here".
+  - **OAuth is not run here.** The practice project has no OAuth authorization server, so the OAuth parts are a
+    review of requests and rules taken from the standards and the WSTG, plus one computation (the PKCE S256
+    challenge) that is run. Nothing in the OAuth sections was tested against a live server.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. A JWT is a
+    credential: a forged or replayed token is an attack on a live system, and the identity provider of a third
+    party (a "Sign in with ..." button) is almost never in your scope. Cracking an HMAC key is done offline, on a
+    token you were allowed to capture, and only when the engagement says so.
+  - **Testing guide:** OWASP Web Security Testing Guide, development version on
+    [GitHub](https://github.com/OWASP/wstg/tree/master/document/4-Web_Application_Security_Testing) as read on 20
+    November 2026 - [JSON Web Tokens (WSTG-SESS-10)](https://github.com/OWASP/wstg/blob/master/document/4-Web_Application_Security_Testing/06-Session_Management/10-JSON_Web_Tokens.md),
+    [OAuth Weaknesses (WSTG-ATHZ-05)](https://github.com/OWASP/wstg/blob/master/document/4-Web_Application_Security_Testing/05-Authorization/05-OAuth_Weaknesses.md)
+    and its two sub-pages, OAuth Authorization Server Weaknesses and OAuth Client Weaknesses. The latest stable
+    release is v4.2; these pages were read in the development version and were not compared with v4.2, so check
+    the release you cite in a report.
+  - **Standards (read in full text from the RFC Editor on 20 November 2026):**
+    [RFC 7519](https://www.rfc-editor.org/rfc/rfc7519) JSON Web Token (sections 4.1, 6, 7.2),
+    [RFC 7515](https://www.rfc-editor.org/rfc/rfc7515) JSON Web Signature (section 4.1.1, appendix C),
+    [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725) JWT Best Current Practices (sections 2.1, 2.2, 3.1, 3.2, 3.5,
+    3.8, 3.9, 3.10), [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0 (sections 4.1.1, 4.1.3, 10.12),
+    [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) OAuth 2.0 Security Best Current Practice (sections 2.1,
+    2.1.1, 2.1.2, 2.4) and [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE (sections 4.1, 7.2, appendix B).
+  - **Cheat sheets:** OWASP [JSON Web Token Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_Cheat_Sheet.html)
+    and [OAuth 2.0 Protocol Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/OAuth2_Cheat_Sheet.html), as
+    documented on 20 November 2026.
+  - **Tools named, not run here:** jwt_tool, the JSON Web Tokens Burp extension, the ZAP JWT add-on, John the Ripper
+    and jwt-cracker are listed by the WSTG; this lesson builds the equivalent probes in Python instead.
+  - **Not repeated here:** how developers issue and store sessions -
+    [Sessions, cookies and tokens](#/lesson/sessions-cookies-and-tokens); the session-id replay technique -
+    [Testing session management](#/lesson/testing-session-management); open redirects and SSRF, which several JWT and
+    OAuth attacks lean on - [Testing for SSRF and open redirects](#/lesson/testing-ssrf-and-open-redirects); the
+    risk list this lesson goes deeper on - [The OWASP API Security Top 10](#/lesson/owasp-api-security-top-10).
+
+prerequisites:
+  - security-testing-fundamentals
+  - http-security-for-testers
+  - sessions-cookies-and-tokens
+  - testing-session-management
+
+concepts:
+  - id: sec-jwt-signature-algorithm
+    name: Reading a JWT and verifying its signature
+    summary: A JWT is three base64url parts that anyone holding it can read, so only the signature protects it. The server must pick the algorithm itself from a short allow-list, never from the token's own alg header - otherwise an attacker sets alg to none, deletes the signature, and is accepted as any user. A tester decodes the token to see what it reveals, then sends a tampered token, an unsecured token and a no-token request, and reports the status codes.
+  - id: sec-jwt-claims-key-trust
+    name: Claims and key material the token names
+    summary: A valid signature only proves who signed the token. The verifier must still check that the token is current (exp, nbf), came from the expected issuer (iss), and was meant for this service (aud), all with exact comparisons, and must never fetch or trust keys that the token's own header names (kid, jku, jwk). A signed token for service A that service B accepts is a finding even though nothing was forged.
+  - id: sec-oauth-flow-weaknesses
+    name: OAuth 2.0 authorization-code flow weaknesses
+    summary: OAuth lets a user give an app limited access without giving it a password, and every parameter in the flow is a place to go wrong - a redirect URI compared loosely leaks the authorization code, a missing or downgradable PKCE challenge lets a stolen code be redeemed, a missing state invites cross-site request forgery, and the implicit and password grants should not be used at all. A tester reviews each request against RFC 9700 and the WSTG and checks the server enforces it.
+
+objectives:
+  - Decode a JWT without a key and judge what its header and claims reveal, including sensitive data and an unsafe lifetime.
+  - Probe an API for the alg none flaw and for a signature that is never checked, with a baseline and a negative control so the result can be trusted.
+  - Write a validator that enforces the algorithm allow-list, signature, expiry, not-before, issuer and audience, and explain the order of the checks.
+  - Explain the key-confusion, weak-key, kid, jku and jwk attacks and the one rule that stops all of them.
+  - Review an OAuth authorization-code request for redirect URI, PKCE, state and grant-type weaknesses against RFC 9700, and compute a PKCE S256 challenge.
+  - Design a test plan for a token-based API and an OAuth sign-in that gives expected results and evidence for each case.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: The idea in plain language
+    body: |
+      Picture a festival wristband. The print on it says who you are and what it lets you do: "Ana - backstage - valid
+      until 23:00". Anyone can read the print. What makes the wristband trustworthy is the **hologram stamp** that only
+      the festival's own machine can make. A guard at a door does not phone the office; they read the print and look
+      at the stamp. That is a JSON Web Token (JWT): readable claims plus a signature, checked by whoever is at the
+      door - your API.
+
+      Everything that can go wrong is a guard who checks the wrong thing:
+
+      - **A guard who accepts a wristband that says "no stamp needed".** The wristband itself states how it should be
+        checked. If the guard believes it, anyone can print their own "no stamp needed" band for "Ana - backstage".
+        That is the **alg none** flaw, and it is the one the practice portal has.
+      - **A guard who checks that a stamp exists but not whose festival it is from, or whether the band has expired.**
+        Ana's band for the *car park* opens the *artists' door*. That is a missing **audience** or **expiry** check.
+      - **A guard who lets the wristband tell them where to find the stamp-checking kit.** "Look up my stamp in the
+        drawer called `../../empty`" - or in a drawer the wearer built. That is trusting `kid`, `jku` or `jwk`.
+      - **A band printed with a secret on it.** The print is readable by everyone who holds the band, so a password
+        hash on it is a leak, however good the stamp is.
+
+      OAuth 2.0 is the system that hands out some of those wristbands. It works like a hotel key card that opens only
+      the gym and the pool: you let an app use a *part* of your account without giving it your password. The app is
+      sent to the hotel desk (the authorization server), you say yes, and the desk sends the app back with a one-use
+      **claim ticket** (the authorization code) which the app swaps for the key card (the access token). It goes
+      wrong when the desk will send the ticket to *any* address the app names, when someone else can swap the ticket
+      first, or when the desk allows old routes (handing the password to the app, or the key card in the URL) that
+      the standards now forbid.
+
+      This lesson tests each of those mistakes. On the portal it uses real tokens and real requests; for OAuth it
+      reviews requests and rules from the standards, because the practice project has no OAuth server.
+
+  - id: what
+    kind: what
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **JWT** | JSON Web Token (RFC 7519) - a set of claims, written as dot-separated base64url parts |
+      | **JWS** | JSON Web Signature - the signed form of a JWT: `header.payload.signature` (three parts) |
+      | **Claim** | one name and value in the payload, for example `sub` (subject) or `exp` (expiry) |
+      | **`alg`** | the header field naming the signature algorithm, for example `HS256` or `RS256`; the WSTG says an unsigned token names `none` |
+      | **Unsecured JWT** | RFC 7519 section 6: "a JWS using the `alg` Header Parameter value `none` and with the empty string for its JWS Signature value" |
+      | **HS256** | HMAC with SHA-256: one shared secret both signs and verifies |
+      | **RS256** | RSA signature: a private key signs, a public key verifies |
+      | **`kid` / `jku` / `jwk`** | header fields that name the key: an id, a URL of a key set, or the key itself |
+      | **`iss` / `aud` / `exp` / `nbf`** | issuer, audience (who the token is for), expiry time, not-before time |
+      | **Key confusion** | making a verifier use a public key as an HMAC secret by changing `alg` from RS256 to HS256 |
+      | **Resource owner / client / authorization server / resource server** | the user, the app, the server that authenticates the user and issues tokens, and the API the tokens open (RFC 6749) |
+      | **Authorization code grant** | the client sends the user to the authorization server, gets a short-lived code on a **redirect URI**, and swaps it for tokens |
+      | **PKCE** | Proof Key for Code Exchange (RFC 7636): the client sends a hash (`code_challenge`) first and the secret (`code_verifier`) when redeeming the code |
+      | **`state`** | an opaque value the client sends and gets back, used to tie the callback to the request and stop CSRF |
+      | **Implicit grant / password grant** | older flows - a token in the redirect, or the user's password given to the client - that the current best practice discourages or forbids |
+      | **Access token / refresh token** | the short-lived key to the API, and the longer-lived token used to get new access tokens |
+
+      The tests this lesson follows:
+
+      | Id | Test | Here |
+      | --- | --- | --- |
+      | WSTG-SESS-10 | JSON Web Tokens | decode, signature, `none`, weak keys, confusion, `kid`, `jku`, `aud`, `iss` |
+      | WSTG-ATHZ-05 | OAuth Weaknesses | grant types, redirect URI, PKCE, state, token lifetime and storage |
+
+      Two reminders from the WSTG itself. A JWT's payload is "not usually encrypted", so treat every value in it "as
+      readable by anyone who holds the token". And the WSTG's objectives for JWTs are two questions: do the tokens
+      "expose sensitive information", and "can they be tampered with or modified"?
+
+  - id: why
+    kind: why
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Why token flaws are so serious
+    body: |
+      **A flawed token check is a flawed login.** The WSTG puts it plainly: "As they are used for authentication, a
+      vulnerability can easily result in a complete compromise of the application." A JWT is usually a *bearer*
+      token: whoever presents it is treated as the user it names. If the API will accept a token the attacker made,
+      the attacker chooses who they are - including `ops@sandpay.example`, the administrator.
+
+      **There is no server-side record to fall back on.** A session id is looked up in a table; a JWT is *verified*,
+      and the claims are believed. So every rule has to live in the verifier: right algorithm, right key, not expired,
+      right issuer, right audience. Nothing else catches a mistake - a missing check is silently an open door, and
+      the API still returns `200` to every legitimate request, so ordinary functional tests never notice.
+
+      **The mistakes are well known and keep coming back.** RFC 8725 (the JWT best current practice) lists them as
+      threats: "The algorithm can be changed to `none` by an attacker, and some libraries would trust this value and
+      `validate` the JWT without checking any signature"; an `RS256` token "can be changed into `HS256`" so the RSA
+      public key becomes the HMAC secret; and keys with "insufficient entropy" fall to "offline brute-force or
+      dictionary attacks once an attacker gets hold of such a token".
+
+      **OAuth multiplies the places a token can leak.** RFC 9700 says redirect-based flows must use "exact string
+      matching" for the redirect URI because loose matching "contributes to the prevention of leakage of authorization
+      codes and access tokens" - which means loose matching causes the leak. Every parameter in the flow is a
+      boundary an attacker can try to move.
+
+      **Where this sits in the lists you will be asked about.** Weak token verification is OWASP Top 10:2021 A07
+      (Identification and Authentication Failures) and, for the algorithm and key mistakes, A02 (Cryptographic
+      Failures); on APIs it is API2:2023 Broken Authentication. See
+      [The OWASP API Security Top 10](#/lesson/owasp-api-security-top-10) and
+      [OWASP Top 10 for developers](#/lesson/owasp-top-10-for-developers).
+
+  - id: jwt-internals
+    kind: internals
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust]
+    title: How a JWT is built and how a verifier should check it
+    body: |
+      **Structure.** `header.payload.signature`, each base64url-encoded without `=` padding (so you may need to add
+      padding back to decode). The header says how the signature was made; the payload holds the claims; the signature
+      covers the first two parts exactly as sent. **Decoding needs no key** - it is reading, and says nothing about
+      whether the token is genuine.
+
+      **What a verifier must do.** RFC 7519 section 7.2 lists the steps and ends: "If any of the listed steps fail,
+      then the JWT MUST be rejected". RFC 8725 adds the rules that matter for testing:
+
+      - *Algorithm* (3.1): "Libraries MUST enable the caller to specify a supported set of algorithms and MUST NOT use
+        any other algorithms when performing cryptographic operations." The allow-list belongs to the **application**,
+        not to the token. RFC 7515 4.1.1 adds that `alg` "is a case-sensitive ASCII string", so `None` is not `none` -
+        and not an algorithm either.
+      - *None* (3.2): "JWT libraries SHOULD NOT consume JWTs using `none` unless explicitly requested by the caller."
+        The RFC allows `none` only where the JWT is protected by other means, which an API reading a bearer header is
+        not.
+      - *All operations* (3.3): the whole JWT is rejected if any cryptographic step fails.
+      - *Keys* (3.5): "human-memorizable passwords MUST NOT be directly used as the key to a keyed-MAC algorithm such
+        as `HS256`".
+      - *Issuer and subject* (3.8): the keys used must "belong to the issuer", otherwise "the application MUST reject
+        the JWT".
+      - *Audience* (3.9): when one issuer serves several applications, "the relying party or application MUST validate
+        the audience value, and if the audience value is not present or not associated with the recipient, it MUST
+        reject the JWT" (RFC 7519 4.1.3 says the same).
+      - *Do not trust received claims* (3.10): `kid` can cause SQL or LDAP injection; "blindly following a `jku` ... or
+        `x5u` header, which may contain an arbitrary URL, could result in server-side request forgery".
+
+      **Time claims** (RFC 7519 4.1.4 and 4.1.5): the current time "MUST be before the expiration" `exp`, and "after or
+      equal to" `nbf`; a verifier "MAY provide for some small leeway, usually no more than a few minutes".
+
+      **The attacks, and where each one lives.** All but the first row are from the docs, not run here - the practice
+      portal has only the `none` flaw.
+
+      | Attack | What the server does wrong | How a tester checks | Stopped by |
+      | --- | --- | --- | --- |
+      | Signature never checked | decodes the token instead of verifying it (the WSTG's example is Node's `jwt.decode()` instead of `jwt.verify()`) | change the payload, keep the old signature, send it | verify before reading any claim |
+      | `alg: none` | believes the token's `alg`, accepts an empty signature | header `none`, drop the signature (the token ends with a dot) | a fixed allow-list without `none` |
+      | `NoNe`, `NONE` | blocks the exact string `none` but a library matches names loosely | the same token with other spellings | exact, case-sensitive comparison (and still no `none`) |
+      | Weak HMAC key | signs with a guessable secret | dictionary or brute force **offline** on a captured token | a random key of enough entropy |
+      | RS256 to HS256 confusion | verifies with one function for both kinds of key, trusts the header | re-sign the token with HS256 using the **public** key as the secret | one key, one algorithm, checked against the header |
+      | Embedded `jwk` | takes the verification key from the token | put your own public key in the header, sign with your private key | never trust a key that arrives in the token |
+      | `kid` traversal or injection | uses `kid` as a file path or in a SQL query | `../../../../dev/null` (an empty key), or a SQL string that returns a known key | treat `kid` as an opaque lookup into a fixed set |
+      | `jku` / `x5u` | fetches the key set from the URL in the header | point it at a server you control (and at internal addresses to test SSRF) | an allow-list of URLs, no cookies sent |
+      | Missing `aud` / `iss` check | trusts any validly signed token from the same identity provider | replay a low-privilege service's token at a high-privilege one | exact `aud` and `iss` comparison |
+      | No expiry | accepts tokens with no `exp`, or ignores it | read the lifetime, replay an expired token | require `exp` and enforce it |
+
+      **What the portal does.** It verifies `HS256` tokens with a fixed key and refuses a changed payload - that part
+      is sound. But when `alg` is exactly `none` it skips the signature check (flaw `jwt-none`). It also accepts a
+      validly signed token with no `exp`, and checks no issuer or audience - behaviours the section "The evidence"
+      shows, and which closing the `jwt-none` flaw does **not** change.
+
+  - id: oauth-internals
+    kind: internals
+    concepts: [sec-oauth-flow-weaknesses]
+    title: How the authorization-code flow works and where it breaks
+    body: |
+      **Roles** (RFC 6749, as the WSTG summarises): the *resource owner* (the user), the *client* (the app asking for
+      access - *public* if it cannot keep a secret, like a mobile app or single-page app, *confidential* if it can),
+      the *authorization server* (issues tokens) and the *resource server* (the API).
+
+      **The flow, with PKCE.**
+
+      1. The client makes a random `code_verifier` and sends its hash as `code_challenge` (with
+         `code_challenge_method=S256`), plus `client_id`, `redirect_uri`, `scope`, `state` and `response_type=code`.
+      2. The user signs in and consents at the authorization server.
+      3. The server redirects the browser to `redirect_uri` with a one-use `code` (and the same `state`).
+      4. The client sends the `code` and the `code_verifier` to the token endpoint. The server hashes the verifier,
+         compares it with the stored challenge, and only then issues tokens.
+
+      The challenge is computed as `BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))` for `S256` (RFC 7636 section 4.2).
+      A verifier is "a minimum length of 43 characters and a maximum length of 128 characters" of unreserved
+      characters (section 4.1), and the RFC recommends "a minimum of 256 bits of entropy" - 32 random octets encoded
+      as 43 characters. The section "The evidence" computes the RFC's own example.
+
+      **Where each parameter goes wrong, and what to test.** Quotations are from RFC 9700 unless marked; the tests are
+      from the WSTG OAuth pages.
+
+      | Parameter or choice | The rule | The mistake | The test |
+      | --- | --- | --- | --- |
+      | `redirect_uri` | "authorization servers MUST utilize exact string matching" (2.1), apart from the port of a localhost redirect for native apps | prefix, domain-only or wildcard matching: `https://app.example.com` as a prefix also matches `https://app.example.com.evil.test` | send a forged or altered `redirect_uri` and see whether the server redirects there; the WSTG: the attacker "can capture the `code` value" |
+      | Open redirectors | clients and servers "MUST NOT expose URLs that forward the user's browser to arbitrary URIs obtained from a query parameter" (2.1) | a `?next=` on a trusted host used as the redirect target | look for open redirects on every host the flow touches (see the SSRF and open-redirect lesson) |
+      | PKCE | "Public clients MUST use PKCE"; for confidential clients it is "RECOMMENDED" (2.1.1) | server does not support or enforce it | the four downgrade tests below |
+      | PKCE method | clients "SHOULD use PKCE code challenge methods that do not expose the PKCE verifier"; "S256 is the only such method" (2.1.1); RFC 7636: a client that can use S256 "MUST use S256" | `plain` makes the challenge equal to the verifier | read `code_challenge_method` in the authorization request |
+      | PKCE downgrade | the server "MUST mitigate PKCE downgrade attacks" by accepting a `code_verifier` "only if a `code_challenge` parameter was present in the authorization request" (2.1.1) | the verifier is accepted though no challenge was sent | WSTG: (1) no `code_challenge`, (2) empty `code_challenge`, (3) forged `code_challenge`, (4) no challenge, then redeem the code **with** a verifier - the server must refuse |
+      | `state` | RFC 6749 4.1.1: "SHOULD be used for preventing cross-site request forgery"; RFC 9700 lets a client rely on PKCE instead only once it "has ensured that the authorization server supports" it | no `state` and no PKCE | complete a flow with the callback replaced by one from another session |
+      | Grant type | the password grant "MUST NOT be used" (2.4); clients "SHOULD NOT use the implicit grant" (2.1.2) | a mobile app that posts the user's password to the token endpoint, or a token in the redirect | read `grant_type` in the token request and `response_type` in the authorization request: `password`, or `response_type=token` |
+      | Token lifetime | the WSTG: "No OAuth specification mandates a universal lifetime such as 5 to 15 minutes" - choose a short one and verify it is enforced; refresh tokens should be "one-time" and replaced when used | tokens that never expire, or an expiry that is not enforced | record `expires_in` and `exp`, then replay before, at and after expiry and compare with what was advertised |
+      | Token storage (client) | the WSTG: public clients "may store tokens in the browsers session storage or in a cookie, but not in the local storage" | tokens in local storage, readable by any script on the page (XSS) | developer tools, Application tab |
+
+      The three WSTG downgrade variants matter because each is a different bug: a server that does not support PKCE at
+      all, one that does not validate it, and one that accepts a verifier nobody asked for.
+
+      **Not run here.** The table and the flow are from the standards and the WSTG. The practice project has no
+      authorization server, so no OAuth request in this lesson was sent to anything.
+
+  - id: when
+    kind: when
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: When to test this, and what it does not replace
+    body: |
+      **Use these tests when** an API accepts a bearer token (almost every mobile backend, single-page app and
+      microservice), when a service delegates sign-in ("Sign in with ..." or an internal single sign-on), and again
+      whenever the token library, the signing key, the identity provider or the set of audiences changes. A
+      token-library upgrade is a good time: several of these flaws are library defaults.
+
+      **Start with the cheap, safe reads.** Decoding a token you were issued, and reading its lifetime, claims and
+      header, changes nothing on the server. Do that first; it also tells you which attacks apply (an `HS256`
+      token has no public key to confuse; a header with `kid` suggests a key lookup).
+
+      **When not to, or with extra care:**
+
+      - Forged tokens are *authentication attacks*. Send them only to systems and endpoints in the written scope, and
+        use test accounts, never real customers' identities.
+      - Never brute-force an HMAC key against a **live** service - the attack is offline, against a token you hold, and
+        it needs explicit permission because a recovered key lets anyone mint tokens.
+      - The authorization server of a third-party identity provider is usually out of scope. Test *your* client's
+        use of it (redirect URI registered, `state`, PKCE, token storage), not their platform.
+      - Do not put a real customer's token into an online JWT decoder: a token is a credential, and a website you
+        paste it into now holds it.
+
+      **What this does not replace.** A JWT test does not test *authorization* - what an authenticated user may do
+      ([Testing for access control and IDOR](#/lesson/testing-access-control-idor)) - and does not replace a code
+      review of the verification path or an update of the library. A passing probe says "none of these attacks worked
+      in these requests", not "the verifier is correct".
+
+  - id: visual-alg-none
+    kind: visual
+    concepts: [sec-jwt-signature-algorithm]
+    title: The alg none attack, step by step
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant T as Tester (alice, a merchant)
+        participant P as SandPay portal
+        T->>P: POST /api/login alice and password
+        P-->>T: 200 token with alg HS256 and a signature
+        T->>T: decode the token, change sub to ops@sandpay.example
+        T->>P: GET /api/me with the changed token and the OLD signature
+        P-->>T: 401 bad signature
+        T->>T: build a new token with alg none and an EMPTY signature
+        T->>P: GET /api/me with the unsigned token (it ends with a dot)
+        P-->>T: 200 ops@sandpay.example with role admin
+        Note over P: The fix is one rule - the server chooses the allowed algorithms and none is not one of them
+      ```
+
+      Notice the middle exchange. The portal **does** reject the tampered signed token - it verifies `HS256`
+      properly. The flaw is not weak cryptography; it is that the token is allowed to choose *no* cryptography.
+      That is why the probe sends both: a tampered token (the signature check works) and an unsigned one (the check
+      can be skipped).
+
+  - id: visual-oauth
+    kind: visual
+    concepts: [sec-oauth-flow-weaknesses]
+    title: The authorization-code flow with PKCE, and where the attacks land
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant U as User browser
+        participant C as Client app
+        participant A as Authorization server
+        participant R as Resource API
+        C->>C: make code_verifier and code_challenge from it
+        C->>U: send the user to the authorization endpoint
+        U->>A: GET authorize with code_challenge and redirect_uri and state
+        Note over A: Test 1 - is redirect_uri compared by exact string?
+        A-->>U: sign in and consent, then redirect to redirect_uri with code and state
+        Note over U,C: Test 2 - is state checked on the callback?
+        U->>C: callback with code and state
+        C->>A: POST token with code and code_verifier
+        Note over A: Test 3 - is a code_verifier refused when no challenge was sent?
+        A-->>C: access token and refresh token
+        C->>R: GET with Authorization Bearer access token
+        Note over R: Test 4 - is the token checked for signature and exp and iss and aud?
+      ```
+
+      Notice that the attacks do not all happen at the same place. Tests 1 and 3 are about the *authorization server*
+      (WSTG OAuth Authorization Server Weaknesses); test 2 and the storage of the token are about the *client*
+      (OAuth Client Weaknesses); test 4 is the JWT half of this lesson, done by the *resource server*. A report must
+      say whose bug each one is, because they have different owners.
+
+  - id: raw-exchanges
+    kind: code
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: The evidence - real exchanges with the vulnerable and the fixed portal
+    body: |
+      Run here on 20 November 2026 against the portal on loopback (`make_app()`, then `make_app({"jwt-none"})`). The
+      code is an excerpt of the script that produced the output, using the lesson's own modules
+      (`solutions/api/jwt_inspect.py`, `jwt_probe.py` and `jwt_validate.py`). Lines of each token are cut with `...`.
+
+      **1. Sign in and read the token**
+
+      ```python
+      tok = get_token(base, "alice@shop-a.example", "alice-pass-1")
+      jwt = decode_token(tok)
+      print("header :", jwt.header)
+      print("payload:", jwt.payload)
+      print("signature chars:", len(jwt.signature))
+      print("findings:", describe_token(tok, now=time.time()))
+      ```
+
+      ```text
+      header : {'alg': 'HS256', 'typ': 'JWT'}
+      payload: {'sub': 'alice@shop-a.example', 'exp': 1795196357}
+      signature chars: 43
+      findings: []
+      ```
+
+      The `exp` differs on every run (it is the time of issue plus an hour). The token has a sound algorithm and a
+      one-hour life, and carries nothing sensitive, so `describe_token` finds nothing. Notice what else it does *not*
+      have: no `iat`, no `iss`, no `aud`. Section 4 comes back to that.
+
+      The WSTG's own example payload is worth running through the same function. It comes from the OWASP Juice Shop
+      and carries the user's role and a password hash inside a nested object (here with a made-up value):
+
+      ```text
+      ['missing-exp', 'sensitive-claim:data.password']
+      ```
+
+      **2. The portal, vulnerable - the three requests the probe makes**
+
+      ```python
+      forged = forge_unsigned({"sub": "ops@sandpay.example", "exp": int(time.time()) + 300}, alg="none")
+      r = requests.get(base + "/api/me", headers={"Authorization": "Bearer " + forged})
+      ```
+
+      ```text
+      no token  -> 401 {"error": "authentication required"}
+      alice     -> 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      tampered  -> 401 {"error": "bad signature"}
+      none      -> 200 {"email": "ops@sandpay.example", "merchant_id": null, "role": "admin", "display_name": "SandPay Ops"}
+      None      -> 401 {"error": "unsupported alg"}
+      NONE      -> 401 {"error": "unsupported alg"}
+      ```
+
+      `tampered` changed `sub` to the administrator and kept alice's signature: refused. `none` is the same claim with
+      **no signature at all**: accepted, as the administrator. The other spellings fail on this portal because it
+      compares `alg` exactly - which is the correct behaviour, so the probe reports only `none` as accepted. A real
+      application with a loose comparison would accept more spellings; the probe tries them all.
+
+      The forged token, with a fixed `exp` so you can decode it yourself (note the dot at the end - the empty
+      signature):
+
+      ```text
+      eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJvcHNAc2FuZHBheS5leGFtcGxlIiwiZXhwIjoxODAwMDAwMDAwfQ.
+      ```
+
+      **3. The probe's verdict, vulnerable and fixed**
+
+      ```text
+      vulnerable: AlgNoneResult(baseline_status=401, accepted_spellings=['none'], tampered_rejected=True, victim_role='admin', vulnerable=True)
+      fixed     : AlgNoneResult(baseline_status=401, accepted_spellings=[], tampered_rejected=True, victim_role=None, vulnerable=False)
+      ```
+
+      With `jwt-none` fixed, the same unsigned token gets `401 {"error": "unsupported alg"}` for every spelling, and the
+      probe is quiet. Both portals refuse the tampered token, so `tampered_rejected` is `True` in both: that one is a
+      control, not a finding.
+
+      **4. What closing `jwt-none` did not fix**
+
+      The tester here is also a developer with the synthetic key, so can mint a *correctly signed* token. Signed, with
+      **no `exp` claim at all**, the portal answers on both builds:
+
+      ```text
+      vulnerable, signed, no exp -> 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      fixed,      signed, no exp -> 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      ```
+
+      A token with no expiry is accepted for ever. The portal's own tokens do carry `exp`, so this is a verifier that
+      would accept a longer-lived token someone else mints - a weakness rather than a live exploit, and one that the
+      `jwt-none` fix leaves open. Run the lesson's validator over the portal's real token and the same gap shows up as
+      missing claims:
+
+      ```text
+      basic policy  : Verdict(ok=True, reasons=[])
+      strict policy : Verdict(ok=False, reasons=['missing-iss', 'missing-aud'])
+      unsigned token: Verdict(ok=False, reasons=['alg-not-allowed'])
+      ```
+
+      The basic policy (signature and expiry) passes: the token is genuine and current. The strict policy also demands
+      issuer `https://auth.sandpay.example` and audience `merchant-api`, and the token names neither - so a second
+      SandPay service sharing this signing key could not tell this token was not meant for it. The unsigned token is
+      refused by the validator **before any claim is read**, which is the rule the vulnerable portal lacks.
+
+      **5. The PKCE S256 challenge, computed**
+
+      RFC 7636 appendix B gives a verifier and the challenge it must produce. This is the computation, run here:
+
+      ```python
+      v = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+      print(base64.urlsafe_b64encode(hashlib.sha256(v.encode("ascii")).digest()).rstrip(b"=").decode())
+      print(len(v))
+      ```
+
+      ```text
+      E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+      43
+      ```
+
+      The challenge matches the `code_challenge` the RFC prints for that verifier, and the verifier is 43 characters
+      - the shortest allowed, from 32 random octets. Notice that a `plain` challenge would have been the verifier
+      itself: whoever saw the authorization request would hold the secret.
+
+  - id: probes-code
+    kind: code
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust]
+    title: The probe and the validator
+    collapsed: true
+    body: |
+      The alg none probe (`solutions/api/jwt_probe.py`, core):
+
+      ```python
+      def probe_alg_none(base_url, valid_token, victim_email, timeout=5, path=PROTECTED_PATH):
+          baseline = _call(base_url, None, timeout, path)
+          if baseline.status_code not in (401, 403):
+              raise RuntimeError(f"{path} answered {baseline.status_code} with no token: it does not "
+                                 "authenticate, so this probe cannot conclude anything")
+          if _call(base_url, valid_token, timeout, path).status_code != 200:
+              raise RuntimeError("the valid token was refused: fix the precondition before probing")
+          result = AlgNoneResult(baseline.status_code)
+          tampered = _call(base_url, forge_tampered(valid_token, {"sub": victim_email}), timeout, path)
+          result.tampered_rejected = tampered.status_code in (401, 403)
+          for spelling in SPELLINGS:
+              forged = forge_unsigned({"sub": victim_email, "exp": int(time.time()) + 300}, alg=spelling)
+              r = _call(base_url, forged, timeout, path)
+              if r.status_code == 200 and r.json().get("email") == victim_email:
+                  result.accepted_spellings.append(spelling)
+                  result.victim_role = r.json().get("role")
+          result.vulnerable = bool(result.accepted_spellings) or not result.tampered_rejected
+          return result
+      ```
+
+      The unsecured token and the tampered token (same file):
+
+      ```python
+      def forge_unsigned(claims, alg="none"):
+          return f"{b64url_json({'alg': alg, 'typ': 'JWT'})}.{b64url_json(claims)}."
+
+      def forge_tampered(token, changes):
+          header, payload, signature = token.split(".")
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          claims.update(changes)
+          return f"{header}.{b64url_json(claims)}.{signature}"
+      ```
+
+      The validator's order of checks (`solutions/api/jwt_validate.py`, core):
+
+      ```python
+      def validate_token(token, policy, now):
+          if set(policy.algorithms) - set(HMAC_ALGS):
+              raise ValueError(f"this validator implements only {sorted(HMAC_ALGS)}; never 'none'")
+          try:
+              header, claims, signature, signing_input = split_token(token)
+          except ValueError:
+              return Verdict(False, ["malformed"])
+          alg = header.get("alg")
+          if not isinstance(alg, str) or alg not in policy.algorithms:
+              return Verdict(False, ["alg-not-allowed"])
+          expected = hmac.new(policy.key, signing_input.encode(), HMAC_ALGS[alg]).digest()
+          try:
+              given = _b64url_decode(signature)
+          except ValueError:
+              return Verdict(False, ["bad-signature"])
+          if not hmac.compare_digest(expected, given):
+              return Verdict(False, ["bad-signature"])
+          # only now are the claims read: missing-*, bad-claim, expired, not-yet-valid,
+          # issuer-mismatch, audience-mismatch, lifetime-too-long
+          ...
+      ```
+
+      The decoder that the other two build on (`solutions/api/jwt_inspect.py`):
+
+      ```python
+      def decode_token(token):
+          parts = token.split(".")
+          if len(parts) != 3:
+              raise ValueError(f"a compact JWT has 3 dot-separated parts, this has {len(parts)}")
+          return DecodedJwt(_json_object(parts[0], "header"), _json_object(parts[1], "payload"), parts[2],
+                            f"{parts[0]}.{parts[1]}")
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust]
+    title: Why the important lines are written that way
+    body: |
+      - `if baseline.status_code not in (401, 403): raise RuntimeError(...)` - if the endpoint answers `200` to a
+        request with no token, it does not authenticate, and every "accepted" result after it would be meaningless.
+        A probe that cannot set up its precondition must say so rather than report "secure" or "vulnerable".
+      - `if _call(base_url, valid_token, ...) != 200: raise` - the second precondition: the valid token must work, or
+        the later refusals could just mean the test token is broken.
+      - `forge_tampered(...)` keeps the **old** signature - it asks "is the signature checked at all?". A server that
+        decodes instead of verifies accepts it. On the portal it is refused, which is the control that shows the
+        flaw is specifically the `none` path.
+      - `forge_unsigned(...)` ends with `"."` - the empty signature. Leaving the dot off makes a two-part token that is
+        simply malformed, and a rejection would prove nothing.
+      - `for spelling in SPELLINGS` - `none`, `None`, `NONE`, `nOnE`. A fixed build rejects all of them, a build with a
+        case-sensitive filter in front of a case-insensitive library may accept some; reporting *which* spellings were
+        accepted tells the developer exactly what to fix.
+      - `r.json().get("email") == victim_email` - the accepted verdict needs `200` **and** the response naming the victim.
+        A `200` alone could be a public page; the identity in the answer is the evidence the forged identity was used.
+      - `result.vulnerable = bool(accepted) or not tampered_rejected` - either failure is a finding: an unsecured token
+        accepted, or a signature that is never checked.
+      - `if alg not in policy.algorithms` **before** the signature check, with exact comparison - the allow-list is the
+        application's, not the token's. `hs256` in lower case is not on the list, so it is rejected (RFC 7515 4.1.1:
+        `alg` is case-sensitive).
+      - `return Verdict(False, ["bad-signature"])` straight away - claims in a token that is not proven genuine are not
+        worth reading, and reporting them ("expired", "wrong audience") next to a bad signature would suggest they
+        were checked and trusted.
+      - `hmac.compare_digest` - a constant-time comparison, so the check does not leak how many leading bytes matched.
+      - `claims["iss"] != policy.issuer` - exact equality. A prefix or substring check would accept
+        `https://auth.sandpay.example.evil.test` for `https://auth.sandpay.example`.
+      - `raise ValueError` for a policy that allows `none` or an algorithm the code cannot verify - a configuration
+        that would silently accept unsigned tokens must fail loudly, not run.
+      - In `describe_token`, sensitive claim names are matched as **whole words** (`password_hash`, `card_number`), not
+        substrings - `company` contains `pan`, and a substring rule would call it a card number.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: A procedure you can follow
+    body: |
+      **A. A token-based API (about 45 minutes)**
+
+      1. **Get two valid tokens** for two test accounts of different privilege, and note which endpoints each can use.
+         Record the baseline: the protected endpoint with no token (expect `401`) and with a valid one (expect `200`).
+      2. **Decode and review** each token (no key needed): `alg`, header parameters (`kid`, `jku`, `jwk`, `x5u`), `exp`,
+         `iat`, `iss`, `aud`, and any value that should not be readable - passwords, hashes, card or personal data.
+         Note the lifetime: is it reasonable for the application?
+      3. **Tamper with the payload, keep the signature.** Change `sub` or a role claim and send it. Expect `401`. A
+         `200` means the signature is not checked - stop and report.
+      4. **Try the unsecured token** in every spelling, for a victim account you own. Expect `401` for all.
+      5. **Replay an expired token** and a token with no `exp` (when you can mint one - white-box only). Expect `401`.
+      6. **Test audience and issuer.** Take a token from one service or tenant and present it to another that shares
+         the identity provider. Expect `401`. (From the docs, not run here: it needs two services.)
+      7. **Check header trust** (from the docs, not run here): `kid` set to a path or a SQL string, `jku` to a URL you
+         control or to a loopback address, an embedded `jwk`. All must be refused.
+      8. **Offline key check, only if the scope allows it:** a dictionary attack on the HMAC secret using a captured
+         token. A recovered key is a critical finding.
+      9. **Run the negative control** - the same probes against a build with the flaw fixed. They must be quiet.
+
+      **B. An OAuth sign-in (from the docs, not run here)**
+
+      1. **Identify the flow** from the requests: `response_type` on the authorization request, `grant_type` on the token
+         request. `password` and `response_type=token` are findings.
+      2. **Check PKCE:** does the authorization request carry `code_challenge` and `code_challenge_method=S256`? Then run
+         the four downgrade tests from the WSTG.
+      3. **Check the redirect URI:** the registered value, then an altered one (different host, extra path, trailing
+         slash, a registered-host prefix). The server must refuse every alteration.
+      4. **Check `state`:** present, unpredictable, bound to the user's session, and verified on the callback.
+      5. **Check token handling:** lifetime (`expires_in`, `exp`) against the documented value, refresh-token rotation,
+         where the client stores the tokens.
+      6. **Report by owner:** authorization server, client or resource server.
+
+  - id: example
+    kind: example
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: "Example: the SandPay partner app (a hypothetical scenario)"
+    body: |
+      This scenario is made up to show how the checks combine; it contains no measured figures.
+
+      SandPay adds a partner mobile app, **SandPay Partner**, for shop owners. The app signs users in through the
+      authorization code flow with PKCE against SandPay's own authorization server, then calls three services with the
+      access token (a JWT): `merchant-api` (payments and payouts), `reports-api` and `admin-api`. All three trust one
+      signing key and one issuer, `https://auth.sandpay.example`.
+
+      What the tester checks, and why:
+
+      - **Decode the token first.** It carries `aud: "merchant-api"`, `iss`, `exp` one hour out - and a nested
+        `profile.card_reference` field. The reference is a token rather than a card number, but it is a customer
+        identifier that does not need to be in a readable token: a note for the developers.
+      - **Tamper, then `none`.** Changing `sub` to another merchant is refused; the unsigned token is refused. The
+        verifier is sound on the basics.
+      - **Audience replay.** The tester takes a `reports-api` token and presents it to `admin-api`. If it returns `200`,
+        nothing was forged - a legitimate token was used at the wrong service, and a reports user has become an
+        administrator. This is the check most teams have not written, because every functional test sends the right
+        token to the right service.
+      - **The OAuth flow.** The registered redirect is `sandpay-partner://callback`. The tester alters it (an extra
+        path, another scheme) and expects an error page, not a redirect. The authorization request carries
+        `code_challenge_method=S256`; the tester then requests a code *without* a challenge and tries to redeem it
+        *with* a verifier, which must be refused.
+      - **A pleasant surprise is still a finding to record.** If the app also still offers a "sign in with your
+        password" screen that posts the password to the token endpoint, that is the password grant: RFC 9700 says it
+        "MUST NOT be used".
+
+      The two findings that matter most are the ones that need no forgery at all: a token valid for the wrong
+      audience, and a code that can be redeemed without the PKCE secret. Both are one-line fixes in a configuration
+      or a library call, and both become regression tests.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Test cases with expected results and evidence
+    body: |
+      | # | Case | Steps | Expected (secure) | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Baseline | call the protected endpoint with no token, then with a valid one | `401`, then `200` | both exchanges - without them the rest is unreadable |
+      | 2 | Token contents | decode header and payload | no secret or personal data in the payload; `alg` is one the application uses; `exp` present and reasonable | the decoded JSON, with the finding codes |
+      | 3 | Tampered payload | change `sub`, keep the signature | `401` | request and response |
+      | 4 | Unsecured token | `alg: none` in all spellings, empty signature | `401` for every spelling | one exchange per spelling |
+      | 5 | Expiry | replay an expired token and one with no `exp` | `401` | the token's `exp`, the time, the response |
+      | 6 | Audience and issuer | present service A's token to service B; a token from another tenant | `401` | the `aud` and `iss` values, the response |
+      | 7 | Header trust (docs, not run here) | `kid` path or SQL string, `jku` to your server, embedded `jwk` | `401`; no outbound request to your server | request, response, your server's access log |
+      | 8 | Key strength (docs, not run here, scope permitting) | offline dictionary attack on a captured HMAC token | key not recovered | the tool's output, the wordlist used |
+      | 9 | Redirect URI (docs, not run here) | altered `redirect_uri` values | error, never a redirect to the altered address | the authorization requests and responses |
+      | 10 | PKCE (docs, not run here) | the four downgrade tests; `plain` method | all refused | each token-endpoint response |
+      | 11 | `state` and grant types (docs, not run here) | a callback from another session; `grant_type=password`; `response_type=token` | refused or not offered | the requests |
+      | 12 | Negative control | run cases 3 - 6 against a build with the flaw fixed | no findings | the same probes, quiet |
+
+      Case 12 is what makes the others trustworthy: a probe that also fires against the fixed build is measuring
+      something else - and a probe that never fires against a build you *know* is vulnerable is worse.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Calling a decoded token "verified".** Decoding needs no key and proves nothing. A tester who reports "the token
+        is valid HS256" after reading the header has verified nothing.
+      - **Treating "the tampered token was rejected" as "the signature check is sound".** The portal rejects tampered
+        tokens and still accepts an unsigned one. Test *both*, and test every spelling.
+      - **Testing only the happy path of the controls.** A probe with no baseline cannot tell "the server refused my
+        forged token" from "the server refuses everything" - the valid token must work and the no-token request must
+        fail, or the verdict is noise.
+      - **Forgetting the dot.** An unsecured token is `header.payload.` - with the trailing dot. Without it the token is
+        malformed and a `401` means nothing.
+      - **Believing the signature is the only check.** A genuinely signed token for the wrong audience, an expired
+        one, or one from the wrong issuer is accepted by a verifier that only checks the signature. These are the
+        findings that need no forgery.
+      - **Substring or prefix comparisons** for `iss`, `aud` and `redirect_uri`. `https://auth.sandpay.example.evil.test`
+        starts with the issuer; `https://app.example.com.evil.test` starts with the registered host.
+      - **Pasting real tokens into online decoders**, or logging them. A token is a credential until it expires, and
+        longer if it can be refreshed.
+      - **Reporting `NoNe` as an attack on a correct library.** If `none` is rejected in every spelling, there is no
+        finding; the spellings exist to catch a broken filter, not to count.
+      - **Assuming OAuth findings belong to the app.** A redirect-URI problem is usually the authorization server's;
+        a token in local storage is the client's. Name the owner.
+
+      **A debugging method when a probe's result surprises you:**
+
+      1. Print the **raw** exchange (the exact token, the status, the body). Look at the token's three parts.
+      2. Re-run the **baseline**: no token must be `401`, the valid token `200`.
+      3. Decode what you sent: did your forged header really say `none`, and does the token end with a dot?
+      4. Look at the error text. `unsupported alg`, `bad signature`, `malformed token` and `token expired` each mean a
+         different step of the verifier rejected you - and tell you which checks exist.
+      5. Repeat on the fixed build. The finding must disappear, and nothing else may change.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Limitations, trade-offs and alternatives
+    body: |
+      - **Probes find what they try.** The alg none probe says nothing about weak keys, key confusion or `jku`. The
+        practice portal only has one flaw, so the rest of the attack table is covered from the sources, not by running
+        code - a real engagement has to run each against the real verifier.
+      - **Black box versus white box.** From the outside you cannot tell why `401` was returned; with the source you
+        can read the verifier. Combine them: the probes find, the review explains. Minting correctly signed tokens (as
+        in the "no exp" check) needs the key, which a black-box tester does not have.
+      - **JWTs trade a lookup for a check.** The JWT cheat sheet notes the downside of a stateless token: it cannot be
+        revoked by deleting a row, so a stolen token is good until `exp`. That is why lifetimes should be short, why
+        refresh tokens are rotated, and why some systems keep a denylist or status list. A server-side session is
+        simpler to end; the choice is a design decision, not a flaw.
+      - **HMAC versus public-key signatures.** One shared secret (HS256) is simple but every service that verifies can
+        also mint; a public key (RS256, ES256) lets services verify without being able to forge. The cost is key
+        distribution and the confusion attack when a verifier is careless about the algorithm.
+      - **The fixed portal is not a model verifier.** `make_app({"jwt-none"})` closes the `none` hole; it still
+        accepts tokens with no `exp` and checks no issuer or audience. The lesson's `validate_token` is the closer
+        model of what RFC 8725 asks for.
+      - **Maintained libraries beat hand-written verification.** The validator here is deliberately small so you can
+        read every step. In a product, use a well-known library, pin the allowed algorithms, and keep it updated -
+        RFC 8725 itself says libraries must let the caller specify the algorithms.
+      - **Tooling.** jwt_tool, the Burp JSON Web Tokens extension, the ZAP JWT add-on and John the Ripper automate
+        these attacks (from the WSTG, not run here). Use them after you understand the manual probe, so you can tell a
+        tool's false positive from a real one.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-jwt-signature-algorithm, sec-jwt-claims-key-trust, sec-oauth-flow-weaknesses]
+    title: Quick reference
+    body: |
+      - **A JWT is readable by anyone who holds it.** Decode with no key; review `alg`, header fields, claims and
+        lifetime; nothing sensitive belongs in the payload.
+      - **Probe three ways:** tampered payload with the old signature, an unsecured token (`alg: none`, empty signature,
+        trailing dot, several spellings), and an expired or no-`exp` token. Baseline first: no token `401`, valid token `200`.
+      - **The server chooses the algorithm** from a short allow-list, compared exactly and without `none` (RFC 8725 3.1,
+        3.2). Verify the signature **before** reading any claim.
+      - **Claims:** `exp` required and enforced; `nbf`; `iss` and `aud` compared exactly (RFC 8725 3.8, 3.9). A signed token
+        for the wrong service is a finding.
+      - **Never trust key material from the token:** `kid` is an opaque lookup, `jku` and `x5u` need an allow-list, an
+        embedded `jwk` is never a trust anchor (RFC 8725 3.10).
+      - **Weak HMAC keys fall offline.** A password-like key is "MUST NOT" (RFC 8725 3.5); test only with permission, on
+        a captured token.
+      - **OAuth authorization code:** exact `redirect_uri` match, PKCE with `S256` (required for public clients), a
+        `code_verifier` refused when no challenge was sent, `state` checked, no password or implicit grant (RFC 9700).
+      - **S256:** `BASE64URL(SHA256(verifier))`; a verifier of 43 to 128 characters; `plain` makes challenge equal verifier.
+      - **Report by owner:** authorization server, client or resource server.
+      - **Every probe needs a negative control** - quiet against the fixed build.
+
+exercises:
+  - id: payload-readable
+    type: mcq
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: What does a password hash in the payload mean?
+    prompt: |
+      You decode a token the API issued to you and the payload contains `"password_hash": "..."` next to `sub` and
+      `exp`. The signature is valid and nobody can change the token. How do you rate it?
+    options:
+      - id: readable
+        text: "A finding - the payload is only encoded, so anyone who holds or captures the token can read the hash; a signature gives integrity, not secrecy."
+        feedback: "Correct. The WSTG says to treat every value in the payload as readable by anyone who holds the token."
+      - id: safe-signed
+        text: "Not a finding - the token is signed, so the hash cannot be read."
+        feedback: "Signing stops changes; it does not hide anything. Base64url is an encoding that anyone can reverse without a key."
+      - id: only-tamper
+        text: "Only a problem if the hash can be changed."
+        feedback: "Tampering is a separate risk. Readable sensitive data is a leak even when the token cannot be modified."
+      - id: https-only
+        text: "Not a finding as long as the API uses HTTPS."
+        feedback: "HTTPS protects the token in transit. The token is also stored by the client, logged by proxies and shown to the user's own tools."
+    correct: [readable]
+    hints:
+      - How do you decode a JWT payload - with a key?
+      - What does the signature protect, and what does it not?
+    solution: |
+      A JWT payload is base64url-encoded JSON, decoded with no key. The signature covers integrity (the claims
+      were not changed), not confidentiality. Sensitive data in the payload is a finding (WSTG-SESS-10 objective 1).
+
+  - id: none-proof
+    type: mcq
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: Which observation proves the unsigned-token flaw?
+    prompt: |
+      You are testing `GET /api/me`. Which single observation proves the API accepts unsecured JWTs?
+    options:
+      - id: forged-200
+        text: "A token with header alg none, claims naming another user and an empty signature (it ends with a dot) returns 200 and the response shows that other user."
+        feedback: "Correct. The forged identity was accepted without any signature - and the identity in the answer is the evidence."
+      - id: header-says-none
+        text: "The decoded header of your own valid token says alg none."
+        feedback: "That would be a design smell, but it only shows what the token claims. The proof is a forged token being accepted."
+      - id: tamper-401
+        text: "A token with a changed payload and the old signature returns 401."
+        feedback: "That shows the signature is checked for signed tokens - the opposite of the flaw. It is the control, not the proof."
+      - id: no-exp
+        text: "The token you were issued has no exp claim."
+        feedback: "A missing expiry is a lifetime finding. It says nothing about whether an unsigned token is accepted."
+    correct: [forged-200]
+    hints:
+      - The proof must involve a token you built yourself.
+      - What does the answer have to show to prove the forged identity was used?
+    solution: |
+      Send the unsecured token and look at the answer. `200` with the victim's identity in the body proves the
+      server accepted a token with no signature. Everything else is a clue or a control.
+
+  - id: tamper-accepted
+    type: mcq
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: A tampered token returns 200
+    prompt: |
+      You change `sub` in a valid HS256 token and keep the old signature. The API returns `200` and acts as the
+      new `sub`. What is the most likely cause?
+    options:
+      - id: decode-not-verify
+        text: "The server decodes the token to read the claims but never verifies the signature (for example, Node's jwt.decode() instead of jwt.verify())."
+        feedback: "Correct. This is the WSTG's example of 'failing to validate that the signature is correct', and it means anyone can be anyone."
+      - id: none-enabled
+        text: "The server has the none algorithm enabled."
+        feedback: "That would affect unsigned tokens. Your token is still HS256, so the cause is that the HS256 signature is not checked."
+      - id: weak-key
+        text: "The HMAC key is weak."
+        feedback: "A weak key lets an attacker compute a valid signature offline. Here the old, now-wrong signature was accepted - nothing was checked."
+      - id: clock-skew
+        text: "Clock skew between the client and the server."
+        feedback: "Clock skew affects exp and nbf, not whether the signature matches the payload."
+    correct: [decode-not-verify]
+    hints:
+      - The signature no longer matches the payload, and the server did not care.
+      - What would a server have to be doing to ignore that?
+    solution: |
+      If a signature that cannot match is accepted, the server is not verifying it - typically a decode function used
+      where a verify function belongs. Report it as critical and confirm with a second tampered claim.
+
+  - id: aud-replay
+    type: mcq
+    concept: sec-jwt-claims-key-trust
+    skill: analysis
+    title: A genuine token for the wrong service
+    prompt: |
+      Both `reports-api` and `admin-api` trust the same identity provider. A token issued for `reports-api` (`aud:
+      "reports-api"`, valid signature, not expired) is accepted by `admin-api` and the action succeeds. Nothing was forged.
+      What is the finding?
+    options:
+      - id: aud-missing
+        text: "admin-api does not validate the audience claim - a token meant for another service is accepted (RFC 8725 3.9)."
+        feedback: "Correct. When one issuer serves several applications the recipient must check that it is the intended audience."
+      - id: weak-sig
+        text: "The signature algorithm is too weak."
+        feedback: "The signature was fine - it correctly proves the identity provider issued the token. That is exactly why the audience check matters."
+      - id: expired
+        text: "admin-api does not enforce expiry."
+        feedback: "The token had not expired. The problem is who the token was for, not when it is valid."
+      - id: normal-sso
+        text: "Nothing - single sign-on means one token works everywhere."
+        feedback: "SSO shares the identity, not the authority. Each service must still check it is a recipient, or any low-privilege token opens the admin API."
+    correct: [aud-missing]
+    hints:
+      - The signature, the issuer and the expiry are all fine. What else names a recipient?
+      - Which RFC 8725 rule is about the intended recipient?
+    solution: |
+      The missing check is the audience: `admin-api` must reject a token whose `aud` does not name it (RFC 8725 3.9,
+      RFC 7519 4.1.3). This is a legitimate token used at the wrong place, which is why it passes every
+      forgery-focused test.
+
+  - id: kid-traversal
+    type: mcq
+    concept: sec-jwt-claims-key-trust
+    skill: application
+    title: The empty key
+    prompt: |
+      (From the docs, not run here.) A token with the header `{"alg": "HS256", "kid": "../../../../dev/null"}`, signed
+      with an empty string as the key, is accepted. What is the root cause?
+    options:
+      - id: kid-path
+        text: "The server uses the unvalidated kid as a file path to find the key, so the attacker points it at an empty file and signs with an empty secret."
+        feedback: "Correct. This is the WSTG's directory-traversal case for kid; RFC 8725 3.10 says not to trust received header values."
+      - id: short-key
+        text: "The HMAC key is too short."
+        feedback: "The key on the server may be fine. The attacker made the server use a different key - the content of /dev/null."
+      - id: sig-length
+        text: "The signature is too short to check."
+        feedback: "The signature is a normal HMAC of an empty key. The weakness is where the key came from."
+      - id: no-https
+        text: "The token was sent over HTTP."
+        feedback: "Transport is not involved: the attacker built the whole token themselves."
+    correct: [kid-path]
+    hints:
+      - What does /dev/null contain?
+      - Who decided which key the server used?
+    solution: |
+      The token chose its own verification key through `kid`. Treat `kid` as an opaque lookup into a fixed set of
+      keys, never as a file path or part of a query.
+
+  - id: key-confusion
+    type: mcq
+    concept: sec-jwt-claims-key-trust
+    skill: recall
+    title: When can RS256 be turned into HS256?
+    prompt: |
+      Which set of conditions makes the RS256-to-HS256 confusion attack work, according to the WSTG?
+    options:
+      - id: three-conditions
+        text: "The app expects a public-key algorithm, does not check which algorithm the token actually uses, and the attacker can get the public key."
+        feedback: "Correct. With all three, the attacker signs with HS256 using the public key as the secret and the verifier accepts it."
+      - id: private-key
+        text: "The attacker has the private key and the app uses HS256."
+        feedback: "With the private key the attacker can sign legitimately - that is a key compromise, not a confusion."
+      - id: none-on
+        text: "The none algorithm is enabled and the token has no exp."
+        feedback: "That is the unsigned-token flaw. Confusion needs a signature made with the wrong kind of key."
+      - id: long-token
+        text: "The token has a long lifetime and a large payload."
+        feedback: "Lifetime and size do not matter. The attack works on the choice of algorithm and key."
+    correct: [three-conditions]
+    hints:
+      - Think about what the server does with the public key and the header's alg.
+      - The public key is meant to be public - what happens if it is used as an HMAC secret?
+    solution: |
+      The three conditions are an expected public-key algorithm, no check of the token's actual algorithm, and an
+      obtainable public key. The fix is one key, one algorithm, and checking the header against it (RFC 8725 3.1).
+
+  - id: weak-hmac-method
+    type: mcq
+    concept: sec-jwt-claims-key-trust
+    skill: application
+    title: How is a weak HMAC key found?
+    prompt: |
+      You are allowed, in writing, to assess the strength of the HS256 secret behind a captured token. Which method fits?
+    options:
+      - id: offline
+        text: "An offline dictionary or brute-force attack on the captured token - guess a key, recompute the signature, compare."
+        feedback: "Correct. RFC 8725 2.2 describes exactly this: weak keys fall to offline attacks 'once an attacker gets hold of such a token'. It sends nothing to the server."
+      - id: flood
+        text: "Send thousands of forged tokens to the API and count the 200 responses."
+        feedback: "That is noisy, risks account lockout and denial of service, and is unnecessary - the check can be done offline."
+      - id: decode
+        text: "Decode the payload and look for the secret."
+        feedback: "The secret is not in the token. Only a signature made with it is."
+      - id: none-token
+        text: "Send an alg none token."
+        feedback: "That tests the unsigned-token path, not the strength of the key."
+    correct: [offline]
+    hints:
+      - You hold a token and its signature. What can you compute locally?
+      - Does this need any request to the server?
+    solution: |
+      A captured token contains everything needed to test a guess: the signing input and the signature. Test
+      candidate keys locally; a match is a recovered key and a critical finding. Only with permission.
+
+  - id: redirect-compare
+    type: mcq
+    concept: sec-oauth-flow-weaknesses
+    skill: application
+    title: How should the redirect URI be compared?
+    prompt: |
+      The registered redirect URI is `https://app.example.com/callback`. Which rule should the authorization server use
+      to accept a `redirect_uri` in an authorization request?
+    options:
+      - id: exact
+        text: "Exact string matching against the registered value."
+        feedback: "Correct. RFC 9700 2.1: 'authorization servers MUST utilize exact string matching' (apart from the port of a localhost redirect for native apps)."
+      - id: prefix
+        text: "The request value may start with the registered value."
+        feedback: "A prefix rule accepts https://app.example.com/callback/../x and, with a shorter registered value, hosts like app.example.com.evil.test."
+      - id: domain
+        text: "Any URL on the registered domain."
+        feedback: "A domain-only rule turns every open redirect or user-content page on that domain into a way to leak the code."
+      - id: regex
+        text: "A pattern with wildcards, such as https://*.example.com/*."
+        feedback: "Wildcards widen the set of places a code can be sent. The standard asks for exact matching."
+    correct: [exact]
+    hints:
+      - What does loose matching let an attacker do with the link?
+      - What does RFC 9700 say is the comparison?
+    solution: |
+      Exact string matching. Anything looser lets an attacker craft an authorization link whose redirect lands on a
+      page they control, and the code goes with it.
+
+  - id: pkce-downgrade
+    type: mcq
+    concept: sec-oauth-flow-weaknesses
+    skill: analysis
+    title: Which PKCE result is a finding?
+    prompt: |
+      (From the docs, not run here.) You run the WSTG PKCE downgrade tests against an authorization server. Which result is a finding?
+    options:
+      - id: verifier-without-challenge
+        text: "You requested a code with no code_challenge, then redeemed it with a code_verifier, and the token endpoint issued tokens."
+        feedback: "Correct. RFC 9700 2.1.1: a request with a code_verifier must be accepted 'only if a code_challenge parameter was present in the authorization request'. The WSTG lists this as the third downgrade case."
+      - id: wrong-verifier
+        text: "You sent a code_verifier that does not match the challenge and the token endpoint refused it."
+        feedback: "That is correct behaviour - the server must enforce the verifier when a challenge was sent."
+      - id: metadata
+        text: "The server's metadata lists code_challenge_methods_supported as S256."
+        feedback: "That is what RFC 9700 recommends authorization servers publish."
+      - id: unknown-method
+        text: "An authorization request with an unknown code_challenge_method returned an error."
+        feedback: "Rejecting an unsupported method is correct. It is the silent acceptance of weaker flows that is the problem."
+    correct: [verifier-without-challenge]
+    hints:
+      - A downgrade means PKCE is removed from the flow without the server noticing.
+      - Which step of the flow should refuse a verifier nobody asked for?
+    solution: |
+      A server that redeems a code with a verifier although no challenge was recorded can be pushed into an
+      unprotected flow. It must refuse that exchange.
+
+  - id: grant-choice
+    type: mcq
+    concept: sec-oauth-flow-weaknesses
+    skill: analysis
+    title: A single-page app sends grant_type=password
+    prompt: |
+      A SandPay single-page app collects the user's email and password and posts them, with `grant_type=password`, to the
+      token endpoint. The developers say it is fine because the app is their own and the connection uses HTTPS. How do you rate it?
+    options:
+      - id: finding
+        text: "A finding - RFC 9700 2.4 says the resource owner password credentials grant MUST NOT be used; it exposes the user's credentials to the client."
+        feedback: "Correct. Even a benign client increases the attack surface, and users learn to type their password outside the authorization server."
+      - id: fine-https
+        text: "Fine, because HTTPS protects the password."
+        feedback: "HTTPS protects it in transit. The issue is that the client handles the credentials at all."
+      - id: mobile-only
+        text: "Only a problem for mobile apps."
+        feedback: "The standard's rule is not limited to a platform."
+      - id: info
+        text: "Informational - it is deprecated but harmless."
+        feedback: "The wording is 'MUST NOT'. Credentials leak in more places than the authorization server."
+    correct: [finding]
+    hints:
+      - Which party sees the password in this grant?
+      - Quote the RFC 9700 section on this grant.
+    solution: |
+      The password grant means the client sees the password. RFC 9700 2.4 forbids it. The remedy is the
+      authorization code flow with PKCE, where the password is typed only at the authorization server.
+
+  - id: s256-vs-plain
+    type: mcq
+    concept: sec-oauth-flow-weaknesses
+    skill: recall
+    title: plain or S256?
+    prompt: |
+      A public client sends `code_challenge_method=plain`. Which statement is correct?
+    options:
+      - id: s256-required
+        text: "Report it: a client that can use S256 must, and with plain the challenge equals the verifier, so anyone who sees the authorization request holds the secret."
+        feedback: "Correct. RFC 7636: 'If the client is capable of using S256, it MUST use S256'; RFC 9700 calls S256 the only method that does not expose the verifier."
+      - id: plain-ok-tls
+        text: "plain is just as safe over TLS."
+        feedback: "RFC 7636 7.2 notes the challenge can be observed on the device or in the request, and with plain it equals the verifier."
+      - id: plain-required
+        text: "public clients must use plain."
+        feedback: "It is the opposite: S256 is mandatory to implement on servers, and plain is for clients that cannot do S256."
+      - id: s256-optional
+        text: "A server that supports PKCE need not support S256."
+        feedback: "RFC 7636: servers that support PKCE are required to support S256."
+    correct: [s256-required]
+    hints:
+      - What is the relationship between the challenge and the verifier in plain?
+      - Which method does RFC 9700 name as the only safe one?
+    solution: |
+      Use S256 whenever the client can. `plain` sends the verifier in the open. Report it unless the client genuinely
+      cannot compute SHA-256.
+
+  - id: jwt-test-order
+    type: order
+    concept: sec-jwt-signature-algorithm
+    skill: application
+    title: Run an alg none test in order
+    prompt: Put the steps of a trustworthy unsigned-token test in order.
+    items:
+      - id: baseline-none
+        text: Call the protected endpoint with no token and record the 401
+      - id: baseline-valid
+        text: Call it with a valid token and confirm 200
+      - id: decode
+        text: Decode the valid token and read its header and claims
+      - id: tamper
+        text: Send the same token with a changed sub and the old signature - expect 401, which shows the signature is checked
+      - id: forge
+        text: Build unsecured tokens (alg none in several spellings, empty signature, trailing dot) naming a test victim and send each
+      - id: report
+        text: Report any 200 that shows the victim's identity, with the exchanges
+      - id: control-run
+        text: Re-run against the build with the flaw fixed and confirm nothing is reported
+    hints:
+      - You need to know the endpoint works and refuses before you can trust any later result.
+      - The negative control comes last.
+    solution: |
+      Baselines first (no token, valid token), then read the token, then the tampered control, then the forged
+      tokens, then the report, and finally the negative control on the fixed build.
+
+  - id: verify-debug
+    type: debug
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: Which line makes this verifier accept forged tokens?
+    prompt: |
+      This function is used by every endpoint to identify the caller. Pick the line that lets an attacker become any
+      user without knowing the key.
+    language: python
+    code: |
+      def current_user(token):
+          header = decode_header(token)
+          claims = decode_payload(token)
+          if header["alg"] != "none" and not verify(token, KEY, header["alg"]):
+              raise Unauthorized()
+          return claims["sub"]
+    correctLines: [4]
+    hints:
+      - Which line decides whether the signature is checked?
+      - Who chooses the value of header["alg"]?
+    lineNotes:
+      - line: 2
+        note: Reading the header is normal - a verifier has to know what the token says. The problem is trusting it.
+      - line: 5
+        note: Rejecting on a failed check is right. The flaw is the condition that lets some tokens skip the check.
+      - line: 6
+        note: Returning the subject after a successful check is right.
+    solution: |
+      Line 4 lets the token choose: with `alg` set to `none` the check is skipped, and otherwise the algorithm that is
+      used comes from the header. The application should hold an allow-list, for example `("HS256",)`, reject any
+      other `alg`, and verify with that algorithm and the server's key.
+
+  - id: why-not-confidential
+    type: short
+    concept: sec-jwt-claims-key-trust
+    skill: analysis
+    title: Signed does not mean secret
+    prompt: |
+      A developer proposes putting the user's national id number in the access token "because the token is signed
+      and sent over HTTPS". Explain in a few sentences what is wrong, and what you would recommend.
+    modelAnswer: |
+      A signed JWT is only base64url-encoded, so anyone who holds the token can decode and read the payload without any
+      key. The signature stops the claims being changed; it does not hide them. HTTPS protects the token on the wire,
+      but the token is also stored on the device, can appear in logs and proxies, and is visible to the user and to
+      any script that can read it. A national id in it is a data leak.
+
+      Recommend keeping the payload to what the API needs (an identifier, roles, expiry, issuer, audience), and
+      looking up sensitive data on the server using that identifier. If a token really must carry confidential data,
+      use an encrypted JWT (JWE) as well, and treat the cost and key management that brings as a design decision.
+    rubric:
+      - Says the payload is encoded, not encrypted, and readable by anyone holding the token.
+      - Distinguishes integrity (signature) and transport protection (HTTPS) from confidentiality.
+      - Recommends keeping sensitive data out of the token and looking it up server-side, or using JWE.
+    hints:
+      - How would you read the payload without the key?
+      - What does the signature protect?
+    solution: Signing gives integrity, not confidentiality - keep sensitive data out of the payload and look it up server-side.
+
+  - id: oauth-testdesign
+    type: testdesign
+    concept: sec-oauth-flow-weaknesses
+    skill: application
+    title: Test plan for the SandPay Partner sign-in
+    prompt: |
+      (From the docs, not run here.) The SandPay Partner app signs in with the authorization code flow and PKCE
+      against SandPay's own authorization server, with the registered redirect `sandpay-partner://callback`, then calls
+      the APIs with a JWT access token that lives one hour. Design the test cases for the OAuth flow and the token -
+      preconditions, steps, expected result and evidence for each.
+    modelAnswer: |
+      Preconditions for all: written scope covering the authorization server and the app, two test accounts, an
+      intercepting proxy, the documented values (redirect URI, token lifetime, PKCE required).
+
+      1. **Flow identification** - capture one sign-in. Expected: `response_type=code`, `grant_type=authorization_code`;
+         no `password` grant and no `response_type=token`. Evidence: the authorization and token requests.
+      2. **Redirect URI** - alter the value: an extra path, another scheme, a different host. Expected: an error page for
+         each, never a redirect to the altered address. Evidence: each request and response.
+      3. **PKCE present** - the authorization request has `code_challenge` and `code_challenge_method=S256`; the verifier is
+         43 to 128 characters. Evidence: the request.
+      4. **PKCE downgrade** - the four WSTG tests: no challenge, empty challenge, forged challenge, and a code obtained
+         with no challenge redeemed with a verifier. Expected: all refused. Evidence: each token-endpoint response.
+      5. **State** - replace the callback with one from another session. Expected: the app rejects it. Evidence: the
+         replayed callback and the app's reaction.
+      6. **Token** - decode it: `alg`, `iss`, `aud`, `exp`, no sensitive claims. Expected: allow-listed algorithm, one
+         hour or less, audience naming the API. Evidence: the decoded JSON.
+      7. **Token checks at the API** - tampered payload, unsecured token, expired token, token for another audience.
+         Expected: `401` each. Evidence: exchanges, with a baseline and a negative control.
+      8. **Refresh and lifetime** - replay the access token after the documented hour; use the refresh token twice.
+         Expected: expired token refused; a used refresh token refused. Evidence: the responses.
+      9. **Storage** - find where the app stores tokens. Expected: not in local storage (web) or other readable files.
+    rubric:
+      - Identifies the flow and checks for the password and implicit grants.
+      - Tests the redirect URI by alteration and PKCE by the downgrade cases.
+      - Covers state, token contents and token checks at the API with a baseline and a negative control.
+      - Covers lifetime, refresh-token reuse and storage.
+      - Every case has preconditions, steps, an expected result and evidence.
+    hints:
+      - Walk the flow in order - authorization request, callback, token request, API call.
+      - Which RFC 9700 and WSTG tests apply to each step?
+    solution: |
+      Walk the flow step by step and attach one test from the standards to each: grant types, redirect URI, PKCE and
+      its downgrades, state, then the token itself and the API's checks, lifetime and storage - with evidence and a
+      negative control for each.
+
+  - id: interview-jwt-oauth
+    type: interview
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: 'Interview: how do you test a JWT-based API?'
+    prompt: '"Walk me through how you would test the security of an API that uses JWTs and OAuth 2.0."'
+    modelAnswer: |
+      I start by establishing a baseline: the protected endpoint refuses a request with no token and accepts a valid
+      one - without that, no later result means anything. Then I decode the token, which needs no key, and review
+      the header, the claims and the lifetime: the algorithm, any `kid`, `jku` or `jwk`, `exp`, `iss`, `aud`, and
+      whether anything sensitive is in the payload, because a JWT is readable by anyone who holds it.
+
+      Then I probe the verifier. I change a claim and keep the signature, which must be refused. I send an unsecured
+      token - `alg` none, empty signature, trailing dot, a few spellings - which must also be refused. I replay an
+      expired token. I present a token meant for one service to another that shares the identity provider, because a
+      genuine token for the wrong audience needs no forgery. If the scope allows it I test the key: offline guessing
+      of a weak HMAC secret, the RS256 to HS256 confusion, and header tricks such as a `kid` path or a `jku` to my
+      server.
+
+      For OAuth I identify the flow, check the redirect URI is compared exactly, that PKCE with S256 is required and
+      that a code cannot be redeemed with a verifier if no challenge was sent, that `state` is checked, that the
+      password and implicit grants are not used, and that token lifetime and storage are sensible. I report each
+      finding to its owner - authorization server, client or API - and every probe gets a negative control against a
+      fixed build, which also becomes the regression test.
+    rubric:
+      - Starts with a baseline and decodes the token to review its contents.
+      - Covers tampering, the unsecured token, expiry and audience or issuer.
+      - Mentions key-related attacks (weak key, confusion, kid, jku) and that they need scope or permission.
+      - Covers OAuth redirect URI, PKCE and its downgrade, state and grant types.
+      - Mentions negative controls and reporting to the right owner.
+    followUps:
+      - How would you test token revocation for a stateless JWT?
+      - What would you do if the API validates the signature but not the audience?
+      - How is testing a mobile client's OAuth different from a web client's?
+    hints:
+      - Structure it as baseline, read the token, probe the verifier, then the OAuth flow.
+    solution: Baseline, decode, tamper, unsigned and expired and wrong-audience tokens, key attacks within scope, then the OAuth redirect, PKCE, state and grant checks - with negative controls.
+
+  - id: inspect-code
+    type: coding
+    concept: sec-jwt-signature-algorithm
+    skill: application
+    title: Write the JWT reader
+    prompt: |
+      In `practice/security/exercises/api/jwt_inspect.py`, implement `b64url_decode`, `decode_token` and `describe_token`.
+      The tests decode hand-built tokens and a real token from the loopback portal: the reader must split a compact JWT
+      without verifying it, restore the missing padding, reject anything that is not three parts of base64url-encoded
+      JSON objects, and report alg none, lifetime problems, header parameters that name keys and sensitive claims
+      (nested too, matched as whole words).
+    project: security
+    files: [exercises/api/jwt_inspect.py]
+    test: tests/api/test_jwt_inspect.py
+    command: .venv/bin/python -m pytest tests/api/test_jwt_inspect.py
+    modelAnswer: |
+      ```python
+      def b64url_decode(text):
+          if not re.match(r"^[A-Za-z0-9_-]*$", text):
+              raise ValueError("not base64url")
+          return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+      def decode_token(token):
+          parts = token.split(".")
+          if len(parts) != 3:
+              raise ValueError("a compact JWT has 3 parts")
+          return DecodedJwt(_json_object(parts[0], "header"), _json_object(parts[1], "payload"),
+                            parts[2], f"{parts[0]}.{parts[1]}")
+      ```
+
+      `describe_token` collects a set of codes: `alg-none` when `alg.lower() == "none"`, `missing-exp`, `expired`
+      (`exp <= now`) and `long-lived` (`exp - (iat or now) > max_lifetime_s`), `untrusted-header:<name>` for `jwk`,
+      `jku`, `x5u`, `kid`, and `sensitive-claim:<path>` from a recursive walk that splits claim names into words. It
+      returns the sorted list. Nothing here verifies a signature - that is the point.
+    rubric:
+      - Every test in tests/api/test_jwt_inspect.py passes.
+      - Decoding never verifies a signature or needs a key.
+      - A malformed token raises ValueError instead of returning partial data.
+      - Sensitive claim names are matched as whole words, so company is not flagged.
+    hints:
+      - Padding is needed when the length is not a multiple of 4.
+      - A JSON array is valid JSON but is not a header or a claims set.
+      - Use a set so a finding is reported once, and sort at the end.
+    solution: Split on dots, decode each of the first two parts as JSON objects, and build the finding codes from the decoded data only.
+
+  - id: probe-code
+    type: coding
+    concept: sec-jwt-signature-algorithm
+    skill: application
+    title: Write the alg none probe
+    prompt: |
+      In `practice/security/exercises/api/jwt_probe.py`, implement `get_token`, `forge_unsigned`, `forge_tampered` and
+      `probe_alg_none`. The tests run the probe against the loopback portal: it must report the flaw on `make_app()`
+      (the exact spelling `none` accepted, the victim's role `admin`, signature checking still working) and stay quiet
+      on `make_app({"jwt-none"})` - and it must refuse to give a verdict when the endpoint does not authenticate or the
+      valid token is refused.
+    project: security
+    files: [exercises/api/jwt_probe.py]
+    test: tests/api/test_jwt_probe.py
+    command: .venv/bin/python -m pytest tests/api/test_jwt_probe.py
+    modelAnswer: |
+      ```python
+      def forge_unsigned(claims, alg="none"):
+          return f"{b64url_json({'alg': alg, 'typ': 'JWT'})}.{b64url_json(claims)}."
+
+      baseline = _call(base_url, None, timeout, path)
+      if baseline.status_code not in (401, 403):
+          raise RuntimeError("endpoint does not authenticate")
+      if _call(base_url, valid_token, timeout, path).status_code != 200:
+          raise RuntimeError("valid token refused")
+      ...
+      result.vulnerable = bool(result.accepted_spellings) or not result.tampered_rejected
+      ```
+
+      A spelling counts as accepted only when the answer is `200` **and** the JSON `email` is the victim's. The
+      tampered token keeps the old signature and only the payload is re-encoded. The verdict comes from the answers,
+      never from guessing what the server should do.
+    rubric:
+      - Every test in tests/api/test_jwt_probe.py passes.
+      - The probe checks the no-token baseline and the valid token before judging anything.
+      - A spelling is accepted only on a 200 that shows the victim's identity.
+      - A tampered token with the old signature is part of the verdict.
+      - It reports nothing against the fixed portal.
+    hints:
+      - The unsecured token ends with a dot.
+      - The tampered token keeps the header and the signature unchanged.
+      - Raise RuntimeError when a precondition fails - do not return a verdict.
+    solution: Check the baselines, send the tampered and the unsigned tokens, count a spelling only when the victim's identity comes back, and stay quiet on the fixed build.
+
+  - id: validate-code
+    type: coding
+    concept: sec-jwt-claims-key-trust
+    skill: analysis
+    title: Write the token validator
+    prompt: |
+      In `practice/security/exercises/api/jwt_validate.py`, implement `validate_token`. It follows RFC 7519 7.2 and RFC
+      8725: refuse a policy that would accept `none`, reject a malformed token, check the algorithm against the allow-list
+      before the signature (exact, case-sensitive), verify the HMAC in constant time, and only then report every claim
+      problem - missing claims, wrong types, expiry and not-before with leeway, exact issuer, audience as string or list,
+      and a lifetime cap. The tests also run it over the portal's own token with a strict issuer and audience policy.
+    project: security
+    files: [exercises/api/jwt_validate.py]
+    test: tests/api/test_jwt_validate.py
+    command: .venv/bin/python -m pytest tests/api/test_jwt_validate.py
+    modelAnswer: |
+      ```python
+      if set(policy.algorithms) - set(HMAC_ALGS):
+          raise ValueError("never 'none'")
+      try:
+          header, claims, signature, signing_input = split_token(token)
+      except ValueError:
+          return Verdict(False, ["malformed"])
+      alg = header.get("alg")
+      if not isinstance(alg, str) or alg not in policy.algorithms:
+          return Verdict(False, ["alg-not-allowed"])
+      expected = hmac.new(policy.key, signing_input.encode(), HMAC_ALGS[alg]).digest()
+      if not hmac.compare_digest(expected, _b64url_decode(signature)):   # undecodable -> bad-signature too
+          return Verdict(False, ["bad-signature"])
+      ```
+
+      After that, collect reasons: `missing-<name>` for each required claim (plus `iss` and `aud` when the policy sets
+      them), `bad-claim:<name>` for non-numbers (a boolean is not a number), `expired` when `now - leeway >= exp`,
+      `not-yet-valid`, `issuer-mismatch` by `!=`, `audience-mismatch` when the policy audience is not one of the values,
+      and `lifetime-too-long`. `ok` is `not reasons`.
+    rubric:
+      - Every test in tests/api/test_jwt_validate.py passes.
+      - Algorithm and signature are checked first and return at once, before any claim is read.
+      - Issuer and audience are compared exactly, never by prefix.
+      - A policy that allows none or an unsupported algorithm raises ValueError.
+      - Several claim problems are reported together in a stable order.
+    hints:
+      - Return early on a bad algorithm or signature - claims of an unproven token are not worth reading.
+      - isinstance(True, int) is True in Python - exclude booleans when checking for numbers.
+      - aud may be a string or a list of strings.
+    solution: Check the policy, then the algorithm, then the signature - each returning at once - and only then collect all claim problems in order.
+
+placement:
+  - id: place-none
+    type: mcq
+    concept: sec-jwt-signature-algorithm
+    skill: analysis
+    title: Is the signature check sound?
+    prompt: |
+      You send an API three tokens for another user: a signed token with the payload edited and the old signature, a token
+      with `alg: none` and an empty signature, and the original valid token. Results: `401`, `200` (showing the other user), `200`
+      (showing you). Verdict?
+    options:
+      - id: none-flaw
+        text: "Vulnerable - signed tokens are checked, but the server lets the token choose none and skips verification."
+        feedback: "Correct. Refusing the edited signed token only shows that signed tokens are verified; the accepted unsigned token is the flaw."
+      - id: sound
+        text: "Sound - the edited token was refused."
+        feedback: "The unsigned token was accepted as another user. One refused control does not clear the other path."
+      - id: weak-key
+        text: "Weak key - the signature was forged."
+        feedback: "No signature was forged. The accepted token had none."
+    correct: [none-flaw]
+    solution: A refused tampered token is the control. The accepted unsigned token for another user is the finding.
+
+  - id: place-claims
+    type: mcq
+    concept: sec-jwt-claims-key-trust
+    skill: application
+    title: Which of these is a finding?
+    prompt: |
+      A shared identity provider signs tokens for `shop-api` and `admin-api`. Which observation is a finding?
+    options:
+      - id: aud-accepted
+        text: "A genuine, unexpired token with aud shop-api is accepted by admin-api."
+        feedback: "Correct. admin-api does not check that it is an intended audience (RFC 8725 3.9)."
+      - id: aud-refused
+        text: "admin-api refuses a token with aud shop-api and accepts one with aud admin-api."
+        feedback: "That is correct behaviour - the audience is enforced."
+      - id: expired-refused
+        text: "admin-api refuses a token whose exp is in the past."
+        feedback: "That is correct. Expiry is enforced."
+    correct: [aud-accepted]
+    solution: A valid signature does not make a token valid for every service; the audience must be checked.
+
+  - id: place-oauth
+    type: mcq
+    concept: sec-oauth-flow-weaknesses
+    skill: application
+    title: The redirect URI
+    prompt: |
+      (From the docs, not run here.) The registered redirect URI is `https://app.example.com/callback`. An authorization request with
+      `redirect_uri=https://app.example.com/callback/extra` is accepted and the server redirects there with a code. Verdict?
+    options:
+      - id: loose-match
+        text: "A finding - the redirect URI is not compared by exact string, so a code can be sent to addresses the attacker influences."
+        feedback: "Correct. RFC 9700 2.1 requires exact string matching, with one exception for the port of localhost redirects."
+      - id: same-host
+        text: "Fine - it is on the same host."
+        feedback: "A path on the same host can host user content or an open redirect that forwards the code onward."
+      - id: pkce-covers
+        text: "Fine - PKCE protects the code anyway."
+        feedback: "PKCE helps against a stolen code being redeemed, but exact matching is a separate requirement and also prevents token leaks."
+    correct: [loose-match]
+    solution: Exact string matching is required; accepting a different path shows the comparison is loose.
+
+recall:
+  - id: recall-readable
+    concept: sec-jwt-signature-algorithm
+    prompt: Is a signed JWT's payload secret, and what does the signature protect?
+    answer: No - it is base64url-encoded and readable by anyone who holds the token. The signature gives integrity (claims not changed), not confidentiality.
+  - id: recall-none
+    concept: sec-jwt-signature-algorithm
+    prompt: How do you build and test an unsecured token, and what must a fixed API do?
+    answer: Header alg none, the claims, and an empty signature - the token ends with a dot. Try several spellings. A fixed API refuses all of them because the application, not the token, chooses a short allow-list of algorithms.
+  - id: recall-order
+    concept: sec-jwt-claims-key-trust
+    prompt: In what order should a verifier check a JWT, and why?
+    answer: Algorithm against the allow-list, then the signature, and only then the claims (exp, nbf, iss, aud). Claims of a token that is not proven genuine must not be trusted.
+  - id: recall-aud
+    concept: sec-jwt-claims-key-trust
+    prompt: Why is a validly signed token still dangerous at the wrong service?
+    answer: The signature only proves the issuer made it. Without an exact aud check a low-privilege service's token opens a high-privilege service that shares the issuer (RFC 8725 3.9).
+  - id: recall-keys
+    concept: sec-jwt-claims-key-trust
+    prompt: Which header fields must a verifier never trust to pick a key?
+    answer: kid (use as an opaque lookup, never a path or query), jku and x5u (URL allow-list only) and an embedded jwk. The key must come from the application's own configuration.
+  - id: recall-pkce
+    concept: sec-oauth-flow-weaknesses
+    prompt: What does PKCE protect, and which challenge method should be used?
+    answer: It binds an authorization code to the client that started the flow, so a stolen code is useless without the verifier. Use S256 - BASE64URL(SHA256(verifier)) - not plain; public clients must use PKCE.
+  - id: recall-oauth-tests
+    concept: sec-oauth-flow-weaknesses
+    prompt: Name four things to check in an OAuth authorization-code sign-in.
+    answer: Exact redirect_uri matching, PKCE required and not downgradable (a verifier refused when no challenge was sent), state checked on the callback, and no password or implicit grant. Also token lifetime and storage.
+
+next:
+  - testing-mass-assignment-and-data-exposure
+  - testing-business-logic-and-rate-limits
+  - owasp-api-security-top-10

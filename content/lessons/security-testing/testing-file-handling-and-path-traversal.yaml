@@ -1,0 +1,1491 @@
+id: testing-file-handling-and-path-traversal
+title: Testing file handling and path traversal
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: How a file name from a request becomes a path on the server, and how a tester finds, confirms and proves path traversal safely - the dot-dot-slash family, encodings, filters that remove "../" once, absolute paths and links - with a harmless canary file and redacted evidence, then how uploads go wrong and how to verify the allow-lists that hold - an allow-listed name, a resolved path checked for containment, a generated stored name - against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    path traversal,
+    directory traversal,
+    dot-dot-slash,
+    WSTG-ATHZ-01,
+    WSTG-BUSL-08,
+    WSTG-BUSL-09,
+    A01:2021,
+    CWE-22,
+    file inclusion,
+    file upload,
+    unrestricted file upload,
+    double encoding,
+    allow-list,
+    canonicalisation,
+    realpath,
+    symbolic links,
+    zip slip,
+    web shell,
+    Content-Type,
+    file signature,
+    nosniff,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, curl 8.5.0, on
+    Linux. Every output in this lesson was printed by the commands and code shown, run on 20 November 2026
+    against the practice portal or on temporary folders on this machine. Windows-specific behaviour is quoted
+    from the documents below and was **not run here**.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal that binds to `127.0.0.1` only. Its `path-traversal` flaw is in `GET /files?name=...`, which
+    serves files from a small *virtual* tree (a `public/` folder and a secret `internal/settlement-keys.txt`
+    next to it, with synthetic content); `make_app({"path-traversal"})` builds the same portal with that route
+    fixed. The portal has no upload route, so uploads are taught from the documents and practised on the
+    validator function in `exercises/web/files_upload_check.py`. SandPay, its files and keys are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. A
+    traversal test can read credentials and personal data; use a **canary** file that the system's owner has
+    agreed to (a harmless file placed outside the served folder), never real secrets, and never copy a file's
+    content into a report. Upload tests can plant code on a server: do them only where the rules of engagement
+    say so, and remove what you uploaded. Everything here runs on your own machine.
+  - **Testing guide:** OWASP Web Security Testing Guide v4.2,
+    [WSTG-ATHZ-01 Testing Directory Traversal File Include](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/05-Authorization_Testing/01-Testing_Directory_Traversal_File_Include),
+    [WSTG-BUSL-08 Test Upload of Unexpected File Types](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/08-Test_Upload_of_Unexpected_File_Types)
+    and
+    [WSTG-BUSL-09 Test Upload of Malicious Files](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/09-Test_Upload_of_Malicious_Files),
+    read from the v4.2 tag on [GitHub](https://github.com/OWASP/wstg) on 20 November 2026 (v4.2 is the latest
+    stable release). Quotations are from those pages.
+  - **Prevention:** OWASP Cheat Sheet Series,
+    [Path Traversal Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Path_Traversal_Prevention_Cheat_Sheet.html)
+    and
+    [File Upload](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html), as published on
+    20 November 2026; OWASP Top 10:2021
+    [A01 Broken Access Control](https://owasp.org/Top10/2021/A01_2021-Broken_Access_Control/), whose mapped
+    CWEs include CWE-22, CWE-23, CWE-35 and CWE-59; MITRE
+    [CWE-22](https://cwe.mitre.org/data/definitions/22.html) (read on 20 November 2026). CWE-434 (unrestricted
+    upload of a file with a dangerous type) is named in the references of both upload test cases.
+  - **Python and HTTP details:** `os.path.realpath`, `os.path.commonpath` and `os.path.join` as described and
+    linked by the Path Traversal Prevention cheat sheet; MDN
+    [X-Content-Type-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options)
+    and
+    [Content-Disposition](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Disposition),
+    as on 20 November 2026.
+  - **Tools, from the docs, not run here:** the WSTG's tool list for WSTG-ATHZ-01 - DotDotPwn, the WFuzz
+    traversal word list, OWASP ZAP and Burp Suite. None is installed in this project; point a fuzzer only at a
+    system inside your written scope.
+  - **Not repeated here:** the developer's view of the flaw -
+    [The OWASP Top 10 for developers](#/lesson/owasp-top-10-for-developers); replaying and tampering with
+    requests - [Intercepting proxies](#/lesson/intercepting-proxies); reading headers -
+    [HTTP security for testers](#/lesson/http-security-for-testers).
+
+prerequisites:
+  - security-testing-fundamentals
+  - intercepting-proxies
+  - http-security-for-testers
+  - testing-access-control-idor
+
+concepts:
+  - id: sec-files-traversal
+    name: How a file name becomes a path - and how it escapes
+    summary: Path traversal happens when input is used to build a file path meant to stay under one folder, and special elements - dot-dot-slash, encoded or double-encoded forms, backslashes, absolute paths, symbolic links - make the path resolve somewhere else. Each trick targets one stage of the pipeline (decoding, string filters, joining, resolving, opening), so a filter that removes "../" once, or a check made before decoding, fails against the next form.
+  - id: sec-files-testing
+    name: Finding and proving file-handling flaws safely
+    summary: Enumerate every input that names a file - parameters, cookies, headers, JSON fields, upload names - then try the encodings against a harmless canary file outside the served folder. A hit needs a stable baseline, an answer that differs from it, and a negative control (the same payload aimed at a name that cannot exist must not succeed), so catch-all pages and echoes are not reported; evidence is redacted and tests stop at proof. Upload tests check what the server really enforces - client-side script, the Content-Type header, the extension, the content - one at a time.
+  - id: sec-files-defences
+    name: Defences that hold, and how to verify them
+    summary: The reliable defence is to keep user input out of paths. When a name is accepted it is allow-listed, joined to a fixed base, resolved (links included), checked for containment by path components, and the checked path is the one opened; rejected names and missing files answer alike. Uploads add an extension allow-list, a content signature check that does not trust the declared type, a size limit, a server-generated stored name, storage outside the web root and download headers. Verify by re-running the same probes, trying symbolic links and sibling folders, and reading the code path.
+
+objectives:
+  - Explain, with a real request, how a file-name parameter becomes a path and name the pipeline stages (decoding, string filters, joining, resolving, opening) that each traversal trick targets.
+  - Enumerate the inputs that name files and try the dot-dot-slash encodings the WSTG lists - plain, encoded, double-encoded, backslash, nested and absolute - against a canary file, telling a real read from a catch-all page or an echo.
+  - Write a read-only traversal probe with a stable baseline, a negative control and redacted evidence, and explain why the evidence must not contain the file.
+  - Compare filters that remove "../" with allow-lists and containment checks, and explain why a string-prefix check and an unresolved path both fail.
+  - Test an upload feature for unexpected and malicious types - client-side checks, Content-Type, extension, content, filename - and name the controls that fix each.
+  - Verify a fix with the original probes, a sibling folder, a symbolic link, a legitimate name and a code review of the path.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-files-traversal, sec-files-testing]
+    title: The idea in plain language
+    body: |
+      SandPay's portal has a "download your terms" link: `GET /files?name=terms.txt`. Picture a clerk at a
+      counter. The rule is *fetch the named paper from the public shelf*. A visitor says "terms.txt" and the
+      clerk fetches it. Another visitor says "go up one floor, then fetch settlement-keys from the staff
+      room". A clerk who follows directions literally walks up the stairs. Nothing in the rule said "stay on
+      this floor"; the rule only said "from the public shelf", and the visitor changed where the shelf is.
+
+      That is path traversal. The server builds a file path from text it was given, and text such as `../`
+      means *the folder above*. The tester's job is the visitor's: ask for something outside the shelf and see
+      whether the clerk goes. The tester's care is the part the visitor skips: ask only for a paper that the
+      owner has agreed is a harmless stand-in (a **canary**), and note *that* it was fetched, not what it
+      said.
+
+      Uploads are the same counter in the other direction: the visitor hands in a paper and the clerk files it.
+      If the clerk trusts the label on the paper ("this is an image"), keeps the visitor's own name for it, and
+      files it where the public can open it, the visitor decides what is on the shelf - and what the shelf can
+      do.
+
+  - id: what
+    kind: what
+    concepts: [sec-files-traversal, sec-files-testing, sec-files-defences]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Path traversal** | MITRE CWE-22: the product "uses external input to construct a pathname that is intended to identify a file or directory that is located underneath a restricted parent directory, but the product does not properly neutralize special elements within the pathname that can cause the pathname to resolve to a location that is outside of the restricted directory." Also called directory traversal, directory climbing, backtracking or the dot-dot-slash attack (`../`) - the WSTG's names. |
+      | **Relative / absolute traversal** | Climbing out with `..` segments, or supplying a complete path (`/etc/passwd`, `C:\...`) so the base folder is ignored. CWE-22's extended description covers both. |
+      | **File inclusion** | The same flaw where the file is *run*: `include`, `require` or a template loader fed with input. The WSTG's example `index.php?file=http://...` is a remote file include. |
+      | **Input vector** | Any input used for a file operation: a query or form parameter, a cookie (the WSTG shows `Cookie: USER=...:PSTYLE=../../../../etc/passwd`), a header, a JSON field, an uploaded file's name, an archive entry's name. |
+      | **Canary file** | A harmless file outside the served folder, agreed with the owner, that proves a read without exposing anything. In this lesson: `internal/settlement-keys.txt`, synthetic content. |
+      | **Base folder** | The one folder the application means to serve from. "Inside the base" is a property of the *resolved* path, not of the text the user sent. |
+      | **Canonicalisation** | Turning a path into its one real form: `..` and `.` resolved, links followed. Python's `os.path.realpath` does this; CWE-22's mitigation advice names `realpath()`, `getCanonicalPath()` and `GetFullPath()`. |
+      | **Unrestricted file upload** | CWE-434: a file of a dangerous type is accepted, stored or served in a way that lets it do harm - run as code, shown as a page, overwrite another file. |
+      | **Allow-list** | A fixed list of acceptable values (names, extensions, types). The Path Traversal Prevention cheat sheet: "look the name up in an allowlist and use the stored path, not the input". |
+
+      OWASP Top 10:2021 files this under **A01 Broken Access Control**; its list of mapped CWEs includes
+      CWE-22 (path traversal), CWE-23 (relative path traversal), CWE-35 (`.../...//`) and CWE-59 (link
+      following). The access control is the *folder boundary*: the application means "only this folder" and
+      enforces it with a string it does not control.
+
+  - id: why
+    kind: why
+    concepts: [sec-files-traversal, sec-files-defences]
+    title: Why it matters
+    body: |
+      The WSTG states what is at stake: an attacker may "read or write files that are not intended to be
+      accessible" and, "in particular situations, it could be possible to execute arbitrary code or system
+      commands". The files in reach are whatever the application's own account can read:
+
+      - **Secrets** - configuration, signing keys, API credentials. On SandPay the portal's neighbour folder
+        holds the settlement signing key; whoever reads it can sign settlement files.
+      - **Source code** - the WSTG shows that no traversal characters are needed at all:
+        `main.cgi?home=main.cgi` shows the source of the CGI component itself, "located in the same directory as
+        the normal HTML static files".
+      - **Other users' data** - exports, statements and logs that happen to sit near the public folder. Logs
+        are a favourite: they hold session ids, tokens and sometimes card data
+        ([the logging flaw](#/lesson/testing-cryptography-and-data-exposure)).
+      - **Write access** - the upload variant: an attacker-chosen name or location overwrites a file, or places
+        a script where the server will run it.
+
+      It is also a **cheap** flaw to introduce: one line that joins a base folder and a request parameter.
+      And it is *easy to half-fix*, which is why testers keep finding it: removing `../` from the input,
+      checking the start of the string, or blocking one encoding all feel like fixes and each fails against
+      the next form.
+
+  - id: internals-pipeline
+    kind: internals
+    concepts: [sec-files-traversal]
+    title: The pipeline a name travels - and the trick for each stage
+    body: |
+      A file name takes five steps between the request and the disk. Every traversal technique targets one of
+      them, and a defence only holds if it sits *after* the last step that can change the text.
+
+      | Stage | What happens | Trick that targets it |
+      | --- | --- | --- |
+      | 1. Decoding | The web server turns `%2e` into `.` - once. Frameworks, proxies and the application's own code may decode again. | URL encoding and **double encoding**: `%2e%2e%2f` is `../`; `%252e%252e%252f` becomes `%2e%2e%2f` after one decode and `../` after two (WSTG list). Overlong UTF-8 such as `..%c0%af` "only works in systems that are able to accept" it. |
+      | 2. String filters | Code "cleans" the name: removes `../`, replaces `/` with `\`, checks an extension. | **Nested sequences**: the WSTG's `....//` - removing the inner `../` once leaves `../`. The WSTG calls such repair functions "usually prone to security flaws". |
+      | 3. Joining | The name is attached to the base folder. | **Absolute paths**: the cheat sheet notes that "many join functions drop the base directory when the second argument is absolute" - Python's `os.path.join('/srv/uploads', '/etc/passwd')` returns `/etc/passwd`. |
+      | 4. Resolving | `..` and `.` are resolved, links are followed. | **Climbing** with `../` (deep chains are harmless where the resolver stops at the root), **backslashes** where the platform treats `\` as a separator, and **symbolic links** that point out of the folder. |
+      | 5. Opening | The checked string is opened. | **Races**: a link swapped in after the check and before the open (the cheat sheet's TOCTOU note). |
+
+      The practice portal shows stages 1, 2 and 4 clearly. This is what its handler does, in the order it does it
+      (read in `sandpay_vuln.py`, then confirmed by the requests below): the HTTP layer decodes the query value
+      once; the handler calls `urllib.parse.unquote` **again**; turns `\` into `/`; starts at `public`; pops
+      one level for each `..` (a `..` at the root is ignored); and looks the result up in a virtual tree. So on
+      this portal `..%5c` works, and **double encoding works**, while `....//` and a leading `/` do not -
+      because it never removes `../` and never joins with `os.path.join`. A different application would fail
+      the other way round. That is why a tester tries *all* the forms.
+
+      **Windows adds forms Linux ignores** - quoted from the WSTG and the cheat sheet, *not run here*: both `\`
+      and `/` separate; `C:\...` and `\\server\share\...` are absolute; trailing dots and spaces are discarded
+      ("`file.txt...`" opens `file.txt`); on NTFS `file.txt::$DATA` is another name for `file.txt`; reserved
+      device names such as `CON`, `NUL` and `COM1` are devices even with an extension. A check written on
+      Linux misses all of them.
+
+  - id: internals-uploads
+    kind: internals
+    concepts: [sec-files-testing, sec-files-defences]
+    title: How uploads go wrong
+    body: |
+      An upload hands the attacker three things the server may trust by mistake: the **file name**, the
+      **declared type** (`Content-Type`) and the **content**. The two WSTG test cases split the risk the same
+      way:
+
+      - **Unexpected file types (WSTG-BUSL-08)** - the application "must check the files and only allow certain
+        approved file types". The test checks whether the check lives only in client-side JavaScript, only in
+        the `Content-Type` header, or only in the extension.
+      - **Malicious files (WSTG-BUSL-09)** - even an *allowed* type can be harmful: "legitimate file types that
+        have malicious contents". It lists web shells ("the file needs to be uploaded inside the webroot, and
+        the server must be configured to execute the code"), malware (the EICAR test file is the safe way to
+        test a scanner), archive directory traversal ("Zip Slip": entries named `..\..\..\..\shell.php`),
+        zip bombs, XML files and active content in CSV, Office and PDF files.
+
+      The WSTG's list of **filter evasions** is the tester's checklist, and each item names a control the
+      application is missing: change `Content-Type` to `image/jpeg`; use a less common extension (`.php5`,
+      `.phtml`, `.shtml`, `.asa`, `.jspx`); change the case (`file.PhP`); add trailing characters (`file.asp...`,
+      `file.php;jpg`) or a null (`file.asp%00.jpg`); and, in badly configured nginx, `test.jpg/x.php`. The File
+      Upload cheat sheet adds the double extension (`.jpg.php`) and, on Windows, the colon (`shell.asp:.jpg`),
+      and says to validate "after decoding the filename".
+
+      **A name is also a path.** An upload that is stored under the client's filename inherits every flaw of
+      the first half of this lesson: a name of `../../app/settings.py` writes outside the upload folder, and a
+      name that matches an existing file overwrites it (the cheat sheet lists "overwrite an existing file on the
+      system" among the threats). That is why the cheat sheet says "change the filename to something generated
+      by the application".
+
+      **Stored files can also attack people.** If an uploaded file is publicly retrievable and the browser
+      treats it as a page, its script runs on SandPay's origin. MDN: with `X-Content-Type-Options: nosniff`
+      the browser "uses the supplied `Content-Type` as-is instead of examining the content", which "prevents
+      XSS-attacks where user-uploaded content is executed as an HTML document"; with
+      `Content-Disposition: attachment` the content "should be downloaded".
+
+  - id: when
+    kind: when
+    concepts: [sec-files-testing, sec-files-defences]
+    title: When to test this - and what it does not replace
+    body: |
+      Test for it whenever a request carries something that *names* a thing the server then reads or writes:
+
+      - download and preview endpoints (`/files?name=`, `/statements?file=`, `/export?report=`), image and
+        template loaders, "language" or "theme" parameters and cookies (the WSTG's `TEMPLATE=flower` example);
+      - **every upload**, including profile pictures, dispute evidence, bulk-import CSV and ZIP files;
+      - anything that builds a path from a database value an earlier request stored - the WSTG warns these
+        "seem internal and safe but are not in reality".
+
+      It does **not** replace:
+
+      - **Reading the code** (gray-box). The WSTG: search for inclusion and filesystem functions with grep
+        (`include`, `readfile`, `fopen`, `java.io.File`), and check any function that "tries to change invalid
+        input to make it valid". A black-box probe proves a flaw is there; it cannot prove one is not.
+      - **Least privilege on the server.** The account running the application should read only what it must,
+        so a traversal reaches as little as possible.
+      - **The next lessons.** A traversal that reaches a URL scheme (`file://`, `http://`) is also an SSRF
+        question ([SSRF and open redirects](#/lesson/testing-ssrf-and-open-redirects)); a file the server
+        returns with secrets inside is also [data exposure](#/lesson/testing-cryptography-and-data-exposure);
+        a header-level fix belongs to [security misconfiguration](#/lesson/testing-security-misconfiguration).
+
+      Scope first. A traversal test is a *read of files the owner did not mean you to read*; the rules of
+      engagement should name the canary, or at least agree that you may read one harmless file outside the
+      folder to prove the flaw.
+
+  - id: visual-double-decode
+    kind: visual
+    concepts: [sec-files-traversal]
+    title: Why double encoding works on the practice portal
+    body: |
+      Notice that the tester sends a name that *looks harmless after the first decode*. The check - if there
+      were one - would see the text in the middle; the handler decodes once more and climbs.
+
+      ```mermaid
+      sequenceDiagram
+        participant T as Tester
+        participant S as HTTP layer
+        participant H as Portal handler
+        participant F as Virtual file tree
+        T->>S: name is the double-encoded path to the canary
+        S->>H: name decoded once, still looks like an encoded path
+        H->>H: unquote again, now the text climbs one folder
+        H->>H: start at the public folder and go up one level
+        H->>F: look up internal settlement keys
+        F-->>H: 46 bytes of synthetic text
+        H-->>T: 200 with the file
+      ```
+
+      Read it left to right: the vulnerable step is not the climbing, it is the second `unquote` after the
+      point where anything could have inspected the name. Every extra decode is another stage a filter has to
+      come *after*.
+
+  - id: visual-fix-flow
+    kind: visual
+    concepts: [sec-files-defences]
+    title: The fix as a decision flow
+    body: |
+      Every rejection ends in the same answer. The only path to "serve" passes an allow-list, a resolved
+      containment check and a file test.
+
+      ```mermaid
+      flowchart TD
+        A["name from the request, decoded once"] --> B{"every part matches the allow-list?"}
+        B -- "no" --> R["404 file not found"]
+        B -- "yes" --> C["join with the base and resolve with realpath"]
+        C --> D{"resolved path strictly inside the resolved base?"}
+        D -- "no, a link or a sibling folder" --> R
+        D -- "yes" --> E{"existing regular file?"}
+        E -- "no" --> R
+        E -- "yes" --> F["open the checked path and serve it"]
+      ```
+
+      Notice that the check runs on the **resolved** path, and that "serve" opens that same path - it is never
+      rebuilt from the original text.
+
+  - id: curl-evidence
+    kind: code
+    concepts: [sec-files-traversal, sec-files-testing]
+    title: The requests, one encoding at a time
+    body: |
+      Two portals on loopback, the vulnerable one (port 8766) and one started with `--fix path-traversal`
+      (port 8767). curl 8.5.0 sends the query string exactly as typed, so the encodings reach the server
+      unchanged. The helper prints each request's status and the first 70 characters of the body. The names are
+      the canary file's path with different forms of `../`.
+
+      ```bash
+      cd practice/security
+      .venv/bin/python support/sandpay_vuln.py --port 8766 &
+      .venv/bin/python support/sandpay_vuln.py --port 8767 --fix path-traversal &
+
+      show() {
+        printf '%s -> ' "$2"
+        curl -s -o body.txt -w '%{http_code}' "http://127.0.0.1:$1/files?name=$2"
+        echo " $(head -c 70 body.txt | tr -d '\n')"
+      }
+      for n in terms.txt nope.txt '../internal/nope.txt' \
+               '../internal/settlement-keys.txt' \
+               '%2e%2e%2finternal%2fsettlement-keys.txt' \
+               '%252e%252e%252finternal%252fsettlement-keys.txt' \
+               '..%5cinternal%5csettlement-keys.txt' \
+               '....//internal/settlement-keys.txt' \
+               '/internal/settlement-keys.txt'; do show 8766 "$n"; done
+      ```
+
+      ```text
+      terms.txt -> 200 SandPay merchant terms (practice copy).
+      nope.txt -> 404 {"error": "file not found: public/nope.txt"}
+      ../internal/nope.txt -> 404 {"error": "file not found: internal/nope.txt"}
+      ../internal/settlement-keys.txt -> 200 SETTLEMENT_SIGNING_KEY=sk_practice_do_not_use
+      %2e%2e%2finternal%2fsettlement-keys.txt -> 200 SETTLEMENT_SIGNING_KEY=sk_practice_do_not_use
+      %252e%252e%252finternal%252fsettlement-keys.txt -> 200 SETTLEMENT_SIGNING_KEY=sk_practice_do_not_use
+      ..%5cinternal%5csettlement-keys.txt -> 200 SETTLEMENT_SIGNING_KEY=sk_practice_do_not_use
+      ....//internal/settlement-keys.txt -> 404 {"error": "file not found: public/..../internal/settlement-keys.txt"}
+      /internal/settlement-keys.txt -> 404 {"error": "file not found: public/internal/settlement-keys.txt"}
+      ```
+
+      The same requests against the fixed portal (port 8767), for four of the names:
+
+      ```text
+      terms.txt -> 200 SandPay merchant terms (practice copy).
+      nope.txt -> 404 {"error": "file not found"}
+      ../internal/settlement-keys.txt -> 404 {"error": "file not found"}
+      %252e%252e%252finternal%252fsettlement-keys.txt -> 404 {"error": "file not found"}
+      ```
+
+      What to read from it:
+
+      - **Five encodings reach the canary**, two do not. That pattern is information about the application:
+        it decodes twice, accepts backslashes, resolves `..`, and neither strips `../` nor joins with an
+        absolute path.
+      - **The 404 on the vulnerable portal is an oracle.** `file not found: internal/nope.txt` shows the
+        *resolved* path: the tester learns that `..` was consumed and that a folder called `internal` is
+        being looked in. A tester can map folders from the messages alone. The fixed portal answers
+        `file not found` for a missing file, a rejected name and an escape alike.
+      - **The legitimate request still works** on the fixed portal - always include it. A fix that breaks
+        `terms.txt` is not a fix.
+      - Some forms were not shown because the portal never accepts them. `..%c0%af` (overlong UTF-8) came back
+        as a 404 whose message held two replacement characters: this portal's decoder does not accept it,
+        which is what the WSTG means by "only works in systems that are able to accept overlong UTF-8
+        sequences". A `%00` null before `.png` was also a plain 404 here.
+
+  - id: probe-code
+    kind: code
+    concepts: [sec-files-testing]
+    title: A read-only probe - encodings, a control and redacted evidence
+    collapsed: true
+    body: |
+      From `practice/security/solutions/web/files_traversal_probe.py` (an excerpt; the full file has the
+      portal sender and the docstrings). `send` takes the **raw** query value and returns `(status, body)`.
+
+      ```python
+      def variants(target):
+          if target.startswith("/") or ".." in target:
+              raise ValueError("target must be a relative path without '..'")
+          return [
+              ("dot-dot-slash", f"../{target}"),
+              ("deep", f"../../../../{target}"),
+              ("url-encoded", "%2e%2e%2f" + target.replace("/", "%2f")),
+              ("double-encoded", "%252e%252e%252f" + target.replace("/", "%252f")),
+              ("backslash", "..%5c" + target.replace("/", "%5c")),
+              ("nested-strip", f"....//{target}"),
+              ("absolute", f"/{target}"),
+          ]
+
+      def redact(body):
+          return f"{len(body)} bytes, begins {body[:4]!r}..."
+
+      def probe_traversal(send, legit_name, target):
+          first, second = send(legit_name), send(legit_name)
+          if first != second or first[0] != 200 or not first[1]:
+              raise InconclusiveError(f"{legit_name!r} is not a stable 200")
+          baseline_body = first[1]
+          findings = []
+          for label, raw in variants(target):
+              status, body = send(raw)
+              if status != 200 or not body or body == baseline_body:
+                  continue
+              control_status, _ = send(raw + CONTROL_SUFFIX)   # ".missing"
+              if control_status == 200:
+                  continue
+              findings.append(Finding(label, raw, status, len(body), redact(body)))
+          return findings
+      ```
+
+      Run against both portals (`portal_sender` sends the raw value with `http.client`; `requests` would turn
+      `%2e` back into `.` before sending):
+
+      ```text
+      == probe against the vulnerable portal: 5 finding(s)
+        dot-dot-slash   ../internal/settlement-keys.txt                  200 46 bytes, begins 'SETT'...
+        deep            ../../../../internal/settlement-keys.txt         200 46 bytes, begins 'SETT'...
+        url-encoded     %2e%2e%2finternal%2fsettlement-keys.txt          200 46 bytes, begins 'SETT'...
+        double-encoded  %252e%252e%252finternal%252fsettlement-keys.txt  200 46 bytes, begins 'SETT'...
+        backslash       ..%5cinternal%5csettlement-keys.txt              200 46 bytes, begins 'SETT'...
+      == probe against the path-traversal fixed portal: 0 finding(s)
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-files-testing]
+    title: Why the probe is written that way
+    body: |
+      | Line | Why |
+      | --- | --- |
+      | `first, second = send(legit_name), send(legit_name)` | Two identical requests give the baseline. A page that changes by itself makes every comparison meaningless, so the probe raises `InconclusiveError` instead of guessing - the same discipline as the SQL injection probe. |
+      | `first[0] != 200 or not first[1]` | The legitimate file must load first. If `terms.txt` does not work, a 404 on a payload proves nothing. |
+      | `body == baseline_body` | A catch-all page that returns the home page for every path answers 200 with the *baseline's* body. Not file access. |
+      | `send(raw + CONTROL_SUFFIX)` | The **negative control**. The same payload aimed at a name that cannot exist must *not* succeed. An echo page (`you asked for ...`) or a custom error that is a 200 answers the control with a 200 too, and is skipped. Without the control, both look like hits. |
+      | `Finding(..., redact(body))` | Evidence is the status, the size and four characters - enough to see the canary was read (`46 bytes, begins 'SETT'`), nothing that could leak if the report is shared. The file's content never enters the report. |
+      | `("nested-strip", ...)` and `("absolute", ...)` | These two find nothing on the practice portal. They stay in the list because a different application fails exactly there: a filter that removes `../` once, or a join that drops the base. |
+      | `portal_sender` uses `http.client` | It sends the query value as given. `requests` normalises the URL (it turned `%2e%2e%2f` into `..%2F` in a check on this machine), which would silently replace the encodings the test is about. |
+
+      The probe stops at proof: **at most 16 GET requests** (two baselines, seven payloads, and a control for
+      each payload that got a different 200), no listing of folders, no attempt to read anything but the
+      canary, and no write.
+
+  - id: fix-code
+    kind: code
+    concepts: [sec-files-defences]
+    title: The fix - allow-list, resolve, contain, check, open
+    collapsed: true
+    body: |
+      From `practice/security/solutions/web/files_safe_path.py`. `naive_read` is the vulnerable original kept
+      for comparison; `resolve_inside` is the fix; `read_public` is the handler.
+
+      ```python
+      SEGMENT = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}")
+      MAX_SEGMENTS = 4
+
+      def naive_read(base, name):                      # VULNERABLE
+          cleaned = name.replace("../", "")
+          return Path(os.path.join(base, cleaned)).read_text()
+
+      def resolve_inside(base, name):
+          parts = name.split("/")
+          if not name or len(parts) > MAX_SEGMENTS or not all(SEGMENT.fullmatch(p) for p in parts):
+              raise PathRejected("not an acceptable file name")
+          real_base = os.path.realpath(base)
+          target = os.path.realpath(os.path.join(real_base, *parts))
+          try:
+              inside = os.path.commonpath([real_base, target]) == real_base and target != real_base
+          except ValueError:                           # different drives on Windows
+              inside = False
+          if not inside:
+              raise PathRejected("resolves outside the base folder")
+          if not os.path.isfile(target):
+              raise FileNotFoundError(name)
+          return Path(target)
+
+      def read_public(base, name):
+          try:
+              return 200, resolve_inside(base, name).read_text()
+          except (PathRejected, FileNotFoundError):
+              return 404, "file not found"
+      ```
+
+      Run on a temporary tree (`uploads/` with `terms.txt`, `reports/2026-11.txt`, a link inside and a link
+      outside; `secret.txt` and a sibling `uploads-old/` next to it). The absolute name in the second line is
+      the secret's own path, shortened here:
+
+      ```text
+      naive_read '....//secret.txt'          -> 'secret.txt\n'
+      naive_read '/tmp/.../secret.txt'       -> 'secret.txt\n'
+      resolve_inside 'terms.txt'               -> ok terms.txt
+      resolve_inside 'reports/2026-11.txt'     -> ok reports/2026-11.txt
+      resolve_inside '../secret.txt'           -> PathRejected: not an acceptable file name
+      resolve_inside '....//secret.txt'        -> PathRejected: not an acceptable file name
+      resolve_inside '..%2fsecret.txt'         -> PathRejected: not an acceptable file name
+      resolve_inside '/etc/passwd'             -> PathRejected: not an acceptable file name
+      resolve_inside '../uploads-old/old.txt'  -> PathRejected: not an acceptable file name
+      resolve_inside 'link-inside.txt'         -> ok terms.txt
+      resolve_inside 'link-outside.txt'        -> PathRejected: resolves outside the base folder
+      resolve_inside 'nope.txt'                -> FileNotFoundError
+      read_public ../secret.txt -> (404, 'file not found') | nope.txt -> (404, 'file not found')
+      ```
+
+      Why there are **two** layers: the character allow-list stops every form above except the link; the
+      resolved containment check is the only thing that stops `link-outside.txt`, whose name is perfectly
+      innocent. And a string-prefix check would be wrong in a way that is easy to miss - on this tree,
+      `str(uploads-old/old.txt).startswith(str(uploads))` is `True`, while `os.path.commonpath` compares whole
+      components and says the sibling is outside. The cheat sheet makes the same point with
+      `/srv/uploads-old` and `/srv/uploads`.
+
+  - id: upload-code
+    kind: code
+    concepts: [sec-files-testing, sec-files-defences]
+    title: The upload checks - and how to test them on a real system
+    collapsed: true
+    body: |
+      From `practice/security/solutions/web/files_upload_check.py`: SandPay accepts dispute evidence as PNG, JPEG
+      or PDF, at most 1 MiB. The function applies the File Upload cheat sheet's principles in the order a
+      cheap check should come: size, name, extension, signature, then a generated stored name.
+
+      ```python
+      ALLOWED = {
+          ".png": ("image/png", b"\x89PNG\r\n\x1a\n"),
+          ".jpg": ("image/jpeg", b"\xff\xd8\xff"),
+          ".pdf": ("application/pdf", b"%PDF-"),
+      }
+
+      def validate_upload(filename, declared_type, data, new_id=lambda: secrets.token_hex(16)):
+          if not data or len(data) > MAX_BYTES:
+              raise UploadRejected(f"size must be 1 to {MAX_BYTES} bytes")
+          if len(filename) > MAX_NAME or any(ch in filename for ch in "\x00/\\:") or filename.endswith((".", " ")):
+              raise UploadRejected("unacceptable file name")
+          stem, dot, extension = filename.rpartition(".")
+          if not dot or not stem:
+              raise UploadRejected("file name needs a stem and an extension")
+          extension = "." + extension.lower()
+          if extension not in ALLOWED:
+              raise UploadRejected(f"extension {extension!r} is not allowed")
+          content_type, signature = ALLOWED[extension]
+          if not data.startswith(signature):
+              raise UploadRejected("content does not match the extension")
+          return StoredUpload(new_id() + extension, content_type, len(data))   # declared_type is never read
+      ```
+
+      Run on small byte strings that start with real signatures (not complete files), with the id fixed to
+      `a1b2c3` so the output is repeatable:
+
+      ```text
+      'receipt.png'    'image/png'  -> StoredUpload(stored_name='a1b2c3.png', content_type='image/png', size=28)
+      'receipt.PNG'    'text/html'  -> StoredUpload(stored_name='a1b2c3.png', content_type='image/png', size=28)
+      'evil.php.png'   'image/png'  -> StoredUpload(stored_name='a1b2c3.png', content_type='image/png', size=28)
+      'evil.png.php'   'image/png'  -> UploadRejected: extension '.php' is not allowed
+      'evil.png'       'image/png'  -> UploadRejected: content does not match the extension
+      'evil.png:.php'  'image/png'  -> UploadRejected: unacceptable file name
+      'a.png'          'image/png'  -> UploadRejected: size must be 1 to 1048576 bytes
+      {'Content-Type': 'image/png', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'attachment; filename="a1b2c3.png"'}
+      ```
+
+      Read it for what the function *decides*: line 2 - the declared `text/html` is ignored and the type is the
+      server's; line 3 - `evil.php.png` is a PNG by its last extension and its bytes, and the stored name has
+      no trace of `.php`; line 5 - HTML bytes declared as `image/png` are rejected. The cheat sheet warns that
+      a signature check "should not be used on its own, as bypassing it is pretty common and easy": it is one
+      layer next to the allow-list, the generated name, the size limit and the storage and serving rules.
+
+      **Testing a real upload feature** (from the WSTG, *not run here* - the practice portal has no upload
+      route): with written permission, send one file at a time and note what the server enforces.
+
+      | Test | What a pass and a fail look like |
+      | --- | --- |
+      | A disallowed file (an HTML file with a script tag, a harmless text file named `.php`) | Rejected = a server-side check exists. Accepted = look at where it is stored and how it is served. |
+      | The same file with `Content-Type: image/jpeg` | Accepted now = the server trusts the header. |
+      | The allowed extension on the wrong content (a text file named `.png`) | Accepted = no content check. |
+      | Extension variants - case, `.php5`, `file.php;jpg`, `file.asp%00.jpg`, `file.jpg.php` | Any accepted = the allow-list or its decoding is wrong. |
+      | A file name with `../` | Stored outside the folder or overwriting a file = the name is used as a path. |
+      | A direct request for the stored file | Is it reachable? Is it served with the right type, `nosniff` and `attachment`? Does the server execute it? |
+      | The EICAR test file | Accepted and kept = no malware scan (the WSTG: "an safe file that is flagged as malicious by all anti-malware software"). |
+      | Remove what you uploaded | Always. The WSTG: "Remember to remove the shell when you are done." |
+
+  - id: steps
+    kind: steps
+    concepts: [sec-files-traversal, sec-files-testing, sec-files-defences]
+    title: Testing one file-name parameter, step by step
+    body: |
+      1. **Confirm scope and the canary.** The endpoint is in scope, you have written permission, and the owner
+         has named (or agreed to) a harmless file outside the served folder. Never use a real secret as the
+         target.
+      2. **Enumerate the inputs.** Which parameters, cookies, headers and JSON fields name a file, a template, a
+         language or a theme? Note unusual extensions and variable names such as `file`, `item`, `template`,
+         `page` (the WSTG's questions).
+      3. **Record the baseline.** Request the legitimate name twice. Different answers? Find a stable part or
+         stop and note the parameter as inconclusive.
+      4. **Try the forms against the canary.** Plain `../`, a deeper chain, URL-encoded, double-encoded,
+         backslash, nested (`....//`) and absolute - and, on Windows targets, the Windows forms. The WSTG's
+         tip: "If at first the test string isn't successful, try another encoding scheme." Change one thing
+         at a time.
+      5. **Add the negative control.** For every payload that gets a 200 different from the baseline, send the
+         same payload aimed at a name that cannot exist. A 200 there means a catch-all or an echo - not a hit.
+      6. **Read the failures too.** Error messages that include a resolved or absolute path are an information
+         leak of their own; note them as a finding.
+      7. **Stop at proof.** One canary read, redacted: the status, the size, a few characters. No directory
+         walking, no reading real files, no writes.
+      8. **Test the uploads** separately, one control at a time (see the table in the upload code section), and
+         remove everything you uploaded.
+      9. **Record the evidence.** Request and response lines with tokens redacted, the working forms, the
+         control result, and what the fix must cover (every decoding, links, siblings).
+      10. **After the fix,** re-run steps 3 to 5 unchanged. They must now be quiet, the legitimate name must
+          still work, and the code path must be read.
+
+  - id: example
+    kind: example
+    concepts: [sec-files-traversal, sec-files-testing, sec-files-defences]
+    title: "Example: the statement download that was fixed twice"
+    body: |
+      This is a hypothetical scenario; it shows the order of work, not measured figures.
+
+      SandPay's merchant portal downloads monthly statements: `GET /statements?file=2026-10.csv`. The tester
+      has written permission, and the owner has placed `ops/canary.txt` outside the statements folder.
+
+      **Round one.** The baseline `2026-10.csv` is stable. `../ops/canary.txt` returns 404 with the message
+      `invalid file name` - a filter exists. `....//ops/canary.txt` returns the canary: the developer removed
+      `../` once, and the remainder is `../`. The control (`....//ops/canary.txt.missing`) is a 404, so it is a
+      real read. Evidence: status, size, first four characters. The report asks for an allow-list and a
+      containment check, and explicitly warns against *improving the filter*.
+
+      **Round two.** The developers "fix" it by removing `../` in a loop until none are left. The tester
+      re-runs the same probe: the nested form is quiet - but `..%2fops%2fcanary.txt` returns the canary,
+      because the loop runs before the framework's second decode. Another round of "improving the filter"
+      would chase encodings forever.
+
+      **Round three.** The developers replace the parameter with an identifier looked up in a table
+      (`file=2026-10` maps to a stored path) and add a containment check on the resolved path as a second
+      layer. The probe is quiet for every form, `2026-10` still downloads, and a link planted in the folder
+      by the test environment's owner (`link-outside.txt` pointing at the canary) is refused. The tester
+      closes the finding with the probe output, the legitimate download, the link test and the diff.
+
+      What the tester keeps for the regression suite: the baseline, the seven forms with their controls, the
+      link and sibling checks, and a check that the 404 text never contains a path
+      ([regression automation](#/lesson/security-regression-automation)).
+
+  - id: tests
+    kind: tests
+    concepts: [sec-files-testing, sec-files-defences]
+    title: Test cases for a file endpoint and its fix
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Baseline stable | Request the legitimate name twice | Identical 200 answers | Both responses |
+      | 2 | Plain traversal | `../<canary>` and a deeper chain | Vulnerable: 200, a different body; fixed: the same 404 as any unknown name | Status, size, four characters |
+      | 3 | Encodings | URL-encoded, double-encoded, backslash | Fixed: all quiet; the vulnerable answer shows which decodings are accepted | The working forms |
+      | 4 | Nested and absolute | `....//<canary>` and `/<canary>` | Fixed: quiet; vulnerable depends on the filter or join | Responses |
+      | 5 | Negative control | Each working payload with `.missing` appended | 404 - otherwise the 200 is a catch-all or an echo | The control response |
+      | 6 | Error text | A missing file and a traversal attempt | Same message, no path, no input echoed | Both bodies |
+      | 7 | Sibling folder | A name that reaches a folder sharing the base's prefix (`uploads-old`) | Rejected | Response |
+      | 8 | Symbolic link | A link inside the base pointing outside (planted by the owner in a test environment) | Rejected; a link that stays inside is allowed | Response |
+      | 9 | Legitimate names | A normal file, a file in a sub-folder, a name with a dot and a hyphen | Served | Responses |
+      | 10 | Upload - type | A disallowed file; the same file with `Content-Type: image/jpeg` | Rejected both times | Responses |
+      | 11 | Upload - content | A text file named `.png`; an allowed file with a double extension | The first rejected; the second stored under a generated name | Response, stored name |
+      | 12 | Upload - name | A name with `../` or a colon | Rejected, or stored under a generated name outside any path the client controls | Response, storage listing |
+      | 13 | Upload - serving | Request the stored file | `nosniff`, `attachment`, the server's content type, not executed | Response headers |
+      | 14 | Code path | Read the file-handling code | Allow-list or id lookup, resolve, containment by components, opened path = checked path | File and line |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-files-traversal, sec-files-testing, sec-files-defences]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Removing `../` and calling it fixed.** One pass leaves `....//` as `../`; a loop leaves encoded forms
+        that are decoded later; the filter misses `\` where it separates. The cheat sheet: "Don't try to remove
+        `../` from the input instead."
+      - **Checking before decoding - or decoding after checking.** The check must see the text the file system
+        will see. The cheat sheet: decode completely *once*, "and don't decode it again afterwards".
+      - **Checking the string, not the resolved path.** `startswith(base)` on `/srv/uploads/../../etc/passwd`
+        is true. Resolve first, then compare. And compare **components**, not characters:
+        `uploads-old` starts with `uploads`.
+      - **Opening a different string than the one checked.** Rebuilding the path from the original input after
+        the check restores every bypass; use the resolved, checked path.
+      - **Forgetting `os.path.join` with an absolute name.** It "drops the base directory when the second
+        argument is absolute" - the containment check after joining is what catches it.
+      - **Ignoring links.** A lexical check passes a link that leads outside. Resolve links, and keep untrusted
+        users from creating them where the application reads.
+      - **Different errors for different failures.** A message that shows the resolved path or says
+        "directory traversal detected" maps the file system for the tester.
+      - **Trusting the Content-Type or the client-side check.** Both can be changed with a proxy
+        ([intercepting proxies](#/lesson/intercepting-proxies)). The server must decide from the extension
+        allow-list and the content.
+      - **Storing under the client's name.** Generate the stored name; keep the original only as data, never
+        as a path.
+      - **Reporting a hit without the control.** A catch-all page, an echo and a "200 with an error message"
+        all look like file access until the same payload at a name that cannot exist gets the same answer.
+      - **Putting the file's content in the report.** Redact it. If it is a real secret the report itself is now
+        a leak.
+
+      **Debugging method when a probe finds nothing:** (1) does the baseline still work; (2) which form got
+      *any* different answer - a 400 or a different 404 text means a filter, and the text often says which; (3)
+      try a form that targets the stage that filter probably misses (decoding, nesting, separators); (4) read
+      the code if you can - the WSTG's gray-box advice - because a black-box "nothing" is not a proof.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-files-testing, sec-files-defences]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **A black-box probe proves presence, not absence.** The seven forms are the common ones; a filter you
+        have not guessed can still be hiding a path. A code review of the path-building code is the stronger
+        evidence for a *closed* finding.
+      - **Allow-lists versus containment checks.** The strongest design uses no user input in the path at all
+        (an id mapped to a stored path). A strict name allow-list is the next layer; the resolved containment
+        check is the safety net for what the allow-list does not see, such as links. Using only the containment
+        check is common and works, but accepts odd names the business does not need.
+      - **Resolving has a race.** The cheat sheet notes a link can be swapped in after the check and before the
+        open (TOCTOU). Prefer APIs that enforce the folder at open time (Go's `os.Root`, Linux `openat2` with
+        `RESOLVE_BENEATH`) and keep untrusted users from writing to the directory.
+      - **A signature check is shallow.** It only looks at the first bytes. Content scanning, re-encoding images
+        and refusing archives are separate, heavier controls; the cheat sheet calls the signature check
+        something that "should not be used on its own".
+      - **Stricter than the standard may be the right call.** The practice validator rejects any name with a
+        colon or separator, although it would never use the name as a path, because a name that tries is worth
+        refusing and logging.
+      - **Fuzzers are fast and noisy.** DotDotPwn, the WFuzz word list, ZAP and Burp (the WSTG's tools) send
+        many requests; use them only in scope, and keep the minimal canary evidence by hand.
+      - **Windows is a separate test.** Drive letters, UNC paths, trailing dots, `::$DATA` and device names need
+        their own cases on Windows hosts; this lesson's runs are Linux.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-files-traversal, sec-files-testing, sec-files-defences]
+    title: Quick reference
+    body: |
+      - **Path traversal** (CWE-22, OWASP A01) = input builds a path that resolves outside the intended folder.
+        Test every input that names a file, including cookies, headers, JSON fields and upload names.
+      - **Five stages, five tricks:** decoding (encoded, double-encoded), string filters (`....//`), joining
+        (absolute names), resolving (`..`, backslashes, links), opening (races).
+      - **Prove it with a canary,** a stable baseline, a different answer and a **negative control**; report
+        the status, size and a few characters - never the file.
+      - **The practice portal:** five encodings reach the canary (plain, deep, URL-encoded, double-encoded,
+        backslash), two do not (nested, absolute); its 404 text leaks the resolved path.
+      - **Fix:** no user input in paths if possible; else allow-list, join, `realpath`, containment by
+        components, check the file, **open the checked path**; every failure answers the same.
+      - **Verify:** the same probes quiet, the legitimate name still works, a sibling folder and a link
+        refused, the error text clean, the code read.
+      - **Uploads:** test client-side checks, `Content-Type`, extension, content and filename separately;
+        fix with an extension allow-list, a signature check (not alone), a size limit, a generated stored
+        name, storage outside the web root and `nosniff` + `attachment` on download.
+      - **Ethics:** written permission, a harmless canary, redacted evidence, remove what you upload.
+
+exercises:
+  - id: vectors-pick
+    type: mcq
+    concept: sec-files-traversal
+    skill: application
+    title: Which request is a path traversal candidate?
+    prompt: |
+      You are mapping SandPay's portal. Which of these requests should go on the list of inputs to test for
+      path traversal?
+    options:
+      - id: template-cookie
+        text: 'A request with the cookie `PSTYLE=GreenDotRed` where the application loads a stylesheet or template named by the cookie.'
+        feedback: Correct - the WSTG lists cookies used for the dynamic generation of pages or templates as input vectors; any value that names a file is a candidate.
+      - id: amount
+        text: 'A `POST /payments` field `amount=2500` that is stored as a number.'
+        feedback: A numeric amount never names a file; it belongs on the injection and business-logic lists.
+      - id: static-hash
+        text: 'The hashed file name inside `<script src="/assets/app.3f9c1.js">` in the page.'
+        feedback: The browser requests that name; the server chose it. Test only inputs the user (or an attacker) controls and the server turns into a file operation.
+      - id: tls-version
+        text: 'The TLS version negotiated in the handshake.'
+        feedback: It is not input to a file operation at all.
+    correct: [template-cookie]
+    hints:
+      - Which of these values might the server use to decide which file to open?
+    solution: |
+      Any input that names a file, template, language or theme is an input vector - query and form fields,
+      cookies, headers, JSON fields, upload names. Enumerate them before choosing payloads.
+
+  - id: double-decode
+    type: mcq
+    concept: sec-files-traversal
+    skill: analysis
+    title: Why does the double-encoded name work?
+    prompt: |
+      On the practice portal `name=%252e%252e%252finternal%252fsettlement-keys.txt` returns the canary. The
+      same request against the fixed portal gets `404 file not found`. What explains the vulnerable result?
+    options:
+      - id: decoded-twice
+        text: 'The HTTP layer decodes the value once (to `%2e%2e%2f...`) and the handler decodes it again with `unquote`, so the climbing appears after the point where anything could have looked at it.'
+        feedback: Correct - each extra decode is another stage a filter has to come after; the cheat sheet says to decode once and never again.
+      - id: strips-percent
+        text: 'The portal strips `%25` and keeps the rest.'
+        feedback: Nothing is stripped; the value is decoded, and the decoded text is what climbs.
+      - id: backslash
+        text: 'The `%25` is turned into a backslash.'
+        feedback: '`%25` is a percent sign. The backslash form is a different request (`..%5c`).'
+      - id: absolute
+        text: 'The leading `%25` makes the name absolute, so the base folder is ignored.'
+        feedback: The portal never joins with an absolute path; a leading `/` gave a plain 404 in the evidence above.
+    correct: [decoded-twice]
+    hints:
+      - What does `%25` stand for, and what does the text look like after one decode?
+    solution: |
+      `%252e` is `%2e` after one decode and `.` after two. The portal decodes in the HTTP layer and again in the
+      handler, so a name that looks harmless after the first decode climbs after the second. Fix: decode
+      exactly once, and check the resolved path after the last decode.
+
+  - id: nested-strip
+    type: mcq
+    concept: sec-files-traversal
+    skill: analysis
+    title: Why does ....// survive the filter?
+    prompt: |
+      A developer "fixes" `/statements?file=` with `name = name.replace("../", "")`. A tester sends
+      `file=....//ops/canary.txt` and gets the canary. Why?
+    options:
+      - id: one-pass
+        text: 'Removing the `../` in the middle of `....//` joins the remaining `..` and `/` into a new `../`; the replace runs once and does not look again.'
+        feedback: Correct - this is the WSTG's `....//` example for functions that "change invalid input to make it valid". Looping fixes this form and leaves encodings and backslashes.
+      - id: case
+        text: 'The replace is case-sensitive and the tester used capital letters.'
+        feedback: There are no letters in `....//`; the cause is what is left after the removal.
+      - id: regex
+        text: 'The replace only works on regular expressions.'
+        feedback: Python `replace` is a plain substring replacement; its limit is that it makes a single pass.
+      - id: slash
+        text: 'The server treats `//` as a comment.'
+        feedback: No file system treats `//` as a comment; it is the remainder that climbs.
+    correct: [one-pass]
+    hints:
+      - Write the string down and delete the first `../` you can find. What is left?
+    solution: |
+      `....//` minus its inner `../` is `../`. Sanitising by removal is fragile - a loop, a decode after the
+      filter, or a backslash get past it. Resolve the path and check where it lands instead.
+
+  - id: absolute-join
+    type: mcq
+    concept: sec-files-defences
+    skill: application
+    title: The base folder disappears
+    prompt: |
+      A handler does `path = os.path.join("/srv/uploads", name)` and then opens `path`. A tester sends
+      `name=/etc/hostname`. Which defence stops it even if the developer forgot to block `/` and `..`?
+    options:
+      - id: containment
+        text: 'Resolving `path` and checking that it is inside the resolved base - `os.path.join` returns `/etc/hostname` for an absolute second argument, which is not inside `/srv/uploads`.'
+        feedback: Correct - the cheat sheet notes that join functions drop the base for an absolute argument ("Python's os.path.join('/srv/uploads', '/etc/passwd') returns /etc/passwd"), and the containment check after resolving catches it.
+      - id: strip-slash
+        text: 'Removing a leading `/` from the name.'
+        feedback: That handles one form; `C:\` drive letters, UNC paths and encoded forms remain. It is a filter, not a boundary.
+      - id: https
+        text: 'Serving the endpoint over HTTPS.'
+        feedback: TLS protects the transport; the server still opens whatever path it builds.
+      - id: waf
+        text: 'A WAF rule that blocks `../`.'
+        feedback: The payload contains no `../` at all.
+    correct: [containment]
+    hints:
+      - What does `os.path.join` do when the second argument is absolute?
+    solution: |
+      Join, resolve, then check containment by components - and open the checked path. That works for
+      absolute names, `..` chains and links alike.
+
+  - id: control-request
+    type: mcq
+    concept: sec-files-testing
+    skill: analysis
+    title: Is a 200 enough?
+    prompt: |
+      A staging server answers `GET /files?name=../internal/keys.txt` with 200 and a 4 KB HTML page, different
+      from `terms.txt`. The tester wants to report path traversal. What should they do first?
+    options:
+      - id: control
+        text: 'Send the same payload aimed at a name that cannot exist (`../internal/keys.txt.missing`) - a 200 there means the server answers 200 for everything.'
+        feedback: Correct - the negative control separates a catch-all page, an echo or a "200 with an error message" from a real file read.
+      - id: report
+        text: 'Report it - a 200 for a path outside the folder is proof.'
+        feedback: A 200 only says something answered. Without a control, a SPA that returns its home page for every route looks like a traversal.
+      - id: more-files
+        text: 'Request `/etc/passwd` to be sure.'
+        feedback: That reads a real sensitive file, off the canary, and does not answer the doubt.
+      - id: more-encodings
+        text: 'Try all encodings again until one gives 404.'
+        feedback: A 404 does not prove the first form worked; the control does.
+    correct: [control]
+    hints:
+      - What would a server that returns its home page for every unknown path do with this request?
+    solution: |
+      Always add a negative control: the same payload with a final name that cannot exist must not succeed. Then
+      compare the body with the baseline and the canary's expected size or first characters.
+
+  - id: canary-choice
+    type: mcq
+    concept: sec-files-testing
+    skill: application
+    title: Which file do you request to prove it?
+    prompt: |
+      The portal is in scope and you suspect traversal. The rules of engagement say nothing about target files.
+      Which choice is right?
+    options:
+      - id: ask-canary
+        text: 'Ask the owner to place a harmless canary file outside the served folder (or agree on one), prove the read with it, and report the status, size and a few characters.'
+        feedback: Correct - the WSTG notes you need to know the system and the location of the files being requested; a canary proves the flaw without exposing anything.
+      - id: shadow
+        text: 'Read `/etc/shadow` or the application''s configuration file - they are the obvious targets.'
+        feedback: Those hold real secrets. The proof of the flaw is that you *can* read outside the folder, not what is in a sensitive file.
+      - id: dump
+        text: 'Walk the directory tree and download everything you can reach to show the impact.'
+        feedback: That is a breach, not a test; stop at proof.
+      - id: skip
+        text: 'Skip the test; reading any file outside the folder is out of scope by default.'
+        feedback: Testing is why you have permission; the fix is to agree the canary in advance, not to skip the test.
+    correct: [ask-canary]
+    hints:
+      - What is the smallest read that proves the flaw?
+    solution: |
+      Agree on a canary, request it, redact the evidence (status, size, four characters) and stop. Impact can be
+      explained from the application's own privileges without reading real secrets.
+
+  - id: prefix-check
+    type: mcq
+    concept: sec-files-defences
+    skill: analysis
+    title: The sibling folder that passes
+    prompt: |
+      A developer checks `resolved.startswith(base)` where `base = "/srv/uploads"`. Another folder,
+      `/srv/uploads-old`, holds retired exports. Which statement is true?
+    options:
+      - id: passes
+        text: '`/srv/uploads-old/2025.csv` starts with `/srv/uploads`, so the check passes for it; compare whole path components (for example `os.path.commonpath`) instead.'
+        feedback: Correct - this is the example in the cheat sheet. On the practice tree the same check gave `True` for the sibling.
+      - id: fails
+        text: 'The check rejects it because the next character is `-`.'
+        feedback: '`startswith` compares characters and does not know where a folder name ends.'
+      - id: trailing
+        text: 'The check is fine because `uploads-old` is not reachable from the URL.'
+        feedback: The point of the check is that it must not depend on what is "reachable"; a `..` chain can reach it.
+      - id: case
+        text: 'The only problem is upper and lower case.'
+        feedback: Case matters on Windows, but this failure happens on any system.
+    correct: [passes]
+    hints:
+      - Is `/srv/uploads-old` a *child* of `/srv/uploads`?
+    solution: |
+      String prefixes are not folder boundaries. Compare components after resolving, or append a path
+      separator to the base before comparing; the practice exercise uses `os.path.commonpath`.
+
+  - id: symlink-check
+    type: mcq
+    concept: sec-files-defences
+    skill: analysis
+    title: A harmless name that is a link
+    prompt: |
+      `uploads/link-outside.txt` is a symbolic link to `../secret.txt`. A handler checks the *name* against an
+      allow-list (letters, digits, `.`, `-`, `_`) and joins it to the base. The name passes. What is missing?
+    options:
+      - id: resolve
+        text: 'Resolve the path (`realpath`) and check that the resolved target is inside the resolved base; ideally also keep untrusted users from creating links where the application reads.'
+        feedback: Correct - the allow-list sees only the text; only the resolved path shows where the link leads. The cheat sheet also notes a link can be swapped between check and open (TOCTOU).
+      - id: more-chars
+        text: 'A longer list of forbidden characters in the name.'
+        feedback: The name has no forbidden characters; the problem is not in the text.
+      - id: lowercase
+        text: 'Lower-casing the name before the check.'
+        feedback: Case has nothing to do with where a link points.
+      - id: nothing
+        text: 'Nothing - the name is clean.'
+        feedback: A clean name can still resolve outside the folder; that is why the containment check exists.
+    correct: [resolve]
+    hints:
+      - What does the name look like, and what does the file system do with it?
+    solution: |
+      Two layers: a name allow-list and a containment check on the resolved path. A link with an innocent name
+      is the case only the second layer catches.
+
+  - id: error-oracle
+    type: mcq
+    concept: sec-files-testing
+    skill: analysis
+    title: What does the 404 tell the tester?
+    prompt: |
+      The vulnerable portal answers a missing file with `file not found: internal/nope.txt` for
+      `name=../internal/nope.txt`; the fixed portal answers `file not found` to every failure. What does the
+      first message give a tester?
+    options:
+      - id: oracle
+        text: 'The resolved path: it shows that `..` was consumed, that a folder `internal` exists to look in, and lets the tester map the tree one name at a time.'
+        feedback: Correct - a response that repeats a resolved path or input is an information leak and an existence oracle; the fix answers alike for every failure.
+      - id: nothing
+        text: 'Nothing - a 404 is a 404.'
+        feedback: The body text matters; here it leaks structure.
+      - id: sql
+        text: 'That the portal is vulnerable to SQL injection.'
+        feedback: Nothing in the message points to SQL.
+      - id: version
+        text: 'The portal''s version.'
+        feedback: No version is shown; the leak is the resolved path.
+    correct: [oracle]
+    hints:
+      - Compare `public/nope.txt` and `internal/nope.txt` in the two evidence lines.
+    solution: |
+      Report error text that shows resolved or absolute paths as a finding of its own, and verify the fix
+      answers a missing file, a rejected name and an escape identically.
+
+  - id: upload-trust
+    type: mcq
+    concept: sec-files-testing
+    skill: application
+    title: Which upload test shows the server trusts the header?
+    prompt: |
+      You upload a harmless text file named `note.png` and it is rejected. You upload the same file again with
+      `Content-Type: image/png` and it is accepted. What does that show?
+    options:
+      - id: header
+        text: 'The server decides from the `Content-Type` header, which the client controls; it needs an extension allow-list and a content check.'
+        feedback: Correct - the WSTG asks the tester to check whether the site only checks "Content-Type" in the HTTP request, and the cheat sheet says not to trust it as it can be spoofed.
+      - id: extension
+        text: 'The extension allow-list works, so the upload is safe.'
+        feedback: The extension was `.png` both times; only the header changed the answer.
+      - id: client
+        text: 'The check is client-side JavaScript.'
+        feedback: A client-side check would not have changed its answer when a proxy changed the header; the server's answer changed.
+      - id: nothing
+        text: 'Nothing; both uploads are harmless text.'
+        feedback: The point is what the server enforces, not whether this file is dangerous.
+    correct: [header]
+    hints:
+      - Which part of the request changed between the two uploads?
+    solution: |
+      The only change was the declared type, so the declared type decided. Test the controls one at a time:
+      client-side script, header, extension, content, name.
+
+  - id: double-extension
+    type: mcq
+    concept: sec-files-defences
+    skill: analysis
+    title: evil.php.png and the stored name
+    prompt: |
+      The upload validator takes the extension after the *last* dot, checks it against an allow-list,
+      checks the first bytes, and stores the file as `<random id>.png`. A PNG named `evil.php.png` is
+      accepted. Is that a vulnerability?
+    options:
+      - id: fine
+        text: 'No - it is a real PNG by extension and content, and the stored name has no trace of `.php`; the dangerous cases are `evil.png.php` (rejected by the allow-list) and a regex that only looked for `.jpg`.'
+        feedback: Correct - the cheat sheet's double-extension bypass targets filters that match the *first* extension and servers that act on the *original* name; a generated name removes the second.
+      - id: reject
+        text: 'Yes - any name with two dots must be rejected.'
+        feedback: That would also reject `scan.v2.pdf`; the control that matters is the generated stored name and the content check.
+      - id: both
+        text: 'Yes - `.php` anywhere in the name makes the file executable.'
+        feedback: Execution depends on the stored name and server configuration, not on text elsewhere in the client's name.
+      - id: unknown
+        text: 'It cannot be known without a virus scan.'
+        feedback: A scan helps with content; this question is about the name and type decisions.
+    correct: [fine]
+    hints:
+      - Which name does the server actually store and serve?
+    solution: |
+      Judge the last extension against an allow-list, check the content, and never use the client's name for
+      storage. Reject `evil.png.php` (last extension `php`); accept `evil.php.png` with a generated name.
+
+  - id: traversal-order
+    type: order
+    concept: sec-files-testing
+    skill: application
+    title: Put a safe traversal test in order
+    prompt: Order the steps for testing one file-name parameter for path traversal safely.
+    items:
+      - id: scope
+        text: Confirm scope and written permission, and agree on a harmless canary file outside the served folder.
+      - id: baseline
+        text: Request the legitimate name twice and check that the answers are identical.
+      - id: forms
+        text: Try the forms against the canary - plain, deep, encoded, double-encoded, backslash, nested, absolute.
+      - id: control
+        text: For every different 200, send the same payload aimed at a name that cannot exist.
+      - id: stop
+        text: Stop at the first proof and record the status, size and a few characters - not the content.
+      - id: report
+        text: Write up the working forms and what the fix must cover, then re-run the probe after the fix.
+    hints:
+      - You cannot compare anything before you have a stable baseline.
+      - The control belongs right after a candidate hit, before anyone reports it.
+    solution: |
+      Scope and canary, stable baseline, the forms, the negative control, stop at proof with redacted evidence,
+      then the report and the re-run after the fix.
+
+  - id: unsafe-handler-debug
+    type: debug
+    concept: sec-files-defences
+    skill: analysis
+    title: Which lines still allow traversal?
+    prompt: |
+      This "fixed" download handler removes `../`, joins, and checks that the path is inside the base. Pick the
+      lines that still let a tester read outside `/srv/uploads`.
+    language: python
+    code: |
+      BASE = "/srv/uploads"
+
+      def download(name):
+          name = name.replace("../", "")
+          path = os.path.join(BASE, name)
+          if not path.startswith(BASE):
+              abort(403)
+          with open(path) as f:
+              return f.read()
+    correctLines: [4, 6]
+    hints:
+      - Which line works on the text only once, and which compares characters of an unresolved path?
+      - What does `startswith` say for `/srv/uploads/../../etc/passwd` and for `/srv/uploads-old/x`?
+    lineNotes:
+      - line: 5
+        note: The join itself is not the flaw - it is what an absolute name does here that the containment check must catch, and line 6 does not resolve first.
+      - line: 8
+        note: Opening the checked string is right; the problem is that the string was never resolved.
+    solution: |
+      Line 4 removes `../` once (`....//` leaves `../`) and sees only the text. Line 6 checks the *unresolved*
+      string with a character prefix: `/srv/uploads/../../etc/passwd` and `/srv/uploads-old/x` both start with
+      `/srv/uploads`. Fix: allow-list the name, resolve with `realpath`, compare whole components with
+      `commonpath`, then open that resolved path.
+
+  - id: scanner-short
+    type: short
+    concept: sec-files-testing
+    skill: analysis
+    title: "The scan found no path traversal - is that proof?"
+    prompt: |
+      An automated scanner reports "no path traversal" for `/files?name=`. It tried `../etc/passwd` and got 404.
+      Explain in a few sentences why that is not proof and what you would do.
+    modelAnswer: |
+      A 404 for one target says only that this file was not found by this form. The server may not have that
+      file, the scanner chose a Linux file for a Windows host, or the filter blocks that one spelling while
+      accepting another (nested, encoded, double-encoded, backslash). On the practice portal `../etc/passwd`
+      is a 404 (`file not found: etc/passwd`) while the canary is readable with five forms. I would agree a
+      canary with the owner, run the baseline, try every form with a negative control, and - if I may - read
+      the code for file operations built from input. A black-box "nothing" is not a proof of absence.
+    rubric:
+      - Says one 404 on one target and one spelling proves nothing.
+      - Names a canary that exists (or the right platform's file) instead of an assumed system file.
+      - Lists several forms - encoded, double-encoded, nested, backslash, absolute.
+      - Mentions the negative control and a code review, and that absence cannot be proven black-box.
+    hints:
+      - What did the scanner assume about the server, and how many spellings did it try?
+    solution: |
+      One 404 is weak evidence. Use a real canary, all forms with a control, and read the code; black-box
+      testing can find a flaw but cannot prove its absence.
+
+  - id: file-fix-testdesign
+    type: testdesign
+    concept: sec-files-defences
+    skill: application
+    title: Test plan for the statement download fix
+    prompt: |
+      `GET /statements?file=` had a path traversal flaw. The developers say it now maps the name through an
+      allow-list, resolves the path and checks containment. Design the test cases that verify the fix -
+      preconditions, steps, expected results and evidence for each.
+    modelAnswer: |
+      Preconditions for all: the fixed build on a test environment I may test; the owner's canary
+      `ops/canary.txt` outside the statements folder; a sibling folder `statements-old/`; a link inside the
+      folder pointing at the canary (placed by the owner); the probe from the lesson.
+
+      1. **Baseline** - `2026-10.csv` twice. Expected: identical 200. Evidence: both responses.
+      2. **Every form** - plain, deep, URL-encoded, double-encoded, backslash, nested, absolute, each aimed at
+         the canary. Expected: the same answer as any unknown name (404 with the same body). Evidence: the
+         probe output (no findings).
+      3. **Negative control** - each form with a final name that cannot exist. Expected: the same 404. Evidence:
+         responses.
+      4. **Sibling folder** - a name that reaches `statements-old/`. Expected: rejected. Evidence: response.
+      5. **Symbolic link** - the link to the canary. Expected: rejected; a link that stays inside is served.
+         Evidence: both responses.
+      6. **Legitimate names** - a normal statement, one in a sub-folder, a name with a dot and a hyphen.
+         Expected: served. Evidence: responses.
+      7. **Error text** - a missing file, a rejected name, an escape. Expected: identical body, no path or input
+         echoed. Evidence: the three bodies.
+      8. **Other inputs** - any cookie, header or JSON field that names a file. Expected: the same quiet result.
+      9. **Code review** - allow-list or id lookup, resolve, component containment, the checked path is opened.
+         Evidence: file and line, diff.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence.
+      - Re-runs every form with the negative control against the canary, not a real secret.
+      - Includes a sibling folder and a symbolic link, not only `../` forms.
+      - Checks that legitimate names still work and that error text is uniform.
+      - Includes a code review of the path-building code.
+    hints:
+      - A fix has to reject attacks and still serve the files people ask for.
+      - Which cases only a containment check on the resolved path can pass?
+    solution: |
+      Re-run the probe quietly, add the sibling and link cases, prove legitimate names work and errors are
+      uniform, then back it with the diff.
+
+  - id: interview-files
+    type: interview
+    concept: sec-files-testing
+    skill: analysis
+    title: "Interview: how do you test file handling and uploads?"
+    prompt: |
+      "Walk me through how you would test a download endpoint and an upload form for security problems, and how
+      you would know the fixes work."
+    modelAnswer: |
+      First scope: written permission, which endpoints, and a harmless canary file outside the served folder
+      agreed with the owner. Then I enumerate every input that names a file - parameters, cookies, headers,
+      JSON fields, upload names - following OWASP WSTG-ATHZ-01.
+
+      For each, I take a stable baseline, then try the forms against the canary: `../`, a deeper chain, URL-
+      and double-encoded, backslashes, `....//` for filters that remove `../` once, and an absolute path. I add
+      a negative control - the same payload at a name that cannot exist - so a catch-all page or an echo is not
+      reported. I stop at proof, with redacted evidence, and note error messages that show resolved paths.
+
+      For uploads I test one control at a time (WSTG-BUSL-08 and 09): client-side checks, the Content-Type
+      header, the extension (case, double, `.php5`, trailing characters, null, colon), the content, the file
+      name as a path, where it is stored and how it is served; EICAR for scanning. I remove what I upload.
+
+      The fixes: keep user input out of paths, or allow-list the name, resolve, check containment by
+      components and open the checked path; for uploads an extension allow-list, a content check, a size limit,
+      a generated stored name, storage outside the web root, `nosniff` and `attachment`. I verify by re-running
+      the same probes, a sibling folder, a symbolic link, legitimate names, uniform error text, and reading the
+      code - because a black-box result cannot prove absence.
+    rubric:
+      - Starts with scope, permission and a harmless canary, and enumerates inputs beyond visible fields.
+      - Names several traversal forms and the negative control, and stops at redacted proof.
+      - Tests upload controls separately - client-side, Content-Type, extension, content, name, storage.
+      - Names the fixes - allow-list or id, resolve, containment by components; upload allow-list, generated name, serving headers.
+      - Verifies with the same probes, sibling and link cases, legitimate names and a code review.
+    followUps:
+      - How would your tests change on a Windows server?
+      - What if the endpoint takes a ZIP file and extracts it?
+      - How do you stop a symbolic link race?
+    hints:
+      - Structure it as - scope, find, prove, stop, fix, verify.
+    solution: |
+      Scope and canary, enumerate inputs, forms with a control, stop at proof, test each upload control,
+      then fix with allow-list, resolution, containment and a generated name, and verify with the same probes.
+
+  - id: traversal-probe-code
+    type: coding
+    concept: sec-files-testing
+    skill: application
+    title: Write a path traversal probe with a negative control
+    prompt: |
+      In `practice/security/exercises/web/files_traversal_probe.py`, implement `variants`, `redact` and
+      `probe_traversal`. The tests run your probe against fakes (single decode, double decode and backslashes,
+      a catch-all page, an echo, an unstable baseline) and against the practice portal: it must find the
+      canary in five encodings on `make_app()`, stay quiet on `make_app({"path-traversal"})`, and never put the
+      file's content in its evidence.
+    project: security
+    files: [exercises/web/files_traversal_probe.py]
+    test: tests/web/test_files_traversal_probe.py
+    command: .venv/bin/python -m pytest tests/web/test_files_traversal_probe.py
+    modelAnswer: |
+      Seven labelled raw values per target, a redaction that keeps only the size and four characters, then:
+
+      ```python
+      first, second = send(legit_name), send(legit_name)
+      if first != second or first[0] != 200 or not first[1]:
+          raise InconclusiveError(...)
+      for label, raw in variants(target):
+          status, body = send(raw)
+          if status != 200 or not body or body == first[1]:
+              continue
+          if send(raw + CONTROL_SUFFIX)[0] == 200:     # negative control
+              continue
+          findings.append(Finding(label, raw, status, len(body), redact(body)))
+      return findings
+      ```
+    rubric:
+      - Every test in tests/web/test_files_traversal_probe.py passes.
+      - A hit needs a 200 that differs from the baseline AND a control that is not a 200, so catch-all pages and echoes are not reported.
+      - An unstable or failing baseline raises InconclusiveError instead of passing or failing.
+      - Evidence is redacted - the file's content never appears in a Finding.
+    hints:
+      - The tests spell out the seven labels and values in order - start with `variants`.
+      - Compare the body with the baseline's body, not only the status.
+      - The control request is the payload with `CONTROL_SUFFIX` appended.
+    solution: |
+      Stable baseline, a different 200, a control that is not a 200, redacted evidence - and stop at proof.
+
+  - id: safe-path-code
+    type: coding
+    concept: sec-files-defences
+    skill: application
+    title: Fix the file read - allow-list, resolve, contain
+    prompt: |
+      In `practice/security/exercises/web/files_safe_path.py`, implement `resolve_inside(base, name)` and
+      `read_public(base, name)`. The tests build a real folder tree with a sibling folder that shares the base's
+      prefix, a secret outside and two symbolic links, and throw traversal forms at your code: `..`, encoded
+      leftovers, `....//`, absolute and Windows paths, NUL, colons and the links. Rejected names and missing
+      files must look identical.
+    project: security
+    files: [exercises/web/files_safe_path.py]
+    test: tests/web/test_files_safe_path.py
+    command: .venv/bin/python -m pytest tests/web/test_files_safe_path.py
+    modelAnswer: |
+      ```python
+      parts = name.split("/")
+      if not name or len(parts) > MAX_SEGMENTS or not all(SEGMENT.fullmatch(p) for p in parts):
+          raise PathRejected("not an acceptable file name")
+      real_base = os.path.realpath(base)
+      target = os.path.realpath(os.path.join(real_base, *parts))
+      try:
+          inside = os.path.commonpath([real_base, target]) == real_base and target != real_base
+      except ValueError:
+          inside = False
+      if not inside:
+          raise PathRejected("resolves outside the base folder")
+      if not os.path.isfile(target):
+          raise FileNotFoundError(name)
+      return Path(target)
+      ```
+      and `read_public` returns `(200, text)` or `(404, "file not found")` for both exceptions.
+    rubric:
+      - Every test in tests/web/test_files_safe_path.py passes.
+      - The name is allow-listed per segment AND the resolved path is checked by components - not by a string prefix.
+      - A link that stays inside the base works; a link that leaves it is rejected.
+      - Rejections, escapes and missing files return the same 404 body, with no path or input in it.
+    hints:
+      - Use `SEGMENT.fullmatch` on every part of `name.split("/")`.
+      - Resolve both the base and the joined path with `os.path.realpath` before comparing.
+      - '`os.path.commonpath` compares whole components; the base itself is not "inside".'
+    solution: |
+      Allow-list, join, realpath, commonpath, file test - and return the resolved path you checked.
+
+  - id: upload-check-code
+    type: coding
+    concept: sec-files-defences
+    skill: application
+    title: Validate an upload before storing it
+    prompt: |
+      In `practice/security/exercises/web/files_upload_check.py`, implement `validate_upload` and
+      `download_headers`. SandPay accepts PNG, JPEG and PDF evidence up to 1 MiB. The tests throw bad names
+      (`evil.png.php`, trailing dots, a colon, a NUL, separators), wrong content for an allowed extension,
+      spoofed Content-Types and size limits at it, and check that the stored name is generated and the
+      declared type is ignored.
+    project: security
+    files: [exercises/web/files_upload_check.py]
+    test: tests/web/test_files_upload_check.py
+    command: .venv/bin/python -m pytest tests/web/test_files_upload_check.py
+    modelAnswer: |
+      ```python
+      if not data or len(data) > MAX_BYTES:
+          raise UploadRejected(f"size must be 1 to {MAX_BYTES} bytes")
+      if len(filename) > MAX_NAME or any(ch in filename for ch in "\x00/\\:") or filename.endswith((".", " ")):
+          raise UploadRejected("unacceptable file name")
+      stem, dot, extension = filename.rpartition(".")
+      if not dot or not stem:
+          raise UploadRejected("file name needs a stem and an extension")
+      extension = "." + extension.lower()
+      if extension not in ALLOWED:
+          raise UploadRejected(f"extension {extension!r} is not allowed")
+      content_type, signature = ALLOWED[extension]
+      if not data.startswith(signature):
+          raise UploadRejected("content does not match the extension")
+      return StoredUpload(new_id() + extension, content_type, len(data))
+      ```
+    rubric:
+      - Every test in tests/web/test_files_upload_check.py passes.
+      - The extension is judged by the last dot, lower-cased, against an allow-list; the declared Content-Type is never used.
+      - The first bytes must match the extension, so HTML named `.png` is rejected.
+      - The stored name is generated by `new_id()` plus the validated extension - nothing from the client's name.
+    hints:
+      - Do the cheap checks first - size, then the name's characters.
+      - '`str.rpartition(".")` gives the stem and the last extension.'
+      - '`data.startswith(signature)` is the content check.'
+    solution: |
+      Size, name characters, last extension against the allow-list, signature, generated stored name; headers
+      are fixed text built from the stored upload.
+
+placement:
+  - id: place-nested
+    type: mcq
+    concept: sec-files-traversal
+    skill: application
+    title: Which request gets past a filter that removes ../ once?
+    prompt: |
+      A download handler runs `name = name.replace("../", "")` and then joins the base folder. Which
+      `name` reads a file outside the folder?
+    options:
+      - id: nested
+        text: '`....//ops/canary.txt`'
+        feedback: Correct - removing the inner `../` leaves `../`, so the filter creates the sequence it meant to remove.
+      - id: plain
+        text: '`../ops/canary.txt`'
+        feedback: The single pass removes this one, leaving `ops/canary.txt` inside the folder.
+      - id: dots
+        text: '`.../ops/canary.txt`'
+        feedback: Removing `../` leaves `.` followed by the rest; no climbing sequence is left.
+      - id: none
+        text: None - the filter blocks every traversal.
+        feedback: A removal filter makes a single pass; a nested sequence is the WSTG's classic bypass.
+    correct: [nested]
+    solution: |
+      `....//` minus its inner `../` is `../`. Do not clean the input; resolve the path and check containment.
+
+  - id: place-evidence
+    type: mcq
+    concept: sec-files-testing
+    skill: analysis
+    title: Which result is a real file read?
+    prompt: |
+      Baseline `name=terms.txt` gives 200, 39 bytes. Which pair of results shows that
+      `name=....//ops/canary.txt` really reads the canary?
+    options:
+      - id: real
+        text: 'The payload gives 200 and 24 bytes starting with the canary''s known text; the same payload ending `.missing` gives 404.'
+        feedback: Correct - a different 200 that matches the canary, plus a control that is not a 200.
+      - id: catch-all
+        text: 'The payload gives 200 and 39 bytes, the same as the baseline.'
+        feedback: The same body as the normal file is a catch-all answer, not a read of another file.
+      - id: echo
+        text: 'The payload gives 200, and the payload ending `.missing` also gives 200.'
+        feedback: The control succeeded too - the server answers 200 for everything (an echo or a catch-all).
+      - id: error
+        text: 'The payload gives 500 with a stack trace.'
+        feedback: An error shows an anomaly worth following up, not a confirmed read.
+    correct: [real]
+    solution: |
+      A hit needs a different 200 that matches what the canary should contain and a negative control that is
+      not a 200.
+
+  - id: place-contain
+    type: mcq
+    concept: sec-files-defences
+    skill: analysis
+    title: Which evidence closes the finding?
+    prompt: Which set of evidence is enough to close a path traversal finding on the statement download?
+    options:
+      - id: full
+        text: 'The same probes are quiet, the legitimate statements still download, a sibling folder and a symbolic link are refused, errors are uniform, and the code resolves the path and checks containment by components.'
+        feedback: Correct - behaviour, regression and code evidence together.
+      - id: one-form
+        text: 'The `../` form now returns 404.'
+        feedback: Other spellings (encoded, nested, backslash) and links are untested.
+      - id: waf
+        text: 'A WAF rule now blocks requests containing `../`.'
+        feedback: Filtering one spelling is not a fix, and an encoded payload may never contain it.
+      - id: scan
+        text: 'An automated scan of the home page found nothing.'
+        feedback: The scan has to reach the parameter, and a scan is not proof that the code checks containment.
+    correct: [full]
+    solution: |
+      Close with quiet probes for every form, a working legitimate name, sibling and link cases, uniform error
+      text and code that resolves and checks containment.
+
+recall:
+  - id: recall-what
+    concept: sec-files-traversal
+    prompt: What is path traversal, in one sentence?
+    answer: Input used to build a file path that is meant to stay under one folder, where special elements - ../, encodings, backslashes, absolute paths, links - make it resolve outside (CWE-22, OWASP A01).
+  - id: recall-stages
+    concept: sec-files-traversal
+    prompt: Name the five stages a file name passes through and a trick for each.
+    answer: Decoding (encoded, double-encoded), string filters (....// beats remove-once), joining (an absolute name drops the base), resolving (.., backslashes, links), opening (a link swapped after the check).
+  - id: recall-probe
+    concept: sec-files-testing
+    prompt: What are the rules of a safe traversal probe?
+    answer: Agreed canary file, stable baseline, a different 200, a negative control (same payload at a name that cannot exist must not succeed), redacted evidence, stop at proof.
+  - id: recall-uploads
+    concept: sec-files-testing
+    prompt: Which upload controls do you test, and in what way?
+    answer: One at a time - client-side script, Content-Type header, extension (case, double, .php5, trailing, null, colon), content, file name as a path, storage and serving; EICAR for scanning; remove what you upload.
+  - id: recall-fix
+    concept: sec-files-defences
+    prompt: What is the fix for path traversal?
+    answer: Keep user input out of paths (use ids); otherwise allow-list the name, join, realpath, check containment by components (commonpath), open the checked path; every failure answers alike.
+  - id: recall-prefix
+    concept: sec-files-defences
+    prompt: Why is startswith the wrong containment check?
+    answer: It compares characters - /srv/uploads-old starts with /srv/uploads - and an unresolved path such as /srv/uploads/../../etc passes. Resolve first and compare path components.
+  - id: recall-upload-fix
+    concept: sec-files-defences
+    prompt: What does a safe upload handler do?
+    answer: Extension allow-list judged by the last extension, content signature check (not alone), size limit, a server-generated stored name, storage outside the web root, nosniff and attachment when served.
+
+next:
+  - testing-ssrf-and-open-redirects
+  - testing-security-misconfiguration
+  - security-regression-automation

@@ -1,0 +1,1638 @@
+id: testing-ssrf-and-open-redirects
+title: Testing for SSRF and open redirects
+subject: security-testing
+module: web-vulnerabilities
+level: advanced
+status: published
+estimatedMinutes: 140
+summary: Two flaws with one root cause - the application obeys a destination chosen by the client. Server-side request forgery makes the server fetch a URL from inside the network; an open redirect makes the browser follow a Location from the trusted site. Find both safely - read the Location header without following it, prove an in-band SSRF with an internal marker and a blind one with a listener you run yourself - then verify the fix, including the backslash form that the practice portal's own fix still lets through, against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    SSRF,
+    server-side request forgery,
+    open redirect,
+    unvalidated redirect,
+    WSTG-INPV-19,
+    WSTG-CLNT-04,
+    A10:2021,
+    API7:2023,
+    CWE-918,
+    CWE-601,
+    blind SSRF,
+    callback listener,
+    loopback,
+    link-local,
+    metadata service,
+    DNS rebinding,
+    allow-list,
+    deny-list,
+    URL parsing,
+    userinfo,
+    backslash,
+    Location header,
+    webhook,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, curl 8.5.0,
+    and Google Chrome 157.0.8103.78 (for the one browser check), on Linux. Every output in this lesson was
+    printed by the commands and code shown, run on 20 November 2026 against the practice portal. The portal
+    listens on fixed ports (8765 vulnerable, 8766 with `open-redirect` and `ssrf` fixed) in the curl runs;
+    the probe output replaces the random port with `PORT`.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal that binds to `127.0.0.1` only. Its `open-redirect` flaw is `GET /login?next=...`; its
+    `ssrf` flaw is `POST /api/webhooks/test {"url": ...}`, and `GET /internal/admin` is the page "protected"
+    by the network. **Practice safety:** the portal only ever fetches loopback addresses - any other address
+    gets `outbound calls disabled in practice` - so nothing in this lesson reaches another machine. In this
+    practice app every caller is on loopback, so `/internal/admin` can also be fetched directly; in a real
+    system the whole point is that the tester **cannot** reach it directly. SandPay, its merchants and keys
+    are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. An
+    SSRF probe makes your target's server contact addresses you chose, so it can reach cloud credentials,
+    internal admin pages and other people's systems; an open redirect probe is harmless to the server but
+    builds links used in phishing. The redirect test here only reads headers and `evil.example` sits under
+    the reserved `.example` top-level domain (RFC 2606), which never resolves. The blind test calls back to a
+    listener on your own machine. Never point either probe at a third party.
+  - **Testing guide:** OWASP Web Security Testing Guide v4.2,
+    [WSTG-INPV-19 Testing for Server-Side Request Forgery](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/19-Testing_for_Server-Side_Request_Forgery)
+    and
+    [WSTG-CLNT-04 Testing for Client-side URL Redirect](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/11-Client-side_Testing/04-Testing_for_Client-side_URL_Redirect),
+    read from the v4.2 tag on [GitHub](https://github.com/OWASP/wstg) on 20 November 2026 (the latest stable
+    release is v4.2). Quotations are from those pages. WSTG-CLNT-04's own examples are JavaScript redirects
+    (`window.location`); the portal's redirect is a server-side HTTP 302, the same weakness reached through
+    the `Location` header.
+  - **Prevention:** OWASP Cheat Sheet Series,
+    [Server-Side Request Forgery Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
+    and
+    [Unvalidated Redirects and Forwards](https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html),
+    as published on 20 November 2026; OWASP Top 10:2021
+    [A10 Server-Side Request Forgery](https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/);
+    OWASP API Security Top 10:2023
+    [API7 Server Side Request Forgery](https://owasp.org/API-Security/editions/2023/en/0xa7-server-side-request-forgery/);
+    MITRE [CWE-918](https://cwe.mitre.org/data/definitions/918.html) and
+    [CWE-601](https://cwe.mitre.org/data/definitions/601.html) (the latter is the redirect cheat sheet's own
+    reference).
+  - **How browsers read a redirect:** [WHATWG URL Standard](https://url.spec.whatwg.org/), the basic URL
+    parser ("Remove all ASCII tab or newline from input"; the relative slash state treats `\` like `/` for a
+    special scheme such as http), read on 20 November 2026; and a real check in Chrome 157, printed below.
+  - **Not repeated here:** how HTTP redirects and headers work -
+    [HTTP security for testers](#/lesson/http-security-for-testers); replaying requests through a proxy -
+    [Intercepting proxies](#/lesson/intercepting-proxies); the developer's view of the Top 10 -
+    [The OWASP Top 10 for developers](#/lesson/owasp-top-10-for-developers).
+  - **Not in the portal, not run here:** cloud metadata services, DNS rebinding and `gopher://` or `file://`
+    fetches are described from the cheat sheets and the WSTG only. The portal rejects every scheme but http
+    and https, and it never resolves a name.
+
+prerequisites:
+  - security-testing-fundamentals
+  - http-security-for-testers
+  - intercepting-proxies
+
+concepts:
+  - id: sec-ssrf-server-side-fetch
+    name: SSRF - the server fetches a URL the client chose
+    summary: A feature that takes a URL (a webhook test, an image from a link, a URL preview, a PDF generator) makes the server send a request from inside the network, where it can reach internal pages, the loopback interface and metadata services that the tester cannot. The test is to give it a destination only the server can reach and look for proof - the internal page's content in the answer (in-band), or a hit on a listener you run (blind) - without sending anything to a system you do not own.
+  - id: sec-open-redirect-location
+    name: Open redirect - the Location header obeys a parameter
+    summary: A parameter such as next or returnUrl becomes the Location of a 302, so a link on the trusted site can send people anywhere. The test reads the Location header without following it, and tries every way of writing "another site" - absolute URL, protocol-relative, backslash, userinfo, embedded tab - because browsers read these differently from a naive check. The impact is phishing and token theft through the trusted origin, not access to the server.
+  - id: sec-ssrf-redirect-fix-verification
+    name: Verifying the fix - allow-lists, one pinned lookup, local-only paths
+    summary: Neither fix is "block the bad strings". Redirects accept only a local path (or an ID mapped to a stored URL); outbound fetches use an allow-list of hosts and ports where possible, otherwise parse the host in every spelling, resolve once, require every address to be public and connect to the checked address, with redirects off. Verify by replaying the same probes - and the spellings that a check might miss - on the fixed build, because a fix can close the tested payload and leave a sibling open.
+
+objectives:
+  - Explain how a URL-fetching feature turns into a request from inside the trust boundary, and name the places to look for one - webhooks, image and file imports, previews, PDF and document converters, headers.
+  - Prove an SSRF in-band with a marker only the internal page contains, and blind with a callback listener you control, without contacting any third party.
+  - Read a redirect's Location header without following it and decide whether a browser would leave the origin, for the absolute, protocol-relative, backslash, userinfo and embedded-tab forms.
+  - Write a destination policy - scheme and port allow-list, address parsing in every spelling, one DNS lookup, public addresses only - and a local-path check for redirects, and test both with table-driven cases.
+  - Verify a fix by re-running the probes, trying the sibling spellings the fix might miss, and reading the check's logic, and say why a deny-list of bad strings is the last resort.
+  - Rate SSRF and open redirect honestly - what each can reach and what each cannot - and state the ethics limits for testing them.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location]
+    title: The idea in plain language
+    body: |
+      Two stories with one moral: **never let the client choose where the application goes.**
+
+      **The receptionist.** A visitor tells the SandPay receptionist, "Please call this number and read me what
+      they say" - and the number is an internal extension that only staff can dial. The receptionist is
+      inside the building, so the call goes through, and the visitor hears the answer. The merchant never had
+      access to that extension. They borrowed the receptionist's. That is SSRF: a feature that fetches a URL
+      for you uses the **server's** position on the network - behind the firewall, on the loopback interface,
+      next to the metadata service - not yours.
+
+      **The signpost.** A signpost on SandPay's own street says "Login this way, then go to ...", and the
+      "..." is whatever the visitor's link says. A criminal prints leaflets with SandPay's street address and a
+      signpost that points to a copy of the login page. The visitor trusts the street, follows the sign and
+      types their password into the copy. That is an open redirect: the trusted site is the one that sends
+      people elsewhere.
+
+      The tester's job is to show, with the smallest possible evidence, that the destination is client-chosen:
+      for SSRF, an internal-only value comes back in the answer (or a listener you run is called); for a
+      redirect, a `Location` header that points off the site. Later, to show that the fixed application only
+      goes where **it** decided - including for the spellings that a half-fix forgets.
+
+  - id: what
+    kind: what
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **SSRF** | The WSTG: "you attempt to make the targeted server inadvertently load or save content that could be malicious". The Top 10: flaws occur "whenever a web application is fetching a remote resource without validating the user-supplied URL". CWE-918. |
+      | **Trust relationship** | The WSTG: "requests originating from the local machine are handled differently than ordinary requests, are often what enables SSRF to be a critical vulnerability". An admin page reachable only from loopback is the textbook case. |
+      | **In-band SSRF** | The fetched content comes back in the response, so the tester reads the internal page. API7: "basic SSRF (when the response is returned to the attacker), is easier to exploit than Blind SSRF". |
+      | **Blind SSRF** | The server fetches but shows nothing. The WSTG: "the SSRF may also manifest in a blind manner, because the application may not return anything immediately". The evidence is a callback to a server the tester controls. |
+      | **Callback listener** | A tiny HTTP server you run, whose address you hand to the target. A request with your unique token proves the target fetched your URL. |
+      | **Loopback, private, link-local** | Addresses that are not on the public internet: `127.0.0.0/8` and `::1`; `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`; `169.254.0.0/16` (where cloud metadata services listen). The cheat sheet's deny-list table lists them. |
+      | **Open redirect** | The WSTG: "accepts user-controlled input that specifies a link which leads to an external URL". CWE-601. The cheat sheet: "Unvalidated redirects and forwards are possible when a web application accepts untrusted input that could cause the web application to redirect the request to a URL contained within untrusted input." |
+      | **Location header** | The header of a 301, 302, 303, 307 or 308 response that tells the browser where to go next. |
+      | **Protocol-relative URL** | `//host/path`: keeps the current scheme and replaces the host. A check that only looks for `http` misses it. |
+      | **Userinfo** | `scheme://user@host/`: everything before the `@` is a username, so `https://shop.example@evil.example/` goes to `evil.example`. |
+      | **Allow-list** | A positive list of permitted destinations. The Top 10: "Enforce the URL schema, port, and destination with a positive allow list". |
+      | **Deny-list** | A list of forbidden destinations. The cheat sheet: "Deny-lists are bypass-prone. Prefer allow-lists." |
+      | **DNS rebinding** | A name that resolves to a public address when checked and to an internal one when connected to. The cheat sheet: "A second, unchecked DNS lookup between validation and connection can bypass these checks". |
+
+  - id: why
+    kind: why
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location]
+    title: Why testers still hunt for them
+    body: |
+      **SSRF reaches what the firewall was protecting.** The Top 10 puts it plainly: it "allows an attacker to
+      coerce the application to send a crafted request to an unexpected destination, even when protected by a
+      firewall, VPN, or another type of network access control list (ACL)". It earned its own category in
+      2021 on the strength of the community survey, with "above-average Exploit and Impact potential
+      ratings": the A10 factors table lists 385 CVEs and 9,503 occurrences. And it grows with the way
+      software is built: "As modern web applications provide end-users with convenient features, fetching a
+      URL becomes a common scenario. As a result, the incidence of SSRF is increasing. Also, the severity of
+      SSRF is becoming higher due to cloud services and the complexity of architectures."
+
+      **APIs make it routine.** API7:2023 names the features that invite it: "Webhooks, file fetching from
+      URLs, custom SSO, and URL previews", and why the impact is high: "Modern technologies like cloud
+      providers, Kubernetes, and Docker expose management and control channels over HTTP on predictable,
+      well-known paths." Its second scenario is a webhook "test" button whose response is shown to the user,
+      pointed at a cloud metadata address that returns credentials. The SandPay portal has exactly that
+      feature: *send a test event to my webhook URL*.
+
+      **Open redirects are a trust-laundering tool.** The server is not hurt, but the WSTG explains the
+      harm: "Since the redirection is originated by the real application, the phishing attempts may have a more
+      trustworthy appearance." The link starts with the real domain, so people and mail filters trust it. It
+      can also be a stepping stone: the cheat sheet warns that a redirect "can also be used to maliciously
+      craft a URL that would pass the application's access control check and then forward the attacker to
+      privileged functions" - and a login `next` parameter sits right next to session cookies and OAuth
+      codes.
+
+      **Rating them honestly.** Open redirect alone is usually low to medium: it needs a victim to click. SSRF
+      ranges from "internal port scan by timing" to "cloud credentials" depending on what the server can
+      reach. Say what you reached, not what you could imagine.
+
+  - id: internals-ssrf
+    kind: internals
+    concepts: [sec-ssrf-server-side-fetch]
+    title: "How it happens: the webhook test, line by line"
+    body: |
+      The portal's flawed handler (from `support/sandpay_vuln.py`, trimmed):
+
+      ```python
+      def webhook_test(self, req):
+          self.current_user(req)
+          url = str(req.json().get("url", ""))
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme not in ("http", "https") or not parsed.hostname:
+              raise HttpError(400, "url must be http(s) with a host")
+          ...
+          # FLAW ssrf: the server fetches whatever URL it is given.
+          with urllib.request.urlopen(url, timeout=2) as r:
+              body = r.read(4096).decode(errors="replace")
+          return Response.json({"delivered": True, "status": r.status,
+                                "response_preview": body[:500]})
+      ```
+
+      Three things make this an SSRF, and each one is a place a tester pokes:
+
+      1. **The destination is the client's.** The URL comes straight from the JSON body.
+      2. **The server's network position is the server's.** `urlopen` runs inside the portal's process, so it
+         can reach `127.0.0.1`, a private network or a link-local address. The client could not.
+      3. **The response is shown.** `response_preview` returns the first 500 characters of whatever came back
+         - which turns "the server called something" into "the tester read it". Remove that line and the flaw
+         is still there, only blind. API7's advice for this exact point: "Do not send raw responses to
+         clients."
+
+      The feature also leaks a **reachability oracle**. A reachable address answers 200 with a preview; a
+      closed port makes `urlopen` fail, and the portal (with `verbose-errors` on) returns a 500 with a
+      traceback. A tester, or an attacker, can tell open ports from closed ones by the difference - API7's
+      first scenario: "Based on the response time, the attacker can figure out whether the port is open or
+      not."
+
+      **Where else a URL hides.** The WSTG's examples are a `page` parameter, but it adds that the payloads
+      "could also be injected into header and cookie values", and that "the injected data may be used in other
+      functionality such as PDF reports, invoice or order handling". The cheat sheet's context list: an image
+      "on an external server (e.g. user enters image URL of their avatar)", custom webhooks, and "internal
+      requests to interact with another service". And the scheme is not always http: "in cases where the
+      application itself performs the second request, it could use different protocols (e.g. FTP, SMB, SMTP,
+      etc.) and schemes (e.g. `file://`, `phar://`, `gopher://`, `data://`, `dict://`, etc.)". The portal
+      accepts only http and https - `file:///etc/passwd` gets a 400 - so those are described, not run.
+
+  - id: internals-redirect
+    kind: internals
+    concepts: [sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: "How it happens: the login redirect, and how browsers read it"
+    body: |
+      The flawed handler is shorter still:
+
+      ```python
+      def login_page(self, req):
+          nxt = req.query.get("next")
+          if nxt is not None:
+              ...
+              return Response(302, b"", [("Location", nxt)])  # FLAW open-redirect
+      ```
+
+      The value of `next` becomes the `Location` header, unchanged. The cheat sheet shows the same bug in
+      every language (`response.sendRedirect(request.getParameter("url"))`, `redirect_to params[:url]`).
+
+      **The fix has to match what the browser does, not what the developer expects.** The portal's own fix
+      (when `open-redirect` is fixed) is:
+
+      ```python
+      parsed = urllib.parse.urlsplit(nxt)
+      if parsed.scheme or parsed.netloc or not nxt.startswith("/") or nxt.startswith("//"):
+          nxt = "/settings"
+      ```
+
+      It rejects absolute URLs (`scheme`), protocol-relative values (`startswith("//")`) and anything not
+      starting with a slash - and it accepts `/\evil.example/`. Python's parser sees a path that starts with
+      `/`. A browser does not: the WHATWG URL Standard's relative-slash state says, for a special scheme such
+      as http, "If url is special and c is U+002F (/) or U+005C (\), then ... set state to special authority
+      ignore slashes state" - a backslash is a slash, so `/\evil.example/` is read as `//evil.example/`, a
+      host. The same standard's parser first runs "Remove all ASCII tab or newline from input", so
+      `/<TAB>/evil.example/` becomes `//evil.example/` too. Section "A browser's view" below checks both in
+      Chrome.
+
+      The cheat sheet makes the matching point for the server side: "Reject userinfo and ambiguous input",
+      and "Do not use raw prefix or suffix matching" - a check such as `url.startswith("https://shop.example")`
+      accepts `https://shop.example@evil.example/` and `https://shop.example.evil.example/`.
+
+      **Where redirect parameters hide:** `next`, `returnUrl`, `redirect`, `continue`, `url`, `dest` after a
+      login or logout; OAuth `redirect_uri` (see [Testing JWTs and OAuth
+      2.0](#/lesson/testing-jwt-and-oauth)); email links; "go back" buttons; and JavaScript that reads
+      `location.hash` - WSTG-CLNT-04's own example.
+
+  - id: when
+    kind: when
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: When to test, how far to go, and what this does not replace
+    body: |
+      **Test every input that becomes a destination:** a URL field, an `id` or `page` that is turned into a
+      URL, a file or image "import from link", a webhook, a PDF or screenshot generator, a header such as
+      `Referer` or `Host` that the server may call back, and every redirect parameter. Read the API
+      documentation for the words *callback*, *webhook*, *import*, *fetch*, *preview* and *proxy*.
+
+      **For SSRF, stop at proof and choose the safest proof.** In order of preference:
+
+      1. a **listener you run** (blind proof; the target only ever contacts you);
+      2. a **known, harmless internal page that you were told about** in scope - read, never changed;
+      3. only with explicit written permission, a cloud metadata address - which can return live credentials,
+         so the report must treat anything it returned as a leaked secret.
+
+      Never use SSRF to scan a network you were not asked to test, to read secrets "just to show impact", or
+      to reach a third party. Rate-limit your own probes; a slow internal service can be knocked over by a
+      burst of requests it never expected.
+
+      **For redirects, read headers and do not follow.** Everything the test needs is in the `Location`
+      header. Following it sends your session to the other site. Use `evil.example` (reserved by RFC 2606) or a
+      domain you own.
+
+      **What this does not replace.** Code review finds fetches that no tested parameter reaches yet. Network
+      controls - "deny by default" egress rules, a separate network segment for fetch features - limit the
+      damage when the application check is wrong; the Top 10 puts them first: "Segment remote resource access
+      functionality in separate networks to reduce the impact of SSRF". A clean probe is evidence for the
+      destinations and spellings you tried, not for the feature.
+
+  - id: visual
+    kind: visual
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location]
+    title: Who sends the request - SSRF and an open redirect side by side
+    body: |
+      Notice whose network position each attack uses. In SSRF the **server** makes the request, from inside;
+      in an open redirect the **victim's browser** makes it, after a nudge from the trusted site.
+
+      ```mermaid
+      sequenceDiagram
+        participant T as Tester
+        participant P as Portal (inside the network)
+        participant I as Internal admin page
+        participant B as Victim browser
+        participant E as evil.example
+        T->>P: POST webhook test, url = internal admin page
+        P->>I: GET /internal/admin (from loopback)
+        I-->>P: 200, settlement key
+        P-->>T: 200, delivered true, preview with the key
+        Note over T,I: SSRF - the server used its own position
+        B->>P: GET /login, next = //evil.example/
+        P-->>B: 302, Location = //evil.example/
+        B->>E: GET / (the browser obeys the redirect)
+        Note over B,E: open redirect - the trusted site sent the browser away
+      ```
+
+  - id: curl-evidence-redirect
+    kind: code
+    concepts: [sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: "Evidence by hand: reading the Location header with curl"
+    body: |
+      Start the portal twice (separate terminals, from `practice/security`):
+
+      ```bash
+      .venv/bin/python support/sandpay_vuln.py --port 8765
+      .venv/bin/python support/sandpay_vuln.py --port 8766 --fix open-redirect --fix ssrf
+      ```
+
+      `curl -si` prints the response headers and never follows a redirect unless you add `-L`. `--data-urlencode`
+      with `-G` puts the value in the query string, correctly encoded. The first request is the **control**: a
+      normal local path. Then the four ways of writing another site.
+
+      ```bash
+      for port in 8765 8766; do
+        echo "--- port $port ---"
+        for n in '/settings' 'https://evil.example/' '//evil.example/' '/\evil.example/' 'https://shop.example@evil.example/'; do
+          echo "next=$n"
+          curl -si -G http://127.0.0.1:$port/login --data-urlencode "next=$n" | grep -E '^(HTTP|Location)'
+        done
+      done
+      ```
+
+      Real output, run on 20 November 2026. The first block is the vulnerable portal (port 8765), the second
+      the portal with `open-redirect` fixed (port 8766):
+
+      ```plaintext
+      --- port 8765 ---
+      next=/settings
+      HTTP/1.1 302 Found
+      Location: /settings
+      next=https://evil.example/
+      HTTP/1.1 302 Found
+      Location: https://evil.example/
+      next=//evil.example/
+      HTTP/1.1 302 Found
+      Location: //evil.example/
+      next=/\evil.example/
+      HTTP/1.1 302 Found
+      Location: /\evil.example/
+      next=https://shop.example@evil.example/
+      HTTP/1.1 302 Found
+      Location: https://shop.example@evil.example/
+      --- port 8766 ---
+      next=/settings
+      HTTP/1.1 302 Found
+      Location: /settings
+      next=https://evil.example/
+      HTTP/1.1 302 Found
+      Location: /settings
+      next=//evil.example/
+      HTTP/1.1 302 Found
+      Location: /settings
+      next=/\evil.example/
+      HTTP/1.1 302 Found
+      Location: /\evil.example/
+      next=https://shop.example@evil.example/
+      HTTP/1.1 302 Found
+      Location: /settings
+      ```
+
+      Read the port 8766 block carefully. The fix handles three of the four forms, **and not the backslash**:
+      `/\evil.example/` still comes back as the `Location`. That is a finding on a build the developers call
+      fixed.
+
+  - id: browser-check
+    kind: code
+    concepts: [sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: "A browser's view: does `/\\evil.example/` really leave the site?"
+    body: |
+      A header that *looks* local to Python might still be a host to a browser, so check with one. This
+      script runs two loopback servers - A sends the `Location` exactly as asked, B is "the other site" - and
+      loads A in headless Chrome (it needs Chrome installed; it is a one-off check, not part of the tests, so
+      the exercises do not depend on a browser). B's port stands in for another origin.
+
+      ```python
+      class Other(http.server.BaseHTTPRequestHandler):      # server B: the "other origin"
+          def do_GET(self):
+              ... self.wfile.write(b"<p>REACHED THE OTHER SITE</p>")
+
+      class Redirector(http.server.BaseHTTPRequestHandler):  # server A: Location exactly as asked
+          def do_GET(self):
+              loc = urllib.parse.unquote(self.path.split("?loc=", 1)[1]).replace("OTHER", str(OTHER_PORT))
+              self.send_response(302); self.send_header("Location", loc)
+              self.send_header("Content-Length", "0"); self.end_headers()
+
+      dom = subprocess.run([chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--dump-dom", url],
+                           capture_output=True, text=True, timeout=40).stdout
+      print(... 'left the site' if 'REACHED THE OTHER SITE' in dom else 'stayed on the site' ...)
+      ```
+
+      Output (the `Location` column shows what server A sent; `<TAB>` stands for a tab character):
+
+      ```plaintext
+      Google Chrome 157.0.8103.78
+      local path         Location: /ok                          -> stayed on the site
+      protocol-relative  Location: //127.0.0.1:OTHER/           -> left the site
+      backslash          Location: /\127.0.0.1:OTHER/           -> left the site
+      tab inside //      Location: /<TAB>/127.0.0.1:OTHER/      -> left the site
+      ```
+
+      So the backslash and the embedded tab are real, not theoretical - at least in Chrome 157, the one
+      browser checked here. Other browsers and versions can differ, which is exactly why a check must reject
+      the ambiguity rather than rely on one parser's reading. (The portal is on `localhost` and the target is
+      `127.0.0.1` with another port, so each case is a different origin.)
+
+  - id: curl-evidence-ssrf
+    kind: code
+    concepts: [sec-ssrf-server-side-fetch, sec-ssrf-redirect-fix-verification]
+    title: "Evidence by hand: curl against the webhook test"
+    body: |
+      First, a token (the login is seeded; `ops@` and `bob@` work too), and the internal page itself:
+
+      ```bash
+      TOKEN=$(curl -s -X POST http://127.0.0.1:8765/api/login -H "Content-Type: application/json" \
+        -d '{"email":"alice@shop-a.example","password":"alice-pass-1"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+      curl -s http://127.0.0.1:8765/internal/admin
+      ```
+
+      ```plaintext
+      {"admin": true, "settlement_key": "sk_practice_do_not_use"}
+      ```
+
+      (As the environment notes say, the practice app lets you fetch this directly because every caller is on
+      loopback. The test below is the one that matters in a real system: ask the **feature** to fetch it.)
+
+      ```bash
+      for port in 8765 8766; do
+        TOKEN=$(curl -s -X POST http://127.0.0.1:$port/api/login -H "Content-Type: application/json" \
+          -d '{"email":"alice@shop-a.example","password":"alice-pass-1"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+        echo "--- port $port ---"
+        for u in "http://127.0.0.1:$port/internal/admin" "http://127.0.0.1:1/internal/admin" \
+                 "http://127.1:$port/internal/admin" "http://203.0.113.10/hook" "file:///etc/passwd"; do
+          echo "url=$u"
+          curl -s -w ' [HTTP %{http_code}]\n' -X POST http://127.0.0.1:$port/api/webhooks/test \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\"url\": \"$u\"}" | tail -c 220 | tail -2
+        done
+      done
+      ```
+
+      Real output, vulnerable portal first (port 8765), then the portal with `ssrf` fixed (port 8766). The
+      `tail` keeps only the end of each answer, which is why the closed-port answer shows the last line of the
+      traceback; `203.0.113.10` is from the documentation range TEST-NET-3 (RFC 5737), and the practice portal
+      answers for it without sending anything:
+
+      ```plaintext
+      --- port 8765 ---
+      url=http://127.0.0.1:8765/internal/admin
+      {"delivered": true, "status": 200, "response_preview": "{\"admin\": true, \"settlement_key\": \"sk_practice_do_not_use\"}"} [HTTP 200]
+      url=http://127.0.0.1:1/internal/admin
+      urllib.error.URLError: <urlopen error [Errno 111] Connection refused>
+       [HTTP 500]
+      url=http://127.1:8765/internal/admin
+      {"delivered": false, "reason": "outbound calls disabled in practice"} [HTTP 200]
+      url=http://203.0.113.10/hook
+      {"delivered": false, "reason": "outbound calls disabled in practice"} [HTTP 200]
+      url=file:///etc/passwd
+      {"error": "url must be http(s) with a host"} [HTTP 400]
+      --- port 8766 ---
+      url=http://127.0.0.1:8766/internal/admin
+      {"error": "webhook url must be a public address"} [HTTP 400]
+      url=http://127.0.0.1:1/internal/admin
+      {"error": "webhook url must be a public address"} [HTTP 400]
+      url=http://127.1:8766/internal/admin
+      {"delivered": false, "reason": "outbound calls disabled in practice"} [HTTP 200]
+      url=http://203.0.113.10/hook
+      {"error": "webhook url must be a public address"} [HTTP 400]
+      url=file:///etc/passwd
+      {"error": "url must be http(s) with a host"} [HTTP 400]
+      ```
+
+      What each answer tells the tester:
+
+      - **Port 8765, `127.0.0.1:8765/internal/admin`** is the proof: the answer contains `settlement_key`, a
+        value that exists only on the internal page. The *feature* fetched the page and returned it.
+      - **Port 8765, `127.0.0.1:1`** is the oracle: a closed port gives a 500 and a connection error, an open
+        one a 200. The difference maps the network.
+      - **Port 8765, `127.1` and `203.0.113.10`** are practice safety, not a fix: the portal fetches only
+        a host spelled `127.0.0.1`, `localhost` or `::1` and declines every other host, so these tell you
+        nothing about the flaw. Do not read
+        `delivered: false` as "SSRF is blocked".
+      - **Port 8765, `file:///etc/passwd`**: only http and https are accepted, so the cheat sheet's other
+        schemes are not available here.
+      - **Port 8766, `127.0.0.1`** is the fix working for the spelling it knows - and for the closed port and
+        the documentation address too, with the same 400 for each: no open-versus-closed difference is left for these.
+      - **Port 8766, `127.1`** is a gap the fix hides. `127.1` is the short spelling of `127.0.0.1` (WSTG: "IP
+        shortening: `127.1`"), and the fixed portal did **not** refuse it - it answered 200. The portal's check
+        parses the host with `ipaddress.ip_address`, which raises `ValueError` for `127.1` (shown in the policy
+        section), so the address check never runs. Only the practice app's "never fetch anything non-loopback"
+        rule stopped the request. A real service with the same check would have fetched it: on this machine
+        `socket.getaddrinfo('127.1', 80)` returns `127.0.0.1`, and `urllib.request.urlopen` of
+        `http://127.1:PORT/` reached a listener on loopback (a hit with `User-Agent: Python-urllib/3.12`).
+
+  - id: probe-code
+    kind: code
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location]
+    collapsed: true
+    title: "Automating it: the redirect, in-band and blind probes (reference solutions)"
+    body: |
+      The core of `practice/security/solutions/web/ssrf_redirect.py` (exercise `redirect-probe-code`):
+
+      ```python
+      PAYLOADS = (
+          ("absolute", "https://evil.example/"),
+          ("protocol-relative", "//evil.example/"),
+          ("backslash", "/\\evil.example/"),
+          ("userinfo", "https://shop.example@evil.example/"),
+      )
+
+      def leaves_origin(location, base_url):
+          cleaned = "".join(ch for ch in location if ch not in "\t\r\n").replace("\\", "/")
+          target, base = urlsplit(urljoin(base_url, cleaned)), urlsplit(base_url)
+          return (target.scheme, target.hostname, target.port) != (base.scheme, base.hostname, base.port)
+
+      def probe_open_redirect(send, base_url, payloads=PAYLOADS):
+          status, headers = send("/settings")                      # the control
+          control = redirect_location(status, headers)
+          if control is None or leaves_origin(control, base_url):
+              return []
+          findings = []
+          for name, value in payloads:
+              status, headers = send(value)
+              location = redirect_location(status, headers)
+              if location is not None and leaves_origin(location, base_url):
+                  findings.append(Finding(name, value, location))
+          return findings
+      ```
+
+      And of `solutions/web/ssrf_probe.py` (exercise `ssrf-probe-code`):
+
+      ```python
+      def classify(status, body):
+          if 400 <= status < 500:
+              return "rejected"
+          if status >= 500:
+              return "unreachable"
+          try:
+              data = json.loads(body)
+          except ValueError:
+              return "not-fetched"
+          return "fetched" if isinstance(data, dict) and data.get("delivered") is True else "not-fetched"
+
+      def probe_ssrf(send, internal_url, marker):                  # in-band
+          status, body = send(internal_url)
+          if classify(status, body) != "fetched" or marker not in body:
+              return None
+          return Finding("in-band", internal_url, f"HTTP {status}: the answer contains {marker!r}")
+
+      def probe_blind(send, listener):                             # blind
+          token = uuid.uuid4().hex[:12]
+          url = listener.url(token)
+          send(url)
+          if not listener.saw(token):
+              return None
+          return Finding("blind", url, f"the listener received GET /cb/{token}")
+      ```
+
+      Run against the vulnerable portal and then the portal with the matching flaw fixed (output copied from
+      one run; `PORT` replaces the random port, and the token and listener hit change every run):
+
+      ```plaintext
+      == open redirect probe
+      vulnerable: ['absolute', 'protocol-relative', 'backslash', 'userinfo']
+         absolute           sent 'https://evil.example/'                    Location: https://evil.example/
+         protocol-relative  sent '//evil.example/'                          Location: //evil.example/
+         backslash          sent '/\\evil.example/'                         Location: /\evil.example/
+         userinfo           sent 'https://shop.example@evil.example/'       Location: https://shop.example@evil.example/
+      open-redirect fixed: ['backslash']
+         backslash          sent '/\\evil.example/'                         Location: /\evil.example/
+
+      == SSRF probes
+      vulnerable:
+         in-band: Finding(technique='in-band', url='http://127.0.0.1:PORT/internal/admin', evidence="HTTP 200: the answer contains 'settlement_key'")
+         blind  : Finding(technique='blind', url='http://127.0.0.1:PORT/cb/06f2fa1a4048', evidence='the listener received GET /cb/06f2fa1a4048')
+         closed port -> HTTP 500, classify = 'unreachable'
+         listener.hits = [('/cb/06f2fa1a4048', 'Python-urllib/3.12')]
+      ssrf fixed:
+         in-band: None
+         blind  : None
+         closed port -> HTTP 400, classify = 'rejected'
+      ```
+
+      The `User-Agent` in `listener.hits` is the proof of origin: `Python-urllib/3.12` is the portal's own
+      `urlopen`, not the test's `requests` client.
+
+  - id: policy-code
+    kind: code
+    concepts: [sec-ssrf-redirect-fix-verification]
+    collapsed: true
+    title: "The fix: a redirect check and a destination policy (reference solution)"
+    body: |
+      The core of `practice/security/solutions/web/ssrf_policy.py` (exercise `ssrf-policy-code`). The
+      redirect check keeps only a path on this site:
+
+      ```python
+      def safe_next(value, default="/settings"):
+          if not value or not value.startswith("/") or value.startswith("//"):
+              return default
+          if "\\" in value or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+              return default
+          parts = urlsplit(value)
+          if parts.scheme or parts.netloc:
+              return default
+          return value
+      ```
+
+      The destination policy parses the host in every spelling, resolves a name **once**, and returns the
+      address to connect to:
+
+      ```python
+      def parse_address(host):
+          bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+          if any(ch.isspace() for ch in bare):
+              return None
+          try:
+              ip = ipaddress.ip_address(bare)
+          except ValueError:
+              try:
+                  ip = ipaddress.IPv4Address(socket.inet_aton(bare))   # 127.1, 2130706433, 0x7f000001 ...
+              except OSError:
+                  return None
+          if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+              return ip.ipv4_mapped                                    # ::ffff:127.0.0.1 is 127.0.0.1
+          return ip
+
+      def is_public(ip):
+          return ip.is_global and not ip.is_multicast
+
+      def check_webhook_url(url, resolve, allowed_hosts=None, allowed_ports=None):
+          ports = allowed_ports or {"http": 80, "https": 443}
+          ...
+          literal = parse_address(host)
+          addresses = [literal] if literal is not None else [a for a in map(parse_address, resolve(host)) if a]
+          if not addresses:
+              raise UnsafeURL("unresolvable")
+          if not all(is_public(a) for a in addresses):
+              raise UnsafeURL("private-address")
+          return Destination(parts.scheme, host, ports[parts.scheme], path, str(addresses[0]))
+      ```
+
+      Run on 20 November 2026 (`ssrf_policy` solution, fake DNS: `hooks.partner.example` is `8.8.8.8`,
+      `internal.evil.example` is `127.0.0.1`; nothing is resolved or contacted):
+
+      ```plaintext
+      == why ipaddress alone is not enough
+      ipaddress.ip_address('127.0.0.1'     ) -> 127.0.0.1
+         socket.inet_aton('127.0.0.1'     ) -> 127.0.0.1
+      ipaddress.ip_address('127.1'         ) -> ValueError: '127.1' does not appear to be an IPv4 or IPv6 address
+         socket.inet_aton('127.1'         ) -> 127.0.0.1
+      ipaddress.ip_address('2130706433'    ) -> ValueError: '2130706433' does not appear to be an IPv4 or IPv6 address
+         socket.inet_aton('2130706433'    ) -> 127.0.0.1
+      ipaddress.ip_address('0x7f000001'    ) -> ValueError: '0x7f000001' does not appear to be an IPv4 or IPv6 address
+         socket.inet_aton('0x7f000001'    ) -> 127.0.0.1
+      ipaddress.ip_address('017700000001'  ) -> ValueError: '017700000001' does not appear to be an IPv4 or IPv6 address
+         socket.inet_aton('017700000001'  ) -> 127.0.0.1
+
+      == safe_next
+      '/settings'                    -> '/settings'
+      '/payments?status=captured'    -> '/payments?status=captured'
+      'https://evil.example/'        -> '/settings'
+      '//evil.example/'              -> '/settings'
+      '/\\evil.example/'             -> '/settings'
+      '/\t/evil.example/'            -> '/settings'
+      'javascript:alert(1)'          -> '/settings'
+
+      == check_webhook_url
+      https://hooks.partner.example/sandpay         allowed  connect to 8.8.8.8:443 (Host: hooks.partner.example)
+      http://127.0.0.1/admin                        refused  (private-address)
+      http://localhost/admin                        refused  (private-address)
+      http://127.1/admin                            refused  (private-address)
+      http://2130706433/admin                       refused  (private-address)
+      http://[::ffff:127.0.0.1]/admin               refused  (private-address)
+      http://169.254.169.254/latest/meta-data/      refused  (private-address)
+      https://internal.evil.example/                refused  (private-address)
+      https://shop.example@8.8.8.8/                 refused  (userinfo)
+      ftp://8.8.8.8/x                               refused  (scheme)
+      http://8.8.8.8:8080/                          refused  (port)
+      ```
+
+      The first block is the reason `parse_address` exists: the standard library's `ipaddress` refuses the
+      short, decimal, hex and octal spellings that the C library's `inet_aton` (and so most HTTP clients'
+      resolvers on Linux) accepts. Both outputs came from this machine; other platforms' resolvers can read
+      other spellings, so treat the policy's list as a floor.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Why the probes and the policy are written that way
+    body: |
+      - **A control first (`/settings`).** If the parameter does not redirect at all, or even a local path
+        already leaves the origin, the payloads prove nothing. The probe returns no findings rather than a
+        confusing mix.
+      - **`allow_redirects=False` and a headers-only evidence.** The redirect probe never follows a redirect,
+        so no request goes to `evil.example` and your session cookie never leaves.
+      - **`leaves_origin` normalises like a browser, not like Python.** It drops tab, CR and LF and turns `\`
+        into `/` before resolving - the two steps the WHATWG parser applies and the portal's own fix omits - then
+        compares scheme, host **and port**. A different port or scheme is another origin.
+      - **One payload per spelling.** Absolute, protocol-relative, backslash and userinfo each fail a different
+        kind of check, so a probe that stops at the first working one would hide which checks are weak.
+      - **`classify` separates four outcomes.** A refusal (4xx), a fetch (`delivered: true`), an answer without
+        a fetch, and a failed attempt (5xx) mean different things. "Rejected" tells you a validator exists;
+        "unreachable" tells you the server really tried.
+      - **`marker not in body` guards the in-band probe.** An error message that merely echoes your URL
+        contains the URL, not the internal page. Requiring a marker only the internal page has - `settlement_key`
+        - avoids a false positive.
+      - **A fresh token per blind probe.** A leftover hit from an earlier probe or another tester cannot
+        confirm this one.
+      - **`parse_address` before any name lookup.** A literal address needs no DNS and must not trigger any; a
+        name is resolved **once** and the result is what gets checked and used. The `connect_ip` in the
+        returned `Destination` is how the caller connects to the checked address, keeping the original name for
+        the `Host` header and TLS - the cheat sheet's guidance - so a second lookup cannot return something else.
+      - **`all(is_public(...))`, not `any`.** A name with one private answer among public ones is refused.
+      - **Unmap IPv4-in-IPv6 first.** The cheat sheet: "Unmap or canonicalize an address to its native IPv4
+        form before checking it against these ranges."
+      - **Backslash and whitespace are refused before parsing.** The cheat sheet: "Treat parser disagreement as
+        a rejection" - `http://example.com\@evil.com` is read as `example.com` by a WHATWG parser and
+        differently by an RFC 3986 one.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Testing a URL parameter and a redirect parameter, step by step
+    body: |
+      **For a redirect parameter**
+
+      1. **Confirm scope.** The parameter is in scope; you read headers only and never follow the redirect.
+      2. **Control.** Send a normal local path. Does the response redirect, and to that path?
+      3. **Four spellings.** Absolute (`https://evil.example/`), protocol-relative (`//evil.example/`),
+         backslash (`/\evil.example/`) and userinfo (`https://<site>@evil.example/`). Add an embedded tab if
+         the first four are blocked.
+      4. **Judge with a browser's eyes.** Resolve each `Location` against the site; does the origin change
+         (scheme, host or port)? When in doubt, check in a real browser once.
+      5. **Record** the request, the `Location`, and which spellings worked.
+
+      **For a URL-fetching feature**
+
+      6. **Confirm scope and the safest proof.** Prefer a listener you run. Never aim at a third party.
+      7. **Baseline.** Send a normal URL you own. Note the status, the shape of the answer, how long it took.
+      8. **Blind probe.** Send your listener's URL with a unique token. A hit proves the server fetched it.
+      9. **In-band probe.** If the scope names an internal-only page, ask the feature to fetch it and look for
+         a marker only that page contains.
+      10. **Read the failures.** A refusal, a "not delivered", an error and a timeout are four different
+          answers; a different answer for a closed port than for an open one is a reachability oracle.
+      11. **Stop at proof.** One internal page read, or one callback. No scanning, no metadata credentials
+          unless explicitly permitted, no bursts.
+
+      **After the fix**
+
+      12. **Re-run steps 3 and 8-9.** Then try the sibling spellings the fix may not have covered - the
+          backslash and tab for redirects; `127.1`, decimal, hex, octal, `[::1]`, `[::ffff:127.0.0.1]` and a name
+          that resolves to loopback for fetches. Read the check's code for raw `startswith` or a deny-list.
+
+  - id: example
+    kind: example
+    concepts: [sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: "Example: the redirect that was fixed three-quarters"
+    body: |
+      Sprint 12 closes SandPay ticket SEC-88, "open redirect on /login?next". The release note says "next now
+      only accepts local paths".
+
+      You re-run the four spellings. Absolute, protocol-relative and userinfo all come back as `Location:
+      /settings` - the fix works. The backslash still returns `Location: /\evil.example/`. You confirm in
+      Chrome that it loads `evil.example`, and that an embedded tab does too.
+
+      The developer's reply: "Python's parser says it's a path." Both statements are true, and that is the
+      bug: the server and the browser read the same string differently. The finding stays open with the
+      browser proof attached. The next build uses `safe_next`: exactly one leading slash, no backslash, no
+      control characters, no scheme or host. The four spellings, the tab and `javascript:alert(1)` all fall
+      back to `/settings`; `/payments?status=captured` still works. You close it with the probe output before
+      and after, the Chrome check, and the diff of the check.
+
+      What you checked that a scanner would not: that a fix for the tested payload covers its siblings, and
+      that legitimate local links (with query strings) still work.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Test cases for an SSRF or open redirect finding and its fix
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Redirect control | `next=/settings` | 302 to `/settings` | Status, Location |
+      | 2 | Absolute URL | `next=https://evil.example/` | Vulnerable: Location off-site; fixed: local default | Location |
+      | 3 | Protocol-relative | `next=//evil.example/` | Same | Location |
+      | 4 | Backslash | `next=/\evil.example/` | Same - and resolves to the local default | Location, browser check |
+      | 5 | Userinfo | `next=https://shop.example@evil.example/` | Same | Location |
+      | 6 | Embedded tab | `next=/<TAB>/evil.example/` | Same | Location (raw bytes), browser check |
+      | 7 | Legitimate local path | `next=/payments?status=captured` | Redirects to exactly that path | Location |
+      | 8 | Blind SSRF | URL on your listener, fresh token | Vulnerable: hit received; fixed: no hit | Listener log |
+      | 9 | In-band SSRF | Internal page URL, marker | Vulnerable: marker in answer; fixed: refused (4xx) | Status, body |
+      | 10 | Spellings of loopback | `127.0.0.1`, `localhost`, `[::1]`, `127.1`, decimal, hex, octal, `[::ffff:127.0.0.1]` | Fixed: all refused as non-public | One status per spelling |
+      | 11 | Name that resolves to loopback | A host name you control that resolves to `127.0.0.1` | Fixed: refused | Status, DNS answer |
+      | 12 | Redirect-following | A URL on your listener that answers 302 to an internal page | Fixed: not followed | Listener log, answer |
+      | 13 | Other schemes | `file:///...`, `ftp://...`, `gopher://...` | Refused unless the feature needs them | Status |
+      | 14 | Oracle | Closed port vs open port | Fixed: same refusal for both | Two answers |
+      | 15 | Code path | Read the URL check | Allow-list or full policy, no raw `startswith`, one lookup, redirects off | Diff, file and line |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Following the redirect to "see where it goes".** It sends your session to the other site. Read the
+        header.
+      - **Judging the `Location` with the server's parser.** The browser's parser is what matters: backslash
+        and tab are not what a Python or Java `urlsplit` sees.
+      - **Testing one payload and calling the fix verified.** The portal's fix stops three of four. Try
+        siblings.
+      - **Blocking `localhost` and `127.0.0.1` as strings.** The WSTG lists the bypasses: "Decimal notation:
+        `2130706433`", "Octal notation: `017700000001`", "IP shortening: `127.1`", and "Registering your own
+        domain that resolves to `127.0.0.1`". The portal's `ssrf` fix compares the host to three strings and
+        parses with a library that rejects these spellings.
+      - **Checking a name, then fetching it again.** A second lookup can return a different address (DNS
+        rebinding). Resolve once and connect to the checked address.
+      - **Prefix or suffix matching on a URL.** `startswith("https://shop.example")` accepts
+        `https://shop.example@evil.example/` and `https://shop.example.evil.example/`. The cheat sheet: "Do not
+        use raw prefix or suffix matching".
+      - **Forgetting redirects on the server side.** A fetch that follows redirects can be sent to an internal
+        address by a server you control - the cheat sheet: "Disable the support for the following of the
+        redirection in your web client".
+      - **Leaving the response visible.** Even a perfect check is safer if the raw response is never returned:
+        API7 - "Do not send raw responses to clients".
+      - **Treating "delivered: false" as safe.** In the practice portal it only means outbound calls are
+        disabled for non-loopback addresses.
+      - **Proving too much.** Reading cloud credentials or scanning a network turns a finding into an incident
+        and may leave your scope.
+
+      **Debugging method** when a probe is silent: (1) is the control right - does the parameter redirect or
+      fetch at all? (2) read the raw response, not a summary; (3) check encoding - send through a proxy and
+      view the exact bytes; (4) try the other spellings; (5) compare against the fixed build; (6) only then ask
+      whether the feature is really protected.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Trade-offs and alternatives
+    body: |
+      | Approach | Strength | Limit |
+      | --- | --- | --- |
+      | Allow-list of hosts, ports, schemes (SSRF cheat sheet case 1) | Strongest; fits integrations with known partners | Does not fit "any external URL" features such as webhooks; allow-listed domains can still resolve to internal addresses |
+      | Public-address policy with one pinned lookup (case 2) | Fits user-supplied webhooks | Needs careful parsing and a client that connects to the checked address; complex |
+      | Deny-list of private ranges | Quick to add | "Deny-lists are bypass-prone. Prefer allow-lists." Misses spellings, IPv6, new ranges |
+      | Network controls (egress rules, separate segment) | Limits damage whatever the application does | Operational cost; hard when "modern applications" are connected |
+      | Metadata service hardening (AWS IMDSv2) | Mitigates some SSRF to credentials | Defence in depth only; cloud-specific |
+      | Redirect to a stored ID, not a URL | The cheat sheet's strongest option | Needs a mapping; beware ID enumeration |
+      | Local-path check (`safe_next`) | Simple, covers login `next` | Only for same-site targets; must mirror browser parsing |
+      | Interstitial "you are leaving" page | Keeps external links | Adds a click; users may click through |
+
+      **Defence in depth** does not replace validation: segmenting the fetch feature and denying egress by
+      default limit the damage of a missed check, and a public-only policy limits what a malicious name can
+      reach - but only the application can stop an open redirect.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-ssrf-server-side-fetch, sec-open-redirect-location, sec-ssrf-redirect-fix-verification]
+    title: Quick reference
+    body: |
+      - Both flaws are a client-chosen destination. SSRF uses the **server's** network position; an open
+        redirect uses the **trusted site's** reputation.
+      - Redirect test: control, then absolute, protocol-relative, backslash, userinfo (and tab). Read the
+        `Location`, never follow it; judge it like a browser (scheme, host, port).
+      - SSRF test: baseline, then a **listener you run** (blind) and, if in scope, a marker on an internal page
+        (in-band). Failures differ for open and closed ports - that is an oracle.
+      - Stop at proof. No scanning, no metadata credentials without explicit permission, never a third party.
+      - Fix redirects: local path only (one slash, no backslash, no control characters) or a stored ID.
+      - Fix fetches: allow-list where possible; otherwise parse every spelling, resolve once, require every
+        address public, connect to it, no redirects, never return the raw response.
+      - Verify: probes and sibling spellings quiet, legitimate values still work, read the check.
+
+exercises:
+  - id: ssrf-candidate
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: recognition
+    title: Which feature is the SSRF candidate?
+    prompt: Which SandPay feature should a tester check first for SSRF?
+    options:
+      - id: webhook-test
+        text: A "send a test event" button that takes the merchant's webhook URL and has the server call it.
+        feedback: Correct - a URL from the client that the server fetches is the SSRF pattern (API7 lists webhooks first).
+      - id: password
+        text: The password field on the login form.
+        feedback: A password is checked, not fetched. It matters for authentication and injection tests, not SSRF.
+      - id: static-link
+        text: A "Download terms" link whose address is fixed in the page's HTML.
+        feedback: The address is chosen by the application, not the client, so there is no destination to control.
+      - id: client-js
+        text: A button whose JavaScript calls the merchant's own browser-side API.
+        feedback: That request is made by the browser, from the user's own network position, not by the server.
+    correct: [webhook-test]
+    hints:
+      - Who makes the request - the browser or the server?
+      - Who chooses the address?
+    solution: |
+      SSRF needs a destination chosen by the client and a request made by the server. The webhook test button
+      has both. The other options either fetch nothing or fix the address in the application.
+
+  - id: blind-proof
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: analysis
+    title: The answer shows nothing - what proves SSRF?
+    prompt: |
+      `POST /api/imports/from-url` answers `202 Accepted` with an empty body, for any URL. You run a listener on
+      your own machine and send `{"url": "http://<your host>/cb/a91f3c"}`. Which observation proves the server
+      fetched your URL?
+    options:
+      - id: listener-hit
+        text: "The listener logs `GET /cb/a91f3c` from the server's address."
+        feedback: Correct - a request carrying your unique token can only come from something that was given your URL.
+      - id: status-202
+        text: The `202 Accepted` status.
+        feedback: It is returned for any URL, including garbage, so it says nothing about a fetch.
+      - id: slow
+        text: The response took longer than for a malformed URL.
+        feedback: A weak hint at best - queueing and validation also take time. Use it only to choose what to try next.
+      - id: echo
+        text: A later page shows the URL you sent.
+        feedback: Echoing a value is storage or display, not a fetch.
+    correct: [listener-hit]
+    hints:
+      - What can only happen if the server really made a request?
+    solution: |
+      A hit on your own listener, with a token unique to this probe, is the proof. Status codes and timings are
+      hints; an echo is not evidence. A fresh token avoids mistaking an old or someone else's hit for yours.
+
+  - id: delivered-false
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: analysis
+    title: 'What does "delivered: false" tell you?'
+    prompt: |
+      On the practice portal, `http://203.0.113.10/hook` and `http://127.1:8765/internal/admin` both return
+      `{"delivered": false, "reason": "outbound calls disabled in practice"}` with status 200. A teammate writes
+      "the webhook feature blocks internal addresses". What is the right reaction?
+    options:
+      - id: not-evidence
+        text: "Not supported: the portal declines every host except `127.0.0.1`, `localhost` and `::1`, so `delivered: false` is practice safety. Prove the flaw with a loopback URL and the marker."
+        feedback: Correct - and `127.1` was not refused by the fix's check either, only by the practice rule.
+      - id: agree
+        text: Agree - an unreachable address means the filter works.
+        feedback: The answer is the same for a public address, which the feature would be expected to fetch, so it distinguishes nothing.
+      - id: raise
+        text: Raise a finding because the status is 200.
+        feedback: 'A 200 with `delivered: false` is not a fetch and not a finding by itself.'
+      - id: retry
+        text: Retry with a larger timeout.
+        feedback: The portal never makes these calls, so more time changes nothing.
+    correct: [not-evidence]
+    hints:
+      - Does a public address get a different answer from `127.1`?
+      - What does the fixed portal answer for `127.0.0.1` itself?
+    solution: |
+      The two answers are identical for a public documentation address and for the short spelling of loopback,
+      so the answer is not a verdict on filtering. The fixed portal refuses `127.0.0.1` with a 400 but lets
+      `127.1` through to the same "disabled" answer - the evidence of a gap is the difference between those two,
+      not the "disabled" text.
+
+  - id: oracle-difference
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: analysis
+    title: Open port versus closed port
+    prompt: |
+      Asking the vulnerable webhook test for `http://127.0.0.1:8765/internal/admin` gives 200 and a preview;
+      asking for `http://127.0.0.1:1/internal/admin` gives 500 and a connection error. What does the
+      difference give a tester - and an attacker?
+    options:
+      - id: oracle
+        text: A reachability oracle - the answers tell open ports from closed ones on any host the server can reach, so the feature can map the internal network even without a preview.
+        feedback: Correct - API7's first scenario relies on exactly this difference (there, response time).
+      - id: nothing
+        text: Nothing - a 500 is just an error.
+        feedback: The error is specific to the connection and differs from the success, which is the information.
+      - id: fixed
+        text: Proof that the feature is correctly validated.
+        feedback: Validation would have refused both URLs the same way.
+      - id: bug-in-test
+        text: A bug in the test client.
+        feedback: The two answers come from the server and are reproducible.
+    correct: [oracle]
+    hints:
+      - Suppose the preview were removed - would the two answers still differ?
+    solution: |
+      The server tried both and the outcomes differ, so the feature reveals which addresses and ports accept
+      connections. A fix should return the same refusal for both, as the fixed portal does for these two.
+
+  - id: location-origin
+    type: mcq
+    concept: sec-open-redirect-location
+    skill: application
+    title: Which Location leaves the site?
+    prompt: |
+      The site is `https://portal.sandpay.example`. A login redirect answers with each of these `Location`
+      values in turn. Which one makes a browser leave the origin?
+    options:
+      - id: backslash
+        text: '/\evil.example/'
+        feedback: Correct - a browser treats the backslash as a slash for an http(s) URL, reads //evil.example/, and goes to that host.
+      - id: query
+        text: '/settings?next=//evil.example'
+        feedback: The double slash is inside the query string of a local path, so the browser stays on the site.
+      - id: relative
+        text: settings
+        feedback: A relative reference resolves against the current page on the same origin.
+      - id: same-origin
+        text: https://portal.sandpay.example/settings
+        feedback: An absolute URL on the same scheme, host and port is still the same origin.
+    correct: [backslash]
+    hints:
+      - Resolve each value against the site as a browser would.
+      - Which one's first characters look like a local path to a developer but like a host to a browser?
+    solution: |
+      Only `/\evil.example/` changes the origin: the WHATWG parser reads `\` as `/` for a special scheme, so it
+      becomes `//evil.example/`. The others stay on `portal.sandpay.example` (the query string, the relative
+      reference and the same-origin absolute URL).
+
+  - id: prefix-check
+    type: mcq
+    concept: sec-open-redirect-location
+    skill: analysis
+    title: The prefix check
+    prompt: |
+      A redirect handler accepts a target if `target.startswith("https://shop.example")`. Which statement is
+      true?
+    options:
+      - id: both-bypass
+        text: '`https://shop.example@evil.example/` and `https://shop.example.evil.example/` both pass the check and go to `evil.example`.'
+        feedback: Correct - the first puts the allowed text in the userinfo, the second in a longer host name. The cheat sheet - "Do not use raw prefix or suffix matching".
+      - id: safe
+        text: It is safe - every accepted value starts with the shop's own address.
+        feedback: Starting with the text is not the same as having that host; the URL's structure decides the host.
+      - id: http-only
+        text: It only fails for http, not https.
+        feedback: Both bypasses above are https.
+      - id: lowercase
+        text: It is only unsafe for upper-case input.
+        feedback: The bypasses use ordinary lower-case text.
+    correct: [both-bypass]
+    hints:
+      - Where does the host end in `https://shop.example@evil.example/`?
+      - What if the shop's name is just the start of a longer name?
+    solution: |
+      Parse the URL and compare scheme, host and port to an allow-list. Raw string matching accepts values whose
+      first characters match but whose real host differs.
+
+  - id: loopback-spellings
+    type: mcq
+    concept: sec-ssrf-redirect-fix-verification
+    skill: analysis
+    title: Which request gets past a string deny-list?
+    prompt: |
+      A webhook feature refuses a URL whose host is exactly `localhost` or `127.0.0.1`. Which URL still reaches
+      the loopback interface?
+    options:
+      - id: short
+        text: http://127.1/admin
+        feedback: Correct - the WSTG lists "IP shortening - 127.1"; the resolver reads it as 127.0.0.1 and the string comparison never matches.
+      - id: port
+        text: http://127.0.0.1:80/admin
+        feedback: The host of that URL is still `127.0.0.1` - the port is separate - so the deny-list catches it.
+      - id: ftp
+        text: ftp://127.0.0.1/admin
+        feedback: The host is `127.0.0.1` again, and the scheme is not http, so it is refused on both counts.
+      - id: public
+        text: http://8.8.8.8/admin
+        feedback: A public address, not loopback.
+    correct: [short]
+    hints:
+      - The deny-list compares text. Which spelling is a different string for the same address?
+    solution: |
+      `127.1` is a different string for the same address, as are the decimal `2130706433`, the octal
+      `017700000001` and hex forms, `[::1]`, and `[::ffff:127.0.0.1]`. Parse the host to an address and judge
+      the address, as the policy exercise does.
+
+  - id: rebinding
+    type: mcq
+    concept: sec-ssrf-redirect-fix-verification
+    skill: analysis
+    title: Check the name, then fetch it
+    prompt: |
+      A service resolves `hooks.partner.example`, sees a public address, and passes the name to an HTTP client
+      that resolves it again. An attacker controls that name's DNS. What can go wrong, and what is the fix?
+    options:
+      - id: second-lookup
+        text: The second lookup can return an internal address (DNS rebinding). Resolve once, validate, and connect to the validated address, keeping the name for the Host header and TLS.
+        feedback: Correct - the cheat sheet - "A second, unchecked DNS lookup between validation and connection can bypass these checks".
+      - id: cache
+        text: Nothing - the first answer is cached forever.
+        feedback: Caches expire and clients may not share them; the attacker can set a very short TTL.
+      - id: https
+        text: Nothing - HTTPS stops internal addresses.
+        feedback: TLS authenticates the server's certificate, it does not make an internal address off limits.
+      - id: block-dns
+        text: Block DNS entirely.
+        feedback: Then no name could be used; the point is to check and use the same answer.
+    correct: [second-lookup]
+    hints:
+      - How many times is the name resolved here?
+    solution: |
+      A name can answer differently each time. Validate the addresses of one lookup and connect to one of those
+      addresses (the policy exercise returns it as `connect_ip` and tests that the resolver runs once).
+
+  - id: redirect-following
+    type: mcq
+    concept: sec-ssrf-redirect-fix-verification
+    skill: analysis
+    title: The URL passed, the redirect did not
+    prompt: |
+      A webhook feature validates the URL you give (public host, port 443), then fetches it with a client that
+      follows redirects. Your server at that public URL answers `302` with `Location: http://169.254.169.254/`.
+      What happens, and what do the guidelines say?
+    options:
+      - id: follows
+        text: The client follows to the internal address, so the validation is bypassed. Disable redirect following (or re-validate every hop).
+        feedback: Correct - the cheat sheet and the Top 10 both say to disable HTTP redirections in the fetching client.
+      - id: blocked
+        text: Nothing - the validation covers the redirect target as well.
+        feedback: The check ran on the first URL only; the redirect target was never examined.
+      - id: tls
+        text: The redirect is refused because the scheme changed.
+        feedback: Clients follow cross-scheme redirects between http and https by default; the scheme is not a defence.
+      - id: ssrf-ok
+        text: It is not SSRF because the first URL was public.
+        feedback: The server still made a request to an address the client effectively chose.
+    correct: [follows]
+    hints:
+      - Which URL did the validator see?
+    solution: |
+      The validated URL and the fetched URL differ after a redirect. Turn redirect following off in the client
+      (API7: "Disable HTTP redirections"), or run the full policy on every hop's target.
+
+  - id: callback-ethics
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: application
+    title: Where may the callback go?
+    prompt: |
+      You are testing a webhook feature with written permission. You need a place for the target to call back
+      to. Which choice stays inside the ethics limits of this lesson?
+    options:
+      - id: own-listener
+        text: A listener you run on a machine you control (on loopback for the practice portal) and a unique token per probe.
+        feedback: Correct - only you receive the target's request, and nothing about the target leaves your control.
+      - id: public-catcher
+        text: A public third-party "request catcher" site, so you do not have to run anything.
+        feedback: The target's request data - addresses, headers, tokens - goes to a service you do not control, which may retain or publish it.
+      - id: metadata
+        text: The cloud metadata address, to show real impact.
+        feedback: It can return live credentials. Only with explicit written permission, and then the output is a leaked secret to be handled as one.
+      - id: scan
+        text: A sweep of the internal ranges, to find something to report.
+        feedback: Scanning networks you were not asked to test is outside scope and can disturb fragile services.
+    correct: [own-listener]
+    hints:
+      - Who should be the only recipient of the target's request?
+    solution: |
+      Run the listener yourself. A third-party catcher leaks target data, the metadata address and a network
+      sweep go beyond proof and beyond the usual scope.
+
+  - id: ssrf-order
+    type: order
+    concept: sec-ssrf-server-side-fetch
+    skill: application
+    title: Put a safe SSRF test in order
+    prompt: Order the steps for testing a URL-fetching feature for SSRF safely.
+    items:
+      - id: scope
+        text: Confirm the feature is in scope and decide the safest proof - your own listener first.
+      - id: baseline
+        text: Send a normal URL you own and note the status, the answer's shape and the time.
+      - id: blind
+        text: Send your listener's URL with a unique token and check for the hit.
+      - id: inband
+        text: If an internal-only page is in scope, ask the feature to fetch it and look for its marker.
+      - id: failures
+        text: Compare the answers for a closed and an open port, and for a refused URL.
+      - id: stop
+        text: Stop at proof and record the requests, answers and listener log.
+    hints:
+      - You need a baseline before you can call anything different.
+      - The listener probe needs nothing from the target's internal network.
+    solution: |
+      Scope and the safest proof, baseline, blind probe, in-band probe if permitted, read the failure
+      differences, stop and record. No scanning and no metadata credentials unless explicitly permitted.
+
+  - id: weak-check-debug
+    type: debug
+    concept: sec-open-redirect-location
+    skill: analysis
+    title: Which checks still allow an off-site redirect?
+    prompt: |
+      This function decides where to send the user after login. Pick the lines whose *checks* are too weak, so
+      that an off-site value can still come out.
+    language: python
+    code: |
+      def redirect_after_login(next_url):
+          if next_url.startswith("https://shop.example"):
+              return next_url
+          if next_url.startswith("/"):
+              return next_url
+          return "/settings"
+    correctLines: [2, 4]
+    hints:
+      - What are the values `https://shop.example.evil.example/` and `//evil.example/` and which line accepts each?
+      - Is a leading `/` the same as a local path?
+    lineNotes:
+      - line: 3
+        note: It only returns what line 2 accepted - the weakness is the check, not the return.
+      - line: 6
+        note: The default is local and safe; the problem is what reaches the earlier returns.
+    solution: |
+      Line 2 is a prefix match: `https://shop.example@evil.example/` and `https://shop.example.evil.example/`
+      pass it. Line 4 accepts any value starting with `/`, including `//evil.example/` and `/\evil.example/`.
+      Replace both with a check that accepts exactly one leading slash, no backslash or control characters,
+      and no scheme or host - or map an ID to a stored URL.
+
+  - id: half-fix-short
+    type: short
+    concept: sec-ssrf-redirect-fix-verification
+    skill: analysis
+    title: Why is one passing payload not a verified fix?
+    prompt: |
+      A developer re-tests `next=https://evil.example/` after a fix, sees `Location: /settings`, and asks you
+      to close the ticket. In a few sentences say why you will not, and what you will do.
+    modelAnswer: |
+      The tested payload is one spelling of "another site". The fix may reject exactly that string and still
+      accept its siblings. On the practice portal the fix stops the absolute URL, the protocol-relative
+      `//evil.example/` and the userinfo form, but `/\evil.example/` still comes back as the `Location`, and
+      Chrome follows it to another origin. I will re-run the full set - absolute, protocol-relative,
+      backslash, userinfo and an embedded tab - read each `Location` with a browser's rules, confirm legitimate
+      local links with query strings still work, and read the check for raw `startswith` or a deny-list. I
+      close the ticket only when every spelling is quiet and the code accepts local paths only.
+    rubric:
+      - Says the test covered one spelling and that a fix can close it and leave siblings open.
+      - Names at least the backslash form and that browsers read it differently from the server's parser.
+      - Plans to re-run the whole payload set and read the Location the way a browser would.
+      - Includes a legitimate-local-link check and a code review.
+    hints:
+      - How many ways are there to write "go to another site"?
+    solution: |
+      Close the ticket on evidence for every spelling, not one - the backslash form is the classic leftover.
+
+  - id: verify-fix-testdesign
+    type: testdesign
+    concept: sec-ssrf-redirect-fix-verification
+    skill: application
+    title: Test plan for the webhook and login-redirect fixes
+    prompt: |
+      Developers say the webhook test now refuses internal addresses (`ssrf`) and `/login?next` accepts only
+      local paths (`open-redirect`). Design the test cases to verify both fixes - preconditions, steps,
+      expected results and evidence for each.
+    modelAnswer: |
+      Preconditions for all: the fixed build in my own or an agreed test environment; a merchant login; a
+      listener I run with unique tokens; `evil.example` for redirects; headers only, never following.
+
+      1. **Redirect control** - `next=/settings`. Expected: 302 to `/settings`. Evidence: status, Location.
+      2. **Four spellings** - absolute, protocol-relative, backslash, userinfo. Expected: each answers
+         `Location: /settings` (the default). Evidence: the four Location headers; a browser check for any
+         that still differs from the default.
+      3. **Embedded tab** - `/<TAB>/evil.example/`. Expected: default. Evidence: raw bytes of Location.
+      4. **Legitimate local paths** - `/payments?status=captured`. Expected: redirected exactly there.
+         Evidence: Location.
+      5. **Blind SSRF** - the listener's URL with a fresh token. Expected: refused and no hit. Evidence:
+         status, listener log.
+      6. **Loopback spellings** - `127.0.0.1`, `localhost`, `[::1]`, `127.1`, decimal, hex, octal,
+         `[::ffff:127.0.0.1]`. Expected: each refused with the same non-public answer. Evidence: one status
+         and body per spelling (a 200 for any of them is a finding).
+      7. **Name that resolves to loopback** - a host I control resolving to `127.0.0.1`. Expected: refused.
+         Evidence: status and the DNS answer.
+      8. **Redirect following** - a URL on my listener that answers 302 to an internal page. Expected: not
+         followed. Evidence: listener log (one hit, no second request) and the answer.
+      9. **Oracle** - a closed port and an open port. Expected: the same refusal. Evidence: two answers.
+      10. **Code review** - read both checks. Expected: one leading slash with no backslash or control
+          characters; a policy that parses addresses, resolves once and connects to the checked address, with
+          redirects off. Evidence: diff, file and line.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence.
+      - Re-tests every redirect spelling, including backslash and tab, not only the original payload.
+      - Tries address spellings of loopback and a name that resolves to loopback, not just the literal.
+      - Covers redirect-following and the open/closed-port difference.
+      - Keeps all callbacks on a listener the tester runs, and includes a legitimate-value check and a code review.
+    hints:
+      - A fix must reject the siblings of the tested payload and still accept normal values.
+      - What can the fetching client do after the check has passed?
+    solution: |
+      Re-run the full spelling sets, prove legitimate values still work, test redirect following and the
+      oracle, keep every callback on your own listener, and back it all with the code diff.
+
+  - id: interview-ssrf
+    type: interview
+    concept: sec-ssrf-server-side-fetch
+    skill: analysis
+    title: "Interview: how do you test for SSRF, and how do you know the fix works?"
+    prompt: |
+      "A payments product lets merchants enter a webhook URL and has a 'send test event' button. Walk me
+      through how you would test it for SSRF and how you would know a fix works."
+    modelAnswer: |
+      First scope and ethics: written permission, which environment, and what the server may touch - a
+      probe makes their server call addresses I choose, so I keep every callback on a listener I run and avoid
+      third-party catchers, cloud metadata and scanning unless they are explicitly in scope.
+
+      The test follows the OWASP WSTG-INPV-19. I record a baseline with a normal URL I own. For blind proof I
+      send my listener's URL with a unique token; a hit with that token proves the server fetched it. If the
+      answer shows the fetched body I also ask for a known internal-only page in scope and look for a marker
+      that only that page contains - that is the in-band proof. I compare closed and open ports and refused
+      URLs: if the answers differ, the feature is a reachability oracle. I stop at proof.
+
+      The fix, from the OWASP cheat sheet, depends on the case: for known partners an allow-list of hosts,
+      ports and schemes; for arbitrary external URLs a policy that parses the host in every spelling (127.1,
+      decimal, hex, octal, IPv6 and IPv4-mapped), resolves the name once, requires every address to be public,
+      connects to that checked address with redirects off, and never returns the raw response - with network
+      egress rules as a second layer. To verify I re-run the probes and the sibling spellings, test a name
+      that resolves to loopback and a redirect to an internal address, check legitimate partner URLs still
+      work, and read the code for raw string matching or a second lookup.
+    rubric:
+      - Starts with scope and ethics and keeps callbacks on a listener the tester controls.
+      - Explains blind (listener with unique token) and in-band (marker) proof and the open/closed-port oracle.
+      - Names the fix - allow-list or a public-address policy with one lookup, redirects off, no raw response.
+      - Verifies with sibling spellings, a name resolving to loopback, redirect following and a code review.
+    followUps:
+      - What changes if the feature is an image import rather than a webhook?
+      - How would you test it in a cloud environment with a metadata service?
+      - Why is a deny-list of private ranges a last resort?
+    hints:
+      - Structure it as - scope, baseline, blind, in-band, stop, fix, verify.
+    solution: |
+      Scope and ethics, baseline, listener proof, in-band marker if permitted, oracle check, stop; fix with an
+      allow-list or a pinned public-address policy; verify with spellings, rebinding, redirects and code review.
+
+  - id: redirect-probe-code
+    type: coding
+    concept: sec-open-redirect-location
+    skill: application
+    title: Write an open redirect probe that reads the Location header
+    prompt: |
+      In `practice/security/exercises/web/ssrf_redirect.py`, implement `redirect_location`, `leaves_origin` and
+      `probe_open_redirect`. The tests run your probe against in-memory handlers (no check, a prefix check, a
+      portal-style check, a strict check, a non-redirect) and against the practice portal: it must report all
+      four spellings on `make_app()` and exactly the backslash on the portal with `open-redirect` fixed, and
+      it must never follow a redirect.
+    project: security
+    files: [exercises/web/ssrf_redirect.py]
+    test: tests/web/test_ssrf_redirect.py
+    command: .venv/bin/python -m pytest tests/web/test_ssrf_redirect.py
+    modelAnswer: |
+      Normalise like a browser (drop tab, CR, LF; backslash to slash), resolve against the base, compare scheme,
+      host and port:
+
+      ```python
+      def leaves_origin(location, base_url):
+          cleaned = "".join(ch for ch in location if ch not in "\t\r\n").replace("\\", "/")
+          target, base = urlsplit(urljoin(base_url, cleaned)), urlsplit(base_url)
+          return (target.scheme, target.hostname, target.port) != (base.scheme, base.hostname, base.port)
+
+      def probe_open_redirect(send, base_url, payloads=PAYLOADS):
+          control = redirect_location(*send("/settings"))
+          if control is None or leaves_origin(control, base_url):
+              return []
+          return [Finding(n, v, loc) for n, v in payloads
+                  if (loc := redirect_location(*send(v))) is not None and leaves_origin(loc, base_url)]
+      ```
+    rubric:
+      - Every test in tests/web/test_ssrf_redirect.py passes.
+      - A local control value is sent first, and nothing is reported when it does not redirect or already leaves the origin.
+      - Location is judged with a browser's rules (backslash, tab, scheme, host and port), not a string match.
+      - The probe only reads headers - it never follows a redirect.
+    hints:
+      - Start with leaves_origin - the tests list the locations that must and must not leave.
+      - urljoin resolves a relative Location against the base; normalise first.
+      - Header names are case-insensitive.
+    solution: |
+      Control first, then each payload; judge the Location after browser-style normalisation by comparing the
+      origin, and report only those that leave it.
+
+  - id: ssrf-probe-code
+    type: coding
+    concept: sec-ssrf-server-side-fetch
+    skill: application
+    title: Write in-band and blind SSRF probes
+    prompt: |
+      In `practice/security/exercises/web/ssrf_probe.py`, implement `classify`, `probe_ssrf` and `probe_blind`.
+      The tests use fake targets, a real callback listener on loopback (`support/ssrf_fixture.py`) and the
+      practice portal: both probes must find the flaw on `make_app()` and stay quiet on `make_app({"ssrf"})`,
+      an error that merely echoes the URL must not count, and the listener must see your unique token and no
+      one else's.
+    project: security
+    files: [exercises/web/ssrf_probe.py]
+    test: tests/web/test_ssrf_probe.py
+    command: .venv/bin/python -m pytest tests/web/test_ssrf_probe.py
+    modelAnswer: |
+      ```python
+      def classify(status, body):
+          if 400 <= status < 500:
+              return "rejected"
+          if status >= 500:
+              return "unreachable"
+          try:
+              data = json.loads(body)
+          except ValueError:
+              return "not-fetched"
+          return "fetched" if isinstance(data, dict) and data.get("delivered") is True else "not-fetched"
+
+      def probe_ssrf(send, internal_url, marker):
+          status, body = send(internal_url)
+          if classify(status, body) != "fetched" or marker not in body:
+              return None
+          return Finding("in-band", internal_url, f"HTTP {status}: the answer contains {marker!r}")
+
+      def probe_blind(send, listener):
+          token = uuid.uuid4().hex[:12]
+          url = listener.url(token)
+          send(url)
+          return Finding("blind", url, f"the listener received GET /cb/{token}") if listener.saw(token) else None
+      ```
+    rubric:
+      - Every test in tests/web/test_ssrf_probe.py passes.
+      - The in-band probe needs both a fetch and a marker that only the internal page contains.
+      - The blind probe uses a fresh token and ignores the target's answer - only the listener's hit counts.
+      - Nothing is sent to any host other than the target and the loopback listener.
+    hints:
+      - classify only needs the status and the JSON field delivered.
+      - An echo of your own URL is in the body too - that is why a marker is required.
+      - uuid4 gives a unique token per call.
+    solution: |
+      Classify the answer, require fetch plus marker for in-band, and use a unique token with the listener for
+      blind proof.
+
+  - id: ssrf-policy-code
+    type: coding
+    concept: sec-ssrf-redirect-fix-verification
+    skill: application
+    title: Write the destination policy and the local-redirect check
+    prompt: |
+      In `practice/security/exercises/web/ssrf_policy.py`, implement `safe_next`, `parse_address`, `is_public`
+      and `check_webhook_url`. The tests are table-driven with a counting fake resolver (no network): local
+      paths survive and every off-site or ambiguous form falls back to the default; loopback in every spelling
+      is refused; names are resolved exactly once and the validated address is returned as `connect_ip`.
+    project: security
+    files: [exercises/web/ssrf_policy.py]
+    test: tests/web/test_ssrf_policy.py
+    command: .venv/bin/python -m pytest tests/web/test_ssrf_policy.py
+    modelAnswer: |
+      ```python
+      def safe_next(value, default="/settings"):
+          if not value or not value.startswith("/") or value.startswith("//"):
+              return default
+          if "\\" in value or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+              return default
+          parts = urlsplit(value)
+          return default if parts.scheme or parts.netloc else value
+
+      def parse_address(host):
+          bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+          if any(ch.isspace() for ch in bare):
+              return None
+          try:
+              ip = ipaddress.ip_address(bare)
+          except ValueError:
+              try:
+                  ip = ipaddress.IPv4Address(socket.inet_aton(bare))
+              except OSError:
+                  return None
+          if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+              return ip.ipv4_mapped
+          return ip
+      ```
+
+      `is_public` is `ip.is_global and not ip.is_multicast`; `check_webhook_url` checks scheme, backslash or
+      whitespace, userinfo, host, port, the optional allow-list, then resolves once and requires every
+      address to be public.
+    rubric:
+      - Every test in tests/web/test_ssrf_policy.py passes.
+      - Address literals are parsed in every spelling (short, decimal, hex, octal, bracketed IPv6, IPv4-mapped) and judged as addresses, not strings.
+      - A name is resolved once, every answer must be public, and the validated address is returned for connecting.
+      - Refusals carry a reason code, and scheme, userinfo, port and ambiguity are checked before any lookup.
+    hints:
+      - ipaddress rejects 127.1; socket.inet_aton accepts it - the tests print why.
+      - Unmap IPv4-mapped IPv6 before checking ranges.
+      - Return the address you checked, not the name, so a second lookup cannot change it.
+    solution: |
+      Parse every spelling to an address, require public addresses from one lookup, return the checked address,
+      and keep redirects to a single leading slash with no backslash or control characters.
+
+placement:
+  - id: place-ssrf
+    type: mcq
+    concept: sec-ssrf-server-side-fetch
+    skill: analysis
+    title: What does the marker prove?
+    prompt: |
+      You ask a webhook feature to fetch the internal admin page. The answer is
+      `{"delivered": true, "response_preview": "{\"admin\": true, \"settlement_key\": ...}"}`. What does this
+      prove?
+    options:
+      - id: ssrf
+        text: The server fetched an internal-only page for a client-chosen URL and returned its content - an in-band SSRF.
+        feedback: Correct - the marker comes from the internal page, which the client could not reach itself.
+      - id: validation
+        text: That the URL was validated successfully.
+        feedback: A validated URL would have been refused, not fetched.
+      - id: xss
+        text: A cross-site scripting flaw.
+        feedback: Nothing was reflected into a page; the server made the request.
+      - id: nothing
+        text: Nothing - a 200 is normal for webhooks.
+        feedback: The 200 is not the evidence - the internal content in the answer is.
+    correct: [ssrf]
+    solution: |
+      The answer contains content that exists only on the internal page, so the server fetched it on the
+      client's behalf.
+
+  - id: place-redirect
+    type: mcq
+    concept: sec-open-redirect-location
+    skill: application
+    title: Which redirect parameter value goes off-site?
+    prompt: |
+      A fix keeps only values that start with `/` and not `//`. Which value still sends a browser off the site?
+    options:
+      - id: backslash
+        text: '/\evil.example/'
+        feedback: Correct - browsers read the backslash as a slash, so it becomes //evil.example/.
+      - id: path
+        text: /settings?tab=email
+        feedback: A local path with a query string.
+      - id: root
+        text: /
+        feedback: The site's own home page.
+      - id: deep
+        text: /a/b/c#top
+        feedback: A local path with a fragment.
+    correct: [backslash]
+    solution: |
+      The check passes the backslash form because the string starts with a single slash; the browser's parser
+      treats it as a host.
+
+  - id: place-fix
+    type: mcq
+    concept: sec-ssrf-redirect-fix-verification
+    skill: analysis
+    title: Which evidence closes an SSRF finding?
+    prompt: Which set of evidence is enough to close an SSRF finding on a webhook feature?
+    options:
+      - id: full
+        text: The listener and in-band probes are quiet, loopback in every spelling and a name that resolves to it are refused, a redirect to an internal page is not followed, and the code resolves once and connects to the checked address.
+        feedback: Correct - behaviour on the siblings, on rebinding and redirects, and code evidence together.
+      - id: one-string
+        text: The URL `http://127.0.0.1/admin` is now refused.
+        feedback: That is one spelling; `127.1`, decimal, hex, IPv6 and names can still get through.
+      - id: doc
+        text: The documentation now says "do not use internal addresses".
+        feedback: Documentation does not stop a request.
+      - id: waf
+        text: A WAF rule blocks the word localhost.
+        feedback: A string rule is a deny-list - bypass-prone, as the cheat sheet puts it.
+    correct: [full]
+    solution: |
+      Close with evidence for the spellings, the name-resolution and redirect cases, and the code that checks
+      once and connects to what it checked.
+
+recall:
+  - id: recall-ssrf
+    concept: sec-ssrf-server-side-fetch
+    prompt: What is SSRF and what makes it dangerous?
+    answer: A feature fetches a URL the client chose, so the request comes from the server's network position - loopback, internal pages, metadata services - which the client could not reach itself.
+  - id: recall-proof
+    concept: sec-ssrf-server-side-fetch
+    prompt: What are the two safe proofs of SSRF?
+    answer: Blind - a callback to a listener you run, with a unique token. In-band - an internal-only page's marker appears in the answer. Stop there; never aim at third parties.
+  - id: recall-redirect
+    concept: sec-open-redirect-location
+    prompt: How do you test an open redirect safely, and which spellings do you try?
+    answer: Read the Location header and never follow it. Try a local control, then absolute, protocol-relative (//host), backslash (/\host), userinfo (site@evil) and an embedded tab.
+  - id: recall-browser
+    concept: sec-open-redirect-location
+    prompt: Why can a check that looks right still allow an off-site redirect?
+    answer: Browsers read a URL differently from the server's parser - backslash is a slash and tab/CR/LF are dropped - so a value that "starts with /" can still be //host.
+  - id: recall-fix-fetch
+    concept: sec-ssrf-redirect-fix-verification
+    prompt: What does a sound fix for a fetch-any-URL feature do?
+    answer: Allow only expected schemes and ports, parse the host in every spelling, resolve once, require every address to be public, connect to the checked address, disable redirects, and never return the raw response.
+  - id: recall-fix-redirect
+    concept: sec-ssrf-redirect-fix-verification
+    prompt: What is the safest fix for a redirect parameter?
+    answer: Do not take a URL at all - map an ID to a stored target - or accept only a local path (one leading slash, no backslash, no control characters, no scheme or host).
+  - id: recall-verify
+    concept: sec-ssrf-redirect-fix-verification
+    prompt: How do you verify an SSRF or redirect fix?
+    answer: Re-run the probes and the sibling spellings, test a name that resolves to loopback and a redirect to an internal page, check legitimate values still work, and read the check for raw string matching.
+
+next:
+  - testing-file-handling-and-path-traversal
+  - testing-security-misconfiguration
+  - owasp-api-security-top-10
+  - testing-jwt-and-oauth
