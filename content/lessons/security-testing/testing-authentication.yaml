@@ -1,0 +1,1356 @@
+id: testing-authentication
+title: Testing authentication
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Test a login the way the OWASP testing guide does - prove missing throttling with a small, bounded probe instead of a real brute-force attack, find user enumeration in the status, the message and the response time, check password rules against NIST SP 800-63B-4, and watch a fix open a new hole - all against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    authentication testing,
+    login,
+    WSTG-ATHN,
+    WSTG-IDNT-04,
+    brute force,
+    credential stuffing,
+    password spraying,
+    account lockout,
+    rate limiting,
+    throttling,
+    "429",
+    Retry-After,
+    lockout denial of service,
+    user enumeration,
+    timing attack,
+    quick exit,
+    password policy,
+    NIST SP 800-63B,
+    blocklist,
+    composition rules,
+    password expiry,
+    password hashing,
+    PBKDF2,
+    default credentials,
+    forced browsing,
+    secrets in logs,
+    OWASP,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, and curl,
+    on Linux. Every output in this lesson was printed by the code and commands shown, run on 20 November 2026
+    against the practice portal. **Response times depend on the machine**: the medians you measure will differ,
+    but the gaps the lesson relies on (about 60 ms in the fixture, about 117 ms in the portal) are large enough
+    to show up anywhere.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal that binds to `127.0.0.1` only. This lesson uses its `no-rate-limit`, `weak-hash` and
+    `secret-logging` flaws; `make_app({...})` builds the same portal with those flaws fixed (the fixed portal
+    allows 5 login attempts per account per 60 seconds, then answers `429` with `Retry-After: 60`, and stores
+    PBKDF2-SHA256 hashes with 600,000 iterations). `practice/security/support/auth_fixture.py` adds four tiny
+    login servers that each leak exactly one enumeration signal; its "slow hash" is a fixed 60 ms sleep so the
+    gap is the same on every machine. SandPay, its users and their passwords are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope - and
+    for login tests, agree in advance which accounts you may lock out. The probes in this lesson refuse any host
+    but the local portal and never send more than 20 attempts.
+  - **Testing guide:** OWASP Web Security Testing Guide v4.2 (the current stable release), as read on GitHub on
+    20 November 2026: [4.4 Authentication
+    Testing](https://github.com/OWASP/wstg/tree/v4.2/document/4-Web_Application_Security_Testing/04-Authentication_Testing)
+    - WSTG-ATHN-01 Credentials Transported over an Encrypted Channel, ATHN-02 Default Credentials, ATHN-03 Weak
+    Lock Out Mechanism, ATHN-04 Bypassing Authentication Schema, ATHN-05 Vulnerable Remember Password, ATHN-07
+    Weak Password Policy, ATHN-09 Weak Password Change or Reset Functionalities - and
+    [WSTG-IDNT-04](https://github.com/OWASP/wstg/blob/v4.2/document/4-Web_Application_Security_Testing/03-Identity_Management_Testing/04-Testing_for_Account_Enumeration_and_Guessable_User_Account.md)
+    Account Enumeration and Guessable User Account. Quotations are from those pages.
+  - **Standard:** NIST [SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b.html), Digital Identity
+    Guidelines - Authentication and Authenticator Management, part of the SP 800-63-4 suite (the page was dated
+    26 August 2025 when read). The password and throttling rules quoted here are from its sections on password
+    authenticators and rate limiting. It is written for US federal systems, but is widely used as the reference
+    for password rules.
+  - **Cheat sheets (OWASP Cheat Sheet Series, as documented on 20 November 2026):**
+    [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html) (generic
+    error messages, the "quick exit" timing example, account lockout) and [Credential Stuffing
+    Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Credential_Stuffing_Prevention_Cheat_Sheet.html)
+    (the brute force / credential stuffing / password spraying definitions).
+  - **Not repeated here:** sessions and cookies after login -
+    [Testing session management](#/lesson/testing-session-management); how to store passwords as a developer -
+    [Passwords, OAuth and OIDC](#/lesson/passwords-oauth-and-oidc); hashing and secrets in depth -
+    [Testing cryptography and sensitive data exposure](#/lesson/testing-cryptography-and-data-exposure); rate
+    limits on other endpoints and races - [Testing business logic, races and rate
+    limits](#/lesson/testing-business-logic-and-rate-limits).
+
+prerequisites:
+  - security-testing-fundamentals
+  - http-security-for-testers
+  - reconnaissance-and-attack-surface
+  - passwords-oauth-and-oidc
+
+concepts:
+  - id: sec-auth-guessing-throttling
+    name: Password guessing attacks and throttling
+    summary: Brute force tries many passwords on one account, credential stuffing tries pairs leaked from other sites, password spraying tries one common password on many accounts. A login must limit failed attempts per account (NIST caps it at no more than 100 consecutive failures), and the tester proves the limit with a small, bounded probe - then checks that the limit cannot be turned into a lockout of real users.
+  - id: sec-auth-enumeration
+    name: User enumeration through the login response
+    summary: If a login answers a known email with a wrong password differently from an unknown email - by status code, by message or by response time - an attacker can test a list of emails and keep the ones that exist. The tester compares the three signals over several interleaved samples, uses medians for time, and treats a throttled probe as inconclusive, not as safe.
+  - id: sec-auth-password-rules
+    name: Password rules and storage under NIST SP 800-63B-4
+    summary: SP 800-63B-4 asks for length (15 characters for single-factor passwords, 8 when the password is only one factor of MFA), a blocklist of common and compromised passwords compared against the whole password, at least 64 characters allowed, and forbids composition rules, periodic expiry, hints and truncation. Passwords must be stored with a slow, salted hash - and never written to logs.
+
+objectives:
+  - Distinguish brute force, credential stuffing and password spraying and name the control that stops each.
+  - Prove missing login throttling with a bounded probe that stops at the first 429 or success, and classify the result.
+  - Explain how account lockout becomes a denial of service and what to report about it.
+  - Find user enumeration in status codes, messages and response times with interleaved samples and medians.
+  - Explain why fixing password hashing can open a timing oracle, and how a constant-work login closes it.
+  - Check passwords and written policies against NIST SP 800-63B-4 and name each SHALL and SHOULD they break.
+  - Plan the WSTG-ATHN tests for a login, including default credentials, forced browsing and secrets in logs.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: The idea in plain language
+    body: |
+      Think of the SandPay merchant portal's login as the front desk of an office building. A guard checks a
+      name and a code before letting anyone up. An attacker has three ways to get past a guard who only checks
+      codes:
+
+      - **Keep guessing** the code for one name (brute force), try codes stolen from another building
+        (credential stuffing), or try the most popular code against every name on the board (password
+        spraying).
+      - **Learn which names are real** first. If the guard says "no such person" for one name and "wrong code"
+        for another - or simply takes longer to look a real person up - the attacker learns the staff list
+        without ever getting in.
+      - **Hope the codes are weak**: short, common, or written on a sticky note in the lobby (a password in a
+        log file).
+
+      Testing authentication is checking each of these. Does the guard stop someone who keeps guessing - and
+      can an attacker use that rule to lock real staff out? Does every wrong answer look and take the same? Are
+      the code rules the ones the current guidance asks for?
+
+      You test it without becoming the attacker: a handful of guesses is enough to prove that nobody is
+      counting, and comparing a few answers is enough to prove the guard gives names away. This lesson builds
+      those small probes and runs them against a deliberately vulnerable SandPay portal on your own machine -
+      and shows a "fixed" login that still leaks, because fixing one thing changed the timing of another.
+
+  - id: what
+    kind: what
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Authentication** | proving who you are - here, an email and a password at `POST /api/login` |
+      | **Brute force** | "Testing multiple passwords from dictionary or other source against a single account." (OWASP) |
+      | **Credential stuffing** | "Testing username/password pairs obtained from the breach of another site." (OWASP) |
+      | **Password spraying** | "Testing a single weak password against a large number of different accounts." (OWASP) |
+      | **Throttling / rate limiting** | slowing or refusing attempts after too many failures; the portal answers `429 Too Many Requests` with `Retry-After` |
+      | **Account lockout** | refusing every login for an account for a while after N failures - including the right password |
+      | **Lockout threshold / window / duration** | how many failures, within what period, lock for how long (the Authentication Cheat Sheet's three factors) |
+      | **User enumeration** | learning which accounts exist from differences in the login's answers (WSTG-IDNT-04) |
+      | **Discrepancy factor** | any difference between those answers - status, body or time ([CWE-204](https://cwe.mitre.org/data/definitions/204.html), as the cheat sheet cites) |
+      | **Quick exit** | returning early for an unknown user, skipping the slow password hash - a timing discrepancy |
+      | **Blocklist** | NIST's term for the list of "commonly used, expected, or compromised" passwords a verifier must reject |
+      | **Composition rules** | "requiring mixtures of different character types" - which SP 800-63B-4 says verifiers "SHALL NOT impose" |
+      | **Single-factor / MFA** | the password alone, or the password plus another factor; SP 800-63B-4 sets different minimum lengths |
+
+      The WSTG v4.2 authentication tests this lesson covers:
+
+      | ID | Test | Where in this lesson |
+      | --- | --- | --- |
+      | WSTG-ATHN-01 | Credentials transported over an encrypted channel | steps, tests |
+      | WSTG-ATHN-02 | Default credentials | steps, tests |
+      | WSTG-ATHN-03 | Weak lock out mechanism | the throttling probe |
+      | WSTG-ATHN-04 | Bypassing authentication schema | the example (forced browsing) |
+      | WSTG-ATHN-05 | Vulnerable remember password | steps |
+      | WSTG-ATHN-07 | Weak password policy | the password checker |
+      | WSTG-ATHN-09 | Weak password change or reset | steps, tests |
+      | WSTG-IDNT-04 | Account enumeration and guessable user account | the enumeration check |
+
+  - id: why
+    kind: why
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Why the login deserves its own tests
+    body: |
+      Everything else in the portal trusts the login. A merchant who signs in can list payments, change the
+      payout email and test webhooks; if an attacker can sign in as that merchant, every access-control check
+      after the login works perfectly - for the attacker. WSTG-ATHN-03 puts it plainly: "the result of a
+      successful attack is dangerous as the attacker will have full access on the user account and with it all
+      the functionality and services they have access to."
+
+      The attacks are cheap. Lists of breached email and password pairs and of the most common passwords are
+      public, so credential stuffing and spraying need no cleverness, only a login that keeps answering. And
+      they are quiet: each attempt is an ordinary, well-formed request, so functional tests that only check "the
+      right password works and a wrong one fails" pass against a login that is wide open.
+
+      Enumeration multiplies the damage. With a list of real accounts the attacker stops wasting guesses on
+      emails that do not exist, sprays more accounts below any per-account limit, and can phish the real
+      merchants. The OWASP Authentication Cheat Sheet asks for a response that is generic "regardless of
+      whether" the user ID or the password was wrong - status, message and timing included.
+
+      And the rules users live with matter. SP 800-63B-4 turned years of advice around: long passwords and a
+      blocklist instead of "one capital, one digit, one symbol, change every 90 days". A tester who still files
+      "no special character required" as a finding is testing against advice the standard now forbids.
+
+  - id: guessing-internals
+    kind: internals
+    concepts: [sec-auth-guessing-throttling]
+    title: How guessing attacks and throttling work
+    body: |
+      The three attacks differ in **which counter they hit**:
+
+      | Attack | Per account | Per source | What stops it |
+      | --- | --- | --- | --- |
+      | Brute force | many attempts | many | a per-account limit (lockout or throttling) |
+      | Credential stuffing | one or two attempts | many, often spread over many IPs | MFA, blocklists of breached passwords, bot and anomaly detection |
+      | Password spraying | one attempt | many | MFA, a blocklist that rejects the common password at sign-up, detection across accounts |
+
+      The cheat sheet advises that "the counter of failed logins should be associated with the account itself,
+      rather than the source IP address", because a per-IP counter is defeated by spreading attempts over many
+      addresses. But a per-account counter cannot see spraying or stuffing, which never try the same account
+      twice - that is why MFA is called "by far the best defense" against them.
+
+      **What NIST asks for.** SP 800-63B-4: "the verifier SHALL limit consecutive failed authentication
+      attempts using a specific authenticator on a single subscriber account to no more than 100 by disabling
+      that authenticator." And: "The limit of 100 attempts is an upper bound, and agencies MAY impose lower
+      limits." It also lists ways to reduce the chance "that an attacker will lock the legitimate claimant out
+      due to rate limiting", such as a bot-detection challenge or "requiring the claimant to wait after a failed
+      attempt for a period of time that increases as the subscriber account approaches its maximum allowance".
+
+      **Lockout is a weapon too.** A per-account lock refuses the right password as well - so anyone who knows
+      an email can lock its owner out. WSTG-ATHN-03 notes a manual-unlock policy "may lead to a denial-of-service
+      attack if an attacker's goal is to lock the accounts of all users", and the cheat sheet says "care must be
+      taken to prevent it from being used to cause a denial of service by locking out other users' accounts".
+      The tester's job is to report **both**: whether guessing is limited, and whether the limit can be turned
+      against real users.
+
+      **The SandPay portal.** With `no-rate-limit` present, the portal answers every attempt. Fixed, it keeps
+      the times of attempts per email and refuses the sixth within 60 seconds:
+
+      ```python
+      recent = [t for t in self.login_attempts.get(email, []) if now - t < LOGIN_WINDOW_S]
+      if len(recent) >= LOGIN_LIMIT:            # LOGIN_LIMIT = 5, LOGIN_WINDOW_S = 60.0
+          resp = Response.json({"error": "too many attempts"}, 429)
+          resp.headers.append(("Retry-After", str(int(LOGIN_WINDOW_S))))
+          return resp
+      ```
+
+      It counts per email and refuses the right password too - a lockout, with the denial-of-service side the
+      example section measures.
+
+  - id: enumeration-internals
+    kind: internals
+    concepts: [sec-auth-enumeration]
+    title: How a login gives accounts away - and how a fix can make it worse
+    body: |
+      WSTG-IDNT-04's method is a comparison: record the answer for a valid user with a wrong password, then for
+      a nonexistent user, and look for differences, because "Generally the application should respond with the
+      same error message and length to the different incorrect requests." The cheat sheet adds the two quieter
+      signals: the status code ("Even though a generic error page is shown to a user, the HTTP response code
+      may differ") and time.
+
+      The timing leak comes from the **quick exit**. The cheat sheet's first pseudo-code looks up the user and
+      returns at once if there is none; only real users get their password hashed:
+
+      ```text
+      IF USER_EXISTS(username) THEN
+          password_hash=HASH(password)
+          IS_VALID=LOOKUP_CREDENTIALS_IN_STORE(username, password_hash)
+          IF NOT IS_VALID THEN
+              RETURN Error("Invalid Username or Password!")
+          ENDIF
+      ELSE
+         RETURN Error("Invalid Username or Password!")
+      ENDIF
+      ```
+
+      "If the user doesn't exist, the application will directly throw an error. Otherwise ... there will be
+      more processing before the application errors out." The messages are identical; the time is not.
+
+      **Why a fix makes it worse.** The SandPay portal has exactly this shape. While it stores unsalted MD5
+      (`weak-hash`), hashing takes microseconds and the gap is invisible. Fix `weak-hash` - PBKDF2-SHA256 with
+      600,000 iterations, a correct choice - and every login for a real user now costs about a hundred
+      milliseconds, while unknown emails still return at once. The run in the example section measured 118.8 ms
+      against 1.7 ms. A good fix to password storage opened a timing oracle, because nobody re-tested
+      enumeration after it.
+
+      **The constant-work fix** is the cheat sheet's second pseudo-code: hash the submitted password every
+      time, against a dummy hash for unknown users, so both paths do the same work. The fixture's `uniform`
+      server does this; its medians came out 62.3 ms and 62.5 ms.
+
+      **Measuring time honestly.** Single requests are noisy, so take several per email, **interleave** them
+      (known, unknown, known, ...) so drift on a busy machine hits both equally, and compare **medians**, which
+      ignore the occasional slow outlier. Require both an absolute gap and a ratio before calling it a finding:
+      6 ms against 1 ms is noise; 118 ms against 2 ms is not.
+
+  - id: when
+    kind: when
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: When to run these tests - and what they do not replace
+    body: |
+      - **Every login, and every other place a password or code is checked:** password reset, "change email"
+        confirmation, 2FA code entry, API token exchange, the mobile API. WSTG-ATHN-03 says to "repeat this
+        process to every possible functionality that could require a lockout mechanism", and CAPTCHA bypass
+        includes "alternative methods that might not have CAPTCHA enforced, such as an API endpoint meant to
+        facilitate mobile app access".
+      - **After any change to authentication code** - a new hash, a new framework, a new SSO path. The SandPay
+        timing oracle appeared after a security fix.
+      - **Early in a test window for lockout tests.** WSTG-ATHN-03: "If you have only one account with which you
+        can log on to the web application, perform this test at the end of your test plan to avoid losing testing
+        time by being locked out." Agree with the owner which accounts you may lock.
+      - **On the written policy, not only the running system.** A password policy in a requirements document
+        can be audited against SP 800-63B-4 before any code exists.
+
+      What these tests do **not** replace:
+
+      - **Session tests.** A perfect login is useless if the session cookie can be stolen or fixed - see
+        [Testing session management](#/lesson/testing-session-management).
+      - **Access control.** Authentication says who you are; authorisation says what you may do - see
+        [Testing access control and IDOR](#/lesson/testing-access-control-idor).
+      - **A real brute-force run.** You prove that nothing stops guessing; you do not need to crack a password
+        to report it, and on a real system you must not.
+
+  - id: visual
+    kind: visual
+    concepts: [sec-auth-guessing-throttling]
+    title: The bounded probe against the fixed portal
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant P as Probe (max 10 attempts)
+        participant L as POST /api/login
+        participant A as Alice (real merchant)
+        P->>L: "alice, guess-1 ... guess-5"
+        L-->>P: "401 x 5"
+        P->>L: "alice, guess-6"
+        L-->>P: "429, Retry-After 60"
+        Note over P: stop at the first 429 - finding: throttled after 5
+        A->>L: "alice, correct password"
+        L-->>A: "429 too many attempts"
+        Note over A,L: the limit locks the real owner out - report it as a denial-of-service risk
+      ```
+
+      Notice that the probe stops itself at the first `429`: it is proving that a limit exists, not trying to
+      get past it. And the last two arrows are the second finding - the same limit refuses Alice's correct
+      password for the next minute.
+
+  - id: curl-evidence
+    kind: code
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration]
+    title: "Evidence with curl: throttling, and a page that skips the login"
+    body: |
+      Start the portal with only `no-rate-limit` fixed, then send six wrong passwords and the right one:
+
+      ```bash
+      cd practice/security
+      .venv/bin/python support/sandpay_vuln.py --port 8765 --fix no-rate-limit &
+      for i in 1 2 3 4 5 6; do
+        curl -s -o /dev/null -w "attempt $i: %{http_code}\n" -X POST http://127.0.0.1:8765/api/login \
+          -H 'Content-Type: application/json' \
+          -d '{"email":"alice@shop-a.example","password":"guess-'$i'"}'
+      done
+      curl -si -X POST http://127.0.0.1:8765/api/login -H 'Content-Type: application/json' \
+        -d '{"email":"alice@shop-a.example","password":"alice-pass-1"}'
+      ```
+
+      ```plaintext
+      attempt 1: 401
+      attempt 2: 401
+      attempt 3: 401
+      attempt 4: 401
+      attempt 5: 401
+      attempt 6: 429
+      HTTP/1.1 429 Too Many Requests
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Retry-After: 60
+      Content-Length: 30
+
+      {"error": "too many attempts"}
+      ```
+
+      (The `Date` header is left out of every response in this lesson.) The sixth attempt and the correct
+      password both get `429`: throttling, and a lockout of the real owner.
+
+      WSTG-ATHN-04's first check is a **direct page request**: ask for something that should need a login,
+      without one.
+
+      ```bash
+      curl -si http://127.0.0.1:8765/internal/admin
+      curl -si http://127.0.0.1:8765/api/me
+      ```
+
+      ```plaintext
+      HTTP/1.1 200 OK
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 59
+
+      {"admin": true, "settlement_key": "sk_practice_do_not_use"}
+
+      HTTP/1.1 401 Unauthorized
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 36
+
+      {"error": "authentication required"}
+      ```
+
+      `/api/me` is protected; `/internal/admin` is not - the portal "protects" it by trusting callers on the
+      same machine, which is exactly what makes it the target of the
+      [SSRF lesson](#/lesson/testing-ssrf-and-open-redirects).
+
+  - id: probe-code
+    kind: code
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration]
+    title: The two probes
+    collapsed: true
+    body: |
+      The throttling probe (`practice/security/solutions/web/auth_throttling.py`, core):
+
+      ```python
+      def probe_login_throttling(base_url, email, wordlist, max_attempts=10, path="/api/login", session=None):
+          _require_loopback(base_url)
+          if not 1 <= max_attempts <= MAX_ATTEMPTS_CAP:            # MAX_ATTEMPTS_CAP = 20
+              raise ValueError(f"max_attempts must be between 1 and {MAX_ATTEMPTS_CAP}")
+          http = session or requests.Session()
+          statuses = []
+          result = {"attempts": 0, "statuses": statuses, "throttled": False, "throttled_after": None,
+                    "retry_after": None, "found": None}
+          for password in wordlist[:max_attempts]:
+              r = http.post(base_url + path, json={"email": email, "password": password}, timeout=10)
+              statuses.append(r.status_code)
+              result["attempts"] = len(statuses)
+              if r.status_code == 429:
+                  result.update(throttled=True, throttled_after=len(statuses) - 1,
+                                retry_after=r.headers.get("Retry-After"))
+                  break
+              if r.status_code == 200:
+                  result["found"] = password
+                  break
+          return result
+
+
+      def classify(result, min_attempts=10):
+          if result["throttled"]:
+              return "throttled"
+          if result["found"] is not None:
+              return "password-found"
+          if result["attempts"] >= min_attempts:
+              return "missing-rate-limit"
+          return "inconclusive"
+      ```
+
+      The enumeration comparison (`auth_enumeration.py`, core):
+
+      ```python
+      def compare(known, unknown, min_delta_ms=25.0, min_ratio=3.0):
+          if not known or not unknown:
+              raise ValueError("need at least one observation for each email")
+          signals = []
+          if {o.status for o in known} != {o.status for o in unknown}:
+              signals.append("status")
+          if {o.body for o in known} != {o.body for o in unknown}:
+              signals.append("message")
+          k = statistics.median(o.ms for o in known)
+          u = statistics.median(o.ms for o in unknown)
+          slow, fast = max(k, u), min(k, u)
+          if slow - fast >= min_delta_ms and slow >= min_ratio * max(fast, 1.0):
+              signals.append("timing")
+          return {"enumerable": bool(signals), "signals": signals,
+                  "known_median_ms": round(k, 1), "unknown_median_ms": round(u, 1)}
+
+
+      def check_enumeration(base_url, known_email, unknown_email, samples=4, path="/api/login"):
+          # ... loopback check ...
+          for _ in range(samples):
+              for email, bucket in ((known_email, known), (unknown_email, unknown)):
+                  o = observe(http, url, email)
+                  if o.status == 429:
+                      return {"enumerable": None, "signals": [], "rate_limited": True}
+                  bucket.append(o)
+          return {**compare(known, unknown), "rate_limited": False}
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration]
+    title: Why the probes are written that way
+    body: |
+      - `_require_loopback(base_url)` **before** anything else - and the tests prove with a recording session
+        that no request is sent for any other host. A login probe pointed at the wrong host is an attack on
+        someone else.
+      - `MAX_ATTEMPTS_CAP = 20` and `wordlist[:max_attempts]`: the probe proves that nothing is counting; it is
+        not a password cracker. Ten normal answers in a row is already the evidence.
+      - `break` on `429`: once the server pushes back, the limit exists - more requests only lock the account
+        for longer.
+      - `break` on `200`: a password worked. That is a weak-password finding, and continuing would only log you
+        in again.
+      - `throttled_after=len(statuses) - 1`: the number of attempts answered **before** the refusal - the
+        observed lockout threshold you report (5 for the fixed portal).
+      - `classify(...)` returns `"inconclusive"` for a short run: four normal answers do not prove a missing
+        limit when the threshold could be five.
+      - `compare` uses **sets** of statuses and bodies: one different answer among several is already a signal.
+      - `statistics.median`, not the mean: one slow request (garbage collection, a busy CPU) would drag a mean
+        across the threshold. The tests feed in one 400 ms outlier to check this.
+      - `slow - fast >= min_delta_ms and slow >= min_ratio * max(fast, 1.0)`: both an absolute gap and a ratio,
+        so 6 ms against 1 ms (noise) and 330 ms against 300 ms (a slow server) are not findings, while 118.8 ms
+        against 1.7 ms is.
+      - The inner loop alternates known and unknown emails: interleaving spreads any drift over both.
+      - `return {"enumerable": None, ...}` on `429`: a throttled probe learned nothing. "Not enumerable" would
+        be a false negative.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Testing a login, step by step
+    body: |
+      1. **Agree scope and test accounts.** Which login endpoints (web, API, mobile), which accounts you may
+         lock, and who unlocks them.
+      2. **ATHN-01, encrypted channel.** Check that the login form and API are only served over HTTPS and that
+         plain HTTP redirects before any credentials are sent; look at where the form posts to.
+      3. **ATHN-02, default credentials.** Try the names WSTG lists - "admin", "administrator", "root",
+         "system", "guest", "operator" and "super" - with blank and common passwords on admin interfaces you
+         are allowed to test, and check whether new accounts get predictable passwords.
+      4. **IDNT-04, enumeration.** Compare a known and an unknown email with the same wrong password: status,
+         body, time (several interleaved samples, medians). Repeat on reset and sign-up forms.
+      5. **ATHN-03, throttling.** With an account you may lock, send a bounded run of wrong passwords; record
+         the threshold, the response (429, message, delay) and `Retry-After`; then try the **correct** password
+         to see whether the real owner is locked out, and for how long.
+      6. **ATHN-04, bypass.** Request protected pages and API calls directly, without a session; try parameter
+         changes such as `?authenticated=yes` that WSTG describes.
+      7. **ATHN-05, remember password.** Check what a "remember me" cookie contains and whether it can be
+         reused or forged.
+      8. **ATHN-07, password policy.** Read the policy and try passwords against it: length limits, a common
+         password, the username as password, a 64-character passphrase, Unicode.
+      9. **ATHN-09, change and reset.** Does change require the current password? Do reset links expire and
+         work once? Does reset leak whether the account exists?
+      10. **Logs.** With the owner's permission, check what a login writes to logs - never a password.
+      11. **Report** each finding with the request, the response and the counts, and the standard it breaks.
+
+  - id: example
+    kind: example
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: "Example: the portal before and after its fixes"
+    body: |
+      SandPay's team fixed three authentication findings: `no-rate-limit`, `weak-hash` and `secret-logging`.
+      The re-test runs the probes against both builds.
+
+      **Throttling and lockout:**
+
+      ```plaintext
+      vulnerable {'attempts': 10, 'statuses': [401, 401, 401, 401, 401, 401, 401, 401, 401, 401], 'throttled': False, 'throttled_after': None, 'retry_after': None, 'found': None} -> missing-rate-limit
+      no-rate-limit fixed {'attempts': 6, 'statuses': [401, 401, 401, 401, 401, 429], 'throttled': True, 'throttled_after': 5, 'retry_after': '60', 'found': None} -> throttled
+        alice, correct password, right after the probe: 429 60 {"error": "too many attempts"}
+        bob, correct password: 200
+      ```
+
+      Throttling works - and it is a lockout: for 60 seconds Alice cannot sign in even with her password, while
+      Bob is unaffected. The finding is fixed; the re-test adds a new, lower-severity note that anyone knowing a
+      merchant's email can keep them out of the portal by sending five wrong passwords a minute.
+
+      **Enumeration:**
+
+      ```plaintext
+      portal vulnerable (MD5) {'enumerable': False, 'signals': [], 'known_median_ms': 1.0, 'unknown_median_ms': 0.9, 'rate_limited': False}
+      portal all flaws fixed {'enumerable': True, 'signals': ['timing'], 'known_median_ms': 118.8, 'unknown_median_ms': 1.7, 'rate_limited': False}
+      ```
+
+      The vulnerable portal did not leak accounts; the **fixed** one does. The status and the message are the
+      same for both emails (`401`, `{"error": "invalid email or password"}`), but a real merchant's email now
+      takes about 117 ms longer: PBKDF2 runs only when the account exists. That is a new finding caused by the
+      `weak-hash` fix, and the reason a re-test runs the whole authentication checklist, not only the fixed
+      items.
+
+      **Secrets in logs:** after one sign-in, the first two access log lines of each build:
+
+      ```plaintext
+      vulnerable ['login attempt email=alice@shop-a.example password=alice-pass-1', 'POST /api/login 200']
+      secret-logging fixed ['login attempt email=alice@shop-a.example', 'POST /api/login 200']
+      ```
+
+      A password in a log is readable by everyone with log access, copied into backups and log platforms, and
+      outlives any password change. Fixed - and the tester checks the failed-login path too, because that is
+      where a mistyped password (often the user's password for another site) is most likely to be logged.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Test cases for the SandPay login
+    body: |
+      | # | Test | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Throttling exists | 10 wrong passwords for a test account, stop at first 429 | 429 at or before the documented threshold, with `Retry-After` | status list, threshold, header |
+      | 2 | Lockout DoS | after test 1, correct password for that account; correct password for another | documented behaviour; the other account unaffected | both statuses, timestamps |
+      | 3 | Limit is per account | spread the 10 attempts over two client sessions | still throttled | statuses per session |
+      | 4 | Message enumeration | same wrong password, known vs unknown email | identical status and body | both raw responses |
+      | 5 | Timing enumeration | 4+ interleaved samples each, medians | medians within the threshold (about 25 ms) | samples, medians |
+      | 6 | Enumeration elsewhere | repeat 4 and 5 on reset and sign-up | identical answers | raw responses |
+      | 7 | Password rules | 14 and 15 characters, a blocklisted password, a 64-character passphrase with spaces | rejected, rejected, accepted, accepted | responses |
+      | 8 | No composition rules | `correct horse battery staple` | accepted | response |
+      | 9 | Storage | with the owner, read one stored hash | salted, slow hash (for example PBKDF2 or bcrypt), not MD5 or SHA-1 alone | redacted hash format |
+      | 10 | Logs | sign in once, fail once, read the logs | no password in any line | log lines |
+      | 11 | Forced browsing | request admin and API pages with no session | 401 or a redirect to login | statuses |
+      | 12 | Default accounts | admin, test and similar names with common passwords, within the agreed attempt budget | all refused | statuses |
+
+      Negative controls keep the tests honest: the throttling probe must report `missing-rate-limit` on the
+      vulnerable build, and the enumeration check must report nothing on the fixture's `uniform` server.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Brute-forcing to prove brute force.** Ten normal answers prove that nothing is counting; cracking a
+        real user's password proves nothing more and breaks your rules of engagement.
+      - **Forgetting the lockout side.** A report that says "throttling: fixed" without trying the correct
+        password afterwards misses the denial-of-service risk.
+      - **Testing only the web form.** The mobile API, the token endpoint and the reset form need the same
+        limits. WSTG names the mobile API as a typical bypass.
+      - **One request per email for timing.** A single sample is noise; take several, interleave them, use
+        medians, and require a clear gap.
+      - **Reading a 429 as "no enumeration".** If the server throttled the probe, you learned nothing. Wait for
+        the window, lower the sample count, or use another test account.
+      - **Re-testing only the fixed item.** The SandPay timing oracle appeared because of the `weak-hash` fix.
+      - **Filing outdated password findings.** "No special character required" and "passwords never expire"
+        are what SP 800-63B-4 asks for, not findings. "Only 8 characters required" for a single-factor password
+        is a finding.
+      - **Ignoring the success path in logs.** Check both the successful and the failed login.
+
+      **Debugging method** when a result looks wrong: re-run the request by hand with curl and compare the raw
+      responses; confirm which build you are testing (the flaw ids in use); check whether an earlier test
+      locked the account (wait for `Retry-After`); for timing, run the samples again on an idle machine and
+      check that the gap is stable before you report it.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Trade-offs and alternatives
+    body: |
+      - **Lockout versus slowing down.** A hard lock stops guessing but hands attackers a denial-of-service
+        tool. Increasing delays, a bot-detection challenge after a few failures, or unlocking through a reset
+        link (the cheat sheet's suggestion) keep the protection with less harm - SP 800-63B-4 lists the first
+        two.
+      - **Per account versus per source.** Per-account counters resist attackers with many IP addresses but
+        not spraying; per-source counters catch spraying from one source but not botnets. Real systems combine
+        them with detection across accounts.
+      - **Generic messages versus usability.** The cheat sheet admits a generic message is "a User Experience
+        (UX) matter": a real user who mistyped their email is not told so. Sign-up usually has to say "this
+        email is taken" - so it needs its own rate limit or a confirmation email instead.
+      - **Slow hashing versus timing.** A slow hash is right for storage, but it makes a quick exit visible.
+        Hash a dummy for unknown users so both paths cost the same.
+      - **MFA.** Stops most guessing attacks outright, but adds its own surface (code guessing, recovery
+        flows) that needs the same throttling tests.
+      - **Probe thresholds.** The 25 ms / 3x timing rule and the 10-attempt evidence rule are this lesson's
+        choices, not a standard; on noisy networks you need more samples and a wider gap.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-auth-guessing-throttling, sec-auth-enumeration, sec-auth-password-rules]
+    title: Quick reference
+    body: |
+      - Brute force (many passwords, one account), stuffing (leaked pairs), spraying (one password, many
+        accounts). Per-account limits stop the first; MFA and blocklists the other two.
+      - Prove missing throttling with a bounded probe: stop at the first 429 or 200; report the threshold and
+        `Retry-After`; then test the correct password for the lockout DoS.
+      - SP 800-63B-4: no more than 100 consecutive failures per account (an upper bound).
+      - Enumeration: compare status, body and time for known vs unknown emails; interleave, use medians, need a
+        clear gap; a 429 means inconclusive.
+      - The quick exit leaks time once hashing is slow - hash a dummy for unknown users.
+      - Passwords (SP 800-63B-4): at least 15 characters single-factor, 8 when one factor of MFA; allow at least
+        64; whole-password blocklist; no composition rules, no periodic expiry, no hints, no truncation.
+      - Store with a slow, salted hash; never log a password, on success or failure.
+      - Re-test the whole checklist after any authentication fix.
+
+exercises:
+  - id: attack-name
+    type: mcq
+    concept: sec-auth-guessing-throttling
+    skill: recognition
+    title: Name the attack
+    prompt: |
+      SandPay's logs show `Summer2026!` tried once against each of 4,800 merchant accounts over two hours, from
+      40 IP addresses. Which attack is this?
+    options:
+      - id: spraying
+        text: Password spraying
+        feedback: Correct - one common password against many accounts, one attempt each.
+      - id: brute
+        text: Brute force
+        feedback: Brute force tries many passwords against one account; here every account got one attempt.
+      - id: stuffing
+        text: Credential stuffing
+        feedback: Stuffing uses username and password pairs leaked from another site - each account would get its own password.
+      - id: enumeration
+        text: User enumeration
+        feedback: Enumeration learns which accounts exist; this run is trying to get into them.
+    correct: [spraying]
+    hints:
+      - Count how many passwords and how many accounts are involved.
+    solution: |
+      One password, many accounts, one attempt each: password spraying (OWASP's definition). It stays below any
+      per-account limit, which is why MFA and a blocklist that rejects such passwords at sign-up matter.
+
+  - id: lockout-blind-spot
+    type: mcq
+    concept: sec-auth-guessing-throttling
+    skill: analysis
+    title: What a per-account limit cannot see
+    prompt: |
+      The fixed portal locks an email after 5 failures in 60 seconds. Against which attack does that limit do
+      almost nothing?
+    options:
+      - id: spraying
+        text: Password spraying across thousands of merchants
+        feedback: Correct - each account gets one attempt, so no account ever reaches 5.
+      - id: brute
+        text: Brute force against Alice's account
+        feedback: The limit stops this after 5 guesses a minute - it is exactly what per-account limits are for.
+      - id: distributed-brute
+        text: Brute force against Alice from 100 IP addresses
+        feedback: The counter is per email, not per IP, so the attempts still add up on Alice's account.
+      - id: online-guess
+        text: Guessing Alice's password through the login form by hand
+        feedback: Manual guessing against one account hits the same per-account limit.
+    correct: [spraying]
+    hints:
+      - Which attack never tries the same account twice?
+    solution: |
+      A per-account counter sees attempts per account. Spraying and stuffing make one or two per account, so
+      they need MFA, breached-password blocklists and detection across accounts.
+
+  - id: nist-length
+    type: mcq
+    concept: sec-auth-password-rules
+    skill: recall
+    title: Minimum length under SP 800-63B-4
+    prompt: |
+      The SandPay portal uses a password as its only factor. What minimum length does SP 800-63B-4 require?
+    options:
+      - id: fifteen
+        text: 15 characters
+        feedback: Correct - "passwords that are used as a single-factor authentication mechanism" must be at least 15.
+      - id: eight
+        text: 8 characters
+        feedback: 8 is the minimum only for passwords used as part of multi-factor authentication.
+      - id: twelve
+        text: 12 characters, with a capital letter and a digit
+        feedback: 12 is not the NIST figure, and composition rules are forbidden.
+      - id: sixty-four
+        text: 64 characters
+        feedback: 64 is the maximum a verifier SHOULD at least allow, not a minimum.
+    correct: [fifteen]
+    hints:
+      - The answer depends on whether the password is the only factor.
+    solution: |
+      Single-factor passwords: at least 15 characters. As one factor of MFA: at least 8. Verifiers SHOULD allow
+      at least 64.
+
+  - id: nist-composition
+    type: mcq
+    concept: sec-auth-password-rules
+    skill: application
+    title: The legacy policy
+    prompt: |
+      A requirement says: "Passwords must be 16 or more characters and contain an upper-case letter, a digit and
+      a symbol." How do you report it against SP 800-63B-4?
+    options:
+      - id: composition
+        text: The length is fine; the composition rule breaks a SHALL NOT
+        feedback: Correct - "Verifiers and CSPs SHALL NOT impose other composition rules (e.g., requiring mixtures of different character types)".
+      - id: fine
+        text: It meets the standard - it is stricter than required
+        feedback: Stricter is not the test; the standard forbids composition rules outright.
+      - id: too-short
+        text: The length is too short
+        feedback: 16 is above the single-factor minimum of 15.
+      - id: missing-expiry
+        text: It is missing a 90-day expiry
+        feedback: SP 800-63B-4 says verifiers SHALL NOT require periodic changes.
+    correct: [composition]
+    hints:
+      - Read the requirement as two rules and check each.
+    solution: |
+      Length passes; the mixture of character types is a composition rule, which SP 800-63B-4 forbids. Users
+      respond to such rules with predictable patterns rather than stronger passwords.
+
+  - id: nist-expiry
+    type: mcq
+    concept: sec-auth-password-rules
+    skill: application
+    title: When must a password change?
+    prompt: Under SP 800-63B-4, when SHALL a verifier force a password change?
+    options:
+      - id: compromise
+        text: When there is evidence that the password has been compromised
+        feedback: Correct - periodic changes are forbidden, but a change is forced "if there is evidence that the authenticator has been compromised".
+      - id: ninety
+        text: Every 90 days
+        feedback: Verifiers "SHALL NOT require subscribers to change passwords periodically".
+      - id: never
+        text: Never - users choose when to change
+        feedback: Evidence of compromise is the one case where a change is required.
+      - id: failures
+        text: After 5 failed login attempts
+        feedback: Failed attempts call for throttling, not a password change.
+    correct: [compromise]
+    hints:
+      - The standard forbids one kind of change and requires another.
+    solution: |
+      No periodic expiry; a forced change on evidence of compromise (for example the password appears in a
+      breach corpus).
+
+  - id: timing-cause
+    type: mcq
+    concept: sec-auth-enumeration
+    skill: analysis
+    title: Why does the fixed portal leak?
+    prompt: |
+      Re-testing the fixed portal, the enumeration check reports `'signals': ['timing']`, with medians of
+      118.8 ms for `alice@shop-a.example` and 1.7 ms for `nobody@shop-a.example`. Status and body are identical.
+      What is the most likely cause?
+    options:
+      - id: quick-exit
+        text: The login returns early for unknown emails and only hashes the password for real accounts
+        feedback: Correct - the quick exit; with PBKDF2 the hash costs about 117 ms, so real accounts are slower.
+      - id: rate-limit
+        text: The rate limiter adds a delay for Alice's account
+        feedback: The limiter answers 429 after 5 attempts; it adds no delay to the 401s, and the probe saw no 429.
+      - id: database
+        text: Alice's account is slow to find in the database
+        feedback: A lookup by email costs about the same for both; the vulnerable build showed 1.0 against 0.9 ms with the same lookup.
+      - id: network
+        text: Network noise on the test machine
+        feedback: Noise does not produce a stable 117 ms gap in the medians of interleaved samples.
+    correct: [quick-exit]
+    hints:
+      - What changed between the vulnerable build (no gap) and the fixed one?
+    solution: |
+      The `weak-hash` fix made hashing slow, and the hash runs only for existing accounts. Hash a dummy password
+      for unknown emails so both paths do the same work.
+
+  - id: interleave-why
+    type: mcq
+    concept: sec-auth-enumeration
+    skill: recall
+    title: Why interleave?
+    prompt: |
+      The enumeration check sends known, unknown, known, unknown ... instead of four known then four unknown.
+      Why?
+    options:
+      - id: drift
+        text: So that slow drift on the machine or server affects both emails equally
+        feedback: Correct - a burst of load during one block would look like a difference between the emails.
+      - id: rate
+        text: To stay under the rate limit
+        feedback: The same number of attempts per email is sent either way.
+      - id: cache
+        text: To stop the server caching the first answer
+        feedback: Order does not change caching of login responses.
+      - id: medians
+        text: Because medians need alternating samples
+        feedback: A median works on any order; interleaving protects against drift, not the statistic.
+    correct: [drift]
+    hints:
+      - Imagine the machine gets busy halfway through the run.
+    solution: |
+      Interleaving spreads any change over time across both samples, so a difference between the medians comes
+      from the emails, not from when they were sent.
+
+  - id: throttled-probe
+    type: mcq
+    concept: sec-auth-enumeration
+    skill: analysis
+    title: The probe got a 429
+    prompt: |
+      `check_enumeration(..., samples=8)` against the fixed portal returns
+      `{'enumerable': None, 'signals': [], 'rate_limited': True}`. What do you report?
+    options:
+      - id: inconclusive
+        text: Inconclusive - re-run with fewer samples after the window, or with another test account
+        feedback: Correct - the server refused part of the probe, so the comparison never happened.
+      - id: safe
+        text: Not enumerable - no signals were found
+        feedback: No signals were compared at all; reporting "safe" would be a false negative.
+      - id: enumerable
+        text: Enumerable - a 429 shows the account exists
+        feedback: The portal counts attempts per email whether or not it exists; a 429 here says nothing about existence.
+      - id: broken
+        text: The rate limiter is broken
+        feedback: Throttling after 5 attempts is the documented behaviour of the fixed portal.
+    correct: [inconclusive]
+    hints:
+      - How many attempts per email did 8 samples need, and what is the limit?
+    solution: |
+      Eight samples need eight attempts per email; the limit is five. Wait for `Retry-After`, use 4 samples, and
+      re-run. Never turn "could not measure" into "safe".
+
+  - id: lockout-dos
+    type: mcq
+    concept: sec-auth-guessing-throttling
+    skill: analysis
+    title: Throttling works - what else do you report?
+    prompt: |
+      After the bounded probe against the fixed portal, Alice's correct password gets `429` with `Retry-After: 60`,
+      while Bob signs in normally. What is the additional finding?
+    options:
+      - id: dos
+        text: Anyone who knows a merchant's email can keep them locked out by sending a few wrong passwords a minute
+        feedback: Correct - the lockout refuses the real owner too; report it with the counts and the duration.
+      - id: none
+        text: None - this is correct lockout behaviour
+        feedback: It is the intended behaviour, but its abuse case is still a finding for the owner to weigh.
+      - id: bob
+        text: The limit is broken because Bob was not locked
+        feedback: The limit is per account; Bob made no failed attempts.
+      - id: retry
+        text: The Retry-After value is too long
+        feedback: 60 seconds is a short lock; the issue is who can trigger it, not its length.
+    correct: [dos]
+    hints:
+      - Who suffers when the account is locked - the attacker or the owner?
+    solution: |
+      A per-account lock is a denial-of-service lever. Report it with the threshold and duration; alternatives
+      are growing delays, a challenge after a few failures, or unlocking through a reset link.
+
+  - id: forced-browsing
+    type: mcq
+    concept: sec-auth-guessing-throttling
+    skill: application
+    title: Which WSTG test found it?
+    prompt: |
+      Without signing in, `curl -si http://127.0.0.1:8765/internal/admin` returns `200` and a settlement key.
+      Which WSTG test is this?
+    options:
+      - id: athn04
+        text: WSTG-ATHN-04, bypassing authentication schema (direct page request)
+        feedback: Correct - "Attempt to directly access a protected page" without logging in.
+      - id: athn02
+        text: WSTG-ATHN-02, default credentials
+        feedback: No credentials were used at all.
+      - id: athn03
+        text: WSTG-ATHN-03, weak lock out mechanism
+        feedback: Lockout is about repeated failed logins.
+      - id: idnt04
+        text: WSTG-IDNT-04, account enumeration
+        feedback: Nothing here reveals which accounts exist.
+    correct: [athn04]
+    hints:
+      - Was any login attempted?
+    solution: |
+      A protected page answering without authentication is a bypass of the authentication schema - WSTG
+      calls the technique a direct page request, or forced browsing.
+
+  - id: athn03-order
+    type: order
+    concept: sec-auth-guessing-throttling
+    skill: application
+    title: Order the lockout test
+    prompt: Put the steps of a WSTG-ATHN-03 lockout test in order.
+    items:
+      - id: agree
+        text: Agree which test account you may lock and who unlocks it
+      - id: three-wrong
+        text: Log in with a wrong password 3 times
+      - id: correct-ok
+        text: Log in with the correct password and confirm it still works
+      - id: five-wrong
+        text: Log in with a wrong password 5 times
+      - id: correct-locked
+        text: Log in with the correct password and record whether the account is locked
+      - id: wait
+        text: Retry the correct password after set intervals to measure when it unlocks
+      - id: record
+        text: Record the threshold, the response and the unlock time as evidence
+    hints:
+      - You cannot measure the unlock time before the account is locked.
+      - WSTG proves the account is NOT locked at lower counts before showing where it locks.
+    solution: |
+      Agree the account, show the lock does not trigger at a lower count, find the threshold, confirm the
+      lock with the correct password, measure the unlock time, then record everything. This mirrors the
+      WSTG-ATHN-03 example sequence.
+
+  - id: quick-exit-debug
+    type: debug
+    concept: sec-auth-enumeration
+    skill: analysis
+    title: Find the timing oracle
+    prompt: |
+      This login returns the same message for every failure, but the enumeration check reports
+      `['timing']`. Which lines create the timing difference?
+    language: python
+    code: |
+      def login(email, password):
+          user = db.find_user(email)
+          if user is None:
+              return 401, {"error": "invalid email or password"}
+          if not verify_pbkdf2(password, user.password_hash):
+              return 401, {"error": "invalid email or password"}
+          return 200, {"token": issue_token(user)}
+    correctLines: [3, 4]
+    lineNotes:
+      - line: 2
+        note: Looking a user up by email costs about the same whether or not it exists.
+      - line: 5
+        note: A slow hash is correct for storage - the problem is that it only runs for real users.
+      - line: 6
+        note: The message is generic and the status matches line 4 - no message or status leak.
+    hints:
+      - Which path skips the slow work?
+      - The messages are identical; compare what each path does before answering.
+    solution: |
+      Lines 3-4 return at once for unknown emails, so only real accounts pay for PBKDF2. Fix: when the user is
+      missing, verify the password against a fixed dummy hash, then return the same 401.
+
+  - id: secret-in-logs
+    type: short
+    concept: sec-auth-password-rules
+    skill: analysis
+    title: The log is internal - why is it a finding?
+    prompt: |
+      The vulnerable portal logs `login attempt email=alice@shop-a.example password=alice-pass-1`. A developer
+      says the logs are internal, so it does not matter. Answer them.
+    modelAnswer: |
+      A password in a log defeats the slow, salted hash: anyone with log access - support staff, a log
+      platform vendor, whoever reads a backup or a leaked log bundle - reads it in clear text. Logs are copied
+      widely and kept long, so the password outlives a password change in the database. Failed logins are
+      worse: users mistype or try their password from another site, so the log collects passwords for other
+      systems too. The portal's flaw table maps it to OWASP Top 10:2021 A09 (Security Logging and
+      Monitoring Failures). The fix is to never log the password field on any path, and to test both the successful and the failed login. Logs with real
+      passwords should be purged and the affected users told to change them.
+    rubric:
+      - Says that log readers see the password in clear text, bypassing the hash.
+      - Mentions copies and retention (backups, log platforms).
+      - Mentions that failed logins capture passwords for other systems.
+      - Gives the fix and the clean-up (stop logging, purge, rotate).
+    hints:
+      - Who can read logs, and for how long?
+      - What do users type into a login form by mistake?
+    solution: |
+      Logs are widely readable and long-lived, so a logged password is an exposed password - including
+      passwords for other sites typed by mistake. Never log it, and test both paths.
+
+  - id: login-testdesign
+    type: testdesign
+    concept: sec-auth-guessing-throttling
+    skill: application
+    title: Plan the authentication re-test
+    prompt: |
+      SandPay says `no-rate-limit`, `weak-hash` and `secret-logging` are fixed. Design the re-test: give each
+      case its preconditions, steps, expected result and evidence. Include at least one case that could find a
+      **new** problem caused by the fixes.
+    modelAnswer: |
+      Preconditions for all: written scope; the fixed build on the test host; test accounts alice and bob that
+      may be locked; access to the access log with the owner's permission.
+
+      1. **Throttling** - steps: 10 wrong passwords for alice, stop at first 429. Expected: 429 after 5, with
+         `Retry-After`. Evidence: the status list and headers.
+      2. **Lockout side effect** - steps: right after case 1, alice's correct password, then bob's. Expected:
+         documented (alice locked for 60 s, bob signs in); reported as a DoS risk. Evidence: statuses,
+         timestamps.
+      3. **Other entry points** - steps: repeat case 1 on the API token exchange and the reset form. Expected:
+         the same limit. Evidence: status lists.
+      4. **Enumeration (new risk from the hash fix)** - steps: 4 interleaved wrong-password logins each for
+         alice and an unknown email. Expected: same status, body and similar medians. Evidence: samples and
+         medians. (On the fixed portal this finds a timing oracle - about 117 ms - a new finding.)
+      5. **Storage** - steps: with the owner, read alice's stored hash format. Expected: a salted PBKDF2 hash
+         with a high iteration count, not 32-character MD5. Evidence: redacted hash prefix.
+      6. **Logs** - steps: one successful and one failed login, then read the new log lines. Expected: no
+         password on either path. Evidence: log lines.
+      7. **Negative control** - steps: run case 1 against the vulnerable build. Expected: 10 x 401,
+         `missing-rate-limit`. Evidence: proves the probe can detect the flaw.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Covers throttling and its lockout side effect.
+      - Re-tests enumeration after the hashing fix (or otherwise looks for regressions from the fixes).
+      - Covers storage and both success and failure log paths.
+      - Includes a negative control or a reason to trust the probe.
+    hints:
+      - What does a slow hash change about response times?
+      - A fix can be correct and still create a new finding.
+    solution: |
+      Re-test each fix with evidence, add its side effects (lockout DoS, timing), cover other entry points and
+      both log paths, and prove the probes with a negative control.
+
+  - id: interview-login
+    type: interview
+    concept: sec-auth-enumeration
+    skill: analysis
+    title: "Interview: how would you test a login?"
+    prompt: |
+      "We have a merchant login page and a mobile API that signs in with the same accounts. How would you test
+      their security?"
+    modelAnswer: |
+      First scope: written permission, which endpoints (web, mobile API, reset, token exchange), which accounts
+      I may lock. Then the WSTG-ATHN checklist. Transport: HTTPS only, no credentials over HTTP. Default
+      credentials on admin interfaces. Enumeration: the same wrong password for a known and an unknown email,
+      comparing status, body and time - several interleaved samples and medians, because a slow hash with an
+      early return for unknown users leaks through time even when messages match. Throttling: a bounded probe -
+      ten wrong passwords, stop at the first 429 - on every entry point, since the mobile API is a classic gap;
+      then the correct password to see whether the limit locks the real user out, which is a DoS risk to
+      report. Password rules against NIST SP 800-63B-4: 15 characters for single-factor, a blocklist, no
+      composition rules or expiry, at least 64 allowed. Reset and change flows: current password required,
+      one-time expiring links, no enumeration. Storage: a slow salted hash; logs never contain passwords. I
+      prove each finding with requests and responses, never by cracking a real password, and re-run the whole
+      checklist after fixes.
+    rubric:
+      - Starts with scope and permission, including accounts that may be locked.
+      - Covers enumeration with all three signals and explains the timing method.
+      - Proves throttling with a bounded probe on every entry point and mentions the lockout DoS.
+      - Applies current password guidance (NIST SP 800-63B-4), not composition rules.
+      - Covers reset or change flows, storage and logs.
+    followUps:
+      - How would you make a timing measurement trustworthy over a real network?
+      - The team wants to lock accounts after 3 failures. What do you tell them?
+      - How do you test throttling without locking out real customers in production?
+    hints:
+      - Structure it by the WSTG-ATHN tests, then add the side effects.
+    solution: |
+      Scope first; then transport, defaults, enumeration (status, body, time), bounded throttling on every
+      entry point with the lockout side effect, NIST password rules, reset flows, storage and logs.
+
+  - id: throttling-code
+    type: coding
+    concept: sec-auth-guessing-throttling
+    skill: application
+    title: Write a bounded throttling probe
+    prompt: |
+      In `practice/security/exercises/web/auth_throttling.py`, implement `probe_login_throttling` and
+      `classify`. The probe must refuse any host but loopback and any `max_attempts` outside 1-20 **before**
+      sending a request, stop at the first `429` or `200`, and report the threshold and `Retry-After`. The tests
+      run it against the vulnerable portal (`missing-rate-limit`) and against the portal with `no-rate-limit`
+      fixed (`throttled` after 5, stopping at attempt 6).
+    project: security
+    files: [exercises/web/auth_throttling.py]
+    test: tests/web/test_auth_throttling.py
+    command: .venv/bin/python -m pytest tests/web/test_auth_throttling.py
+    modelAnswer: |
+      ```python
+      _require_loopback(base_url)
+      if not 1 <= max_attempts <= MAX_ATTEMPTS_CAP:
+          raise ValueError(...)
+      for password in wordlist[:max_attempts]:
+          r = http.post(base_url + path, json={"email": email, "password": password}, timeout=10)
+          statuses.append(r.status_code)
+          result["attempts"] = len(statuses)
+          if r.status_code == 429:
+              result.update(throttled=True, throttled_after=len(statuses) - 1,
+                            retry_after=r.headers.get("Retry-After"))
+              break
+          if r.status_code == 200:
+              result["found"] = password
+              break
+      ```
+
+      `classify` checks throttled, then found, then whether enough attempts were answered to call the limit
+      missing; anything else is inconclusive.
+    rubric:
+      - Every test in tests/web/test_auth_throttling.py passes.
+      - Nothing is sent before the host and the attempt count are checked.
+      - The probe stops at the first 429 and at the first success.
+      - A short run without throttling is reported as inconclusive, not as a finding.
+    hints:
+      - Validate first, loop second.
+      - throttled_after counts the attempts answered before the 429.
+      - classify has four outcomes; the order of the checks matters.
+    solution: |
+      Guard, loop over at most max_attempts passwords, stop at 429 or 200, and classify with an evidence
+      threshold so short runs stay inconclusive.
+
+  - id: enumeration-code
+    type: coding
+    concept: sec-auth-enumeration
+    skill: application
+    title: Detect user enumeration
+    prompt: |
+      In `practice/security/exercises/web/auth_enumeration.py`, implement `compare` and `check_enumeration`.
+      `observe` is given. The tests run your check against four fixture servers that each leak one signal (or
+      none), against the vulnerable portal (no leak) and against the fully fixed portal - where you must find
+      the timing oracle the `weak-hash` fix created.
+    project: security
+    files: [exercises/web/auth_enumeration.py]
+    test: tests/web/test_auth_enumeration.py
+    command: .venv/bin/python -m pytest tests/web/test_auth_enumeration.py
+    modelAnswer: |
+      ```python
+      signals = []
+      if {o.status for o in known} != {o.status for o in unknown}:
+          signals.append("status")
+      if {o.body for o in known} != {o.body for o in unknown}:
+          signals.append("message")
+      k = statistics.median(o.ms for o in known)
+      u = statistics.median(o.ms for o in unknown)
+      slow, fast = max(k, u), min(k, u)
+      if slow - fast >= min_delta_ms and slow >= min_ratio * max(fast, 1.0):
+          signals.append("timing")
+      ```
+
+      `check_enumeration` refuses non-loopback hosts, alternates known and unknown emails for `samples`
+      rounds, returns an inconclusive result on any 429, and otherwise returns `compare(...)` with
+      `rate_limited: False`.
+    rubric:
+      - Every test in tests/web/test_auth_enumeration.py passes.
+      - Time is compared by medians, with both an absolute and a relative threshold.
+      - Samples are interleaved.
+      - A throttled probe is inconclusive (enumerable None), never "not enumerable".
+    hints:
+      - Compare sets of statuses and bodies, not single responses.
+      - statistics.median ignores one slow outlier; a mean does not.
+      - Interleave by looping over rounds, then over the two emails.
+    solution: |
+      Three signals - status, message, timing (medians, two thresholds) - from interleaved samples, with 429
+      meaning inconclusive.
+
+  - id: policy-code
+    type: coding
+    concept: sec-auth-password-rules
+    skill: application
+    title: Check passwords and policies against SP 800-63B-4
+    prompt: |
+      In `practice/security/exercises/web/auth_policy.py`, implement `check_password` (would an SP 800-63B-4
+      verifier accept this password?) and `audit_policy` (which SHALL and SHOULD rules does a written policy
+      break?). The docstrings list the codes.
+    project: security
+    files: [exercises/web/auth_policy.py]
+    test: tests/web/test_auth_policy.py
+    command: .venv/bin/python -m pytest tests/web/test_auth_policy.py
+    modelAnswer: |
+      ```python
+      normalised = unicodedata.normalize("NFC", password)
+      length = len(normalised)                       # code points, not bytes
+      minimum = 15 if single_factor else 8
+      if length < minimum: reasons.append("too-short")
+      if length > max_length: reasons.append("too-long")
+      folded = normalised.casefold()
+      if folded in {nfc(w).casefold() for w in blocklist}: reasons.append("blocklisted")
+      if folded in {nfc(w).casefold() for w in context_words if w}: reasons.append("context-word")
+      ```
+
+      `audit_policy` adds `min-length-below-15` (or `-8` for MFA), `max-length-below-64` (SHOULD),
+      `composition-rules`, `periodic-expiry`, `no-blocklist`, `hints-allowed`, `security-questions` and
+      `truncation` (all SHALL), sorted.
+    rubric:
+      - Every test in tests/web/test_auth_policy.py passes.
+      - Length is counted in code points after NFC normalisation.
+      - The whole password is compared with the blocklist; substrings are not.
+      - No composition rule is applied anywhere.
+    hints:
+      - unicodedata.normalize("NFC", ...) before counting.
+      - A max_length below 64 is the caller's mistake - raise.
+      - Each policy key maps to one finding code.
+    solution: |
+      Normalise, count code points, apply the length for the use, compare whole passwords with the blocklist
+      and context words; audit a policy rule by rule with its SHALL or SHOULD level.
+
+placement:
+  - id: place-spraying
+    type: mcq
+    concept: sec-auth-guessing-throttling
+    skill: analysis
+    title: Which control stops it?
+    prompt: |
+      An attacker tries `Welcome2026!` once against every merchant account. The portal locks an account after
+      5 failures. Which control actually protects the merchants?
+    options:
+      - id: mfa
+        text: Multi-factor authentication, plus a blocklist that rejects such passwords at sign-up
+        feedback: Correct - spraying never reaches a per-account limit; MFA and blocklists stop it.
+      - id: lockout
+        text: The 5-failure lockout
+        feedback: Each account sees one attempt; the lockout never triggers.
+      - id: lower
+        text: Lowering the lockout to 3 failures
+        feedback: Still more than one attempt per account - spraying stays below any per-account limit.
+      - id: captcha-after
+        text: A CAPTCHA after 3 failed attempts on an account
+        feedback: Per-account triggers never fire for one attempt per account.
+    correct: [mfa]
+    solution: |
+      Spraying makes one attempt per account, so per-account counters never fire. MFA, breached and common
+      password blocklists, and detection across accounts are the controls.
+
+  - id: place-enum
+    type: mcq
+    concept: sec-auth-enumeration
+    skill: analysis
+    title: Read the measurements
+    prompt: |
+      Four interleaved samples each, same wrong password. Known email - status 401, body
+      `{"error": "invalid email or password"}`, median 62.3 ms. Unknown email - status 401, same body, median
+      62.5 ms. What do you report?
+    options:
+      - id: no-leak
+        text: No enumeration through the login - status, body and time match
+        feedback: Correct - all three signals are the same within noise.
+      - id: timing
+        text: Timing enumeration - both requests are slow
+        feedback: Both are equally slow - constant work, which is the fix, not a leak.
+      - id: inconclusive
+        text: Inconclusive - four samples are too few
+        feedback: Four interleaved samples per email with a 0.2 ms gap is clear enough here; a real leak shows tens of milliseconds.
+      - id: message
+        text: Message enumeration - the body names the email
+        feedback: The body is identical for both emails.
+    correct: [no-leak]
+    solution: |
+      Same status, same body, medians 0.2 ms apart: no signal. Slow for everyone is the constant-work design
+      the cheat sheet recommends.
+
+  - id: place-policy
+    type: mcq
+    concept: sec-auth-password-rules
+    skill: application
+    title: Which policy follows SP 800-63B-4?
+    prompt: Which single-factor password policy follows NIST SP 800-63B-4?
+    options:
+      - id: modern
+        text: At least 15 characters, up to 64 or more allowed, checked against a blocklist, no expiry
+        feedback: Correct - length, a long maximum, a blocklist, and no periodic change.
+      - id: complex
+        text: At least 12 characters with upper, lower, digit and symbol, changed every 90 days
+        feedback: Composition rules and periodic expiry are both forbidden, and 12 is below 15.
+      - id: short-mfa
+        text: At least 8 characters, blocklist, no expiry
+        feedback: 8 is the minimum only when the password is one factor of MFA.
+      - id: hint
+        text: At least 15 characters, with a password hint for recovery
+        feedback: Hints accessible to an unauthenticated claimant are forbidden.
+    correct: [modern]
+    solution: |
+      15+ characters for single-factor use, allow at least 64, compare against a blocklist; no composition
+      rules, no periodic expiry, no hints.
+
+recall:
+  - id: recall-attacks
+    concept: sec-auth-guessing-throttling
+    prompt: Define brute force, credential stuffing and password spraying.
+    answer: Brute force - many passwords against one account. Stuffing - username and password pairs leaked from another site. Spraying - one common password against many accounts.
+  - id: recall-probe
+    concept: sec-auth-guessing-throttling
+    prompt: How do you prove missing login throttling without attacking?
+    answer: A bounded probe on an account you may lock - about 10 wrong passwords, stop at the first 429 or 200, record the statuses, the threshold and Retry-After. Then try the correct password to check for a lockout DoS.
+  - id: recall-nist-limit
+    concept: sec-auth-guessing-throttling
+    prompt: What does SP 800-63B-4 say about failed attempts?
+    answer: Verifiers SHALL limit consecutive failed attempts on one account to no more than 100; it is an upper bound and lower limits are allowed.
+  - id: recall-enum-signals
+    concept: sec-auth-enumeration
+    prompt: Which three signals can reveal whether an account exists, and how do you measure the third?
+    answer: Status code, response body, response time. For time - several samples per email, interleaved, compared by median, with both an absolute gap and a ratio before reporting.
+  - id: recall-quick-exit
+    concept: sec-auth-enumeration
+    prompt: What is the quick exit and how is it fixed?
+    answer: Returning at once for an unknown user and hashing only for real users, so real accounts are slower. Fix it by hashing against a dummy hash for unknown users so every path does the same work.
+  - id: recall-nist-passwords
+    concept: sec-auth-password-rules
+    prompt: Summarise SP 800-63B-4's password rules.
+    answer: At least 15 characters single-factor (8 as one factor of MFA), allow at least 64, accept spaces and Unicode, whole-password blocklist check; no composition rules, no periodic expiry, no hints, no truncation.
+  - id: recall-logs
+    concept: sec-auth-password-rules
+    prompt: What do you check about passwords in logs?
+    answer: That no log line on the success or failure path contains the password - failed logins often contain passwords for other sites.
+
+next:
+  - testing-session-management
+  - testing-access-control-idor
+  - testing-cryptography-and-data-exposure
+  - testing-business-logic-and-rate-limits

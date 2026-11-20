@@ -1,0 +1,1270 @@
+id: testing-sql-injection
+title: Testing for SQL injection
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: How untrusted input becomes SQL syntax, and how a tester finds, confirms and proves it without damaging anything - the single-quote error test, the boolean true/false differential that works even when errors are hidden, why time-based and UNION payloads are rarely needed for proof - then verifies the fix - bound parameters, allow-listed identifiers - against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    SQL injection,
+    SQLi,
+    injection,
+    WSTG-INPV-05,
+    A03:2021,
+    CWE-89,
+    blind SQL injection,
+    boolean-based,
+    error-based,
+    time-based,
+    UNION,
+    stacked queries,
+    parameterized queries,
+    prepared statements,
+    bind variables,
+    placeholders,
+    allow-list,
+    ORDER BY injection,
+    ORM,
+    HQL injection,
+    stored procedures,
+    least privilege,
+    sqlmap,
+    sqlite3,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, Python's
+    `sqlite3` module with SQLite 3.45.1, and curl, on Linux. Every output in this lesson was printed by the
+    commands and code shown, run on 20 November 2026 against the practice portal. Paths in tracebacks are
+    shortened.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal that binds to `127.0.0.1` only. Its `sqli` flaw is in `GET /api/payments?status=...`;
+    `make_app({"sqli"})` builds the same portal with that query fixed, and `make_app({"verbose-errors"})`
+    hides error details behind a generic 500. SandPay, its merchants and payments are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope.
+    Injection tests can change or destroy data on a real system; everything here runs against your own
+    machine and only ever adds a read-only condition to a read.
+  - **Testing guide:** OWASP Web Security Testing Guide v4.2,
+    [WSTG-INPV-05 Testing for SQL Injection](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05-Testing_for_SQL_Injection)
+    (read from the v4.2 tag on [GitHub](https://github.com/OWASP/wstg) on 20 November 2026; the latest
+    stable release is v4.2). Quotations are from that page.
+  - **Prevention:** OWASP Cheat Sheet Series,
+    [SQL Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)
+    and
+    [Query Parameterization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Query_Parameterization_Cheat_Sheet.html),
+    as published on 20 November 2026; OWASP Top 10:2021
+    [A03 Injection](https://owasp.org/Top10/A03_2021-Injection/); MITRE
+    [CWE-89](https://cwe.mitre.org/data/definitions/89.html).
+  - **Python:** [sqlite3 - How to use placeholders to bind values in SQL
+    queries](https://docs.python.org/3.12/library/sqlite3.html#sqlite3-placeholders) and `Cursor.execute`
+    ("Execute a single SQL statement"; `ProgrammingError` "If sql contains more than one SQL statement").
+  - **Database error texts** used by the error classifier: SQLite - printed here; PostgreSQL - the parser's
+    source, [`src/backend/parser/scan.l`](https://github.com/postgres/postgres/blob/master/src/backend/parser/scan.l)
+    ("unterminated quoted string", "%s at or near"); MySQL -
+    [Server Error Message Reference](https://dev.mysql.com/doc/mysql-errors/8.4/en/server-error-reference.html),
+    error 1149 `ER_SYNTAX_ERROR`; Oracle - [ORA-01756](https://docs.oracle.com/en/error-help/db/ora-01756/);
+    SQL Server - the "Unclosed quotation mark" message as quoted in WSTG-INPV-05.
+  - **Tool, from the docs, not run here:** sqlmap,
+    [Usage wiki](https://github.com/sqlmapproject/sqlmap/wiki/Usage) as read on 20 November 2026 (`-u`,
+    `--level`, `--risk`, `--technique`, `--batch`). sqlmap is not installed in this project and must never be
+    pointed at a system outside your written scope.
+  - **Not repeated here:** SQL itself - [Relational modelling and SQL](#/lesson/relational-modelling-and-sql);
+    the developer's view of injection - [The OWASP Top 10 for developers](#/lesson/owasp-top-10-for-developers);
+    replaying and tampering requests - [Intercepting proxies](#/lesson/intercepting-proxies).
+
+prerequisites:
+  - security-testing-fundamentals
+  - intercepting-proxies
+  - relational-modelling-and-sql
+
+concepts:
+  - id: sec-sqli-mechanics
+    name: How input becomes SQL syntax
+    summary: Injection happens when an application builds SQL text by joining its own query with user input, so a quote, keyword or comment in the input changes the query's structure. The context decides the payload - inside a quoted string, as a bare number, or as an identifier such as a sort column - and every input that reaches a query is a candidate, including headers, cookies and JSON fields.
+  - id: sec-sqli-detection
+    name: Detecting and confirming SQL injection safely
+    summary: Find candidates with a single quote and look for database errors; confirm with a boolean pair - the same value with an always-true and an always-false condition - where true must answer like the normal value and false must differ. That proof works when errors are hidden, extracts nothing and changes nothing. Time-based and UNION payloads, stacked queries and OR-based payloads are heavier and riskier, and rarely needed to prove the flaw.
+  - id: sec-sqli-fix-verification
+    name: Verifying the fix - bound parameters and allow-lists
+    summary: The fix is to keep SQL structure and data apart - bind every value through the driver's placeholders, and map structural choices (column, direction, table) to fixed application-owned text. Escaping, filtering and ORMs are not proof. Verify by re-running the same probes (they must now be quiet), by reading the code path for concatenation, and by checking that legitimate values with quotes still work.
+
+objectives:
+  - Explain, with a real query, how concatenating input lets a quote or condition change the SQL, and name the string, numeric and identifier contexts.
+  - List the inputs to test for injection and use the single-quote test to find candidates, telling a database error from a generic error.
+  - Confirm injection with a boolean true/false differential, including when the application hides its errors, and explain why the probe must be read-only and small.
+  - Compare error-based, boolean, time-based, UNION and stacked-query techniques by evidence, risk and when each is needed.
+  - Rewrite a vulnerable query with bound parameters and allow-listed sort columns, and explain why escaping and ORMs are not enough on their own.
+  - Verify a fix with the original probes, a code review of the query path and legitimate values containing quotes.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-sqli-mechanics, sec-sqli-detection]
+    title: The idea in plain language
+    body: |
+      A SandPay merchant filters their payments: `status = captured`. Somewhere on the server, a line of code
+      writes a sentence for the database: *give me merchant m_100's payments whose status is 'captured'*. If
+      that sentence is built by pasting the merchant's text into the middle of the server's own words, the
+      merchant is no longer just choosing a value - they are writing part of the sentence.
+
+      Type `captured' AND '1'='2` and the sentence becomes *... whose status is 'captured' and one equals
+      two*. The database obeys: no rows. Type `x' OR '1'='1` and it becomes *... whose status is 'x', or one
+      equals one* - and the database returns **every** merchant's payments. That is SQL injection: data that
+      crossed the line into syntax.
+
+      A tester's job is not to steal those payments. It is to show, with the smallest possible evidence,
+      that the line can be crossed - one condition that makes the answer change exactly the way logic says
+      it should - and later to show that the fixed application keeps the merchant's text on the data side
+      of the line, however strange that text is.
+
+  - id: what
+    kind: what
+    concepts: [sec-sqli-mechanics, sec-sqli-detection, sec-sqli-fix-verification]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **SQL injection** | The WSTG: "insertion or "injection" of either a partial or complete SQL query via the data input or transmitted from the client (browser) to the web application". CWE-89, part of OWASP Top 10:2021 A03 Injection. |
+      | **Injection point** | One input that reaches a query: a query or form parameter, a JSON field, a header, a cookie. The WSTG: "Consider also HTTP headers and Cookies." |
+      | **Context** | Where the input lands: inside a quoted string (`status = '...'`), as a bare number (`amount = ...`), or as an identifier or keyword (`ORDER BY ...`). The payload must fit the context. |
+      | **In-band / blind / out-of-band** | The WSTG's three classes: data comes back in the same response; nothing comes back and the tester infers from behaviour; or data leaves through another channel. |
+      | **Error-based** | The database's error message is shown and reveals the query or data. |
+      | **Boolean-based (blind)** | An always-true and an always-false condition give different answers. |
+      | **Time-based (blind)** | A condition triggers a database delay; the response time is the answer. |
+      | **UNION-based** | A `UNION SELECT` appends the attacker's own query's rows to the result. |
+      | **Stacked queries** | A `;` ends the statement and starts another, for example an `INSERT`. Depends on the database API. |
+      | **Parameterised query** | SQL text with placeholders (`?`, `:name`) and values sent separately; also called a prepared statement or bind variables. The cheat sheet's primary defence. |
+      | **Allow-list** | A fixed map from what the user may choose to application-owned SQL text - for identifiers and keywords that placeholders cannot carry. |
+
+  - id: why
+    kind: why
+    concepts: [sec-sqli-mechanics, sec-sqli-detection]
+    title: Why testers still hunt for it
+    body: |
+      The impact is as large as the database account's rights. The WSTG lists what a successful attack can do:
+      "read sensitive data from the database, modify database data (insert/update/delete), execute
+      administration operations on the database (such as shutdown the DBMS), recover the content of a given
+      file existing on the DBMS file system or write files into the file system, and, in some cases, issue
+      commands to the operating system."
+
+      It is also still common. The OWASP Top 10:2021 data for A03 Injection: "94% of the applications were
+      tested for some form of injection with a max incidence rate of 19%, an average incidence rate of 3%,
+      and 274k occurrences", with CWE-89 named among the notable weaknesses. Frameworks made the safe path the
+      default, but injection survives wherever someone builds SQL text by hand: a report filter, a sort
+      column, a search box, a stored procedure that concatenates internally, an ORM query written as a string.
+
+      For a payments company the stakes are concrete. The vulnerable SandPay filter below returns another
+      merchant's payments to anyone with a merchant login - a confidentiality breach - and in a write query
+      the same flaw could change amounts or statuses. A tester who finds it must prove it without causing the
+      damage they are warning about.
+
+  - id: internals-concatenation
+    kind: internals
+    concepts: [sec-sqli-mechanics]
+    title: "How it happens: the portal's query, character by character"
+    body: |
+      The practice portal builds its filter like this (from `support/sandpay_vuln.py`):
+
+      ```python
+      # FLAW sqli: user input concatenated into SQL
+      rows = self.query(
+          f"SELECT * FROM payments WHERE merchant_id = '{u['merchant_id']}' AND status = '{status}' ORDER BY id")
+      ```
+
+      The server owns everything outside `{status}`; the merchant owns what goes inside. Watch the query the
+      database receives for four inputs:
+
+      | `status` sent | SQL the database parses | Result |
+      | --- | --- | --- |
+      | `captured` | `... AND status = 'captured' ORDER BY id` | Alice's one captured payment |
+      | `captured'` | `... AND status = 'captured'' ORDER BY id` | error: the quote pair opens a new, unterminated string |
+      | `captured' AND '1'='2` | `... AND status = 'captured' AND '1'='2' ORDER BY id` | no rows - the condition is false |
+      | `x' OR '1'='1` | `... merchant_id = 'm_100' AND status = 'x' OR '1'='1' ORDER BY id` | every merchant's payments |
+
+      Two details make this work. The input's own quote closes the server's string early, and the input
+      leaves its last value **unterminated** (`'1`) so that the server's closing quote completes it - the
+      query stays syntactically valid. And `AND` binds tighter than `OR`, so `merchant_id = 'm_100' AND
+      status = 'x' OR '1'='1'` reads as `(merchant and status) OR true`: the merchant filter disappears.
+
+      **Contexts.** The same flaw needs different input in other places:
+
+      - **String:** `WHERE status = '...'` - close the quote, as above.
+      - **Numeric:** `WHERE amount_minor = ...` - no quote to close; `2500 AND 1=2` already changes the logic.
+        The WSTG's example is exactly this: `id=10 AND 1=2` against `id=10 AND 1=1`.
+      - **Identifier or keyword:** `ORDER BY ...`, a table name, `ASC`/`DESC` - placeholders cannot carry
+        these (the cheat sheet: "Parameter markers represent data values, not table names, column names, or
+        SQL keywords"), so this is where hand-built SQL survives longest.
+
+  - id: internals-techniques
+    kind: internals
+    concepts: [sec-sqli-detection]
+    title: Detection techniques and what each costs
+    body: |
+      The WSTG's first step: "make a list of all input fields whose values could be used in crafting a SQL
+      query, including the hidden fields of POST requests and then test them separately". It is explicit about
+      isolating each one: "only one variable must vary while all the other remain constant".
+
+      **Error-based - the single quote.** "The very first test usually consists of adding a single quote `'`
+      or a semicolon `;` to the field or parameter under test." If the response contains a database's own
+      error text, you have a strong candidate and often the database's name. If the application hides errors
+      - "a simple '500 Server Error' or a custom error page might be issued" - a new 500 is only an anomaly.
+
+      **Boolean - the true/false differential.** From the WSTG's blind technique: create a query "that always
+      returns false" and compare it with a true one. The proof is three answers:
+
+      | Request | Must be |
+      | --- | --- |
+      | the normal value, twice | identical (otherwise the page is unstable and you cannot compare) |
+      | value + always-true condition | the **same** as the normal value |
+      | value + always-false condition | **different** from the normal value |
+
+      A page that merely echoes your input fails the second row, so reflection is not mistaken for injection.
+      The pair proves that your text was **evaluated as logic** - and it adds only a read-only condition to a
+      read.
+
+      **Time-based.** "If there is a delay, the tester can assume the result of the conditional query is true"
+      (WSTG, with a MySQL `sleep(10)` example). It needs a database-specific delay function, holds a database
+      connection for the delay, and response times are noisy - use it only when nothing else in the response
+      changes.
+
+      **UNION and stacked queries.** UNION appends attacker-chosen rows; stacked queries run a second statement
+      after `;`. Both are exploitation, not detection: they read or change data you do not need to touch to
+      prove the flaw. Stacked queries also depend on the database API - Python's `sqlite3` refuses them
+      outright (`Cursor.execute`: "Execute a single SQL statement").
+
+      **OR-based payloads are the riskiest.** sqlmap's documentation explains why its `--risk 3` (which "adds
+      also `OR`-based SQL injection tests") is off by default: "In some instances, like a SQL injection in an
+      `UPDATE` statement, injecting an `OR`-based payload can lead to an update of all the entries of the
+      table". The same `x' OR '1'='1` that only reads in a `SELECT` rewrites every row in an `UPDATE`.
+
+  - id: when
+    kind: when
+    concepts: [sec-sqli-detection, sec-sqli-fix-verification]
+    title: When to test, how far to go, and what this does not replace
+    body: |
+      **Test every input that could reach a query** - not only search boxes. Filters, sort and page
+      parameters, JSON fields in API bodies, headers (`User-Agent` and `Referer` are logged into databases),
+      cookies and values that come back later (stored, then used in another query).
+
+      **Stop at proof.** In a test report, a boolean pair plus the normal response is enough to rate SQL
+      injection as confirmed. Extracting data, dumping tables or writing files proves nothing more about the
+      flaw and creates risk and legal exposure, unless the rules of engagement explicitly ask for impact
+      demonstration - and even then, on agreed test data.
+
+      **Prefer read paths.** If the same parameter feeds a `SELECT` and an `UPDATE`, prove it on the
+      `SELECT`. Never send `OR`-based, stacked or destructive payloads to write paths on a shared environment.
+
+      **Automate carefully.** Tools such as sqlmap try hundreds of payloads, including heavier ones as
+      `--level` and `--risk` rise. They are powerful in scope and dangerous out of it. Use them on systems you
+      own or are authorised to test, start at the defaults, and keep your own minimal proof for the report.
+
+      **What this does not replace:** code review finds concatenation that no input reaches today; the Top 10
+      notes that "Source code review is the best method of detecting if applications are vulnerable to
+      injections". Least-privilege database accounts limit the damage when something is missed. A clean probe
+      is evidence for the parameters you tested, not for the application.
+
+  - id: visual
+    kind: visual
+    concepts: [sec-sqli-detection]
+    title: The boolean differential, step by step
+    body: |
+      Notice that the tester never sees SQL. The proof is that the answers line up with logic: true matches
+      the baseline, false differs.
+
+      ```mermaid
+      sequenceDiagram
+        participant T as Tester
+        participant P as Portal
+        participant D as Database
+        T->>P: status = captured (twice)
+        P->>D: status equals captured
+        D-->>P: 1 row
+        P-->>T: 200, 139 bytes (both times, stable)
+        T->>P: status = captured, plus AND 1 equals 1 (quoted)
+        P->>D: status equals captured AND true
+        D-->>P: 1 row
+        P-->>T: 200, 139 bytes (same as baseline)
+        T->>P: status = captured, plus AND 1 equals 2 (quoted)
+        P->>D: status equals captured AND false
+        D-->>P: 0 rows
+        P-->>T: 200, 12 bytes (different)
+        Note over T: input evaluated as logic - injection confirmed
+      ```
+
+  - id: curl-evidence
+    kind: code
+    concepts: [sec-sqli-mechanics, sec-sqli-detection]
+    title: "Evidence by hand: curl against the practice portal"
+    body: |
+      Start the portal (`.venv/bin/python support/sandpay_vuln.py --port 8765`), sign in as Alice and keep
+      the token. `curl -G --data-urlencode` puts each value in the query string correctly encoded - quotes and
+      spaces included:
+
+      ```bash
+      B=http://127.0.0.1:8765
+      TOKEN=$(curl -s -X POST $B/api/login -H 'Content-Type: application/json' \
+        -d '{"email":"alice@shop-a.example","password":"alice-pass-1"}' | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
+      for v in "captured" "captured'" "captured' AND '1'='1" "captured' AND '1'='2"; do
+        echo "### status=$v"
+        curl -s -G -o r.txt -w "HTTP %{http_code}, %{size_download} bytes\n" $B/api/payments \
+          --data-urlencode "status=$v" -H "Authorization: Bearer $TOKEN"
+        tail -c 300 r.txt; echo
+      done
+      ```
+
+      Output (run on 20 November 2026; traceback path shortened):
+
+      ```plaintext
+      ### status=captured
+      HTTP 200, 139 bytes
+      {"data": [{"id": "pay_1001", "merchant_id": "m_100", "amount_minor": 2500, "currency": "EUR", "status": "captured", "card_last4": "4242"}]}
+      ### status=captured'
+      HTTP 500, 804 bytes
+        File ".../practice/security/support/sandpay_vuln.py", line 227, in query
+          return self.db.execute(sql, params).fetchall()
+      sqlite3.OperationalError: unrecognized token: "'captured'' ORDER BY id"
+      ### status=captured' AND '1'='1
+      HTTP 200, 139 bytes
+      {"data": [{"id": "pay_1001", "merchant_id": "m_100", "amount_minor": 2500, "currency": "EUR", "status": "captured", "card_last4": "4242"}]}
+      ### status=captured' AND '1'='2
+      HTTP 200, 12 bytes
+      {"data": []}
+      ```
+
+      Four requests tell the whole story. The quote produced a **SQLite error that quotes the query's tail**
+      (`'captured'' ORDER BY id`) - the input is inside a string literal and SQLite is the database. The true
+      condition gave byte-for-byte the baseline; the false one gave an empty list. Nothing was read that Alice
+      could not already read, and nothing was written.
+
+  - id: probe-code
+    kind: code
+    concepts: [sec-sqli-detection]
+    collapsed: true
+    title: "Automating it: the boolean and error probes (reference solutions)"
+    body: |
+      The core of `practice/security/solutions/web/sqli_detect.py` (exercise `boolean-probe-code`):
+
+      ```python
+      VOLATILE_KEYS = frozenset({"reference", "request_id", "timestamp"})
+
+      def boolean_pairs(value):
+          pairs = [("string", f"{value}' AND '1'='1", f"{value}' AND '1'='2")]
+          if value.isdigit():
+              pairs.append(("numeric", f"{value} AND 1=1", f"{value} AND 1=2"))
+          return pairs
+
+      def fingerprint(status, body):
+          try:
+              data = json.loads(body)
+          except ValueError:
+              return (status, body)
+          return (status, json.dumps(_strip(data), sort_keys=True))   # _strip drops VOLATILE_KEYS
+
+      def probe_boolean(send, parameter, value):
+          s1, b1 = send(value)
+          s2, b2 = send(value)
+          base = fingerprint(s1, b1)
+          if fingerprint(s2, b2) != base:
+              raise InconclusiveError(f"{parameter}={value!r} gave two different answers; compare a stable part instead")
+          for context, true_value, false_value in boolean_pairs(value):
+              st, bt = send(true_value)
+              sf, bf = send(false_value)
+              if fingerprint(st, bt) != base or fingerprint(sf, bf) == base:
+                  continue
+              if fingerprint(*send(true_value)) != base or fingerprint(*send(false_value)) == base:
+                  continue                                    # replay once: rule out a one-off change
+              return Finding(parameter, "boolean", context, true_value, false_value, evidence=...)
+          return None
+      ```
+
+      Run against the three builds of the portal - vulnerable, errors hidden (`verbose-errors` fixed) and
+      query fixed (`sqli` fixed) - together with the error probe from `sqli_errors.py`:
+
+      ```plaintext
+      == vulnerable
+      boolean: Finding(parameter='status', technique='boolean', context='string', true_value="captured' AND '1'='1", false_value="captured' AND '1'='2", evidence=("baseline: 'captured' -> 200, 139 bytes", 'true: "captured\' AND \'1\'=\'1" -> 200, 139 bytes (same as baseline)', 'false: "captured\' AND \'1\'=\'2" -> 200, 12 bytes (different)'))
+      error:   ErrorFinding(parameter='status', kind='sql-error', databases=('SQLite',), status=500, evidence='sqlite3.OperationalError: unrecognized token: "\'captured\'\' ORDER BY id"')
+      == errors hidden
+      boolean: Finding(parameter='status', technique='boolean', context='string', true_value="captured' AND '1'='1", false_value="captured' AND '1'='2", evidence=("baseline: 'captured' -> 200, 139 bytes", 'true: "captured\' AND \'1\'=\'1" -> 200, 139 bytes (same as baseline)', 'false: "captured\' AND \'1\'=\'2" -> 200, 12 bytes (different)'))
+      error:   ErrorFinding(parameter='status', kind='server-error', databases=(), status=500, evidence='\'captured\' -> 200, "captured\'" -> 500')
+      == query fixed
+      boolean: None
+      error:   None
+      ```
+
+      Hiding errors downgraded the error probe to an anomaly - but the boolean probe found the flaw exactly as
+      before. Hiding errors is good hygiene, not a fix. Only fixing the query silenced both.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-sqli-detection]
+    title: Why the probe is written that way
+    body: |
+      - **`send(value)` twice before anything else.** The WSTG warns: "If the server returns two different
+        pages as a result of two identical consecutive web requests, we will not be able to discriminate the
+        true value from the false value." Unstable pages raise `InconclusiveError` instead of producing a
+        guess - a false positive in a security report costs credibility.
+      - **`VOLATILE_KEYS` and `sort_keys=True`.** The portal's generic error carries a random `reference`. Two
+        identical answers must compare equal even when such a field changes; key order is not meaning.
+      - **`true` must equal the baseline.** This single rule rejects pages that reflect your input: an echoed
+        `captured' AND '1'='1` differs from an echoed `captured`, so reflection never looks like injection.
+      - **`false` must differ.** If false also equals the baseline, the condition was ignored - the value was
+        treated as data, which is the fixed portal's behaviour.
+      - **Replay the pair once.** One more true/false round costs two requests and rules out a coincidence
+        such as a row created between requests.
+      - **The payloads.** Only `AND '1'='1` / `AND '1'='2` (and the numeric form). No `OR`, no `;`, no
+        comment, no `UNION`, no `SLEEP`: the probe narrows a read and cannot widen it or write. A test asserts
+        this.
+      - **`send` is injected.** The same probe runs against in-memory fakes in tests and against the portal
+        through `portal_sender`, which also sets `allow_redirects=False` so evidence is the real response.
+
+  - id: fix-code
+    kind: code
+    concepts: [sec-sqli-fix-verification]
+    title: "The fix: bind values, allow-list structure"
+    body: |
+      The cheat sheet's resolution: "define the SQL structure separately from its data values, then bind those
+      values through the database API: use parameterized queries for dynamic data values; use fixed
+      application-owned choices for dynamic table names, column names, sort order (`ASC`, `DESC`), etc."
+
+      Python's own documentation shows the trap and the fix side by side - "beware of using Python's string
+      operations to assemble queries, as they are vulnerable to SQL injection attacks" - and the reference
+      solution of exercise `safe-query-code` follows it:
+
+      ```python
+      SORT_COLUMNS = {"id": "id", "amount": "amount_minor", "status": "status"}
+      DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
+
+      def find_payments(con, merchant_id, statuses=None, sort="id", direction="asc"):
+          if sort not in SORT_COLUMNS:
+              raise ValueError(f"sort must be one of {sorted(SORT_COLUMNS)}")
+          if not isinstance(direction, str) or direction.lower() not in DIRECTIONS:
+              raise ValueError("direction must be asc or desc")
+          params = [merchant_id]
+          sql = f"SELECT {COLUMNS} FROM payments WHERE merchant_id = ?"
+          if statuses is not None:
+              statuses = list(statuses)
+              if not statuses:
+                  return []
+              sql += " AND status IN (" + ", ".join("?" for _ in statuses) + ")"
+              params.extend(statuses)
+          sql += f" ORDER BY {SORT_COLUMNS[sort]} {DIRECTIONS[direction.lower()]}, id ASC"
+          return _rows(con.execute(sql, params))
+      ```
+
+      There is still an f-string - but every piece it inserts comes from the application (`COLUMNS`, the
+      maps, a run of `?` marks). User text only ever travels in `params`. Proof, against a two-row table:
+
+      ```plaintext
+      unsafe: ['pay_1001', 'pay_2001']
+      safe:   []
+      sqlite3.ProgrammingError: You can only execute one statement at a time.
+      rows: 2
+      ValueError: sort must be one of ['amount', 'id', 'status']
+      ```
+
+      The unsafe original handed Alice Bob's `pay_2001` for `x' OR '1'='1`; the bound version matched
+      nothing. The third line is the unsafe version given a stacked `; DROP TABLE` - refused by `sqlite3`
+      itself, which is a property of this driver, not a defence to rely on (other drivers and databases run
+      stacked statements). The table still has its two rows, and a smuggled sort expression is rejected
+      before any SQL is built.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-sqli-detection, sec-sqli-fix-verification]
+    title: Testing one parameter for SQL injection, step by step
+    body: |
+      1. **Confirm scope and data.** The parameter is in scope, you test on your own or agreed test data, and
+         you know whether the endpoint reads or writes.
+      2. **Record the baseline.** Send the normal value twice and keep both responses. Unstable? Find a stable
+         part (row count, a title) or stop and note it.
+      3. **Single quote.** Append `'`. Look for a database error text, a new 500, or a changed page. Note which
+         database the message names.
+      4. **Boolean pair for the context.** String: `value' AND '1'='1` / `value' AND '1'='2`. Numeric:
+         `value AND 1=1` / `value AND 1=2`. True must match the baseline; false must differ. Replay once.
+      5. **Stop at proof.** No `OR` on write paths, no `UNION`, no stacked queries, no time delays unless
+         nothing else differs and the rules of engagement allow it.
+      6. **Record evidence.** The four requests and responses (status, size, the differing part), the database
+         name if shown, and the exact parameter and endpoint. Redact tokens.
+      7. **After the fix,** re-run steps 2-4 - both probes must be quiet; send a legitimate value with a quote
+         (`o'brien-hold`) - it must still work; and read the query path for any remaining concatenation.
+
+  - id: example
+    kind: example
+    concepts: [sec-sqli-detection, sec-sqli-fix-verification]
+    title: "Example: the filter that hid its errors"
+    body: |
+      A release note says "payment filter errors no longer show stack traces". A developer asks you to close
+      the SQL injection finding raised last sprint.
+
+      You re-run the original probes. The single quote now returns `500 {"error": "internal error",
+      "reference": "..."}` - no SQLite text. But the boolean pair still answers 139 bytes for true and 12 bytes
+      for false. The finding stays open, re-rated from "error-based" to "blind (boolean)", with the new evidence
+      attached. The change was `verbose-errors`, not `sqli`.
+
+      The next build binds the status. Both probes are quiet; `o'brien-hold` returns its payment; the code
+      review shows `status IN (?, ...)` and an allow-listed `ORDER BY`. You close the finding with the three
+      pieces of evidence: probe output before and after, the legitimate-quote check, and the diff of the query
+      code.
+
+      What you checked that a scanner would not: that "no error" was not mistaken for "fixed", and that the
+      fix kept legitimate data working.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-sqli-detection, sec-sqli-fix-verification]
+    title: Test cases for an injection finding and its fix
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Baseline stable | Send `status=captured` twice | Identical answers | Both responses |
+      | 2 | Error-based candidate | Send `captured'` | Vulnerable: database error or new 500; fixed: same class of answer as any unknown status | Status, error line |
+      | 3 | Boolean, string context | Send the true and false pair | Vulnerable: true = baseline, false differs; fixed: both differ from baseline and equal each other | Sizes or row counts of all four |
+      | 4 | Errors hidden | Repeat 2-3 on a build with generic errors | Error probe: anomaly only; boolean still confirms | Probe output |
+      | 5 | Other contexts | Numeric and sort parameters | Numeric pair and identifier allow-list behave like 3 | Responses |
+      | 6 | Legitimate quote | Filter by a real value containing `'` | Its rows return, no error | Response |
+      | 7 | Cross-tenant | After the fix, `x' OR '1'='1` | No other merchant's rows | Response ids |
+      | 8 | Code path | Review the query construction | Every value bound, identifiers from a map | Diff, file and line |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-sqli-mechanics, sec-sqli-detection, sec-sqli-fix-verification]
+    title: Common mistakes and a debugging method
+    body: |
+      - **"No error, so no injection."** Generic error pages hide the evidence, not the flaw. Always run the
+        boolean pair.
+      - **Calling reflection injection.** A page that echoes your input changes with every payload. Without
+        "true equals baseline" you will report false positives.
+      - **Comparing whole pages that change by themselves.** Timestamps, request ids and ads differ between
+        identical requests. Compare a stable part, or remove volatile fields first.
+      - **Proving with `OR '1'='1` on a write path.** In an `UPDATE` it changes every row. Prove on reads, with
+        `AND`.
+      - **Testing only the visible form.** JSON body fields, headers, cookies and sort parameters reach
+        queries too; the WSTG names hidden POST fields, headers and cookies.
+      - **Accepting escaping or a blocklist as the fix.** The cheat sheet: "Relying on manually escaping
+        dynamic inputs is error-prone and is strongly discouraged". Blocklists miss encodings and other
+        dialects.
+      - **Trusting the ORM.** The Top 10's scenario #2 is Hibernate HQL built by concatenation; the cheat sheet
+        lists "JPQL injections" and "HQL injections". A string-built query is unsafe in any language.
+      - **Forgetting stored procedures.** "Binding procedure arguments protects the call, not dynamic SQL
+        constructed inside the procedure."
+
+      **Debugging method** when the pair gives an unclear answer: (1) check the baseline is stable; (2) check
+      your encoding - send through a proxy and read the raw request; (3) try the other context (numeric,
+      parenthesised, double-quoted); (4) compare a narrower part of the response (row count, a title);
+      (5) only then consider timing, and only where allowed.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-sqli-detection, sec-sqli-fix-verification]
+    title: Trade-offs and alternatives
+    body: |
+      | Approach | Strength | Limit |
+      | --- | --- | --- |
+      | Single-quote error test | Fast, names the database | Silent when errors are hidden; a 500 alone is not proof |
+      | Boolean differential | Works blind, read-only, two extra requests | Needs a stable response and a context guess |
+      | Time-based | Works when nothing visible changes | Database-specific, holds connections, noisy timings |
+      | UNION / stacked | Shows real impact | Reads or writes data; rarely needed; stacked depends on the driver |
+      | sqlmap (from the docs) | Broad payload coverage, techniques `BEUSTQ` by default | Heavy and risky above defaults; must stay in scope; still verify by hand |
+      | Code review | Finds flaws no input reaches yet | Needs source access; misses runtime-built SQL in config or procedures |
+
+      **Defence in depth** does not replace binding: least-privilege database accounts and views limit what a
+      missed injection can reach; input validation "complements parameter binding; it does not replace it";
+      hiding errors removes the easiest evidence but not the flaw.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-sqli-mechanics, sec-sqli-detection, sec-sqli-fix-verification]
+    title: Quick reference
+    body: |
+      - Injection = input that changes SQL **structure**. Contexts: string, numeric, identifier.
+      - Test every input that reaches a query, one at a time: parameters, JSON fields, headers, cookies.
+      - Candidate: a single quote gives a database error or a new 500.
+      - Proof: baseline twice (stable), `AND` true = baseline, `AND` false differs, replay once.
+      - Stop at proof. No `OR` on writes, no `UNION`, no stacked queries, no delays without need and permission.
+      - Fix: bind every value (`?`, `:name`); map columns and directions to fixed text. Not escaping, not a
+        blocklist, not "we use an ORM".
+      - Verify: both probes quiet, a legitimate quote still works, the code path binds.
+
+exercises:
+  - id: context-pick
+    type: mcq
+    concept: sec-sqli-mechanics
+    skill: application
+    title: Which input fits the context?
+    prompt: |
+      The server builds `SELECT * FROM payments WHERE merchant_id = 'm_100' AND amount_minor = ` + input. Which
+      input proves the logic changes without breaking the syntax?
+    options:
+      - id: numeric
+        text: '`2500 AND 1=2`'
+        feedback: Correct - the value is a bare number, so the condition can follow it directly; no quote to close.
+      - id: string
+        text: "`2500' AND '1'='2`"
+        feedback: There is no quote to close in a numeric context; the stray quote makes a syntax error, not a logic change.
+      - id: comment
+        text: '`2500 --`'
+        feedback: A comment hides the rest of the query but changes no logic you can compare; it proves less.
+      - id: union
+        text: '`2500 UNION SELECT * FROM merchants`'
+        feedback: That is exploitation, reads another table, and probably fails on column counts - not a minimal proof.
+    correct: [numeric]
+    hints:
+      - Is the input inside quotes in the query?
+      - What is the smallest addition that makes the answer predictably different?
+    solution: |
+      Match the payload to the context: numeric context takes a bare `AND 1=2`, string context needs the quote
+      closed first. The minimal proof changes logic, nothing else.
+
+  - id: and-or-precedence
+    type: mcq
+    concept: sec-sqli-mechanics
+    skill: analysis
+    title: Why does the OR payload leak other merchants?
+    prompt: |
+      With `status = x' OR '1'='1` the portal runs
+      `... WHERE merchant_id = 'm_100' AND status = 'x' OR '1'='1' ORDER BY id` and returns every merchant's
+      payments. Why does the merchant filter stop applying?
+    options:
+      - id: precedence
+        text: '`AND` binds tighter than `OR`, so the query is `(merchant AND status) OR true`, which is true for every row.'
+        feedback: Correct - the injected OR wraps the whole earlier condition, including the merchant filter.
+      - id: comment
+        text: The quote turns the merchant filter into a comment.
+        feedback: There is no comment marker in this payload; the filter is still parsed, just outvoted by OR.
+      - id: string-compare
+        text: SQLite compares '1'='1' as numbers and ignores the other conditions.
+        feedback: The comparison is simply true; it is operator precedence that decides how it combines with the rest.
+      - id: index
+        text: The database uses an index that skips the merchant column.
+        feedback: Indexes never change which rows a query returns, only how fast it finds them.
+    correct: [precedence]
+    hints:
+      - Add the parentheses the database uses.
+    solution: |
+      AND is evaluated before OR, so the injected `OR '1'='1'` ORs a true condition onto everything - the
+      tenant filter is lost. That is also why OR payloads are dangerous in UPDATE statements.
+
+  - id: inputs-to-test
+    type: mcq
+    concept: sec-sqli-mechanics
+    skill: recall
+    title: Which inputs belong on the injection test list?
+    prompt: Following WSTG-INPV-05, which inputs should a tester list as possible injection points? Pick all that apply.
+    options:
+      - id: hidden
+        text: Hidden fields of POST requests
+        feedback: Correct - the WSTG names them explicitly.
+      - id: headers
+        text: HTTP headers and cookies
+        feedback: Correct - "Consider also HTTP headers and Cookies."
+      - id: json
+        text: Fields in a JSON request body
+        feedback: Correct - any value that may reach a query is a candidate, whatever the transport.
+      - id: only-visible
+        text: Only the fields visible on the page
+        feedback: Visible fields are a subset; hidden fields, headers, cookies and API bodies reach queries too.
+    correct: [hidden, headers, json]
+    hints:
+      - Where else can a value come from besides what the user types?
+    solution: |
+      Everything that could reach a query: visible and hidden form fields, query parameters, JSON fields,
+      headers and cookies - tested one at a time.
+
+  - id: generic-500
+    type: mcq
+    concept: sec-sqli-detection
+    skill: analysis
+    title: A quote gives a generic 500
+    prompt: |
+      `status=captured` returns 200 with one payment. `status=captured'` returns
+      `500 {"error": "internal error", "reference": "ec57c95a"}`. What do you report?
+    options:
+      - id: anomaly
+        text: An anomaly to follow up with a boolean true/false pair before rating anything.
+        feedback: Correct - a 500 says the input broke something, not that it was parsed as SQL.
+      - id: confirmed
+        text: Confirmed SQL injection, because a quote caused a server error.
+        feedback: Many things fail on a quote (a JSON template, a validation bug); without logic-level proof it is a candidate.
+      - id: safe
+        text: No injection, because no database error is shown.
+        feedback: Hidden errors hide evidence, not flaws - the practice portal with errors hidden is still injectable.
+      - id: verbose
+        text: Only an information disclosure finding about the error reference.
+        feedback: A random reference with no details discloses nothing; the interesting part is the 500 itself.
+    correct: [anomaly]
+    hints:
+      - What would prove that the input changed the query's logic?
+    solution: |
+      Treat a new 500 as a candidate and confirm with the boolean pair. On the practice portal with errors
+      hidden, the pair still answers 139 bytes for true and 12 for false - confirmed blind injection.
+
+  - id: reflection-false-positive
+    type: mcq
+    concept: sec-sqli-detection
+    skill: analysis
+    title: Is this injection?
+    prompt: |
+      A search API answers `{"query": "<your input>", "results": []}`. The baseline `q=fees`, the true variant
+      and the false variant all give different bodies. A colleague says the false variant differs, so it is
+      injectable. What is wrong?
+    options:
+      - id: true-must-match
+        text: The true variant must equal the baseline; here it differs too, because the page reflects the input.
+        feedback: Correct - reflection changes every response; only "true = baseline, false differs" is evidence of logic.
+      - id: need-time
+        text: Nothing - but confirm with a time delay before reporting.
+        feedback: The pair already failed; there is no evidence to confirm, and delays add risk without cause.
+      - id: need-quote
+        text: The false variant needs a double quote instead.
+        feedback: The context is not the problem; the comparison rule is.
+      - id: results-empty
+        text: Empty results always mean injection.
+        feedback: An empty result for an unknown term is the normal behaviour of a search.
+    correct: [true-must-match]
+    hints:
+      - Which of the three comparisons failed?
+    solution: |
+      Both rules are needed. "False differs" alone fires on any page that echoes input; "true equals
+      baseline" is what shows the condition was evaluated rather than displayed.
+
+  - id: unstable-baseline
+    type: mcq
+    concept: sec-sqli-detection
+    skill: application
+    title: The baseline keeps changing
+    prompt: The same `status=captured` request gives two different bodies a second apart - each includes a server timestamp. What should the probe do?
+    options:
+      - id: stable-part
+        text: Compare a stable part - drop the timestamp field, or compare row counts - and stop as inconclusive if nothing is stable.
+        feedback: Correct - this is the WSTG's advice ("eliminate the code that changes between the two requests") and what the practice probe's fingerprint does.
+      - id: report
+        text: Report injection, since responses differ.
+        feedback: The input did not change; differences that appear without any payload prove nothing.
+      - id: ignore
+        text: Compare anyway and take the majority of three runs.
+        feedback: Majority votes on unstable pages still give false results; remove the noise first.
+      - id: sleep
+        text: Switch to time-based probing.
+        feedback: Timing is noisier, not cleaner, and adds load and risk.
+    correct: [stable-part]
+    hints:
+      - What part of the response actually reflects the query result?
+    solution: |
+      Normalise the volatile parts first; if no stable part exists, record the parameter as inconclusive
+      instead of guessing.
+
+  - id: technique-choice
+    type: mcq
+    concept: sec-sqli-detection
+    skill: analysis
+    title: Which technique for the report?
+    prompt: |
+      You have confirmed the boolean pair on a read-only filter. The client asks for "proof of impact". Which
+      next step is appropriate by default?
+    options:
+      - id: minimal
+        text: Show that the false/true pair changes Alice's own results, plus one OR-based read that returns rows Alice should not see - on agreed test data, if the rules of engagement allow it.
+        feedback: Correct - the smallest demonstration of the real consequence (cross-tenant read), only with permission and on test data.
+      - id: dump
+        text: Run a UNION to dump the merchants table with API secrets.
+        feedback: Dumping secrets proves no more about the flaw and creates the very breach you are reporting.
+      - id: stacked
+        text: Insert a test row with a stacked query to show write access.
+        feedback: Writes on someone else's system need explicit permission, and stacked queries depend on the driver.
+      - id: sleep
+        text: Make the database sleep 30 seconds to show control.
+        feedback: That ties up connections and proves nothing the boolean pair did not.
+    correct: [minimal]
+    hints:
+      - What is the least you can do that still shows the business impact?
+    solution: |
+      Stop at proof; if impact must be shown, use the smallest read that shows it, on test data, within the
+      rules of engagement - never dumps or writes.
+
+  - id: or-on-update
+    type: mcq
+    concept: sec-sqli-detection
+    skill: application
+    title: The same parameter feeds an UPDATE
+    prompt: |
+      The `note` field of "Update payment note" is concatenated into
+      `UPDATE payments SET note = '...' WHERE id = 'pay_1001'`. Which probe is safe on a shared test system?
+    options:
+      - id: read-path
+        text: None on this endpoint - prove the flaw on a read path that uses the same code, or use a single-quote error test only.
+        feedback: Correct - any logic payload on an UPDATE risks changing rows; prove it where it can only read.
+      - id: or-payload
+        text: "`x' OR '1'='1` to show every note changes."
+        feedback: That would rewrite every payment's note - exactly the risk sqlmap's documentation warns about for OR payloads.
+      - id: and-payload
+        text: An AND true/false pair in the note value.
+        feedback: In SET position an injected condition can still change what is written; it is not read-only here.
+      - id: comment
+        text: "`x' --` to cut off the WHERE clause."
+        feedback: Cutting off the WHERE clause updates every row.
+    correct: [read-path]
+    hints:
+      - What does the statement do to rows that match?
+    solution: |
+      Write statements turn logic payloads into data changes. Use the quote test only, or prove the flaw on a
+      read that shares the code.
+
+  - id: escaping-fix
+    type: mcq
+    concept: sec-sqli-fix-verification
+    skill: analysis
+    title: The developer doubled the quotes
+    prompt: |
+      The fix is `status.replace("'", "''")` before concatenation. Your probes are now quiet. Do you close the
+      finding?
+    options:
+      - id: no-binding
+        text: No - ask for bound parameters; manual escaping is strongly discouraged and fails across dialects, settings and other contexts.
+        feedback: Correct - the cheat sheet calls manual escaping error-prone and lists dialect and configuration differences.
+      - id: yes
+        text: Yes - the probes are quiet, so it is fixed.
+        feedback: Quiet probes cover the payloads you sent; escaping leaves numeric and identifier contexts and other dialects exposed.
+      - id: blocklist
+        text: Yes, if the developer also blocks the words OR and AND.
+        feedback: Blocklists break legitimate data and miss encodings; they are not a fix.
+      - id: waf
+        text: Yes, if a web application firewall is added.
+        feedback: A WAF filters known payloads; the query still mixes data and structure.
+    correct: [no-binding]
+    hints:
+      - What does the cheat sheet say about manual escaping?
+    solution: |
+      Close only when values are bound. Escaping is "error-prone and is strongly discouraged"; numeric and
+      identifier contexts and dialect settings (for example MySQL NO_BACKSLASH_ESCAPES) defeat it.
+
+  - id: orm-claim
+    type: mcq
+    concept: sec-sqli-fix-verification
+    skill: analysis
+    title: "\"We use an ORM, so we are safe\""
+    prompt: Which statement about ORMs and injection is accurate?
+    options:
+      - id: strings
+        text: ORM query languages such as HQL and JPQL are injectable when the query is built by concatenation; ORM APIs are safe only when values are bound.
+        feedback: Correct - the Top 10's scenario #2 and the cheat sheet's HQL example show exactly this.
+      - id: always-safe
+        text: ORMs never send SQL built from strings, so injection is impossible.
+        feedback: ORMs accept raw SQL and their own string query languages; concatenating into either is injectable.
+      - id: only-sql
+        text: Only raw SQL can be injected; HQL is parsed differently and cannot be.
+        feedback: HQL injection is its own weakness (CWE-564) - it is still a query language built from strings.
+      - id: escaping
+        text: ORMs escape every string automatically, even in raw queries.
+        feedback: Raw queries are passed as written; only bound parameters are handled safely.
+    correct: [strings]
+    hints:
+      - What does the attacker control in `createQuery("from Inventory where productID='" + input + "'")`?
+    solution: |
+      The ORM protects you only through its parameter binding. Review every string-built query - raw SQL,
+      HQL/JPQL, stored procedures - the same way.
+
+  - id: detection-order
+    type: order
+    concept: sec-sqli-detection
+    skill: application
+    title: Put a safe injection test in order
+    prompt: Order the steps for testing one parameter for SQL injection safely.
+    items:
+      - id: scope
+        text: Confirm the parameter is in scope and whether the endpoint reads or writes.
+      - id: baseline
+        text: Send the normal value twice and check the answers are identical.
+      - id: quote
+        text: Append a single quote and look for a database error or a new 500.
+      - id: pair
+        text: Send the always-true and always-false pair for the parameter's context.
+      - id: replay
+        text: Replay the pair once to rule out a one-off change.
+      - id: record
+        text: Record the four requests and responses as evidence, with tokens redacted.
+    hints:
+      - You cannot compare anything before you have a stable baseline.
+      - Evidence comes last, once the result is confirmed.
+    solution: |
+      Scope, stable baseline, quote test, boolean pair, replay, evidence. Stop there unless the rules of
+      engagement ask for more.
+
+  - id: unsafe-sort-debug
+    type: debug
+    concept: sec-sqli-fix-verification
+    skill: analysis
+    title: Which lines still allow injection?
+    prompt: |
+      This "fixed" query binds the merchant and status. Pick the lines that still let user input change the
+      SQL structure.
+    language: python
+    code: |
+      def find_payments(con, merchant_id, status, sort, direction):
+          sql = "SELECT id, amount_minor, status FROM payments WHERE merchant_id = ?"
+          params = [merchant_id]
+          if status:
+              sql += " AND status = ?"
+              params.append(status)
+          sql += " ORDER BY " + sort
+          sql += " " + direction
+          return con.execute(sql, params).fetchall()
+    correctLines: [7, 8]
+    hints:
+      - Which lines add text to the SQL string rather than to params?
+      - Can a placeholder stand for a column name or the word DESC?
+    lineNotes:
+      - line: 5
+        note: A placeholder - the status travels in params, so this line is safe.
+      - line: 9
+        note: Binding is correct here; the damage was done when the SQL text was built.
+    solution: |
+      Lines 7 and 8 append the caller's sort and direction to the SQL text. Placeholders cannot carry
+      identifiers or keywords, so map them through fixed allow-lists (`{"amount": "amount_minor"}`,
+      `{"asc": "ASC", "desc": "DESC"}`) and reject anything else.
+
+  - id: hidden-errors-short
+    type: short
+    concept: sec-sqli-detection
+    skill: analysis
+    title: Why is "errors are hidden now" not a fix?
+    prompt: |
+      A ticket says the SQL injection is fixed because the page no longer shows the SQLite error. Explain in
+      a few sentences why that is not enough and what evidence you would ask for or produce.
+    modelAnswer: |
+      Hiding errors removes the easiest evidence, not the flaw: the query is still built from the input, so
+      the input still changes its logic. On the practice portal with errors hidden, the single quote gives a
+      generic 500, but the boolean pair still answers 139 bytes for true and 12 for false - blind injection.
+      I would re-run the boolean pair (and keep the finding open, re-rated as blind), and ask for the query
+      to bind its values. To close it I want both probes quiet, a legitimate value containing a quote
+      working, and the code showing placeholders.
+    rubric:
+      - Says hiding errors removes evidence, not the vulnerability.
+      - Names the boolean true/false pair as the way to confirm without errors.
+      - Asks for parameter binding as the fix.
+      - Lists closure evidence - quiet probes, legitimate quote works, code review.
+    hints:
+      - What does the boolean probe need from the response?
+    solution: |
+      Generic errors hide evidence; the boolean pair still proves the flaw. Close only after binding, with
+      quiet probes, a working legitimate quote and code evidence.
+
+  - id: sqli-testdesign
+    type: testdesign
+    concept: sec-sqli-fix-verification
+    skill: application
+    title: Test plan for the payments filter fix
+    prompt: |
+      The payments list API (`GET /api/payments?status=...&sort=...&direction=...`) had SQL injection in
+      `status`. Developers say it now binds values and allow-lists sorting. Design the test cases to verify
+      the fix - preconditions, steps, expected results and evidence for each.
+    modelAnswer: |
+      Preconditions for all: the fixed build on my own or agreed test environment; two merchants with known
+      payments (Alice m_100, Bob m_200); Alice's token; probes from `sqli_detect` and `sqli_errors`.
+
+      1. **Baseline** - `status=captured` twice. Expected: identical, Alice's one payment. Evidence: both
+         responses.
+      2. **Quote** - `status=captured'`. Expected: 200 with no rows (same as any unknown status), no database
+         text. Evidence: status and body.
+      3. **Boolean pair, string context** - true and false variants. Expected: both differ from baseline and
+         equal each other (treated as data). Evidence: probe output (None).
+      4. **Cross-tenant** - `status=x' OR '1'='1`. Expected: no rows, no m_200 ids. Evidence: response ids.
+      5. **Legitimate quote** - create or use a status containing `'` (`o'brien-hold`). Expected: its payment
+         returns. Evidence: response.
+      6. **Sort allow-list** - `sort=amount`, `sort=amount_minor; DROP TABLE payments`, `direction=ASC; --`.
+         Expected: first sorted, the others rejected with 400 and no SQL error. Evidence: responses, then a
+         row count unchanged.
+      7. **Other parameters** - repeat 2-3 for every other parameter of the endpoint. Expected: quiet.
+      8. **Code review** - read the query construction. Expected: placeholders for values, maps for
+         identifiers, no concatenation. Evidence: file and line, diff.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence.
+      - Re-runs both the error and the boolean probe on the fixed build.
+      - Checks a legitimate value containing a quote still works.
+      - Tests the sort/direction identifiers, not only the status value.
+      - Includes a cross-tenant check and a code review.
+    hints:
+      - The fix must reject attacks and still accept odd but legitimate data.
+      - Which parts of the query can placeholders not cover?
+    solution: |
+      Re-run the probes (quiet), prove legitimate quotes work, attack the identifiers, check cross-tenant
+      data, and back it with the code diff.
+
+  - id: interview-sqli
+    type: interview
+    concept: sec-sqli-detection
+    skill: analysis
+    title: "Interview: how do you test for SQL injection?"
+    prompt: |
+      "Walk me through how you would test an API endpoint for SQL injection, and how you would know the fix
+      works."
+    modelAnswer: |
+      First scope: is the endpoint in scope, is it a read or a write, and on which data. Then I list every
+      input that could reach a query - query parameters, JSON fields, headers, cookies - and test one at a
+      time, following OWASP WSTG-INPV-05.
+
+      For each input I take a stable baseline, then add a single quote: a database error names the database
+      and is a strong candidate; a generic 500 is only an anomaly. I confirm with a boolean pair that fits the
+      context - for a string, `value' AND '1'='1` and `value' AND '1'='2`. The true one must look exactly like
+      the baseline and the false one must differ; that rules out pages that just echo input, and it works
+      when errors are hidden. I stop at proof: no OR payloads on writes, no UNION or stacked queries, no
+      delays unless nothing else differs and I am allowed to. Tools like sqlmap help in scope, but I keep my
+      own minimal evidence.
+
+      The fix is parameterised queries - values bound through placeholders - and allow-lists for column
+      names and sort direction, which placeholders cannot carry. Escaping, blocklists, a WAF or "we use an
+      ORM" are not proof. To verify, I re-run the same probes - they must be quiet - check that legitimate
+      data with quotes still works, and review the code path for any concatenation, including inside stored
+      procedures.
+    rubric:
+      - Lists inputs beyond visible fields and tests them one at a time.
+      - Explains the single-quote test and its limit when errors are hidden.
+      - Explains the boolean pair with both rules (true = baseline, false differs).
+      - Stops at proof and names the risky payloads to avoid.
+      - Names binding plus allow-lists as the fix, rejects escaping/ORM as proof, and verifies with probes, a legitimate quote and code review.
+    followUps:
+      - How would you test a parameter that only affects sort order?
+      - What changes if the endpoint is an UPDATE?
+      - When would you use a time-based technique?
+    hints:
+      - Structure it as - scope, find, confirm, stop, fix, verify.
+    solution: |
+      Scope, list inputs, quote test, boolean confirmation, stop at proof; fix by binding and allow-lists;
+      verify with the same probes, a legitimate quote and code review.
+
+  - id: boolean-probe-code
+    type: coding
+    concept: sec-sqli-detection
+    skill: application
+    title: Write a boolean differential SQL injection probe
+    prompt: |
+      In `practice/security/exercises/web/sqli_detect.py`, implement `boolean_pairs`, `fingerprint` and
+      `probe_boolean`. The tests run your probe against in-memory fakes (unsafe and safe queries, an echoing
+      page, an unstable page) and against the practice portal: it must find the flaw in `make_app()` and in
+      `make_app({"verbose-errors"})` (errors hidden), stay quiet on `make_app({"sqli"})`, and only ever send
+      small read-only payloads.
+    project: security
+    files: [exercises/web/sqli_detect.py]
+    test: tests/web/test_sqli_detect.py
+    command: .venv/bin/python -m pytest tests/web/test_sqli_detect.py
+    modelAnswer: |
+      Pairs per context (string first; numeric only for digits), a fingerprint that drops volatile JSON keys
+      at any depth and sorts keys, then:
+
+      ```python
+      base = fingerprint(*send(value))
+      if fingerprint(*send(value)) != base:
+          raise InconclusiveError(...)
+      for context, t, f in boolean_pairs(value):
+          if fingerprint(*send(t)) != base or fingerprint(*send(f)) == base:
+              continue
+          if fingerprint(*send(t)) != base or fingerprint(*send(f)) == base:   # replay once
+              continue
+          return Finding(parameter, "boolean", context, t, f, evidence)
+      return None
+      ```
+    rubric:
+      - Every test in tests/web/test_sqli_detect.py passes.
+      - Both rules are applied - true equals the baseline and false differs - so echoing pages are not flagged.
+      - An unstable baseline is reported as inconclusive, not as a finding or a pass.
+      - Payloads are AND-only conditions; nothing widens the read or writes.
+    hints:
+      - Start with boolean_pairs - the tests show the exact strings.
+      - fingerprint returns a tuple of (status, normalised body); json.dumps with sort_keys gives a stable text.
+      - Check the baseline twice before trying any pair.
+    solution: |
+      Stable baseline, true equals it, false differs, replay once - all with AND-only conditions.
+
+  - id: safe-query-code
+    type: coding
+    concept: sec-sqli-fix-verification
+    skill: application
+    title: Fix the query - bind values, allow-list structure
+    prompt: |
+      In `practice/security/exercises/web/sqli_safe_query.py`, implement `find_payments(con, merchant_id,
+      statuses=None, sort="id", direction="asc")`. Bind the merchant id and every status (one placeholder per
+      status, `IN (?, ?, ...)`); map `sort` through `SORT_COLUMNS` and `direction` through `DIRECTIONS`, and
+      raise `ValueError` for anything else. The tests wrap the connection to check that no untrusted value
+      ever appears in the SQL text.
+    project: security
+    files: [exercises/web/sqli_safe_query.py]
+    test: tests/web/test_sqli_safe_query.py
+    command: .venv/bin/python -m pytest tests/web/test_sqli_safe_query.py
+    modelAnswer: |
+      ```python
+      if sort not in SORT_COLUMNS:
+          raise ValueError(...)
+      if not isinstance(direction, str) or direction.lower() not in DIRECTIONS:
+          raise ValueError(...)
+      params = [merchant_id]
+      sql = f"SELECT {COLUMNS} FROM payments WHERE merchant_id = ?"
+      if statuses is not None:
+          statuses = list(statuses)
+          if not statuses:
+              return []
+          sql += " AND status IN (" + ", ".join("?" for _ in statuses) + ")"
+          params.extend(statuses)
+      sql += f" ORDER BY {SORT_COLUMNS[sort]} {DIRECTIONS[direction.lower()]}, id ASC"
+      return _rows(con.execute(sql, params))
+      ```
+    rubric:
+      - Every test in tests/web/test_sqli_safe_query.py passes.
+      - User text travels only in the parameters; the SQL text is built only from application-owned pieces.
+      - Sort column and direction come from fixed maps, and anything else is rejected before SQL is built.
+      - A legitimate value containing a quote still works.
+    hints:
+      - Build the placeholder list from the number of statuses, never from their text.
+      - Validate sort and direction first, then build the SQL.
+      - An empty status list can return immediately.
+    solution: |
+      Bind every value, map every identifier, reject the rest - the SQL text never contains user input.
+
+  - id: error-probe-code
+    type: coding
+    concept: sec-sqli-detection
+    skill: application
+    title: Classify database errors from a single quote
+    prompt: |
+      In `practice/security/exercises/web/sqli_errors.py`, implement `classify`, `evidence_line` and
+      `probe_error` using the given `SIGNATURES`. A signature already on the normal page is not a finding; a
+      database error that only the quote produced is a `sql-error`; a new 5xx without a signature is a
+      `server-error` anomaly. The portal tests expect `sql-error` (SQLite) on `make_app()`, `server-error` on
+      `make_app({"verbose-errors"})` and nothing on `make_app({"sqli"})`.
+    project: security
+    files: [exercises/web/sqli_errors.py]
+    test: tests/web/test_sqli_errors.py
+    command: .venv/bin/python -m pytest tests/web/test_sqli_errors.py
+    modelAnswer: |
+      ```python
+      def classify(body):
+          return [name for name, pattern in SIGNATURES if pattern.search(body)]
+
+      def probe_error(send, parameter, value):
+          base_status, base_body = send(value)
+          status, body = send(value + "'")
+          already = set(classify(base_body))
+          new = tuple(n for n in classify(body) if n not in already)
+          if new:
+              return ErrorFinding(parameter, "sql-error", new, status, evidence_line(body))
+          if status >= 500 and base_status < 500:
+              return ErrorFinding(parameter, "server-error", (), status, f"{value!r} -> {base_status}, ...")
+          return None
+      ```
+    rubric:
+      - Every test in tests/web/test_sqli_errors.py passes.
+      - Only signatures new to the quoted response count, so documentation pages are not flagged.
+      - A generic 500 is reported as an anomaly, not as confirmed injection.
+      - Evidence is one short matching line, not the whole traceback.
+    hints:
+      - classify keeps the order of SIGNATURES and each name once.
+      - Compare the baseline's signatures with the quoted response's.
+    solution: |
+      Database text new to the quoted response is a sql-error; a new 5xx alone is an anomaly to confirm with
+      the boolean probe.
+
+placement:
+  - id: place-context
+    type: mcq
+    concept: sec-sqli-mechanics
+    skill: application
+    title: Which part of this query can a placeholder not protect?
+    prompt: |
+      `SELECT id FROM payments WHERE merchant_id = ? AND status = ? ORDER BY ` + sort_column. Which input
+      still needs another defence?
+    options:
+      - id: sort
+        text: '`sort_column` - identifiers cannot be bound, so it needs a fixed allow-list.'
+        feedback: Correct - placeholders carry values, not column names or keywords.
+      - id: status
+        text: '`status` - placeholders do not work with strings.'
+        feedback: Placeholders bind strings, numbers and other values safely.
+      - id: merchant
+        text: '`merchant_id` - it should be escaped as well as bound.'
+        feedback: Binding is enough; escaping a bound value would corrupt it.
+      - id: none
+        text: None - the query uses placeholders, so it is safe.
+        feedback: The ORDER BY part is concatenated text.
+    correct: [sort]
+    solution: |
+      Values go in placeholders; identifiers and keywords go through allow-lists of application-owned text.
+
+  - id: place-blind
+    type: mcq
+    concept: sec-sqli-detection
+    skill: analysis
+    title: Errors are hidden - which result confirms injection?
+    prompt: |
+      Baseline `status=captured` gives 200 and 139 bytes (twice). Which pair of results confirms SQL injection?
+    options:
+      - id: confirm
+        text: "`captured' AND '1'='1` gives 200 and 139 bytes; `captured' AND '1'='2` gives 200 and 12 bytes"
+        feedback: Correct - true matches the baseline and false differs.
+      - id: both-differ
+        text: "Both variants give 200 and 12 bytes"
+        feedback: The condition had no effect - the value is treated as data (this is the fixed portal).
+      - id: quote-500
+        text: "`captured'` gives a generic 500"
+        feedback: An anomaly to follow up, not proof.
+      - id: echo
+        text: "Each variant gives a different size, none equal to the baseline"
+        feedback: That is what a page reflecting the input looks like; true must equal the baseline.
+    correct: [confirm]
+    solution: |
+      Confirmation needs both rules: true equals the stable baseline, false differs.
+
+  - id: place-fix
+    type: mcq
+    concept: sec-sqli-fix-verification
+    skill: analysis
+    title: Which evidence closes the finding?
+    prompt: Which set of evidence is enough to close a SQL injection finding on the status filter?
+    options:
+      - id: full
+        text: The boolean and quote probes are quiet, a legitimate status containing a quote still works, and the code binds the value.
+        feedback: Correct - behaviour, regression and code evidence together.
+      - id: no-error
+        text: The single quote no longer shows a database error.
+        feedback: Hidden errors leave blind injection intact.
+      - id: waf
+        text: A WAF rule now blocks requests containing OR 1=1.
+        feedback: Filtering one payload is not a fix.
+      - id: scanner
+        text: An automated scan of the home page found nothing.
+        feedback: The scan has to reach the parameter, and a scan is not proof the code binds values.
+    correct: [full]
+    solution: |
+      Close with quiet probes on the same parameter, a working legitimate quote and code that binds.
+
+recall:
+  - id: recall-what
+    concept: sec-sqli-mechanics
+    prompt: What is SQL injection, in one sentence?
+    answer: Untrusted input becoming part of a query's SQL syntax, so it changes the query's logic or adds statements - possible wherever the application builds SQL text from input.
+  - id: recall-contexts
+    concept: sec-sqli-mechanics
+    prompt: Name the three injection contexts and a minimal true/false pair for the first two.
+    answer: "String - value' AND '1'='1 / value' AND '1'='2; numeric - value AND 1=1 / value AND 1=2; identifier or keyword (ORDER BY, table names), which placeholders cannot carry."
+  - id: recall-boolean-rules
+    concept: sec-sqli-detection
+    prompt: What are the rules of a boolean differential probe?
+    answer: Stable baseline (same answer twice), true variant equals the baseline, false variant differs, replay once. True-equals-baseline rules out reflection.
+  - id: recall-stop
+    concept: sec-sqli-detection
+    prompt: Which payloads do you avoid when proving SQL injection, and why?
+    answer: OR-based on writes (can change every row), UNION and stacked queries (read or write data you do not need), time delays (load, noise). AND conditions on reads are enough proof.
+  - id: recall-fix
+    concept: sec-sqli-fix-verification
+    prompt: What is the fix for SQL injection according to the OWASP cheat sheet?
+    answer: Define the SQL structure separately and bind values with parameterised queries; map table names, column names and sort order to fixed application-owned values. Escaping is strongly discouraged.
+  - id: recall-verify
+    concept: sec-sqli-fix-verification
+    prompt: How do you verify a SQL injection fix?
+    answer: Re-run the same quote and boolean probes (quiet), check a legitimate value containing a quote still works, check identifiers are allow-listed, and review the code path - including ORMs and stored procedures - for concatenation.
+
+next:
+  - testing-cross-site-scripting
+  - testing-access-control-idor
+  - security-regression-automation

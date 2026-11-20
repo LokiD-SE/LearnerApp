@@ -1,0 +1,1325 @@
+id: testing-csrf-and-clickjacking
+title: Testing for CSRF and clickjacking
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Two attacks that make a signed-in user's own browser act against them - cross-site request forgery, where another site sends the request, and clickjacking, where another site frames the page and borrows the click. How each works, which defences really stop it (tokens, Origin checks, Fetch Metadata, SameSite, frame-ancestors, X-Frame-Options), and how a tester proves a finding with a control, read-back evidence and a proof-of-concept page - against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    CSRF,
+    cross-site request forgery,
+    XSRF,
+    session riding,
+    confused deputy,
+    ambient credentials,
+    anti-CSRF token,
+    synchronizer token,
+    double-submit cookie,
+    signed double-submit cookie,
+    Origin header,
+    Referer header,
+    Fetch Metadata,
+    Sec-Fetch-Site,
+    SameSite,
+    Lax,
+    Strict,
+    simple request,
+    text/plain,
+    JSON CSRF,
+    proof of concept,
+    clickjacking,
+    UI redressing,
+    DoubleClickjacking,
+    X-Frame-Options,
+    frame-ancestors,
+    Content-Security-Policy,
+    OWASP WSTG,
+    WSTG-SESS-05,
+    WSTG-CLNT-09,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, and curl,
+    on Linux. Every output in this lesson was printed by the commands and code shown, run on 20 November 2026
+    against the practice portal. Session ids and CSRF tokens are random per run, so they are shortened or
+    replaced in the listings; random ports are replaced by the 8765 used in the instructions.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal that binds to `127.0.0.1` only. Its `csrf` flaw (no token on `POST /settings/email`) and
+    `missing-headers` flaw (no `frame-ancestors`) are the ones this lesson tests; `make_app({...})` builds the
+    same portal with those flaws fixed. SandPay, its users and every origin under `sandpay.example`,
+    `partner.example` and `evil.example` are fictional (`.example` is reserved for documentation).
+  - **No browser is driven here.** The tests send, with Python, the exact request a browser would send for a
+    forged form - the victim's cookie included. Whether a particular browser really attaches that cookie
+    depends on the cookie's `SameSite` attribute and the browser's default, as the WSTG notes; the lesson
+    says where that matters.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. A
+    CSRF test changes the victim account's data - use test accounts, read back, and put the data back.
+  - **Testing guide:** OWASP Web Security Testing Guide, latest (development) version on
+    [GitHub](https://github.com/OWASP/wstg) as read on 20 November 2026 (the latest stable release is v4.2,
+    where the same tests are WSTG-SESS-05 "Testing for Cross Site Request Forgery" and WSTG-CLNT-09 "Testing
+    for Clickjacking"): [WSTG-SESS-05 Cross Site Request
+    Forgery](https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/05-Testing_for_Cross_Site_Request_Forgery)
+    and [WSTG-CLNT-09
+    Clickjacking](https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/11-Client-side_Testing/09-Testing_for_Clickjacking).
+    The "SameSite cookie considerations" and "Clickjacking without frames" passages are in the latest version
+    only. Quotations are from those pages.
+  - **Defences:** OWASP Cheat Sheet Series, [Cross-Site Request Forgery Prevention Cheat
+    Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
+    and [Clickjacking Defense Cheat
+    Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Clickjacking_Defense_Cheat_Sheet.html), as
+    documented on 20 November 2026 (read from the project's GitHub source).
+  - **Standards:** W3C [Content Security Policy Level 3](https://www.w3.org/TR/CSP3/) (a Working Draft),
+    section 6.4.2 `frame-ancestors` and 6.4.2.2 "Relation to X-Frame-Options"; WHATWG HTML Living Standard
+    [section 7.7 "The X-Frame-Options
+    header"](https://html.spec.whatwg.org/multipage/speculative-loading.html#the-x-frame-options-header),
+    whose processing model "supersedes" [RFC 7034](https://www.rfc-editor.org/rfc/rfc7034) (an Informational
+    RFC), and [section 4.10.22.9 "Plain text form
+    data"](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#plain-text-form-data);
+    MDN [X-Frame-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Frame-Options).
+    The `frame-ancestors` matching in the exercise is a documented subset of CSP Level 3 section 6.7.2.
+  - **Not repeated here:** the same-origin policy, CORS, cookie attributes and a basic header check -
+    [HTTP security for testers](#/lesson/http-security-for-testers); capturing and replaying requests -
+    [Intercepting proxies](#/lesson/intercepting-proxies); sessions from the developer's side -
+    [Sessions, cookies and tokens](#/lesson/sessions-cookies-and-tokens).
+
+prerequisites:
+  - http-security-for-testers
+  - intercepting-proxies
+  - testing-session-management
+
+concepts:
+  - id: sec-csrf-mechanics
+    name: How CSRF works and what is forgeable
+    summary: Ambient credentials ride along with requests another site makes; only simple requests a form can send are forgeable that way.
+  - id: sec-csrf-defence-testing
+    name: Testing CSRF defences with evidence
+    summary: Control first, forgeries without or with a wrong token, read-back evidence, clean-up - and which defences count.
+  - id: sec-clickjacking-framing
+    name: Clickjacking and framing protection
+    summary: frame-ancestors overrides X-Frame-Options; the HTML standard's rules decide odd values; framing defences miss DoubleClickjacking.
+
+objectives:
+  - Explain why a browser turns another site's form into an authenticated request, and list the three conditions WSTG-SESS-05 names as essential.
+  - Decide whether a captured request is forgeable by a cross-site form from its method, content type and headers.
+  - Run a CSRF test with a control, forged requests without or with a wrong token, read-back evidence and clean-up, and give an honest verdict including "inconclusive".
+  - Rank CSRF defences - synchronizer tokens, signed double-submit cookies, Origin and Fetch Metadata checks, custom headers, SameSite - and say which are defence in depth.
+  - Decide whether a page may be framed from its CSP frame-ancestors and X-Frame-Options headers, including conflicting and invalid values.
+  - Write a CSRF proof-of-concept page for a finding report that states what a form cannot do.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-csrf-mechanics, sec-clickjacking-framing]
+    title: The idea in plain language
+    body: |
+      Ana runs a SandPay shop and is signed in to the merchant portal in one tab. In another tab she reads a
+      forum post. Hidden in that post is a form that points at the portal's "change payout email" page and
+      submits itself. Her browser does what browsers do with every request to the portal: it attaches the
+      portal's session cookie. The portal sees a correctly signed-in Ana asking to change her email to the
+      attacker's, and does it. Ana clicked nothing on the portal. That is **cross-site request forgery
+      (CSRF)**: another site makes the request, and the user's browser makes it authentic.
+
+      **Clickjacking** borrows the user's click instead of forging the request. The attacker's page loads the
+      real portal in an invisible frame and lines a "Win a voucher" button up with the portal's "Confirm
+      payout change" button. Ana clicks what she sees; the click lands on the real, signed-in page underneath.
+      Because the real page sends the request, with its real anti-CSRF token, token defences do not help -
+      only refusing to be framed does.
+
+      Both attacks are confused-deputy problems: the server trusts the browser, and the browser does the
+      attacker's bidding. As a tester you prove them the same way every time - show the action happening when
+      it should not, show it not happening once the defence is in place, and leave the account as you found it.
+
+  - id: what
+    kind: what
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **CSRF** | WSTG-SESS-05: "an attack that forces an end user to execute unintended actions on a web application in which they are currently authenticated" |
+      | **Ambient credentials** | credentials the browser adds to every request on its own - cookies and HTTP authentication (Basic and similar); a bearer token that the app's JavaScript puts in `Authorization` is not ambient |
+      | **State-changing request** | one that changes data or triggers an action (email change, refund, payout), as opposed to reading |
+      | **Simple request** | a request a page can send cross-site without a CORS preflight; for forms: GET or POST with one of three content types, `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain` |
+      | **Anti-CSRF token** | a secret, unpredictable value tied to the session, embedded in the page and required on every state-changing request; the attacker cannot read it |
+      | **Synchronizer token pattern** | the server stores the token in the session and compares (the cheat sheet's recommendation for stateful apps) |
+      | **Signed double-submit cookie** | for stateless apps: the token is in a cookie AND in the request, bound to the session with an HMAC (the cheat sheet's "RECOMMENDED" variant; the unsigned "naive" one is "DISCOURAGED") |
+      | **Origin / Referer check** | the server compares the source origin the browser reports with its own origin |
+      | **Fetch Metadata** | `Sec-Fetch-Site` and related request headers the browser adds; `cross-site` on a POST is a strong refusal signal |
+      | **SameSite** | cookie attribute: `Strict`, `Lax` or `None`; limits when the browser attaches the cookie to cross-site requests - defence in depth, not the main defence |
+      | **Clickjacking** | WSTG-CLNT-09: "a malicious technique whereby a web user is deceived into interacting (in most cases by clicking) with something other than what the user believes they are interacting with" |
+      | **frame-ancestors** | CSP directive listing who may embed the page; overrides X-Frame-Options when enforced |
+      | **X-Frame-Options** | older response header: `DENY` or `SAMEORIGIN` (`ALLOW-FROM` is obsolete and ignored) |
+      | **PoC** | proof of concept - here an HTML page that performs the forged request, written as evidence for the report |
+
+  - id: why
+    kind: why
+    concepts: [sec-csrf-mechanics, sec-clickjacking-framing]
+    title: Why these flaws matter in a payments portal
+    body: |
+      The cheat sheet puts the impact plainly: "Depending on the user's credentials, the attacker can transfer
+      funds, change a password, make an unauthorized purchase, elevate privileges for a target account, or
+      take any action that the user is permitted to do." In SandPay terms: change the payout email, then the
+      payout bank account, then trigger a payout - all as the merchant, all logged as the merchant.
+
+      WSTG-SESS-05 adds two reasons the flaw survives:
+
+      - **POST is not a fix.** "POST requests can be automated via JavaScript and are vulnerable as well;
+        therefore, the use of POST alone is not enough to correct the occurrence of CSRF vulnerabilities."
+      - **Firewalls are not a fix.** The victim's browser sends the request, so "it is sufficient that the link
+        being attacked be reachable by the victim and not directly by the attacker" - an internal admin
+        console is a target too.
+
+      Clickjacking matters because it beats the CSRF defence: WSTG-CLNT-09 notes that "some of the anti-CSRF
+      protections deployed by the developers to protect the web page from CSRF attacks could be bypassed",
+      because the click happens on the real page, token and all.
+
+      And these are cheap to find. A tester who replays one form without its token, and fetches one page's
+      headers, has covered the basics - which is why both appear in nearly every web assessment.
+
+  - id: csrf-internals
+    kind: internals
+    concepts: [sec-csrf-mechanics]
+    title: What makes a request forgeable
+    body: |
+      WSTG-SESS-05 lists what CSRF relies on - browsers sending session information automatically, the
+      attacker knowing the URLs and parameters, session management "relying only on information known by the
+      browser", and tags such as `img` that trigger requests - and adds: "Points 1, 2, and 3 are essential for
+      the vulnerability to be present, while point 4 facilitates the actual exploitation".
+
+      Turn that into a check you can run on any captured request:
+
+      | Question | Forgeable by a cross-site form only if... |
+      | --- | --- |
+      | How is the user identified? | by an ambient credential - a cookie or HTTP authentication. A bearer token in `Authorization`, added by the app's own script, is not sent with a forged request. |
+      | Which method? | GET or POST - the only methods a form submits |
+      | Which body? | none (GET), or `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain` - the three types that need no preflight |
+      | Which headers does the server require? | none that a form cannot send - no custom header, no token header |
+      | Is every value predictable? | no secret token, and nothing the attacker cannot guess (like the current password) |
+
+      **JSON APIs are not automatically safe.** A JSON body normally comes with
+      `Content-Type: application/json`, which a form cannot send - a cross-site `fetch()` with that type needs
+      a CORS preflight the server can refuse. But WSTG-SESS-05 shows the trick: a form with
+      `enctype="text/plain"` whose single field's name and value, joined by the `=` the browser inserts, spell a
+      JSON document. The HTML standard's text/plain encoding writes each field as name, `=`, value and a CR LF
+      pair (section 4.10.22.9). If the server parses the body as JSON without checking the content type, and
+      accepts cookies, the API is forgeable. The cheat sheet's fix: "disallow these simple content types".
+
+      **Where SameSite fits.** When a cookie is `SameSite=Lax`, the browser withholds it from cross-site
+      subresource requests and cross-site POSTs, so the classic auto-submitting POST form arrives without a
+      session. The WSTG-SESS-05 latest version spells out the caveats a tester must remember: Chromium-based
+      browsers treat a cookie without `SameSite` as `Lax` "since 2020", but Firefox and Safari do not default to
+      it, a top-level GET navigation still carries a `Lax` cookie, and when `Lax` is only the default,
+      Chromium "still send[s] the cookie on cross-site top-level POST requests for two minutes after it is
+      set". Its advice: "Don't conclude an application is safe from CSRF just because a PoC fails to fire in
+      one browser - check the actual `Set-Cookie` header for the session cookie."
+
+  - id: framing-internals
+    kind: internals
+    concepts: [sec-clickjacking-framing]
+    title: How a browser decides whether a page may be framed
+    body: |
+      Two response headers can refuse framing, and the browser applies them in a fixed order.
+
+      1. **CSP `frame-ancestors` first.** CSP Level 3 section 6.4.2.2: "If a resource is delivered with a
+         policy that includes a directive named frame-ancestors and whose disposition is "enforce", then the
+         `X-Frame-Options` header will be ignored". The HTML standard says the same: "if both a CSP
+         frame-ancestors directive and an `X-Frame-Options` header are used in the same response, then
+         `X-Frame-Options` is ignored." Every ancestor in the chain must match, and every enforced policy must
+         allow it. `Content-Security-Policy-Report-Only` only reports. And `frame-ancestors` does not fall back
+         to `default-src`.
+      2. **Otherwise `X-Frame-Options`**, by the HTML standard's processing model (section 7.7), which
+         "supersedes" RFC 7034. Values from every such header are split on commas and lower-cased into a set:
+
+      | Values (after splitting) | Result |
+      | --- | --- |
+      | `DENY` | embedding disallowed |
+      | `SAMEORIGIN` | allowed only if every ancestor is the same origin |
+      | anything else alone (`INVALID`, `ALLOWALL`, `ALLOW-FROM ...`) | treated as if absent - embedding allowed |
+      | more than one value, including `deny`, `sameorigin` or `allowall` (for example `SAMEORIGIN,`) | embedding disallowed - "appear confused" |
+      | more than one value, all invalid | treated as absent |
+
+      3. **Neither header:** the page can be framed by anyone.
+
+      The standard is blunt about `ALLOW-FROM`: it "is not to be implemented". A site that relies on
+      `X-Frame-Options: ALLOW-FROM https://partner.example` has no protection at all in current browsers. And
+      the cheat sheet warns that both controls must be HTTP response headers: "Meta-tags that attempt to apply
+      the X-Frame-Options directive DO NOT WORK", and the same goes for `frame-ancestors`.
+
+      **Clickjacking without frames.** The latest WSTG-CLNT-09 describes DoubleClickjacking (Paulos Yibelo,
+      2024): the attacker asks for a double-click and, between the two clicks, navigates another window to the
+      target page, so the second click lands on a real control. "The target page is loaded as a top-level
+      page, so `X-Frame-Options` and the `frame-ancestors` directive don't apply". The test there is about
+      single-click sensitive actions, not headers.
+
+  - id: when
+    kind: when
+    concepts: [sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: When to test, and what a finding is
+    body: |
+      | Situation | Test | Usually a finding? |
+      | --- | --- | --- |
+      | A state-changing form or endpoint authenticated by cookie or HTTP auth | CSRF: replay without and with a wrong token | yes, if the action happens |
+      | A GET that changes state (`/delete?id=7`) | CSRF via a link or `img` | yes - `SameSite=Lax` does not stop top-level GETs |
+      | A JSON API that accepts the session cookie | the `text/plain` trick | yes, if it parses the body anyway |
+      | An API authenticated only by a bearer token the client adds | CSRF is not the risk; check CORS and token storage instead | no CSRF finding |
+      | Login and logout forms | login CSRF (cheat sheet: possible "on login forms where the user is not authenticated") | yes - lower impact, still reportable |
+      | A page with a sensitive single-click action | framing headers, then DoubleClickjacking exposure | yes, if it can be framed |
+      | A static public page with no actions | framing headers | usually informational |
+
+      What these tests do **not** replace: XSS testing. The cheat sheet's warning - "Cross-Site Scripting (XSS)
+      can defeat all CSRF mitigation techniques!" - means a perfect token scheme on a site with XSS is still
+      broken. See [Testing for cross-site scripting](#/lesson/testing-cross-site-scripting).
+
+  - id: visual
+    kind: visual
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing]
+    title: A forged request, with and without a token
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant A as "evil.example page"
+        participant B as "Victim's browser"
+        participant P as "SandPay portal"
+        B->>P: "Sign in - Set-Cookie sid"
+        A->>B: "Page with a self-submitting form"
+        B->>P: "POST /settings/email - cookie sid attached, no token"
+        alt "csrf flaw present"
+          P-->>B: "200 - email changed"
+        else "csrf fixed"
+          P-->>B: "403 - missing or wrong CSRF token"
+        end
+      ```
+
+      Notice that the attacker's page never sees the portal's responses - the same-origin policy still holds.
+      CSRF does not need to read anything; it only needs the write to happen.
+
+  - id: curl-evidence
+    kind: code
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing]
+    title: The test by hand, with curl
+    body: |
+      Start both portals - one with the flaws, one with `csrf` and `missing-headers` fixed - and sign in as
+      Alice on each (the `sid` value is shortened):
+
+      ```bash
+      cd practice/security
+      .venv/bin/python support/sandpay_vuln.py --port 8765 &
+      .venv/bin/python support/sandpay_vuln.py --port 8766 --fix csrf --fix missing-headers &
+      ```
+
+      First look at the form the application itself serves. Vulnerable portal:
+
+      ```bash
+      curl -s http://127.0.0.1:8765/settings -H 'Cookie: sid=...'
+      ```
+
+      ```html
+      <!doctype html><title>Settings</title><form method="post" action="/settings/email"><input name="email"><button>Save</button></form>
+      ```
+
+      No hidden token. Now send what a cross-site form would send - the cookie (the browser adds it), an
+      `Origin` from another site, no token:
+
+      ```bash
+      curl -s -i -X POST http://127.0.0.1:8765/settings/email -H 'Cookie: sid=...' \
+        -H 'Origin: https://evil.example' --data 'email=attacker%40evil.example'
+      ```
+
+      ```http
+      HTTP/1.1 200 OK
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 34
+
+      {"email": "attacker@evil.example"}
+      ```
+
+      The same against the fixed portal - its form now carries a token (the value is per session, replaced
+      here):
+
+      ```html
+      <!doctype html><title>Settings</title><form method="post" action="/settings/email"><input type="hidden" name="csrf" value="(per-session token)"><input name="email"><button>Save</button></form>
+      ```
+
+      ```http
+      HTTP/1.1 403 Forbidden
+      Server: SandPay
+      Content-Type: application/json
+      Content-Security-Policy: default-src 'self'; frame-ancestors 'none'
+      X-Content-Type-Options: nosniff
+      Referrer-Policy: no-referrer
+      Strict-Transport-Security: max-age=31536000
+      Content-Length: 40
+
+      {"error": "missing or wrong CSRF token"}
+      ```
+
+      Two warnings before you write this up. A `200` is not proof the email changed, and a `403` is not proof
+      it did not - read the account back (`GET /api/me`). And the `200` here was produced by curl: whether a
+      real browser attaches this cookie cross-site depends on its `SameSite` attribute (none is set on the
+      vulnerable portal) and the browser's default - check the `Set-Cookie` header and say so in the report.
+
+  - id: probe-code
+    kind: code
+    concepts: [sec-csrf-defence-testing]
+    title: The probe as code - control, forgeries, evidence, clean-up
+    collapsed: true
+    body: |
+      The core of `practice/security/solutions/web/csrf_probe.py` (the exercise; the full file has the form
+      parser and helpers):
+
+      ```python
+      def forged_bodies(form: Form, changes: dict[str, str]) -> dict[str, dict[str, str]]:
+          base = {**form.fields, **changes}
+          tokens = token_fields(form)
+          bodies = {"no-token": {k: v for k, v in base.items() if k not in tokens}}
+          if tokens:
+              bodies["empty-token"] = {**base, **{t: "" for t in tokens}}
+              bodies["wrong-token"] = {**base, **{t: "forged-" + "0" * 16 for t in tokens}}
+          return bodies
+
+
+      def probe_csrf(base_url: str, cookie: str, new_email: str) -> CsrfResult:
+          original = _me(base_url, cookie)["email"]
+          form = _settings_form(base_url, cookie)
+          result = CsrfResult("inconclusive", token_fields(form))
+
+          # 1. Control: the legitimate submission must work, or nothing below means anything.
+          status = _submit(base_url, form, {**form.fields, "email": new_email}, cookie, origin=base_url)
+          changed = _me(base_url, cookie)["email"] == new_email
+          result.attempts.append(Attempt("control", status, changed))
+          if changed:
+              result.restored = _restore(base_url, cookie, original)
+          if not changed or not result.restored:
+              return result
+
+          # 2. Forgeries, each followed by a read-back and, if it worked, a clean-up.
+          for name, body in forged_bodies(form, {"email": new_email}).items():
+              status = _submit(base_url, form, body, cookie, origin=ATTACKER_ORIGIN)
+              changed = _me(base_url, cookie)["email"] == new_email
+              result.attempts.append(Attempt(name, status, changed))
+              if changed:
+                  result.restored = _restore(base_url, cookie, original) and result.restored
+
+          forged = [a for a in result.attempts if a.name != "control"]
+          result.verdict = "vulnerable" if any(a.changed for a in forged) else "not-vulnerable"
+          return result
+      ```
+
+      Run against both portals:
+
+      ```plaintext
+      fixed=[] verdict=vulnerable token_fields=[] restored=True
+        control      200  changed=True
+        no-token     200  changed=True
+      fixed=['csrf'] verdict=not-vulnerable token_fields=['csrf'] restored=True
+        control      200  changed=True
+        no-token     403  changed=False
+        empty-token  403  changed=False
+        wrong-token  403  changed=False
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-csrf-defence-testing]
+    title: Why the probe is written that way
+    body: |
+      - **`original = _me(...)` before anything else.** You cannot put the account back unless you recorded
+        what it was. Clean-up is part of the test, not an afterthought.
+      - **The control comes first and can end the test.** If the legitimate submission fails - expired
+        session, broken handler, a WAF blocking you - every forgery will fail too, and "not vulnerable" would
+        be a false negative. The probe returns `inconclusive` instead. The tests prove it: with the email
+        handler answering `503` for everybody, the verdict is `inconclusive`, never "safe".
+      - **`origin=ATTACKER_ORIGIN` on forgeries.** A browser sends `Origin` on a cross-site form POST; sending
+        it gives a server that checks Origin the chance to refuse - otherwise a "vulnerable" verdict might be
+        wrong for real browsers.
+      - **Three forgeries when there is a token.** Missing, empty and wrong tokens catch three classic bugs:
+        validation only when the field is present, comparing against an empty session value, and accepting any
+        value of the right shape.
+      - **`changed = _me(...)["email"] == new_email` after every request.** The verdict comes from the
+        application's state, not from status codes - some apps answer `200` with an error page, others `302`
+        either way.
+      - **The `Cookie` header is sent by hand.** Once the portal's `weak-session` flaw is fixed the cookie is
+        `Secure`, and `requests` will not send a Secure cookie over plain `http://`. The probe tests the CSRF
+        defence, so it supplies the credential the browser would.
+
+  - id: framing-and-poc-code
+    kind: code
+    concepts: [sec-clickjacking-framing, sec-csrf-mechanics]
+    title: Framing decisions and a PoC for the report
+    collapsed: true
+    body: |
+      `csrf_framing.may_frame(headers, page_url, ancestor_urls)` applies the browser's order. Real output for
+      four response header sets, framed by `https://evil.example`:
+
+      ```plaintext
+      [('X-Frame-Options', 'ALLOW-FROM https://partner.example')] -> allowed=True by=x-frame-options: invalid value 'allow-from https://partner.example' - treated as absent
+      [('X-Frame-Options', 'SAMEORIGIN,')] -> allowed=False by=x-frame-options: conflicting values ['sameorigin', ''] - blocked
+      [('X-Frame-Options', 'DENY'), ('Content-Security-Policy', 'frame-ancestors https://partner.example')] -> allowed=False by=frame-ancestors: https://evil.example:443 is not in frame-ancestors https://partner.example
+      [('Content-Security-Policy-Report-Only', "frame-ancestors 'none'")] -> allowed=True by=none: no frame-ancestors and no X-Frame-Options
+      ```
+
+      The third line hides a trap: for `https://partner.example` the same headers allow framing - the CSP
+      directive overrides `DENY`, so adding `frame-ancestors` can loosen a page that was locked down.
+
+      `framable_pages` runs that decision over a live site, error pages included:
+
+      ```plaintext
+      fixed=[] framable by https://evil.example: ['/search?q=refund', '/login', '/health', '/no-such-page']
+      fixed=['missing-headers'] framable by https://evil.example: []
+      ```
+
+      `csrf_poc.build_poc` turns a captured request into a PoC page - as text for the report; nothing serves
+      it. For the email change captured from the vulnerable portal:
+
+      ```html
+      <!doctype html>
+      <html>
+        <body>
+          <!-- CSRF proof of concept: open while signed in to the target. Evidence only. -->
+          <form id="poc" action="http://127.0.0.1:8765/settings/email" method="POST">
+            <input type="hidden" name="email" value="attacker@evil.example">
+          </form>
+          <script>document.getElementById('poc').submit();</script>
+        </body>
+      </html>
+      ```
+
+      The cookie is not in the page - the browser adds it. For a request a form cannot send, the generator
+      says why instead of producing a page:
+
+      ```plaintext
+      PATCH /api/profile with Authorization: Bearer and a JSON body
+      exploitable_by_form=False
+      method PATCH: an HTML form can only send GET or POST
+      header Authorization: the browser will not send it with a forged request
+      ```
+
+  - id: steps
+    kind: steps
+    concepts: [sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Testing CSRF and clickjacking, step by step
+    body: |
+      1. **Confirm scope and accounts.** Written permission, two test accounts, and agreement that you may
+         change their data.
+      2. **List state-changing requests** from your proxy history - every POST, PUT, PATCH, DELETE, and every
+         GET that changes something.
+      3. **Classify each one** with the forgeability table: how is the user identified, which method, which
+         content type, which required headers. Bearer-only requests drop out; note why.
+      4. **Look at the form the app serves.** Is there a hidden token? Is the session cookie's `SameSite` set?
+      5. **Run the control.** Submit the legitimate request and read the result back. If it fails, stop and
+         fix your setup - the verdict is inconclusive until it works.
+      6. **Forge.** Replay with the cookie and a cross-site `Origin`: no token, empty token, wrong token,
+         another user's token. Read back after each.
+      7. **Try the JSON variant** where an API accepts cookies: the same body as `text/plain`.
+      8. **Clean up.** Put every changed value back and confirm.
+      9. **Check framing** on every page with an action, and on error pages: decide with frame-ancestors first,
+         then X-Frame-Options.
+      10. **List single-click sensitive actions** for DoubleClickjacking exposure.
+      11. **Write the PoC and the finding**, with the browser caveat about `SameSite` defaults.
+
+  - id: example
+    kind: example
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing]
+    title: "Example: the fix that covered one form"
+    body: |
+      After the first report, SandPay's developers fixed the email form - the portal built with `{"csrf"}`
+      shows a token and refuses forgeries, as the probe proved. The retest should not stop at the form that
+      was reported. Step 2 of the method lists every state-changing request, and one of them is
+      `POST /api/notes`, which stores a note for the merchant.
+
+      That endpoint is a JSON API, but the portal authenticates `/api/*` calls with a bearer token **or** the
+      session cookie, and parses the body as JSON whatever the `Content-Type`. So the WSTG `text/plain` trick
+      applies. The PoC generator splits the JSON at its first `=` into one field name and value:
+
+      ```html
+      <form id="poc" action="http://127.0.0.1:8765/api/notes" method="POST" enctype="text/plain">
+        <input type="hidden" name="{&quot;body&quot;:&quot;Payouts paused - call +00 000&quot;,&quot;pad&quot;:&quot;" value="x&quot;}">
+      </form>
+      ```
+
+      Sending exactly what that form sends (the name, `=`, the value and CR LF, with only the cookie) gave, on
+      both portals:
+
+      ```plaintext
+      fixed=[] POST /api/notes (text/plain, cookie only) -> 201 {"status": "saved"}; note stored: True
+      fixed=['csrf'] POST /api/notes (text/plain, cookie only) -> 201 {"status": "saved"}; note stored: True
+      ```
+
+      The finding for the retest: CSRF fixed on `/settings/email` only; `/api/notes` is still forgeable because
+      it accepts the cookie and does not require `application/json`. Recommended fixes from the cheat sheet:
+      a token (or a required custom header) on every state-changing endpoint, refusing the simple content types
+      on JSON endpoints, and a `SameSite` attribute on the session cookie as defence in depth. The caveat goes
+      in the report too: whether a given browser attaches the cookie to this cross-site POST depends on
+      `SameSite` and the browser's default.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Test cases
+    body: |
+      | # | Case | Steps | Expected (secure) | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Control | submit the app's own form with its token | change happens | read-back shows the new value |
+      | 2 | No token | replay with cookie and `Origin: https://evil.example`, token removed | 403, nothing changes | status and read-back |
+      | 3 | Empty token | token field present but empty | 403, nothing changes | status and read-back |
+      | 4 | Wrong token | a made-up token | 403, nothing changes | status and read-back |
+      | 5 | Other user's token | Bob's valid token with Alice's cookie | 403 - tokens are per session | status and read-back |
+      | 6 | State-changing GET | find any GET that changes data | none exist | proxy history listing |
+      | 7 | JSON as text/plain | same JSON body with `Content-Type: text/plain`, cookie only | 415 or 403, nothing stored | status and read-back |
+      | 8 | Session cookie | read `Set-Cookie` on login | `SameSite=Lax` or `Strict` set explicitly | the header |
+      | 9 | Framing, actions | headers of every page with a button that does something | `frame-ancestors 'none'` or `'self'` | headers and decision |
+      | 10 | Framing, errors | headers of 404 and 500 pages | the same protection | headers |
+      | 11 | Conflicting X-Frame-Options | look for repeated or comma-separated values | one valid value, or CSP present | headers |
+      | 12 | Single-click actions | list them | each needs typed input or a confirmation step | the list |
+      | 13 | Clean-up | after testing | every test account back as found | read-back |
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Common mistakes and a debugging method
+    body: |
+      **Mistakes:**
+
+      - **Concluding "safe" because a PoC did not fire in one browser.** WSTG-SESS-05: "check the actual
+        `Set-Cookie` header" - a `Lax` default in Chromium does not protect Firefox users.
+      - **No control.** Forgeries fail because the session expired, and the report says "protected".
+      - **Trusting status codes.** Read the state back.
+      - **"It's POST, so it's fine"** and **"it's JSON, so it's fine"** - see `text/plain`.
+      - **Treating SameSite as the fix.** The cheat sheet: it "does not replace a proper CSRF defense in most
+        deployments"; `Lax` "only blocks unsafe methods" and is "scoped to the registrable domain, not the
+        origin".
+      - **Accepting a missing Origin.** "Missing headers and `Origin: null` are not evidence of a same-origin
+        request."
+      - **Checking `X-Frame-Options` only.** A CSP `frame-ancestors` in the same response overrides it -
+        possibly loosening it.
+      - **`ALLOW-FROM` or a `<meta>` tag** as the framing defence - neither works.
+      - **Leaving test data behind.** A changed payout email on a shared test account breaks the next tester's
+        run.
+
+      **Debugging a surprising result:**
+
+      1. Re-run the control. Does the legitimate request still work?
+      2. Compare the forged request with the legitimate one field by field in your proxy - method, URL, body,
+         cookies, headers.
+      3. Change one thing at a time: drop the token, then change `Origin`, then the content type.
+      4. Read the state back after each change.
+      5. For framing, print every `Content-Security-Policy`, `Content-Security-Policy-Report-Only` and
+         `X-Frame-Options` header of the exact response - including duplicates.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Trade-offs and alternatives
+    body: |
+      | Defence | Strength | Cost or gap |
+      | --- | --- | --- |
+      | Synchronizer token | the cheat sheet's main recommendation for stateful apps | server state; per-request tokens can break the Back button |
+      | Signed double-submit cookie | stateless, bound to the session by HMAC | more to get right; the naive variant is bypassable by cookie injection |
+      | Custom request header | no UI change, relies on CORS preflight | only for script-driven requests; CORS must allow only your origins |
+      | Fetch Metadata (`Sec-Fetch-Site`) | simple server logic, "over 98% global coverage" per the cheat sheet | a fallback to Origin checks is "a mandatory requirement" |
+      | Origin / Referer check | no client change | missing or `null` origins need a fallback, never a pass |
+      | SameSite | free, protects many browsers | defence in depth only; browser defaults differ |
+      | `frame-ancestors` | flexible allow list, overrides X-Frame-Options | must be a header, on every page |
+      | `X-Frame-Options` | old browsers | `DENY`/`SAMEORIGIN` only; obsolete in favour of `frame-ancestors` |
+      | Confirmation step for sensitive actions | stops DoubleClickjacking and CSRF alike | friction for users |
+
+      The cheat sheet's order of preference: use the framework's built-in protection first, add a token (or
+      Fetch Metadata with a fallback) to every state-changing request, then at least one defence-in-depth
+      measure.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-csrf-mechanics, sec-csrf-defence-testing, sec-clickjacking-framing]
+    title: Quick reference
+    body: |
+      - CSRF needs ambient credentials (cookies, HTTP auth), predictable values and a request a form can send:
+        GET or POST, urlencoded, multipart or `text/plain`, no required custom header.
+      - Bearer tokens in `Authorization` are not ambient - but an API that also accepts the cookie is in scope.
+      - JSON APIs: test the `text/plain` trick; the fix is to refuse simple content types.
+      - Test: control, no token, empty token, wrong token, other user's token; read back; clean up.
+      - Verdicts: vulnerable, not vulnerable, or inconclusive when the control fails.
+      - SameSite is defence in depth; check the `Set-Cookie` header, not one browser's behaviour.
+      - Framing: enforced CSP `frame-ancestors` wins and X-Frame-Options is ignored; otherwise X-Frame-Options
+        by the HTML standard's rules; `ALLOW-FROM` and `<meta>` do nothing.
+      - Clickjacking beats CSRF tokens; DoubleClickjacking beats framing headers.
+      - A PoC is evidence: escaped values, no cookie, and a note on what a form cannot do.
+
+exercises:
+  - id: ambient-credential
+    type: mcq
+    concept: sec-csrf-mechanics
+    skill: recall
+    title: Which credential makes CSRF possible?
+    prompt: Which way of identifying the user makes a request forgeable by another site's form?
+    options:
+      - id: cookie
+        text: A session cookie the browser stores and attaches to every request to the site
+        feedback: Correct - the browser adds it to the forged request too; the server cannot tell the difference.
+      - id: bearer
+        text: A bearer token the single-page app keeps in memory and puts in the Authorization header
+        feedback: A cross-site form cannot set Authorization, and the browser does not add it - not ambient.
+      - id: form-login
+        text: The username and password typed into the login form
+        feedback: Typed credentials are sent once; what follows the login is usually a cookie - that is what CSRF rides on.
+      - id: tls
+        text: The server's TLS certificate
+        feedback: The certificate identifies the server, not the user.
+    correct: [cookie]
+    hints:
+      - Which of these does the browser add to a request without the page asking?
+      - A form another site builds cannot set request headers.
+    solution: |
+      CSRF rides on credentials the browser sends by itself - cookies and HTTP authentication. A token the
+      app's script adds is not sent with a request another site makes.
+
+  - id: post-not-enough
+    type: mcq
+    concept: sec-csrf-mechanics
+    skill: application
+    title: The developer moved the action to POST
+    prompt: |
+      A refund was triggered by `GET /refunds/approve?id=91`. The developer changed it to
+      `POST /refunds/approve` with `id=91` in a urlencoded body, and closed the CSRF ticket. Cookie session,
+      no token. Your verdict?
+    options:
+      - id: still
+        text: Still forgeable - an auto-submitting form sends the same POST with the cookie
+        feedback: Correct - WSTG-SESS-05 says "the use of POST alone is not enough to correct the occurrence of CSRF vulnerabilities".
+      - id: fixed
+        text: Fixed - cross-site pages cannot send POST requests
+        feedback: Forms POST to any origin; that is how CSRF has always worked.
+      - id: fixed-sop
+        text: Fixed - the same-origin policy blocks the response
+        feedback: The policy blocks reading the response; the refund still happens.
+      - id: only-get
+        text: Only fixed for GET-based attacks such as img tags, so it is now a low-severity issue
+        feedback: An img tag can no longer trigger it, but a form can - severity is unchanged.
+    correct: [still]
+    hints:
+      - Can a page on another site submit a POST form?
+      - What does the browser attach to that POST?
+    solution: |
+      POST stops `img`-tag and link-based forgery only. A self-submitting form still sends the request with the
+      cookie. A token (or an equivalent defence) is the fix.
+
+  - id: forgeable-request
+    type: mcq
+    concept: sec-csrf-mechanics
+    skill: analysis
+    title: Which request can a cross-site form forge?
+    prompt: All four use the session cookie and have no token. Which can a cross-site HTML form send as-is?
+    options:
+      - id: urlencoded
+        text: '`POST /settings/payout` with `Content-Type: application/x-www-form-urlencoded`'
+        feedback: Correct - a form's default encoding.
+      - id: put
+        text: '`PUT /settings/payout` with a urlencoded body'
+        feedback: Forms only send GET and POST; PUT from script needs a preflight.
+      - id: json
+        text: '`POST /api/payout` with `Content-Type: application/json`, checked by the server'
+        feedback: A form cannot send that type, and fetch() with it needs a preflight - forgeable only if the server also accepts text/plain.
+      - id: header
+        text: '`POST /settings/payout` that the server rejects without `X-Requested-With`'
+        feedback: A form cannot add custom headers, so the server's check stops it.
+    correct: [urlencoded]
+    hints:
+      - Which methods can an HTML form send?
+      - Which content types need no CORS preflight?
+    solution: |
+      Forgeable by a form: GET or POST, one of the three simple content types, and no header the form cannot
+      send. Everything else needs a CORS preflight the server can refuse.
+
+  - id: json-text-plain
+    type: mcq
+    concept: sec-csrf-mechanics
+    skill: analysis
+    title: The JSON API that accepted a form
+    prompt: |
+      `POST /api/notes` normally receives `Content-Type: application/json` from the app. Your text/plain test -
+      cookie only, `Origin: https://evil.example`, body `{"body":"hi","pad":"=x"}` plus CR LF - returns `201`
+      and the note is stored. What is the root cause?
+    options:
+      - id: both
+        text: The endpoint accepts the session cookie AND parses the body as JSON whatever the content type
+        feedback: Correct - both conditions are needed; the cheat sheet's fix is to disallow the simple content types (and add a token).
+      - id: cors
+        text: CORS is misconfigured and allowed evil.example
+        feedback: A text/plain form POST is a simple request - no preflight, so CORS was never asked.
+      - id: samesite
+        text: The cookie has SameSite=None
+        feedback: SameSite affects whether a browser attaches the cookie; the server-side cause is accepting the request.
+      - id: json-safe
+        text: Nothing - JSON APIs are not affected by CSRF, so this must be a test error
+        feedback: The 201 and the stored note are the evidence; the text/plain trick is in WSTG-SESS-05.
+    correct: [both]
+    hints:
+      - Did a CORS preflight happen for a text/plain POST?
+      - Two things had to be true on the server for the note to be stored.
+    solution: |
+      Cookie authentication plus lenient parsing makes a JSON endpoint forgeable by a `text/plain` form.
+      Requiring `application/json` (or a custom header or token) closes it.
+
+  - id: control-failed
+    type: mcq
+    concept: sec-csrf-defence-testing
+    skill: analysis
+    title: Every request got 401
+    prompt: |
+      Your CSRF run: control 401, no-token 401, empty-token 401, wrong-token 401. The email never changed.
+      What do you report?
+    options:
+      - id: inconclusive
+        text: Inconclusive - the control failed, so the forgeries prove nothing; fix the session and re-run
+        feedback: Correct - a forgery can only be judged against a legitimate request that works.
+      - id: safe
+        text: Not vulnerable - every forged request was refused
+        feedback: The legitimate one was refused too; the session is probably expired.
+      - id: vulnerable
+        text: Vulnerable - 401 means the token was not checked
+        feedback: 401 means not authenticated; it says nothing about the token.
+      - id: partial
+        text: Partially protected - report as low severity
+        feedback: There is no evidence either way; a severity would be invented.
+    correct: [inconclusive]
+    hints:
+      - Did the legitimate request work?
+      - What can you conclude from forgeries when the real request also fails?
+    solution: |
+      The control decides whether the test means anything. A failed control makes the result inconclusive,
+      never "safe".
+
+  - id: read-back
+    type: mcq
+    concept: sec-csrf-defence-testing
+    skill: application
+    title: Why read the account back?
+    prompt: The forged request returned `302 Found` to `/settings`. What is the right next step?
+    options:
+      - id: read
+        text: Read the account (`GET /api/me`) and compare the email with the forged value
+        feedback: Correct - the state is the evidence; a redirect happens on success and on refusal alike.
+      - id: success
+        text: Report CSRF - a redirect means the form was accepted
+        feedback: Many apps redirect back to the form after an error too.
+      - id: failure
+        text: Report it as protected - a real success would return 200
+        feedback: Status codes do not decide; some apps redirect after a successful save.
+      - id: follow
+        text: Follow the redirect and check the page title
+        feedback: The title says nothing about whether the email changed; read the value.
+    correct: [read]
+    hints:
+      - Do apps redirect after errors as well as after success?
+      - What is the evidence that the email changed?
+    solution: |
+      Decide by the application's state after the request, not by its status code. Read it back, then put
+      it back.
+
+  - id: samesite-limit
+    type: mcq
+    concept: sec-csrf-defence-testing
+    skill: analysis
+    title: SameSite=Lax and a GET that deletes
+    prompt: |
+      The session cookie is `SameSite=Lax; Secure; HttpOnly`. `GET /payout-accounts/delete?id=3` deletes a
+      payout account, with no token. Is it forgeable from another site?
+    options:
+      - id: yes-link
+        text: Yes - a link or top-level GET navigation still carries a Lax cookie
+        feedback: Correct - the cheat sheet - "If any state-changing operation in the application is reachable via a GET request, SameSite=Lax will not stop it."
+      - id: no-lax
+        text: No - SameSite=Lax blocks every cross-site request
+        feedback: Lax allows top-level navigations with safe methods - that is its usability trade-off.
+      - id: only-img
+        text: Only through an img tag
+        feedback: An img request is a subresource; Lax withholds the cookie there. The top-level link is the way in.
+      - id: no-httponly
+        text: No - HttpOnly stops the cookie being sent
+        feedback: HttpOnly stops script reading it; the browser still sends it.
+    correct: [yes-link]
+    hints:
+      - Which cross-site requests does Lax still attach the cookie to?
+      - Is following a link a top-level navigation with a safe method?
+    solution: |
+      `Lax` withholds the cookie from cross-site POSTs and subresources, not from top-level GET navigations.
+      State-changing GETs stay forgeable.
+
+  - id: origin-null
+    type: mcq
+    concept: sec-csrf-defence-testing
+    skill: application
+    title: The Origin check and the null origin
+    prompt: |
+      The server's Origin check rejects any Origin other than `https://portal.sandpay.example`, but lets a
+      request through when the header is missing or `null`, "for compatibility". Is that acceptable?
+    options:
+      - id: no
+        text: No - a missing or null origin needs a fallback such as a valid token, never a pass
+        feedback: Correct - the cheat sheet - "Missing headers and Origin null are not evidence of a same-origin request."
+      - id: yes
+        text: Yes - browsers always send Origin on POST, so a missing header means a non-browser client
+        feedback: Sandboxed frames and cross-origin redirects can produce Origin null; an attacker can create such a context.
+      - id: yes-https
+        text: Yes, as long as the site is HTTPS only
+        feedback: HTTPS does not guarantee the header is present.
+      - id: referer
+        text: Yes, if the Referer is also missing
+        feedback: Referer is stripped by many proxies and policies; two missing headers are still no evidence.
+    correct: [no]
+    hints:
+      - Which contexts can make a browser send Origin null?
+      - Should the check fail open or fail closed?
+    solution: |
+      Fail closed: when the source origin cannot be established, require another defence (a token) instead of
+      waving the request through.
+
+  - id: framing-precedence
+    type: mcq
+    concept: sec-clickjacking-framing
+    skill: analysis
+    title: DENY and frame-ancestors together
+    prompt: |
+      A page sends `X-Frame-Options: DENY` and
+      `Content-Security-Policy: frame-ancestors 'self' https://partner.example`. Can `https://partner.example`
+      frame it in a current browser?
+    options:
+      - id: yes
+        text: Yes - the enforced frame-ancestors directive overrides X-Frame-Options
+        feedback: Correct - CSP Level 3 and the HTML standard both say X-Frame-Options is ignored when an enforced frame-ancestors is present.
+      - id: no-strictest
+        text: No - browsers apply the stricter of the two headers
+        feedback: There is no "stricter wins" rule; the processing model checks frame-ancestors first and returns.
+      - id: no-deny
+        text: No - DENY cannot be overridden
+        feedback: It can - which is why adding frame-ancestors can loosen a locked-down page.
+      - id: depends-order
+        text: It depends on which header comes first in the response
+        feedback: Header order does not matter here.
+    correct: [yes]
+    hints:
+      - Which header does the browser check first?
+      - What happens to X-Frame-Options when an enforced frame-ancestors is present?
+    solution: |
+      Enforced `frame-ancestors` wins and X-Frame-Options is ignored. Review both headers together; a partner
+      exception in CSP undoes a `DENY`.
+
+  - id: allow-from
+    type: mcq
+    concept: sec-clickjacking-framing
+    skill: application
+    title: ALLOW-FROM for a partner
+    prompt: |
+      The only framing protection is `X-Frame-Options: ALLOW-FROM https://partner.example`. Can
+      `https://evil.example` frame the page in a current browser?
+    options:
+      - id: yes
+        text: Yes - ALLOW-FROM is not implemented, so the header is treated as absent
+        feedback: Correct - the HTML standard says ALLOW-FROM "is not to be implemented"; a lone invalid value allows embedding.
+      - id: no
+        text: No - only partner.example may frame it
+        feedback: That was RFC 7034's intent; current browsers ignore the value.
+      - id: deny
+        text: No - an unknown value is treated as DENY
+        feedback: A lone invalid value is treated as if the header were absent.
+      - id: same
+        text: Only same-origin pages may frame it
+        feedback: That would be SAMEORIGIN; ALLOW-FROM is not read at all.
+    correct: [yes]
+    hints:
+      - Does the HTML standard implement ALLOW-FROM?
+      - What happens to a lone invalid X-Frame-Options value?
+    solution: |
+      `ALLOW-FROM` gives no protection in current browsers. Use `frame-ancestors 'self' https://partner.example`.
+
+  - id: csrf-test-order
+    type: order
+    concept: sec-csrf-defence-testing
+    skill: application
+    title: Put the CSRF test in order
+    prompt: Order the steps of testing one state-changing form for CSRF.
+    items:
+      - id: record
+        text: Record the current value of the field you will change
+      - id: form
+        text: Fetch the form the application serves and note any token field
+      - id: control
+        text: Submit the legitimate request and read the value back
+      - id: forge
+        text: Replay with the cookie and a cross-site Origin - no token, empty, wrong
+      - id: readback
+        text: Read the value back after each forgery
+      - id: restore
+        text: Put the original value back and confirm it
+    hints:
+      - You cannot restore what you did not record.
+      - Which step makes the forgeries meaningful?
+    solution: |
+      Record, look at the form, prove the legitimate path works, forge, read back each time, restore. The
+      control comes before any forgery so a failure can be told apart from protection.
+
+  - id: token-debug
+    type: debug
+    concept: sec-csrf-defence-testing
+    skill: analysis
+    title: The token check that lets forgeries through
+    prompt: |
+      This handler is meant to refuse requests without a valid token. A tester's empty-token and no-token
+      forgeries both succeeded. Which lines are the defect?
+    language: python
+    code: |
+      def change_email(req, session):
+          form = req.form()
+          sent = form.get("csrf")
+          if sent is not None and sent != "":
+              if not hmac.compare_digest(sent, session["csrf"]):
+                  raise HttpError(403, "wrong CSRF token")
+          update_email(session["user_id"], form["email"])
+          return {"email": form["email"]}
+    correctLines: [4]
+    lineNotes:
+      - line: 5
+        note: compare_digest is the right comparison - constant time; the problem is that it is skipped.
+      - line: 3
+        note: Reading the field is fine; what happens when it is missing is decided on line 4.
+    hints:
+      - What happens when the field is missing entirely?
+      - The check only runs under one condition.
+    solution: |
+      Line 4 validates the token only when one is sent, so a request without the field (or with an empty one)
+      skips the check. A missing or empty token must be refused - fail closed. This is exactly why the probe
+      sends no-token and empty-token forgeries.
+
+  - id: bearer-api-short
+    type: short
+    concept: sec-csrf-mechanics
+    skill: analysis
+    title: Is the bearer-token API in scope for CSRF?
+    prompt: |
+      SandPay's mobile app calls `/api/payouts` with `Authorization: Bearer ...`. A developer says "CSRF does not
+      apply to our API". When is that right, and what would you check before agreeing?
+    modelAnswer: |
+      It is right if the API authenticates only by the bearer token that the client adds itself: a cross-site
+      form cannot set `Authorization`, and the browser does not add it, so a forged request arrives
+      unauthenticated. Before agreeing, check that the same endpoints do not also accept the session cookie
+      (the SandPay portal's `/api/*` accepts either), that no state-changing endpoint is reachable with a
+      cookie-only request, that the token is not also sent automatically some other way (for example from a
+      cookie the server reads), and that CORS does not allow untrusted origins with credentials. Then the CSRF
+      risk moves to XSS and token storage.
+    rubric:
+      - Explains that Authorization headers are not ambient - a form cannot set them.
+      - Checks whether the API also accepts cookies.
+      - Checks for cookie-only access to state-changing endpoints.
+      - Mentions CORS or XSS as where the risk moves.
+    hints:
+      - What does the browser add to a forged request on its own?
+    solution: |
+      Bearer-only APIs are not forgeable by a form - but only if nothing else (a cookie) authenticates the same
+      requests. Verify that before agreeing.
+
+  - id: csrf-testdesign
+    type: testdesign
+    concept: sec-csrf-defence-testing
+    skill: application
+    title: Test plan for the payout bank account change
+    prompt: |
+      SandPay adds `POST /settings/payout-account` (cookie session, form with a hidden `csrf` field, then a
+      confirmation page). Design the CSRF and clickjacking test cases: preconditions, steps, expected result
+      and evidence for each.
+    modelAnswer: |
+      Preconditions: written scope, two test merchants (Alice, Bob), proxy capturing, a recorded original
+      payout account for Alice.
+
+      1. **Control** - submit the form and confirmation normally. Expected: account changes. Evidence: read-back
+         of the account and the request pair in the proxy. Restore.
+      2. **No token** - replay with Alice's cookie and `Origin: https://evil.example`, `csrf` removed. Expected:
+         403, unchanged. Evidence: status and read-back.
+      3. **Empty token** and 4. **wrong token** - same, `csrf=""` and a made-up value. Expected: 403,
+         unchanged.
+      5. **Bob's token with Alice's cookie** - expected 403 (tokens per session).
+      6. **Skip the confirmation** - post the final step directly with a forged request. Expected: refused.
+      7. **text/plain body** - if the endpoint accepts JSON. Expected: 415 or 403.
+      8. **Session cookie attributes** - `Set-Cookie` on login. Expected: SameSite set explicitly. Evidence:
+         the header.
+      9. **Framing** - headers of the form, the confirmation page and their error pages. Expected:
+         `frame-ancestors 'none'` or `'self'`. Evidence: headers and the decision.
+      10. **Single-click confirm** - open the confirmation page from a link and click as it renders. Expected:
+          requires typed input or a delay. Evidence: notes or a recording.
+      Clean-up: restore Alice's account and confirm.
+    rubric:
+      - Each case has preconditions, steps, an expected result and evidence.
+      - Includes a control before the forgeries.
+      - Includes missing, empty, wrong and other-user tokens.
+      - Covers framing of the form and confirmation pages, including error pages.
+      - Includes clean-up and read-back.
+    hints:
+      - Which case makes the forgeries meaningful?
+      - Which token mistakes do developers make?
+    solution: |
+      Control, four token forgeries, a workflow bypass, the text/plain variant, cookie attributes, framing and
+      single-click exposure - each with read-back evidence, then clean-up.
+
+  - id: interview-csrf
+    type: interview
+    concept: sec-csrf-defence-testing
+    skill: analysis
+    title: "Interview: how do you test for CSRF?"
+    prompt: '"Walk me through how you test a web application for CSRF, and how you decide it is a real finding."'
+    modelAnswer: |
+      I start from the proxy history and list every state-changing request, including GETs that change state.
+      For each I check how the user is identified - CSRF needs an ambient credential like a cookie or HTTP
+      auth - and whether a cross-site form could send it: GET or POST, a simple content type, no required
+      custom header.
+
+      Then for each candidate I run a control: the legitimate request, with the value read back. If that
+      fails, the result is inconclusive. Then I replay it with the victim's cookie and a cross-site Origin -
+      no token, empty token, wrong token, another user's token - and read the state back after each, because
+      status codes lie. For JSON endpoints that accept cookies I try the text/plain trick. I put every value
+      back.
+
+      It is a finding when a forged request changes state. I check the session cookie's SameSite attribute
+      and say in the report which browsers would send it - Chromium defaults to Lax, others do not - but I do
+      not call it safe just because one browser blocked the PoC. The report has the PoC page, the evidence,
+      and the fix: a token or equivalent on every state-changing request, SameSite as defence in depth. I also
+      check framing headers, because clickjacking bypasses tokens.
+    rubric:
+      - Lists state-changing requests and checks the credential type.
+      - Runs a control and reads state back.
+      - Tries missing, empty, wrong and other-user tokens.
+      - Mentions JSON and text/plain.
+      - Treats SameSite as defence in depth and mentions browser differences.
+      - Cleans up and gives a PoC with the fix.
+    followUps:
+      - How does SameSite=Lax change your test?
+      - Why can't a forged request read the response, and does it matter?
+      - How would you test a single-page app that uses bearer tokens?
+    hints:
+      - Structure it as - which requests, how to prove it, how to report it.
+    solution: |
+      Inventory, classify by credential and forgeability, control, forgeries with read-back, clean-up, then a
+      report with a PoC, the browser caveat and the fix.
+
+  - id: csrf-probe-code
+    type: coding
+    concept: sec-csrf-defence-testing
+    skill: application
+    title: Build the CSRF probe
+    prompt: |
+      In `practice/security`, complete `exercises/web/csrf_probe.py`: `token_fields`, `forged_bodies` and
+      `probe_csrf`. The form parser and the request helpers are given. The tests run the probe against the
+      vulnerable portal (it must say `vulnerable` and leave the account as it was), against the portal with
+      `csrf` fixed (it must say `not-vulnerable`, with 403 for every forgery), and against a portal whose
+      handler is broken for everybody (it must say `inconclusive`).
+    project: security
+    files: [exercises/web/csrf_probe.py]
+    test: tests/web/test_csrf_probe.py
+    command: .venv/bin/python -m pytest tests/web/test_csrf_probe.py
+    modelAnswer: |
+      ```python
+      def token_fields(form: Form) -> list[str]:
+          return sorted(n for n in form.fields if any(h in n.lower() for h in TOKEN_HINTS))
+      ```
+
+      `forged_bodies` and `probe_csrf` are shown in the "The probe as code" section: build the no-token body
+      always and the empty and wrong bodies when there is a token; run the control first and stop with
+      `inconclusive` if it does not change the value; forge with `ATTACKER_ORIGIN`; read back after every
+      request; restore whenever a value changed.
+    rubric:
+      - Every test in tests/web/test_csrf_probe.py passes.
+      - The control runs before any forgery and a failed control gives inconclusive.
+      - The verdict comes from read-back, not from status codes.
+      - The account is restored after every change.
+    hints:
+      - Start with token_fields - it is one line.
+      - In forged_bodies, do not modify form.fields.
+      - The control decides whether the test can continue.
+    solution: |
+      A probe is only trustworthy with a control, read-back evidence and clean-up; the verdict comes from the
+      state, and a failed control means inconclusive.
+
+  - id: framing-code
+    type: coding
+    concept: sec-clickjacking-framing
+    skill: application
+    title: Decide framing like a browser
+    prompt: |
+      Complete `exercises/web/csrf_framing.py`: `source_matches`, `xfo_values` and `may_frame`. The tests use
+      the HTML standard's own tables of X-Frame-Options values, the CSP precedence rule, Report-Only, multiple
+      policies and ancestor chains - then scan the vulnerable portal (every page framable) and the portal with
+      `missing-headers` fixed (none).
+    project: security
+    files: [exercises/web/csrf_framing.py]
+    test: tests/web/test_csrf_framing.py
+    command: .venv/bin/python -m pytest tests/web/test_csrf_framing.py
+    modelAnswer: |
+      ```python
+      def xfo_values(headers):
+          out = []
+          for name, value in headers:
+              if name.lower() == "x-frame-options":
+                  for v in value.split(","):
+                      v = v.strip().lower()
+                      if v not in out:
+                          out.append(v)
+          return out
+      ```
+
+      `may_frame`: if `enforced_frame_ancestors(headers)` is not empty, every ancestor must match a source in
+      every list and X-Frame-Options is not consulted. Otherwise: no values -> allowed; several distinct
+      values containing deny, sameorigin or allowall -> blocked; several invalid -> allowed; deny -> blocked;
+      sameorigin -> every ancestor must equal the page's origin; one invalid value -> allowed.
+    rubric:
+      - Every test in tests/web/test_csrf_framing.py passes.
+      - frame-ancestors is checked first and X-Frame-Options ignored when it applies.
+      - Odd X-Frame-Options values follow the HTML standard, not guesses.
+      - Every ancestor is checked, not only the parent.
+    hints:
+      - Keep the empty value after a trailing comma - it matters.
+      - Report-Only never blocks.
+      - A wildcard host needs a subdomain.
+    solution: |
+      Implement the browser's order exactly: enforced frame-ancestors, else the HTML standard's X-Frame-Options
+      rules, else allowed.
+
+  - id: poc-code
+    type: coding
+    concept: sec-csrf-mechanics
+    skill: application
+    title: Generate an honest PoC
+    prompt: |
+      Complete `build_poc` in `exercises/web/csrf_poc.py`. It turns a captured raw request into a
+      self-submitting form for a finding report - or explains why a form cannot send it. The tests check
+      escaping, GET and POST forms, the text/plain trick, the blockers (method, content type, Authorization,
+      token headers) and, end to end, that the form a browser would submit changes the email on the vulnerable
+      portal and gets 403 once `csrf` is fixed.
+    project: security
+    files: [exercises/web/csrf_poc.py]
+    test: tests/web/test_csrf_poc.py
+    command: .venv/bin/python -m pytest tests/web/test_csrf_poc.py
+    modelAnswer: |
+      Collect blockers first: method not GET or POST; a POST content type not in `FORM_CONTENT_TYPES`; any
+      header in `CREDENTIAL_HEADERS`. Return `Poc(False, "", blockers + notes)` if there are any. Otherwise take
+      fields from the query string (GET) or the urlencoded body (POST), or split a text/plain body at the
+      first `=`; escape every name, value and the action with `html.escape(..., quote=True)`; build the form
+      with `id="poc"` and a script that submits it.
+    rubric:
+      - Every test in tests/web/test_csrf_poc.py passes.
+      - Values are HTML-escaped.
+      - The page contains no cookie or session value.
+      - Requests a form cannot send are reported with reasons, not given a page.
+    hints:
+      - parse_qsl(..., keep_blank_values=True) decodes urlencoded data.
+      - The text/plain encoding is name, "=", value - so split at the first "=".
+    solution: |
+      A PoC states only what a form can do: escaped fields, no cookie, and an explicit reason when the request
+      needs a method, content type or header that a form cannot send.
+
+placement:
+  - id: place-forgeable
+    type: mcq
+    concept: sec-csrf-mechanics
+    skill: analysis
+    title: Which endpoint needs a CSRF defence?
+    prompt: Which of these SandPay endpoints is forgeable by another site if it has no token?
+    options:
+      - id: cookie-post
+        text: '`POST /refunds` with a urlencoded body, authenticated by the session cookie'
+        feedback: Correct - a cookie-authenticated POST with a form encoding is the classic CSRF target.
+      - id: bearer-post
+        text: '`POST /api/refunds` authenticated only by an Authorization bearer token the app adds'
+        feedback: A form cannot set Authorization, and the browser does not add it.
+      - id: json-strict
+        text: '`POST /api/refunds` that requires `Content-Type: application/json` and accepts the cookie'
+        feedback: A form cannot send that type and fetch() needs a preflight - not forgeable while the type is enforced.
+      - id: get-read
+        text: '`GET /refunds` that lists refunds'
+        feedback: Reading is not a state change, and the attacker cannot read the response.
+    correct: [cookie-post]
+    solution: |
+      Forgeable means an ambient credential, a request a form can send, and a state change. Only the
+      cookie-authenticated urlencoded POST has all three.
+
+  - id: place-verdict
+    type: mcq
+    concept: sec-csrf-defence-testing
+    skill: analysis
+    title: Read the results
+    prompt: |
+      Control 200 and changed; no-token 200 and unchanged; empty-token 403 and unchanged; wrong-token 403 and
+      unchanged. What is the verdict?
+    options:
+      - id: not-vuln
+        text: Not vulnerable - no forgery changed the value
+        feedback: Correct - the state decides; the no-token 200 is odd but the value did not change.
+      - id: vuln
+        text: Vulnerable - the no-token request returned 200
+        feedback: The read-back shows no change; status codes do not decide.
+      - id: inconclusive
+        text: Inconclusive - the control changed the value
+        feedback: A working control is what makes the result conclusive.
+      - id: partial
+        text: Vulnerable only when the token is missing
+        feedback: Missing-token did not change anything either.
+    correct: [not-vuln]
+    solution: |
+      With a working control, the read-backs decide. Note the 200 for the developers - it is confusing - but
+      it is not a CSRF finding.
+
+  - id: place-framing
+    type: mcq
+    concept: sec-clickjacking-framing
+    skill: application
+    title: Which response is protected?
+    prompt: Which response stops `https://evil.example` framing the page in a current browser?
+    options:
+      - id: fa-self
+        text: "`Content-Security-Policy: frame-ancestors 'self'`"
+        feedback: Correct - only the page's own origin may frame it.
+      - id: allow-from
+        text: '`X-Frame-Options: ALLOW-FROM https://partner.example`'
+        feedback: ALLOW-FROM is not implemented; the header is treated as absent.
+      - id: report-only
+        text: "`Content-Security-Policy-Report-Only: frame-ancestors 'none'`"
+        feedback: Report-Only reports violations and never blocks.
+      - id: default-src
+        text: "`Content-Security-Policy: default-src 'none'`"
+        feedback: frame-ancestors does not fall back to default-src.
+    correct: [fa-self]
+    solution: |
+      Only an enforced `frame-ancestors` (or `X-Frame-Options: DENY`/`SAMEORIGIN` with no CSP directive)
+      protects. ALLOW-FROM, Report-Only and default-src do not.
+
+recall:
+  - id: recall-csrf-conditions
+    concept: sec-csrf-mechanics
+    prompt: What does a request need to be forgeable by a cross-site form?
+    answer: An ambient credential (cookie or HTTP auth), GET or POST, a simple content type (urlencoded, multipart, text/plain), no required custom header, and no secret the attacker cannot guess.
+  - id: recall-json
+    concept: sec-csrf-mechanics
+    prompt: When is a JSON API forgeable, and how?
+    answer: When it accepts the session cookie and parses JSON whatever the content type - a text/plain form whose field name and value, joined by "=", spell the JSON.
+  - id: recall-test
+    concept: sec-csrf-defence-testing
+    prompt: What are the steps of a CSRF test on one form?
+    answer: Record the value, look at the form, run a control, forge with no, empty and wrong tokens and a cross-site Origin, read back after each, restore.
+  - id: recall-samesite
+    concept: sec-csrf-defence-testing
+    prompt: Why is SameSite not the CSRF fix?
+    answer: Lax still sends the cookie on top-level GETs, it is scoped to the registrable domain, browser defaults differ, and Chromium's default Lax allows POSTs for two minutes after the cookie is set.
+  - id: recall-precedence
+    concept: sec-clickjacking-framing
+    prompt: Which framing header wins, and what do odd X-Frame-Options values do?
+    answer: An enforced CSP frame-ancestors wins and X-Frame-Options is ignored. Otherwise DENY blocks, SAMEORIGIN allows same origin, a lone invalid value (ALLOW-FROM) is ignored, conflicting values block.
+  - id: recall-doubleclick
+    concept: sec-clickjacking-framing
+    prompt: Why do framing headers not stop DoubleClickjacking?
+    answer: The target page is opened as a top-level page between two clicks, so there is no frame; sensitive single-click actions need a confirmation step or typed input.
+
+next:
+  - testing-ssrf-and-open-redirects
+  - testing-cross-site-scripting
+  - testing-business-logic-and-rate-limits
+  - security-regression-automation

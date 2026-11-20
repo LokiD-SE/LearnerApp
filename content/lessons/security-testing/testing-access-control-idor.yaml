@@ -1,0 +1,1225 @@
+id: testing-access-control-idor
+title: Testing access control and IDOR
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: Prove who may do what - horizontal and vertical privilege escalation, insecure direct object references (IDOR) and broken object level authorization (BOLA) - with the two-account method, an authorization matrix that runs on every release, and a check that denied answers do not reveal which objects exist, against a deliberately vulnerable SandPay portal on your own machine.
+tags:
+  [
+    access control,
+    authorization,
+    broken access control,
+    A01,
+    IDOR,
+    insecure direct object reference,
+    BOLA,
+    broken object level authorization,
+    API1,
+    BFLA,
+    API5,
+    horizontal privilege escalation,
+    vertical privilege escalation,
+    forced browsing,
+    two-account method,
+    authorization matrix,
+    deny by default,
+    existence oracle,
+    403 vs 404,
+    CWE-639,
+    WSTG-ATHZ-02,
+    WSTG-ATHZ-03,
+    WSTG-ATHZ-04,
+    WSTG-APIT-02,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, and curl,
+    on Linux. Every output in this lesson was printed by the commands and code shown, run on 20 November 2026
+    against the practice servers. Sign-in tokens are random, so they are not shown.
+  - **Practice targets:** `practice/security/support/sandpay_vuln.py`, a **deliberately vulnerable** SandPay
+    merchant portal bound to `127.0.0.1` only - its `idor` flaw is the one this lesson tests, and
+    `make_app({"idor"})` builds the same portal with it fixed; and `practice/security/support/idor_fixture.py`,
+    a small invoices API written for this lesson that can answer a denied request in four ways (`uniform`,
+    `status`, `message`, `leaky`). SandPay, its merchants (`m_100` Shop A, `m_200` Shop B), users, payments and
+    invoices are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope, and
+    only with **test accounts you were given**. Reading a real customer's record to "prove" an IDOR is a data
+    breach, not a test. Everything here runs against your own machine.
+  - **Testing guide:** OWASP Web Security Testing Guide, stable release
+    [v4.2](https://owasp.org/www-project-web-security-testing-guide/v42/) - WSTG-ATHZ-02 Testing for Bypassing
+    Authorization Schema, WSTG-ATHZ-03 Testing for Privilege Escalation, WSTG-ATHZ-04 Testing for Insecure
+    Direct Object References. The quotations were checked against both v4.2 and the development version on
+    [GitHub](https://github.com/OWASP/wstg) as read on 20 November 2026, which adds WSTG-APIT-02 API Broken
+    Object Level Authorization (a development-version id that may change before the next release).
+  - **Risk lists:** OWASP Top 10:2021
+    [A01 Broken Access Control](https://owasp.org/Top10/A01_2021-Broken_Access_Control/) (still first in the
+    [2025 edition](https://owasp.org/Top10/2025/A01_2025-Broken_Access_Control/)); OWASP API Security Top 10
+    2023 [API1 Broken Object Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/)
+    and [API5 Broken Function Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/);
+    [CWE-639](https://cwe.mitre.org/data/definitions/639.html) Authorization Bypass Through User-Controlled Key.
+  - **Cheat sheets (OWASP Cheat Sheet Series, as published on 20 November 2026):**
+    [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html),
+    [Authorization Testing Automation](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Testing_Automation_Cheat_Sheet.html)
+    (the authorization matrix) and
+    [Insecure Direct Object Reference Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html).
+  - **Tools named, not run here:** the ZAP Access Control Testing add-on and the Burp Suite Autorize
+    extension are named by WSTG-ATHZ-02; neither is installed - the exercises build the same comparison in
+    Python.
+  - **Not repeated here:** tampering with JWTs and OAuth tokens - [Testing JWTs and OAuth 2.0](#/lesson/testing-jwt-and-oauth);
+    becoming admin by sending a `role` field - [Testing mass assignment and excessive data
+    exposure](#/lesson/testing-mass-assignment-and-data-exposure); `../` in file names -
+    [Testing file handling and path traversal](#/lesson/testing-file-handling-and-path-traversal); replaying one
+    request with a changed id in a proxy - [Intercepting proxies](#/lesson/intercepting-proxies).
+
+prerequisites:
+  - security-testing-fundamentals
+  - reconnaissance-and-attack-surface
+  - intercepting-proxies
+
+concepts:
+  - id: sec-idor-escalation
+    name: Horizontal and vertical privilege escalation, IDOR and BOLA
+    summary: Access control decides who may act on what. Horizontal escalation reaches another user's data at the same privilege level (an IDOR or BOLA when it happens by changing an object id); vertical escalation reaches functions of a more privileged role (BFLA in API terms). The check must happen on the server, on every request, for the specific object.
+  - id: sec-idor-two-account
+    name: The two-account method for object-level authorization
+    summary: Use two test accounts of the same role that each own objects. Discover B's real identifiers through B's own session, prove with a control that A's request works for A's own object, then ask for B's objects as A. A 2xx carrying B's data is the finding; a denied answer only counts once the control passed.
+  - id: sec-idor-matrix-oracle
+    name: The authorization matrix and reading denied answers
+    summary: Write the expected decision for each actor and endpoint in a machine-readable matrix and replay it on every release; 2xx is allow, 401/403/404 is deny, anything else is a result to look at. A denied answer should not reveal which ids exist - a 403 for "not yours" next to a 404 for "missing", or different messages, is an existence oracle.
+
+objectives:
+  - Distinguish horizontal from vertical privilege escalation and IDOR/BOLA from BFLA, with an example of each.
+  - Test object-level authorization with two accounts, real identifiers and a control request, and record evidence that proves the leak.
+  - Design an authorization matrix of actors, methods, endpoints and expected decisions and run it automatically against every release.
+  - Classify a denied answer as indistinguishable, an existence oracle or an IDOR by comparing foreign and missing objects.
+  - Explain why unguessable ids, hidden links and client-side checks do not fix broken access control.
+  - Write automated probes that find the IDOR on the vulnerable portal and report nothing once it is fixed.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-idor-escalation, sec-idor-two-account]
+    title: The idea in plain language
+    body: |
+      A coat check gives you ticket 17 for your coat. If the attendant hands over whatever coat matches the
+      number you show - without looking at you or the ticket's stub - then anyone who writes "18" on a scrap of
+      paper walks out with your neighbour's coat. Nothing was hacked: the attendant simply never asked "is this
+      **your** coat?"
+
+      Web applications hand out tickets all the time. SandPay's merchant portal shows Shop A its payment
+      `pay_1001` at `/api/payments/pay_1001`. The id is right there in the address. The only question that
+      matters is what the server does when Shop A's user asks for `/api/payments/pay_2001` - a payment that
+      belongs to Shop B.
+
+      - If the server checks "is this payment one of yours?" and says no, access control works.
+      - If it returns the payment, Shop A can read every other merchant's payments by counting. That is an
+        **insecure direct object reference (IDOR)** - in API language, **broken object level authorization
+        (BOLA)**.
+
+      A tester cannot find this by clicking around as one user, because the user interface only ever shows
+      your own coats. You need **two accounts** that each own something, and you need to swap tickets on
+      purpose. This lesson does exactly that, then turns it into an automated test that runs on every release.
+
+  - id: what
+    kind: what
+    concepts: [sec-idor-escalation, sec-idor-two-account, sec-idor-matrix-oracle]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Authentication** | proving who you are - sign-in. Not the topic here. |
+      | **Authorization / access control** | deciding what an authenticated (or anonymous) caller may do. OWASP A01: access control "enforces policy such that users cannot act outside of their intended permissions". |
+      | **Horizontal escalation** | reaching resources of "a similarly configured account" (WSTG-ATHZ-03) - another merchant at the same level. |
+      | **Vertical escalation** | reaching "resources granted to more privileged accounts (e.g., acquiring administrative privileges for the application)" (WSTG-ATHZ-03). |
+      | **IDOR** | "Insecure Direct Object References (IDOR) occur when an application provides direct access to objects based on user-supplied input" (WSTG-ATHZ-04). |
+      | **BOLA** | OWASP API1:2023 - the API name for the same failure: the API does not check that "the logged-in user has permissions to perform the requested action on the requested object". |
+      | **BFLA** | OWASP API5:2023 - calling a **function** you should not reach, such as an admin endpoint, rather than an object you should not reach. |
+      | **Forced browsing** | requesting a page or endpoint directly that the UI never linked for you (WSTG-ATHZ-02). |
+      | **Object reference** | anything that names an object: an id in the path, query, body, header or cookie - `pay_2001`, `invoice=12345`, a file name, a UUID. |
+      | **Control request** | the same request for an object you **do** own, sent first to prove the request shape and token work. |
+      | **Authorization matrix** | the Authorization Testing Automation cheat sheet's spreadsheet of "the **Feature** and the **Logical Role** that accesses it", kept in a file a program can read. |
+      | **Existence oracle** | a denied answer that still tells an attacker whether the object exists - for example `403` for "not yours" and `404` for "missing". |
+      | **Deny by default** | grant only what a rule explicitly allows; the Authorization cheat sheet: "an application should be configured to deny access by default". |
+
+  - id: why
+    kind: why
+    concepts: [sec-idor-escalation]
+    title: Why access control is the first thing to test
+    body: |
+      **It is the most common serious web weakness.** Broken Access Control is A01 in the OWASP Top 10:2021:
+      "94% of applications were tested for some form of broken access control", and it "has the most
+      occurrences in the contributed dataset". It stays first in the 2025 edition, which reports that "100% of
+      the applications tested were found to have some form of broken access control". API1 in the API Security Top 10:2023 is BOLA, rated "Exploitability **Easy**",
+      "Prevalence **Widespread**", "Detectability **Easy**".
+
+      **Scanners rarely find it.** A scanner sees one response; it cannot know that `pay_2001` belongs to
+      someone else, because "belongs to" is business logic. API1:2023 says the weakness is "extremely common
+      in API-based applications because the server component usually does not fully track the client’s state,
+      and instead, relies more on parameters like object IDs, that are sent from the client". Only a tester who
+      knows who owns what - two accounts and their data - can decide whether a 200 is correct.
+
+      **The impact is a breach, not a glitch.** For a payments portal an IDOR means one merchant reading
+      another's sales, card endings and customers; a write IDOR means refunding or cancelling someone else's
+      payments. API1:2023: "Unauthorized access to other users' objects can result in data disclosure to
+      unauthorized parties, data loss, or data manipulation."
+
+      **It regresses.** The Authorization Testing Automation cheat sheet: "most of the problems with
+      authorizations occur because features are added/modified in updated releases without determining their
+      effect on the application's authorizations". One new endpoint without the ownership check undoes the
+      rest - which is why this lesson ends with a matrix that runs on every release, not a one-off test.
+
+  - id: how-servers-decide
+    kind: internals
+    concepts: [sec-idor-escalation]
+    title: How the server decides - and where it forgets
+    body: |
+      Every request that touches an object goes through three questions. The bug is almost always a missing
+      third one:
+
+      1. **Who is calling?** The session or token says "alice, merchant `m_100`, role merchant".
+      2. **May this role use this function?** "Merchants may read payments" - a function-level check. Missing
+         it lets a merchant call `/admin/...`: BFLA, vertical.
+      3. **May this caller act on this object?** "Is `pay_2001` one of `m_100`'s payments?" - the object-level
+         check. Missing it is IDOR/BOLA, horizontal.
+
+      In code the difference is often one clause. The practice portal's vulnerable handler looks the payment up
+      by id alone; the fixed one adds the ownership check (`practice/security/support/sandpay_vuln.py`):
+
+      ```python
+      rows = self.query("SELECT * FROM payments WHERE id = ?", (pid,))
+      if not rows:
+          raise HttpError(404, "payment not found")
+      row = dict(rows[0])
+      if self.is_fixed("idor") and row["merchant_id"] != u["merchant_id"] and u["role"] != "admin":
+          raise HttpError(404, "payment not found")  # same answer as "missing": no existence oracle
+      return Response.json(row)
+      ```
+
+      The IDOR Prevention cheat sheet recommends the same shape - look objects up **within** what the caller
+      owns: "When looking up objects based on primary keys, use datasets that users have access to", with the
+      Rails example `@current_user.projects.find(params[:id])` instead of `Project.find(params[:id])`.
+
+      **Where the check gets forgotten:**
+
+      - a new endpoint or HTTP method added later (`GET` checks, `PATCH` does not) - API5 asks "Can a user
+        perform sensitive actions ... by simply changing the HTTP method (e.g. from `GET` to `DELETE`)?";
+      - the id arrives somewhere unusual - a body field, a header, a second parameter: WSTG-ATHZ-04 notes "the
+        object reference may be split between more than one parameter";
+      - list and export endpoints - WSTG-APIT-02 (development version) calls this "bulk access", where
+        `GET /api/users` "returns data for all users instead of only the authenticated user's data";
+      - checks done only in the browser, which "should never be the decisive factor in granting or denying
+        access" (Authorization cheat sheet).
+
+  - id: why-ids-dont-fix-it
+    kind: internals
+    concepts: [sec-idor-escalation, sec-idor-matrix-oracle]
+    title: Unguessable ids, hidden links and 403 versus 404
+    body: |
+      **Random ids are defence in depth, not the fix.** `pay_2001` is easy to guess; a UUID is not. But ids leak
+      - in shared links, exports, logs, emails, referer headers and other API responses. API1:2023 is explicit
+      that "Object IDs can be anything from sequential integers, UUIDs, or generic strings. Regardless of the
+      data type, they are easy to identify". The IDOR Prevention cheat sheet: "even with complex identifiers,
+      access control checks are essential. If attackers obtain URLs for unauthorized objects, the application
+      should still block their access attempts." A tester therefore never needs to **guess** an id: the second
+      account supplies real ones.
+
+      **Hiding a link is not access control.** The admin menu missing from the merchant's screen does not stop
+      a merchant typing the URL - that is the forced browsing of WSTG-ATHZ-02.
+
+      **Comparing the id in the URL with the id in the token is not enough either.** API1:2023: "Comparing the
+      user ID of the current session (e.g. by extracting it from the JWT token) with the vulnerable ID parameter
+      isn't a sufficient solution to solve Broken Object Level Authorization (BOLA). This approach could address
+      only a small subset of cases." Most objects (payments, invoices) are not the user; the server has to know
+      who **owns** each one.
+
+      **403 or 404?** Both are denials. The choice matters for a different reason: if "exists but not yours"
+      answers `403 Forbidden` and "does not exist" answers `404 Not Found`, an attacker can enumerate which ids
+      are real - an **existence oracle**. The fixed portal answers both with the same
+      `404 {"error": "payment not found"}` on purpose. Whether an oracle matters depends on the data - knowing
+      that invoice `inv_601` exists may be harmless, knowing that an email address has an account may not - so
+      report it with its context, at a lower severity than a readable object.
+
+  - id: when
+    kind: when
+    concepts: [sec-idor-two-account, sec-idor-matrix-oracle]
+    title: When to use each technique
+    body: |
+      | Situation | Technique |
+      | --- | --- |
+      | an endpoint takes an object id (path, query, body, header) | two-account test: A asks for B's object, after a control |
+      | several roles (merchant, support, admin) | add accounts per role; check each role cannot reach the next role's functions (vertical) |
+      | a release changes routes or permissions | run the authorization matrix in CI |
+      | denied answers look different for different ids | existence-oracle check: foreign against missing |
+      | you only have one account | ask for a second one - guessing other customers' ids in a real system is out of scope |
+      | list, search or export endpoints | check they return only the caller's objects, and that filters cannot widen them |
+
+      **What these tests do not replace.** The matrix decides allow or deny per request; it cannot see that an
+      **allowed** response contains fields the caller should not get. In the practice portal, Shop A may read
+      its own merchant record - the matrix says allow and passes - yet the vulnerable record includes
+      `api_secret`. That is a property-level problem (API3:2023), covered in [Testing mass assignment and
+      excessive data exposure](#/lesson/testing-mass-assignment-and-data-exposure). Business rules ("a
+      merchant may refund only captured payments, once") are covered in [Testing business logic, races and
+      rate limits](#/lesson/testing-business-logic-and-rate-limits).
+
+  - id: visual
+    kind: visual
+    concepts: [sec-idor-two-account]
+    title: The two-account test as a sequence
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant B as Bob - merchant m_200
+        participant A as Alice - merchant m_100
+        participant P as SandPay portal
+        B->>P: GET /api/payments with Bob's token
+        P-->>B: 200 - pay_2001 and pay_2002
+        A->>P: GET /api/payments/pay_1001 with Alice's token - the control
+        P-->>A: 200 - owner m_100, so the request shape works
+        A->>P: GET /api/payments/pay_2001 with Alice's token
+        alt object-level check missing
+          P-->>A: 200 - owner m_200 - IDOR, record the evidence
+        else check present
+          P-->>A: 404 payment not found - same as a missing id
+        end
+      ```
+
+      Notice the order: Bob's own session supplies the real ids, and Alice's control comes **before** the
+      attack request. Without the control, a 404 could just mean Alice's token expired.
+
+  - id: curl-evidence
+    kind: code
+    concepts: [sec-idor-two-account, sec-idor-matrix-oracle]
+    title: The IDOR by hand, with curl
+    body: |
+      Start the vulnerable portal (`.venv/bin/python support/sandpay_vuln.py --port 8791`), sign in as Alice and
+      Bob, and keep their tokens in `$A` and `$BT`. Bob lists his own payments - the ids come from Bob, not from
+      guessing:
+
+      ```bash
+      curl -s http://127.0.0.1:8791/api/payments -H "Authorization: Bearer $BT"
+      ```
+
+      ```plaintext
+      {"data": [{"id": "pay_2001", "merchant_id": "m_200", "amount_minor": 4999, "currency": "EUR", "status": "captured", "card_last4": "1881"}, {"id": "pay_2002", "merchant_id": "m_200", "amount_minor": 150, "currency": "USD", "status": "failed", "card_last4": "0002"}]}
+      ```
+
+      Alice asks for Bob's payment:
+
+      ```bash
+      curl -si http://127.0.0.1:8791/api/payments/pay_2001 -H "Authorization: Bearer $A"
+      ```
+
+      ```http
+      HTTP/1.1 200 OK
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 127
+
+      {"id": "pay_2001", "merchant_id": "m_200", "amount_minor": 4999, "currency": "EUR", "status": "captured", "card_last4": "1881"}
+      ```
+
+      `merchant_id` is `m_200` - Bob's - in a response to Alice's token: that body is the evidence. Without any
+      token the same request is refused, so authentication works and authorization does not:
+
+      ```http
+      HTTP/1.1 401 Unauthorized
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 36
+
+      {"error": "authentication required"}
+      ```
+
+      Against the fixed portal (`--fix idor`), Bob's payment and a payment that does not exist get the **same**
+      answer - denied, and no hint which ids are real:
+
+      ```http
+      HTTP/1.1 404 Not Found
+      Server: SandPayPortal/0.9 Python/3.12
+      Content-Type: application/json
+      Content-Length: 30
+
+      {"error": "payment not found"}
+      ```
+
+      (`Date` headers are left out. The version in `Server` is a separate finding - see [Testing for security
+      misconfiguration](#/lesson/testing-security-misconfiguration).)
+
+  - id: matrix-code
+    kind: code
+    concepts: [sec-idor-matrix-oracle]
+    title: An authorization matrix that runs itself
+    collapsed: true
+    body: |
+      The Authorization Testing Automation cheat sheet keeps the matrix in a file a program reads (its example
+      is XML) so that "the minimum possible of maintenance" is needed when roles change, and so a failure gives
+      "a clear indication ... of the source authorization combination that does not respect the authorization
+      matrix". The practice project uses one line per rule:
+
+      ```plaintext
+      # actor     method  path                     expected
+      alice       GET     /api/payments/pay_1001   allow    # own payment
+      alice       GET     /api/payments/pay_2001   deny     # bob's - horizontal
+      alice       GET     /api/payments/pay_2002   deny
+      bob         GET     /api/payments/pay_2001   allow
+      bob         GET     /api/payments/pay_1001   deny
+      ops         GET     /api/payments/pay_1001   allow    # admin reads any payment
+      ops         GET     /api/payments/pay_2002   allow
+      alice       GET     /api/merchants/m_100     allow
+      alice       GET     /api/merchants/m_200     deny
+      anonymous   GET     /api/payments/pay_1001   deny
+      anonymous   GET     /api/me                  deny
+      ```
+
+      The heart of the runner (`practice/security/solutions/web/idor_matrix.py`):
+
+      ```python
+      def decide(status: int) -> str:
+          if 200 <= status < 300:
+              return "allow"
+          if status in (401, 403, 404):
+              return "deny"
+          return "error"
+
+
+      def run_matrix(base_url: str, rules: list[Rule], tokens: dict[str, str]) -> list[Result]:
+          results: list[Result] = []
+          with requests.Session() as session:
+              for rule in rules:
+                  headers = {}
+                  if rule.actor != "anonymous":
+                      headers["Authorization"] = f"Bearer {tokens[rule.actor]}"
+                  resp = session.request(rule.method, base_url + rule.path, headers=headers,
+                                         allow_redirects=False, timeout=5)
+                  results.append(Result(rule, resp.status_code, decide(resp.status_code)))
+          return results
+      ```
+
+      Run against the vulnerable portal, the report names exactly the broken combinations:
+
+      ```plaintext
+      VIOLATION alice GET /api/payments/pay_2001 expected deny, got allow (200)
+      VIOLATION alice GET /api/payments/pay_2002 expected deny, got allow (200)
+      VIOLATION bob GET /api/payments/pay_1001 expected deny, got allow (200)
+      ```
+
+      Against `make_app({"idor"})`:
+
+      ```plaintext
+      ok: 11 rules match
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-idor-matrix-oracle, sec-idor-two-account]
+    title: Why the runner and the probe are written that way
+    body: |
+      - **`expected` is written down before the run.** The matrix is the specification. A runner that only
+        "notices 200s" cannot tell Bob reading his own payment (correct) from Alice reading it (a breach).
+      - **`deny` covers 401, 403 and 404.** A well-built API may answer 404 for "not yours" on purpose. Treating
+        404 as "endpoint broken" would flag the fixed portal.
+      - **Everything else is `error`, and an error is a violation.** A 500, a 405 or a 302 means the test did
+        not observe a decision. Counting it as "deny" would let a crashing endpoint pass the security gate.
+      - **`allow_redirects=False`.** A 302 to the login page is an answer to classify. Following it would turn
+        "you were sent to sign in" into "200 OK - allowed".
+      - **`tokens[rule.actor]` raises for an unknown actor.** A typo (`alcie`) must not silently become an
+        anonymous request that "passes" every deny rule.
+      - **The runner only replays GET and HEAD.** A write rule also needs a payload - the cheat sheet keeps
+        those in a separate `services-testing` node - and a write against shared test data needs a reset
+        afterwards. Writes still need testing; they need more than a URL.
+      - **The probe discovers ids through B's own listing.** Real ids, no guessing, no requests for objects that
+        may belong to real customers.
+      - **The probe's control comes first and stops the run when it fails.** If Alice cannot read her own
+        payment, every "denied" for Bob's payments is meaningless.
+      - **The probe compares the owner field, not the status alone.** A 200 that returns the caller's own
+        object (some APIs ignore the id and return "my payment") is not a leak.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-idor-two-account, sec-idor-escalation, sec-idor-matrix-oracle]
+    title: Testing access control, step by step
+    body: |
+      1. **Get the accounts in writing.** At least two of each role that matters (two merchants, one support
+         agent, one admin), from the system owner, in the test scope.
+      2. **Create objects in each account.** Payments, invoices, notes - so each account owns something the
+         other must not reach.
+      3. **Map every object reference** (from [reconnaissance](#/lesson/reconnaissance-and-attack-surface)):
+         path ids, query parameters, body fields, headers, file names - and every method on each endpoint.
+      4. **Write the matrix** - actor, method, endpoint, expected decision - including `anonymous` and the
+         admin-only functions.
+      5. **For each object endpoint, run the two-account test:** B's real ids, A's control, then A on B's
+         objects. Repeat in the other direction, and for every method (`GET`, `PATCH`, `DELETE`).
+      6. **Check vertical access:** each lower role calls the higher role's functions directly (forced
+         browsing), including endpoints the UI never shows.
+      7. **Compare denied answers** for foreign and missing ids: same status and same body, or an oracle?
+      8. **Record evidence** for each finding: both requests, both responses, which account owns the object, and
+         why the data proves it.
+      9. **Turn every finding into a matrix rule** so it is re-tested on every release.
+
+  - id: example
+    kind: example
+    concepts: [sec-idor-two-account, sec-idor-matrix-oracle]
+    title: 'Example: the merchant portal before release'
+    body: |
+      SandPay's team asks for an access control review of the merchant portal before launch. The tester gets
+      two merchant accounts (Shop A, Shop B) and one operations admin.
+
+      - **Two-account probe, both directions.** Alice reads `pay_2001` and `pay_2002`; Bob reads `pay_1001` to
+        `pay_1003`. The probe output for Alice against Bob:
+
+        ```plaintext
+        [Leak(object_id='pay_2001', status=200, owner='m_200', fields=('amount_minor', 'card_last4', 'currency', 'id', 'merchant_id', 'status')),
+         Leak(object_id='pay_2002', status=200, owner='m_200', fields=('amount_minor', 'card_last4', 'currency', 'id', 'merchant_id', 'status'))]
+        ```
+
+        The finding: "Any merchant can read every other merchant's payments by id (`GET
+        /api/payments/{id}`), including amount, currency, status and card ending" - High, with the two curl
+        exchanges as evidence.
+      - **The matrix** reports the same three violations; the team adds it to CI.
+      - **Merchant records:** Alice cannot read `m_200` (404), so the matrix rule passes - but her own record
+        returns `api_secret` and the full payout account. Not an access control failure, an excessive data
+        exposure finding, reported separately.
+      - **After the fix** the probe returns `[]`, the matrix prints `ok: 11 rules match`, and the existence-oracle
+        check for `pay_2001` against `pay_9999` says `indistinguishable`. The tester re-runs the whole matrix,
+        not just the three failing rules, because a fix can break legitimate access too - the admin rows
+        (`ops` reads any payment) must still be `allow`.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-idor-two-account, sec-idor-escalation, sec-idor-matrix-oracle]
+    title: Test cases with expected results and evidence
+    body: |
+      | # | Case | Expected (secure) | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Control: A reads own `pay_1001` | 200, `merchant_id` `m_100` | request and response |
+      | 2 | A reads B's `pay_2001` | 404 (or 403) - no body data of B | both requests and responses |
+      | 3 | B reads A's `pay_1001` (other direction) | 404 | as above |
+      | 4 | A reads a missing `pay_9999` | 404 with the **same** body as case 2 | the two bodies side by side |
+      | 5 | Anonymous reads `pay_1001` | 401 | response |
+      | 6 | A lists `/api/payments` | only `m_100` payments | the list, owners checked |
+      | 7 | Merchant calls an admin-only function | 401/403/404, no change of state | response, data unchanged |
+      | 8 | A changes or deletes B's object with each write method | denied, B's object unchanged | B's object before and after |
+      | 9 | Admin reads any payment | 200 - the intended policy | response |
+      | 10 | Matrix in CI after a route change | `ok: <n> rules match`, or a named violation | CI log |
+
+      **Negative-control discipline:** case 1 before case 2, every time. Case 9 proves the fix did not lock out
+      legitimate access. Case 8 checks the **object afterwards** - a 403 that still deleted the payment is a
+      failure.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-idor-two-account, sec-idor-matrix-oracle, sec-idor-escalation]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Testing with one account.** You will only ever see your own objects; every test "passes".
+      - **No control request.** A 404 for B's object "proves" security when A's token had simply expired.
+      - **Guessing ids in a real system.** Incrementing ids against production touches real customers' data.
+        Use the second account's real ids.
+      - **Calling every 200 a finding.** Bob reading Bob's payment, or an admin reading everything, may be
+        correct. Check the owner field and the policy.
+      - **Calling every 403 a pass.** Look at the state afterwards for writes, and compare with a missing id
+        for oracles.
+      - **Testing only GET.** The same path with `PATCH` or `DELETE` often has a separate handler and a separate
+        (missing) check.
+      - **Reporting "IDOR" for sequential ids alone.** Predictable ids make an IDOR easier to exploit; they are
+        not the vulnerability. The vulnerability is the missing check.
+      - **Accepting "we use UUIDs now" as the fix.** Re-run the two-account test with the real UUIDs from
+        account B.
+
+      **Debugging a surprising result:** replay the exact request as the object's **owner** (should work),
+      then as the other account, then anonymously, changing one thing at a time. Read the owner field in each
+      body. If owner and other account get identical bodies, the check is missing; if the other account gets
+      its **own** object back, the server ignores the id (not a leak, but a bug worth reporting).
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-idor-matrix-oracle, sec-idor-escalation]
+    title: Trade-offs and alternatives
+    body: |
+      - **Matrix size.** Actors x endpoints x methods grows fast. Group by role rather than by user, use one
+        object per owner per endpoint, and put the matrix in the same review as the code that changes routes.
+        The cheat sheet's suggestion of "a hierarchy of the authorizations" helps too.
+      - **Reads against writes.** Read rules can run against any shared test environment; write rules need
+        seeded data and a reset, so many teams run them in a disposable environment only.
+      - **404 against 403 for "not yours".** A uniform 404 hides existence but makes support harder ("is the
+        id wrong or am I not allowed?"); a 403 is clearer for users. Choose per data type and document it -
+        this is a design decision, not always a defect.
+      - **Tools.** The ZAP Access Control Testing add-on and Burp's Autorize extension (named in WSTG-ATHZ-02,
+        not run here) replay traffic under other identities automatically - fast for exploration, but they
+        still need you to decide which 200s are wrong. A matrix in the repository is slower to write and is
+        the thing that keeps catching regressions.
+      - **Code review.** Looking for queries by id without an owner clause (`find(params[:id])`) finds IDORs
+        before they ship; testing confirms them and proves the fix.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-idor-escalation, sec-idor-two-account, sec-idor-matrix-oracle]
+    title: Quick reference
+    body: |
+      - Access control = may **this caller** do **this action** on **this object**. Horizontal = same role,
+        someone else's object (IDOR/BOLA); vertical = a more privileged role's function (BFLA).
+      - Two accounts per role, each owning objects. B's real ids from B's own session. A's control first. Then
+        A on B's objects, every method, both directions.
+      - Evidence = both requests, both responses, and the owner field that proves whose data came back.
+      - Random ids, hidden links and token-id comparisons do not fix it; a server-side ownership check on every
+        request does.
+      - Authorization matrix: actor, method, endpoint, expected; 2xx = allow, 401/403/404 = deny, anything else
+        = look at it. Run it on every release.
+      - Denied answers for "not yours" and "missing" should be identical; a 403 against a 404, or different
+        messages, is an existence oracle.
+      - Test only with accounts and scope you were given in writing.
+
+exercises:
+  - id: escalation-kind
+    type: mcq
+    concept: sec-idor-escalation
+    skill: recognition
+    title: Which kind of escalation?
+    prompt: |
+      Signed in as a **merchant**, a tester calls `GET /admin/merchants/export` - an endpoint the merchant UI
+      never shows - and receives every merchant's details. What is it?
+    options:
+      - id: vertical
+        text: Vertical escalation - broken function level authorization (BFLA)
+        feedback: Correct - a lower role reached a function meant for a higher role.
+      - id: horizontal
+        text: Horizontal escalation - an IDOR
+        feedback: Horizontal means another account at the same level via an object reference; here the merchant reached an admin function.
+      - id: authn
+        text: An authentication failure
+        feedback: The tester was authenticated correctly as a merchant; the failure is in what the merchant was allowed to do.
+      - id: none
+        text: Not a vulnerability, because the UI hides the link
+        feedback: Hiding a link is not access control - this is forced browsing, which WSTG-ATHZ-02 tests for.
+    correct: [vertical]
+    hints:
+      - Compare the caller's role with the role the endpoint was built for.
+    solution: |
+      Same role, other user's object = horizontal; lower role, higher role's function = vertical (BFLA in API
+      terms). Forced browsing found it.
+
+  - id: idor-definition
+    type: mcq
+    concept: sec-idor-escalation
+    skill: recognition
+    title: What makes it an IDOR?
+    prompt: Which of these is the actual vulnerability in an IDOR?
+    options:
+      - id: missing-check
+        text: The server returns or changes the object without checking that the caller may access that object
+        feedback: Correct - the IDOR Prevention cheat sheet calls it "a missing object-level authorization check".
+      - id: sequential
+        text: The object ids are sequential numbers
+        feedback: Predictable ids make exploitation easier, but with a correct check they leak nothing.
+      - id: in-url
+        text: The id appears in the URL instead of the body
+        feedback: An id in the body is just as easy to change; where the id travels does not matter.
+      - id: no-https
+        text: The request is sent over plain HTTP
+        feedback: Transport security protects the request in transit; it does not decide who may read the object.
+    correct: [missing-check]
+    hints:
+      - Would a random UUID with no check be safe once someone learns it?
+    solution: |
+      The vulnerability is the missing object-level authorization check. The id format and where it travels
+      only change how easy it is to exploit.
+
+  - id: control-first
+    type: mcq
+    concept: sec-idor-two-account
+    skill: application
+    title: The 404 that proves nothing
+    prompt: |
+      A tester sends `GET /api/payments/pay_2001` with Alice's token and gets `404 payment not found`. They
+      record "IDOR: not vulnerable". What is missing?
+    options:
+      - id: control
+        text: A control - the same request for one of Alice's own payments, showing it returns 200
+        feedback: Correct - without it, the 404 could mean an expired token or a wrong path.
+      - id: guess-more
+        text: Trying a few hundred more ids
+        feedback: More guesses do not fix an unverified request, and guessing real customers' ids is out of scope.
+      - id: anonymous
+        text: The same request without a token
+        feedback: That tests authentication; it says nothing about whether Alice's request works at all.
+      - id: uuid
+        text: Checking whether the ids are UUIDs
+        feedback: The id format does not tell you whether the server checked ownership.
+    correct: [control]
+    hints:
+      - What else, apart from a working access check, can produce a 404?
+    solution: |
+      A denied answer only counts once a control - the same request for the caller's own object - has
+      succeeded.
+
+  - id: where-ids-come-from
+    type: mcq
+    concept: sec-idor-two-account
+    skill: application
+    title: Where should account B's ids come from?
+    prompt: Testing a real staging system with two test merchants, where should the ids of B's payments come from?
+    options:
+      - id: b-session
+        text: From B's own session - B lists or creates its payments and the tester notes their ids
+        feedback: Correct - real ids of objects you are allowed to test with, and no other customer's data touched.
+      - id: increment
+        text: Increment A's own payment id until something comes back
+        feedback: That may return a real customer's payment - accessing it is outside scope even in testing.
+      - id: uuid-guess
+        text: Generate random UUIDs and try them
+        feedback: Random UUIDs almost never exist, so the test finds nothing and proves nothing.
+      - id: logs
+        text: Copy ids from the production logs
+        feedback: Production ids belong to real customers and are not part of a staging test scope.
+    correct: [b-session]
+    hints:
+      - The WSTG says to "obtain the identifier of an invoice belonging to a different test user".
+    solution: |
+      Use the second test account's real ids, obtained through its own session. That keeps the test inside
+      scope and makes it reliable even with unguessable ids.
+
+  - id: uuid-fix
+    type: mcq
+    concept: sec-idor-escalation
+    skill: analysis
+    title: '"We switched to UUIDs - fixed?"'
+    prompt: |
+      A developer closes your IDOR finding: payment ids are now UUIDs instead of `pay_2001`. What do you do?
+    options:
+      - id: retest
+        text: Re-run the two-account test with B's real UUIDs and keep the finding open until A is denied
+        feedback: Correct - ids leak in links, exports and logs; only the ownership check fixes it.
+      - id: accept
+        text: Accept the fix - UUIDs cannot be guessed
+        feedback: The IDOR Prevention cheat sheet says checks are essential "even with complex identifiers".
+      - id: lower
+        text: Lower the severity to informational
+        feedback: Harder to exploit, maybe, but anyone who learns a UUID still reads the payment.
+      - id: encrypt
+        text: Ask them to encrypt the ids as well
+        feedback: The cheat sheet advises against encrypting ids, and it would still not add the missing check.
+    correct: [retest]
+    hints:
+      - How would a tester get B's UUIDs?
+    solution: |
+      Unguessable ids are defence in depth. Retest with the second account's real ids; the finding is fixed
+      only when the server denies them.
+
+  - id: method-swap
+    type: mcq
+    concept: sec-idor-escalation
+    skill: application
+    title: GET is safe - done?
+    prompt: |
+      `GET /api/payments/pay_2001` as Alice is denied correctly. The endpoint also accepts `PATCH` (change the
+      description) and `DELETE` (cancel). What next?
+    options:
+      - id: each-method
+        text: Test PATCH and DELETE as Alice on Bob's payment too, and check Bob's payment afterwards
+        feedback: Correct - each method can have its own handler and its own missing check.
+      - id: done
+        text: Nothing - the same path is protected
+        feedback: API5:2023 asks exactly whether a user can act "by simply changing the HTTP method".
+      - id: delete-real
+        text: Delete a random production payment to prove impact
+        feedback: Destructive tests on real data are never in scope; use test objects you own.
+      - id: options
+        text: Send OPTIONS and trust the Allow header
+        feedback: Allow lists methods the server accepts, not whether each one checks ownership.
+    correct: [each-method]
+    hints:
+      - Is authorization written per path or per handler?
+    solution: |
+      Test every method on every object endpoint, and for writes check the object's state afterwards.
+
+  - id: matrix-decide
+    type: mcq
+    concept: sec-idor-matrix-oracle
+    skill: application
+    title: How should the matrix count a 500?
+    prompt: |
+      A matrix rule expects `deny` for `bob GET /api/payments/pay_1001`. The server answers
+      `500 Internal Server Error`. How should the runner count it?
+    options:
+      - id: error
+        text: As an error - a violation to look at, because no decision was observed
+        feedback: Correct - the test did not see allow or deny; the crash may hide a missing check.
+      - id: deny
+        text: As deny - Bob did not get the payment
+        feedback: Treating crashes as denials lets a broken endpoint pass a security gate; and a 500 body can still leak data.
+      - id: allow
+        text: As allow
+        feedback: Nothing was granted; but it is not a deny either.
+      - id: ignore
+        text: Skip the rule and try again next release
+        feedback: A skipped rule is an untested rule - the regression the matrix exists to catch.
+    correct: [error]
+    hints:
+      - Which status codes mean "the server decided no"?
+    solution: |
+      2xx is allow, 401/403/404 is deny; anything else is an error that fails the run until someone looks.
+
+  - id: matrix-blind-spot
+    type: mcq
+    concept: sec-idor-matrix-oracle
+    skill: analysis
+    title: What the matrix cannot see
+    prompt: |
+      The matrix rule `alice GET /api/merchants/m_100 allow` passes. The response is
+      `{"id": "m_100", "name": "Shop A", "api_secret": "sk_test_shop_a_practice", "payout_iban": "XX00 SAND 0000 0001"}`.
+      What does this show?
+    options:
+      - id: property
+        text: An allowed response can still expose fields the caller should not get - a property-level issue the matrix does not test
+        feedback: Correct - the matrix checks the decision, not the content; excessive data exposure needs its own tests.
+      - id: matrix-bug
+        text: The matrix rule is wrong and should say deny
+        feedback: Alice may read her own merchant record; the problem is which fields come back.
+      - id: idor
+        text: An IDOR on the merchant record
+        feedback: The record is Alice's own; no other account's object was reached.
+      - id: fine
+        text: Nothing - it is her own data
+        feedback: An API secret and full payout account are rarely needed in a profile view and widen the damage of any session theft.
+    correct: [property]
+    hints:
+      - What exactly does a matrix rule assert?
+    solution: |
+      The matrix decides allow/deny. Which properties an allowed response contains is API3:2023 territory, tested
+      separately.
+
+  - id: oracle-kind
+    type: mcq
+    concept: sec-idor-matrix-oracle
+    skill: analysis
+    title: Is this an oracle?
+    prompt: |
+      Signed in as Shop A, `GET /invoices/inv_601` (Shop B's) returns `404 {"error": "invoice inv_601 is not yours"}`
+      and `GET /invoices/inv_999` (does not exist) returns `404 {"error": "invoice inv_999 not found"}`. Verdict?
+    options:
+      - id: oracle
+        text: An existence oracle - the messages differ, so ids can be enumerated
+        feedback: Correct - the status is the same but the body tells the attacker which ids are real.
+      - id: secure
+        text: Secure - both are 404
+        feedback: Compare the bodies too, after replacing the echoed id.
+      - id: idor
+        text: An IDOR
+        feedback: No invoice data came back; it is a lesser information leak.
+      - id: auth
+        text: An authentication problem
+        feedback: The caller is authenticated; the leak is in how denials are worded.
+    correct: [oracle]
+    hints:
+      - Replace each id with a placeholder and compare the two messages.
+    solution: |
+      Same status, different message is still an oracle. The fix is one message for both, as the fixed portal
+      does with "payment not found".
+
+  - id: bulk-access
+    type: mcq
+    concept: sec-idor-two-account
+    skill: application
+    title: The export endpoint
+    prompt: |
+      Alice's single-payment requests are all correctly denied for Bob's ids. Which test is still needed for
+      `GET /api/payments?status=captured&merchant_id=m_200`?
+    options:
+      - id: filter
+        text: Check that list and filter endpoints return only Alice's payments, whatever filter values she sends
+        feedback: Correct - list, search and export endpoints are their own object-level check (bulk access).
+      - id: none
+        text: None - object access was already tested
+        feedback: List endpoints use a different query path, often with filters taken from the request.
+      - id: rate
+        text: Only a rate-limit test
+        feedback: Rate limits slow enumeration down; they do not stop one request returning someone else's data.
+      - id: sql
+        text: Only an SQL injection test
+        feedback: Injection is a separate test; here the question is whose rows the filter may select.
+    correct: [filter]
+    hints:
+      - WSTG-APIT-02 (development version) calls it "bulk access".
+    solution: |
+      Every way of selecting objects - by id, list, filter, search, export - needs its own two-account test.
+
+  - id: idor-test-order
+    type: order
+    concept: sec-idor-two-account
+    skill: application
+    title: Run a two-account IDOR test
+    prompt: Put the steps of a two-account test of `GET /api/payments/{id}` in order.
+    items:
+      - id: accounts
+        text: Get two merchant test accounts in writing, in scope
+      - id: objects
+        text: Make sure each account owns payments
+      - id: discover
+        text: As B, list B's own payments and note their ids
+      - id: control
+        text: As A, read one of A's own payments - expect 200 and A's merchant id
+      - id: attack
+        text: As A, request each of B's payment ids
+      - id: judge
+        text: Call any 2xx carrying B's merchant id a finding; compare denials with a missing id
+      - id: evidence
+        text: Record both requests and responses as evidence and add the case to the matrix
+    hints:
+      - The control must come before the request it protects.
+    solution: |
+      Accounts, objects, real ids from B, A's control, the attack, the judgement, then evidence and a matrix rule
+      so it is re-tested on every release.
+
+  - id: handler-debug
+    type: debug
+    concept: sec-idor-escalation
+    skill: analysis
+    title: Where is the missing check?
+    prompt: |
+      This handler serves `GET /api/payments/{id}` for merchants. Pick the line where the object-level check
+      should be - the line that makes it an IDOR.
+    language: python
+    code: |
+      def get_payment(req, payment_id):
+          user = current_user(req)            # raises 401 without a valid token
+          if user.role not in ("merchant", "admin"):
+              raise HttpError(403, "forbidden")
+          row = db.query_one("SELECT * FROM payments WHERE id = ?", payment_id)
+          if row is None:
+              raise HttpError(404, "payment not found")
+          return json_response(row)
+    correctLines: [5]
+    hints:
+      - Authentication and the role check are both there - which question is never asked?
+      - Look at what the database query uses to find the payment.
+    lineNotes:
+      - line: 2
+        note: Authentication is done - the caller is known.
+      - line: 3
+        note: The function-level check is fine - merchants may read payments.
+      - line: 5
+        note: The query selects by id only; add "AND merchant_id = ?" with the caller's merchant (admins excepted).
+    solution: |
+      Line 5 looks the payment up by id alone. Scope the query to the caller's merchant, and answer a foreign id
+      exactly like a missing one.
+
+  - id: oracle-short
+    type: short
+    concept: sec-idor-matrix-oracle
+    skill: analysis
+    title: 403 or 404?
+    prompt: |
+      A developer says: "Returning 403 for other merchants' payments is more honest than 404." When is that a
+      problem, and what would you recommend?
+    modelAnswer: |
+      A 403 for "exists but not yours" next to a 404 for "does not exist" lets an attacker learn which ids are
+      real - an existence oracle. It matters when knowing that an object exists is itself sensitive or helps
+      enumeration (does this email have an account, does this payment reference exist). For those, answer both
+      cases identically - same status and same body, without echoing different wording - as the fixed portal
+      does with `404 payment not found`. Where existence is harmless, a 403 is acceptable and clearer for users;
+      it is a design decision to document, not automatically a defect.
+    rubric:
+      - Explains that differing answers reveal which ids exist.
+      - Says that identical status and body remove the oracle.
+      - Notes that it depends on how sensitive existence is.
+      - Treats 403 versus 404 as a documented design decision, not a rule.
+    hints:
+      - What can an attacker learn from comparing the two answers?
+    solution: |
+      Different denials leak existence. Make them identical where existence is sensitive; otherwise document
+      the choice.
+
+  - id: authz-testdesign
+    type: testdesign
+    concept: sec-idor-two-account
+    skill: application
+    title: Design access control tests for refunds
+    prompt: |
+      SandPay adds `POST /api/payments/{id}/refunds` (merchant creates a refund), `GET /api/refunds/{refund_id}`
+      and an admin-only `POST /admin/refunds/{refund_id}/approve`. Design the access control tests, with
+      preconditions, steps, expected result and evidence.
+    modelAnswer: |
+      Preconditions: two merchant accounts (Shop A, Shop B) and one admin; each merchant has a captured payment
+      and one pending refund; a way to read refund state as its owner; a reset of the data afterwards.
+
+      1. **Control** - A refunds own `pay_A`. Expected 201 and a refund owned by A. Evidence - response.
+      2. **Horizontal write** - A posts a refund on B's `pay_B`. Expected 404/403 and **no refund created** on
+         `pay_B`. Evidence - response, and B's refund list before and after.
+      3. **Horizontal read** - A reads B's refund id. Expected denied, same body as a missing refund id.
+         Evidence - both responses side by side.
+      4. **Vertical** - A calls `/admin/refunds/{A's refund}/approve`. Expected 401/403/404 and the refund still
+         pending. Evidence - response and refund state afterwards.
+      5. **Admin** - the admin approves B's refund. Expected 200, approved. Evidence - state. (Policy check.)
+      6. **Anonymous** - every endpoint without a token. Expected 401.
+      7. **Methods** - other methods on each path (`PATCH`, `DELETE`) as A on B's objects. Expected denied, state
+         unchanged.
+      8. **Regression** - add every case to the authorization matrix; write rules with their payloads.
+    rubric:
+      - Uses two accounts of the same role and an admin, with objects owned by each.
+      - Starts with a control request.
+      - Checks the state after write attempts, not only the status.
+      - Includes vertical, anonymous and method variations.
+      - Gives concrete evidence for each case and puts the cases in the matrix.
+    hints:
+      - For each endpoint ask - who should succeed, who should not, and how will you prove nothing changed?
+    solution: |
+      Control first, then horizontal read and write, vertical, anonymous and other methods, each with state
+      evidence, all kept in the matrix.
+
+  - id: interview-idor
+    type: interview
+    concept: sec-idor-escalation
+    skill: analysis
+    title: 'Interview: how do you test for IDOR?'
+    prompt: |
+      "Walk me through how you test an API for IDOR, and how you would make sure it does not come back."
+    modelAnswer: |
+      IDOR, or BOLA in API terms, is a missing object-level authorization check: the server serves an object
+      by id without checking that the caller may access that object. I test it with at least two accounts of the
+      same role that each own objects, plus an account per higher role. I map every object reference - path,
+      query, body, headers - and every method. Then for each endpoint: I take B's real ids from B's own session,
+      send a control request as A for A's own object to prove the request works, and request B's objects as A.
+      A 2xx with B's data is the finding; for writes I check B's object afterwards. I compare denied answers for
+      foreign and missing ids to spot existence oracles, and test vertical access by calling admin functions as
+      a merchant. Evidence is both request/response pairs and the owner field. To stop regressions, I write an
+      authorization matrix - actor, method, endpoint, expected - and run it in CI on every release; 2xx is
+      allow, 401/403/404 deny, anything else fails the run. UUIDs or hidden links are not a fix; the server-side
+      ownership check is.
+    rubric:
+      - Defines IDOR/BOLA as a missing object-level check, not as predictable ids.
+      - Describes two accounts, real ids from the second account and a control request.
+      - Mentions writes, methods, list endpoints and vertical access.
+      - Describes evidence and an automated authorization matrix in CI.
+      - Rejects obscurity (UUIDs, hidden links) as the fix.
+    followUps:
+      - How would you test this when you only have one test account?
+      - What is the difference between BOLA and BFLA?
+      - Your matrix has 400 rules and takes too long - what do you do?
+    hints:
+      - Structure it - definition, method, evidence, automation.
+    solution: |
+      Two accounts, real ids, a control, every method, evidence, and a matrix in CI; ownership checks fix it,
+      obscurity does not.
+
+  - id: matrix-runner-code
+    type: coding
+    concept: sec-idor-matrix-oracle
+    skill: application
+    title: Write an authorization matrix runner
+    prompt: |
+      In `practice/security/exercises/web/idor_matrix.py`, implement `parse_matrix`, `decide`, `run_matrix`,
+      `violations` and `report`. The tests parse an 11-rule matrix (alice, bob, ops and anonymous), run it
+      against the vulnerable portal - where it must report exactly three horizontal violations - and against the
+      portal with `idor` fixed, where it must report `ok: 11 rules match`.
+    project: security
+    files: [exercises/web/idor_matrix.py]
+    test: tests/web/test_idor_matrix.py
+    command: .venv/bin/python -m pytest tests/web/test_idor_matrix.py
+    modelAnswer: |
+      Parse each line with `line.split("#", 1)[0].split()`, reject anything that is not four fields, a GET/HEAD
+      method, a `/` path and `allow`/`deny`, naming the line number. Then:
+
+      ```python
+      def decide(status):
+          if 200 <= status < 300:
+              return "allow"
+          if status in (401, 403, 404):
+              return "deny"
+          return "error"
+      ```
+
+      `run_matrix` sends a Bearer token for every actor except `anonymous` (`tokens[actor]` raises for a typo),
+      with `allow_redirects=False`; `violations` keeps results whose `actual != rule.expected`.
+    rubric:
+      - Every test in tests/web/test_idor_matrix.py passes.
+      - Bad matrix lines fail with their line number instead of being skipped.
+      - Errors and redirects count as violations, not as denials.
+      - An unknown actor raises instead of becoming an anonymous request.
+    hints:
+      - Strip comments before splitting into fields.
+      - Which statuses mean the server decided "no"?
+      - A 302 to a login page is an answer - do not follow it.
+    solution: |
+      The matrix is the specification: allow for 2xx, deny for 401/403/404, everything else fails the run.
+
+  - id: two-account-code
+    type: coding
+    concept: sec-idor-two-account
+    skill: application
+    title: Write the two-account IDOR probe
+    prompt: |
+      In `practice/security/exercises/web/idor_probe.py`, implement `list_own_ids` and `two_account_probe`. The
+      tests sign in as Alice and Bob: the probe must find Bob's two payments readable by Alice (and Alice's three
+      by Bob) on the vulnerable portal, report nothing once `idor` is fixed, and refuse to run when an account
+      owns nothing or both sessions are the same account.
+    project: security
+    files: [exercises/web/idor_probe.py]
+    test: tests/web/test_idor_probe.py
+    command: .venv/bin/python -m pytest tests/web/test_idor_probe.py
+    modelAnswer: |
+      ```python
+      ids_a, ids_b = list_own_ids(base, token_a), list_own_ids(base, token_b)
+      if not ids_a or not ids_b or set(ids_a) & set(ids_b):
+          raise ValueError("need two independent accounts that own payments")
+      control = _get(base, f"/api/payments/{ids_a[0]}", token_a)
+      if not 200 <= control.status_code < 300:
+          raise RuntimeError("control failed")
+      owner_b = _get(base, f"/api/payments/{ids_b[0]}", token_b).json()["merchant_id"]
+      for oid in ids_b:
+          resp = _get(base, f"/api/payments/{oid}", token_a)
+          if resp.ok and resp.json().get("merchant_id") == owner_b:
+              leaks.append(Leak(oid, resp.status_code, owner_b, tuple(sorted(resp.json()))))
+      ```
+    rubric:
+      - Every test in tests/web/test_idor_probe.py passes.
+      - B's ids come from B's own listing, not from guessing.
+      - The control runs before any request for B's objects and stops the probe when it fails.
+      - A leak needs B's owner value in the body, not just a 2xx.
+    hints:
+      - What does GET /api/payments return for each account?
+      - Which request tells you A's token and request shape work?
+      - How do you know a 200 contains B's data rather than A's?
+    solution: |
+      Real ids from B, a control for A, then a leak only when A receives an object owned by B.
+
+  - id: oracle-code
+    type: coding
+    concept: sec-idor-matrix-oracle
+    skill: analysis
+    title: Write an existence-oracle check
+    prompt: |
+      In `practice/security/exercises/web/idor_oracle.py`, implement `normalise`, `classify` and
+      `check_existence_oracle`. The tests run your check against the invoices API in all four modes
+      (`uniform`, `status`, `message`, `leaky`) and against the portal before and after the `idor` fix, which
+      must give `readable` and then `indistinguishable`.
+    project: security
+    files: [exercises/web/idor_oracle.py]
+    test: tests/web/test_idor_oracle.py
+    command: .venv/bin/python -m pytest tests/web/test_idor_oracle.py
+    modelAnswer: |
+      ```python
+      def classify(own, foreign, missing, foreign_id, missing_id):
+          if not 200 <= own.status < 300:
+              raise ValueError("control failed")
+          if 200 <= foreign.status < 300:
+              return "readable"
+          if foreign.status != missing.status:
+              return "oracle"
+          if normalise(foreign.body, foreign_id) != normalise(missing.body, missing_id):
+              return "oracle"
+          return "indistinguishable"
+      ```
+
+      `normalise` replaces the echoed id with `{id}` so `invoice inv_601 not found` and `invoice inv_999 not
+      found` compare equal.
+    rubric:
+      - Every test in tests/web/test_idor_oracle.py passes.
+      - The control is checked first.
+      - A readable foreign object is reported as readable, before any oracle check.
+      - Echoed ids are normalised so that equal messages are not reported as an oracle.
+    hints:
+      - Which answer must succeed for the comparison to mean anything?
+      - Two messages that differ only by the id they echo are the same message.
+    solution: |
+      Control, then readable, then compare status, then compare normalised bodies.
+
+placement:
+  - id: place-escalation
+    type: mcq
+    concept: sec-idor-escalation
+    skill: analysis
+    title: Which result is a horizontal escalation?
+    prompt: Four results from testing SandPay's merchant API. Which one is a horizontal privilege escalation?
+    options:
+      - id: other-merchant
+        text: Shop A's user reads Shop B's payment by changing the id in the URL
+        feedback: Correct - same role, another account's object.
+      - id: admin-fn
+        text: Shop A's user calls an admin-only export endpoint
+        feedback: Reaching a higher role's function is vertical escalation (BFLA).
+      - id: admin-all
+        text: The operations admin reads every merchant's payments
+        feedback: That is the intended admin policy, not an escalation.
+      - id: anon-401
+        text: An anonymous request to a payment gets 401
+        feedback: That is authentication working.
+    correct: [other-merchant]
+    solution: |
+      Horizontal = same privilege level, someone else's object; vertical = a more privileged role's function.
+
+  - id: place-two-account
+    type: order
+    concept: sec-idor-two-account
+    skill: application
+    title: Order a two-account test
+    prompt: Put these steps of an IDOR test in order.
+    items:
+      - id: b-ids
+        text: As account B, list B's own objects and note their ids
+      - id: a-control
+        text: As account A, request one of A's own objects and confirm it succeeds
+      - id: a-attack
+        text: As account A, request B's objects
+      - id: verdict
+        text: Report any success that returns B's data, with both requests and responses
+    solution: |
+      Real ids from B, A's control, the attack, then the evidence-backed verdict.
+
+  - id: place-oracle
+    type: mcq
+    concept: sec-idor-matrix-oracle
+    skill: analysis
+    title: Read the denials
+    prompt: |
+      As Shop A: Shop B's invoice gives `403 {"error": "forbidden"}`; a missing invoice gives
+      `404 {"error": "invoice inv_999 not found"}`. Shop A's own invoice gives 200. What is it?
+    options:
+      - id: oracle
+        text: An existence oracle - an attacker can tell real ids from missing ones
+        feedback: Correct - access is denied, but the different answers reveal which invoices exist.
+      - id: idor
+        text: An IDOR
+        feedback: No data of Shop B came back.
+      - id: secure
+        text: Fully secure - both are denials
+        feedback: Both deny, but the difference leaks existence.
+      - id: broken-control
+        text: An invalid test, because the control failed
+        feedback: The control (own invoice) returned 200, so the comparison is valid.
+    correct: [oracle]
+    solution: |
+      Denied but distinguishable: an existence oracle. Identical answers for foreign and missing ids remove it.
+
+recall:
+  - id: recall-horizontal-vertical
+    concept: sec-idor-escalation
+    prompt: What is the difference between horizontal and vertical privilege escalation?
+    answer: Horizontal reaches another account's resources at the same privilege level (IDOR/BOLA); vertical reaches functions or resources of a more privileged role (BFLA).
+  - id: recall-idor-cause
+    concept: sec-idor-escalation
+    prompt: What is the actual vulnerability behind an IDOR, and what does not fix it?
+    answer: A missing server-side object-level authorization check. Random ids, hidden links, encrypted ids and comparing the URL id with the token's user id do not fix it.
+  - id: recall-two-account
+    concept: sec-idor-two-account
+    prompt: Describe the two-account method in one sentence.
+    answer: With two test accounts that own objects, take B's real ids from B's session, prove A's request works on A's own object (the control), then request B's objects as A and report any success carrying B's data.
+  - id: recall-writes
+    concept: sec-idor-two-account
+    prompt: What extra check does a write (PATCH, DELETE) IDOR test need?
+    answer: Read B's object before and after - a denied status that still changed or deleted the object is a failure.
+  - id: recall-matrix
+    concept: sec-idor-matrix-oracle
+    prompt: How does an authorization matrix runner classify responses?
+    answer: 2xx is allow, 401/403/404 is deny, anything else (500, 405, 302) is an error that fails the run; violations are results whose decision differs from the expected one.
+  - id: recall-oracle
+    concept: sec-idor-matrix-oracle
+    prompt: What is an existence oracle and how do you test for it?
+    answer: A denied answer that reveals whether an object exists. Compare the response for another tenant's object with the one for a missing id - status and body, with echoed ids replaced - after a successful control.
+
+next:
+  - testing-mass-assignment-and-data-exposure
+  - testing-jwt-and-oauth
+  - owasp-api-security-top-10
+  - testing-business-logic-and-rate-limits

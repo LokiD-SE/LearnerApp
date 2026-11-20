@@ -1,0 +1,1216 @@
+id: testing-session-management
+title: Testing session management
+subject: security-testing
+module: web-vulnerabilities
+level: intermediate
+status: published
+estimatedMinutes: 135
+summary: Test the life of a session the way the OWASP testing guide does - whether the id is rotated at sign-in (fixation), whether it leaks into URLs, whether logout and the idle and absolute timeouts really end it on the server, and whether the ids are strong enough not to be guessed - with probes that find each flaw in a deliberately vulnerable SandPay sign-in service and stay quiet once it is fixed.
+tags:
+  [
+    session management,
+    session id,
+    session token,
+    session fixation,
+    session rotation,
+    session hijacking,
+    logout,
+    session timeout,
+    idle timeout,
+    absolute timeout,
+    session id entropy,
+    CSPRNG,
+    session id in URL,
+    exposed session variables,
+    session puzzling,
+    privilege change,
+    OWASP WSTG,
+    WSTG-SESS-01,
+    WSTG-SESS-03,
+    WSTG-SESS-04,
+    WSTG-SESS-06,
+    WSTG-SESS-07,
+    WSTG-SESS-08,
+    WSTG-SESS-09,
+    ASVS V7,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, on Linux.
+    Every output in this lesson was printed by the code shown, run on 20 November 2026 against services on
+    `127.0.0.1`. Random session ids differ on every run; the counter-based ids (`s0003e9` ...) are the same each
+    time.
+  - **Practice targets:** `practice/security/support/sess_fixture.py`, a **deliberately vulnerable** SandPay
+    sign-in service written for this lesson (the shared portal has no pre-login session, no logout and no
+    timeouts). It binds to loopback only and has six switchable flaws - `fixation`, `url-session`,
+    `logout-client-only`, `no-idle-timeout`, `no-absolute-timeout`, `predictable-ids`; `make_app({...})`
+    builds it with those fixed. Its clock is fake (`app.clock.advance(seconds)`), so hours of session lifetime
+    take milliseconds - a choice of this lesson, not something real services offer. The shared portal
+    `practice/security/support/sandpay_vuln.py` is used once, to analyse its session ids. SandPay, its users and
+    every id are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope.
+    Timeout tests on a real system can take hours of agreed test window; everything here runs on your machine.
+  - **Testing guide:** OWASP Web Security Testing Guide, latest (development) version on
+    [GitHub](https://github.com/OWASP/wstg/tree/master/document/4-Web_Application_Security_Testing/06-Session_Management)
+    as read on 20 November 2026 - Session Management Schema (WSTG-SESS-01), Session Fixation (03), Exposed
+    Session Variables (04), Logout Functionality (06), Session Timeout (07), Session Puzzling (08) and Session
+    Hijacking (09). The latest stable release is
+    [v4.2](https://github.com/OWASP/wstg/tree/v4.2/document/4-Web_Application_Security_Testing/06-Session_Management_Testing),
+    which has the same nine session tests under slightly different file names; the development version adds
+    JSON Web Tokens (10) and Concurrent Sessions (11). Quotations are from the development version.
+  - **Guidance and requirements:** OWASP Cheat Sheet Series,
+    [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+    (session id entropy and length, exchange mechanisms, renewal after privilege change, expiration), as
+    documented on 20 November 2026; OWASP [ASVS 5.0.0](https://github.com/OWASP/ASVS/blob/v5.0.0/5.0/en/0x16-V7-Session-Management.md)
+    chapter V7 Session Management (requirements 7.2.3, 7.2.4, 7.3.1, 7.3.2, 7.4.1 quoted).
+  - **Tools named, not run here:** the WSTG lists Burp Suite Repeater and ZAP Requester for replaying old
+    session ids; this lesson replays them with Python instead.
+  - **Not repeated here:** cookie attributes (`Secure`, `HttpOnly`, `SameSite`, prefixes) -
+    [HTTP security for testers](#/lesson/http-security-for-testers); how developers build sessions -
+    [Sessions, cookies and tokens](#/lesson/sessions-cookies-and-tokens); JWT-specific checks -
+    [Testing JWTs and OAuth 2.0](#/lesson/testing-jwt-and-oauth); cross-site request forgery -
+    [Testing for CSRF and clickjacking](#/lesson/testing-csrf-and-clickjacking).
+
+prerequisites:
+  - security-testing-fundamentals
+  - http-security-for-testers
+  - sessions-cookies-and-tokens
+
+concepts:
+  - id: sec-sess-rotation-exposure
+    name: Session fixation and exposed session ids
+    summary: A session id must change whenever the privilege level changes - above all at sign-in - and must travel only in the cookie. If the pre-login id still works after sign-in, an attacker who planted it owns the victim's session (fixation); if the id is accepted from or written into URLs, it leaks through history, logs and the Referer header and is easy to plant.
+  - id: sec-sess-termination
+    name: Logout and session timeouts
+    summary: Ending a session is the server's job. Logout, the idle timeout and the absolute timeout must each make the old id unusable on the server; a cleared or expired cookie only changes the browser. The tester replays the old id after each event - and for timeouts reports the lifetime actually observed, because a black-box test can only show that a session lived longer than the test window.
+  - id: sec-sess-token-strength
+    name: Session id strength and structure
+    summary: Session ids must be meaningless and unguessable - at least 64 bits of entropy from a CSPRNG (ASVS 5.0.0 asks 128 bits for reference tokens). A tester collects many ids and looks for short ids, positions that never change, counting values, duplicates and decodable content; a sample can show weakness but never prove randomness.
+
+objectives:
+  - Probe sign-in for session fixation by planting the pre-login id and checking whether it opens the signed-in account afterwards.
+  - Check whether session ids are written into or accepted from URLs, and explain how that leaks and plants ids.
+  - Verify logout by replaying the old id after the logout response, and tell a client-only logout from a real one.
+  - Design and run idle and absolute timeout tests, and report the observed lifetime rather than over-claiming.
+  - Analyse a sample of session ids for length, fixed positions, sequences and duplicates against the 64-bit minimum.
+  - Write automated probes that find each session flaw and stay quiet once it is fixed.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: The idea in plain language
+    body: |
+      A session id is a cloakroom ticket. You hand over your coat (your password) once, and from then on the
+      ticket alone proves the coat is yours. The cloakroom never asks for the password again - it only looks at
+      the ticket. So everything about the ticket matters:
+
+      - **Who chose it?** If someone can give you a ticket *before* you hand over your coat, and the attendant
+        then pins your coat to that same ticket, the person who gave it to you can collect your coat. That is
+        **session fixation**: the id issued before sign-in must be thrown away at sign-in.
+      - **Where does it travel?** A ticket number written on the outside of your shopping bag (a URL) is read
+        by everyone you pass. It belongs in your pocket (the cookie).
+      - **When does it stop working?** When you leave, the attendant must cross the ticket out in *their*
+        book. Tearing up your own copy (deleting the cookie) does nothing if the book still says it is valid. The
+        same applies when you have been gone too long (idle timeout) or the evening is over (absolute timeout).
+      - **Can it be guessed?** Tickets numbered 1001, 1002, 1003 invite anyone to ask for 1004.
+
+      SandPay's merchant portal lets a signed-in merchant see payouts and issue refunds, so a stolen or planted
+      session id is as good as the password - often better, because it skips multi-factor sign-in. This lesson
+      tests each of the four questions on a small sign-in service that gets every one of them wrong, then on the
+      same service with each flaw fixed.
+
+  - id: what
+    kind: what
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Session id** (session token) | the value the server issues to recognise a browser between requests - here the `sid` cookie |
+      | **Reference token** | a random id that points to session data kept on the server (the opposite of a self-contained token such as a JWT) |
+      | **Pre-login (anonymous) session** | a session the site starts before sign-in, for example for a basket or a language choice |
+      | **Rotation** (renewal, regeneration) | issuing a new id and destroying the old one - required "after any privilege level change" (OWASP cheat sheet) |
+      | **Session fixation** | the WSTG's words: "preserving the same value of the session cookies before and after authentication", so an id the attacker obtained or planted becomes an authenticated one |
+      | **Session hijacking** | using a stolen session id - the WSTG: "An attacker who gets access to user session cookies can impersonate them by presenting such cookies" |
+      | **Exposed session variables** | ids sent where they can be seen or stored - over HTTP, in URLs, in cacheable responses (WSTG-SESS-04) |
+      | **Idle timeout** | ends a session after a period with no requests |
+      | **Absolute timeout** | ends a session a fixed time after it began, however busy it is |
+      | **Server-side termination** | the server stops accepting the id - the only termination that counts |
+      | **Entropy** | unpredictability in bits; the cheat sheet: "Session identifiers must have at least `64 bits` of entropy" |
+      | **CSPRNG** | a cryptographically secure pseudorandom number generator - what ids must come from |
+      | **Session puzzling** | one session variable used for two purposes, so a public page can set what a protected page trusts (WSTG-SESS-08) |
+
+      The WSTG session tests used in this lesson:
+
+      | Id | Test | Here |
+      | --- | --- | --- |
+      | WSTG-SESS-01 | Session Management Schema | id structure and randomness |
+      | WSTG-SESS-02 | Cookies Attributes | in [HTTP security for testers](#/lesson/http-security-for-testers) |
+      | WSTG-SESS-03 | Session Fixation | rotation at sign-in |
+      | WSTG-SESS-04 | Exposed Session Variables | ids in URLs |
+      | WSTG-SESS-06 | Logout Functionality | server-side logout |
+      | WSTG-SESS-07 | Session Timeout | idle and absolute |
+      | WSTG-SESS-08 / 09 | Session Puzzling / Hijacking | explained, not automated |
+
+  - id: why
+    kind: why
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Why session flaws matter so much
+    body: |
+      After sign-in, the session id **is** the user. Strong passwords, multi-factor authentication and account
+      lockout all protect one moment - sign-in - and the session id carries that result for hours. The WSTG puts
+      the attacker's aim plainly: "to forge a cookie that will be considered valid by the application and that
+      will provide some kind of unauthorized access (session hijacking, privilege escalation, ...)".
+
+      Each flaw widens a different door:
+
+      - **No rotation at sign-in.** The attacker does not need to steal anything after the victim signs in -
+        they already know the id. The WSTG's fixation summary: "If the victim later authenticates at the target
+        site and the cookies are not refreshed upon login, the victim will be identified by the session cookies
+        chosen by the attacker."
+      - **Ids in URLs.** The cheat sheet warns that an id in the URL "might disclose the session ID (in web links
+        and logs, web browser history and bookmarks, the Referer header or search engines)".
+      - **Logout that only clears the cookie.** The WSTG calls out exactly this: "the client-side session token
+        is set to a new value while the server-side state remains active and can be reused by setting the session
+        cookie back to the previous value." A merchant on a shared shop-floor computer who clicks *Sign out*
+        is still signed in for anyone holding the old id.
+      - **No timeouts.** A stolen id keeps working. The WSTG: "any application that does not enforce a
+        timeout-based log out should be considered not secure, unless such behavior is required by a specific
+        functional requirement."
+      - **Guessable ids.** No theft needed at all - count.
+
+      These are also cheap to test and easy to fix once found, which is why every web assessment checks them.
+      ASVS 5.0.0 makes the main ones Level 1 requirements: a new token on authentication (7.2.4), 128-bit CSPRNG
+      reference tokens (7.2.3) and real termination (7.4.1).
+
+  - id: lifecycle-internals
+    kind: internals
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination]
+    title: How the session life cycle works - and where each test cuts in
+    body: |
+      A server-side session has four moments. Each has a rule and a test:
+
+      | Moment | Rule | Test (replay the old id afterwards) |
+      | --- | --- | --- |
+      | **Created** (often before sign-in) | the id is random and only ever set by the server | collect ids, analyse them |
+      | **Privilege changes** (sign-in, role switch, password change) | issue a new id, destroy the old one | sign in with a planted id, replay the old one |
+      | **Used** | the id comes only from the cookie | send the id in the URL instead |
+      | **Ends** (logout, idle, absolute) | the server deletes or invalidates the session | replay the old id |
+
+      **Rotation.** The cheat sheet: "The session ID must be renewed or regenerated by the web application after
+      any privilege level change within the associated user session." Sign-in is the obvious case; it also
+      names "password changes, permission changes, or switching from a regular user role to an administrator
+      role". ASVS 5.0.0 7.2.4: "Verify that the application generates a new session token on user
+      authentication, including re-authentication, and terminates the current session token." Note both
+      halves - a **new** token *and* the old one **terminated**. A site that sets a new cookie but still
+      accepts the old id has only done the first half.
+
+      **Strict versus permissive.** The cheat sheet separates servers that "initially accept any session ID
+      value set by the user as valid, creating a new session for it" (permissive) from those that "only accept
+      session ID values that have been previously generated by the web application" (strict), and notes that
+      PHP "defaults to permissive". A permissive server makes fixation easier still - the attacker can invent
+      the id instead of fetching one.
+
+      **Exchange mechanism.** "A web application should make use of cookies for session ID exchange
+      management. If a user submits a session ID through a different exchange mechanism, such as a URL
+      parameter, the web application should avoid accepting it". The cheat sheet adds that a site might
+      **accept** other mechanisms even if it never **uses** them - so the tester sends the id by URL and sees.
+
+      **Termination is server-side.** The WSTG timeout page: "The `Expires` and `Max-Age` attributes of a
+      cookie only tell the browser when to delete it, and are never sent back to the server. A session that has
+      disappeared from the browser can therefore still be valid on the server." ASVS 5.0.0 7.4.1 says the same
+      for every ending: "when session termination is triggered (such as logout or expiration), the application
+      disallows any further use of the session."
+
+      **Two timeouts, two purposes.** The idle timeout limits how long a forgotten session lies around, but the
+      cheat sheet notes it "does not limit the attacker's actions, as they can generate activity on the session
+      periodically to keep the session active". Only the **absolute** timeout bounds a hijacked session. Common
+      values in the cheat sheet: idle "2-5 minutes for high-value applications and 15-30 minutes for low risk
+      applications"; absolute "between 4 and 8 hours" for an application used for a full working day. ASVS
+      5.0.0 (7.3.1, 7.3.2, Level 2) asks for both, set "according to risk analysis and documented security
+      decisions" - so the tester compares observed values with the documented ones.
+
+  - id: strength-internals
+    kind: internals
+    concepts: [sec-sess-token-strength]
+    title: What makes a session id strong - and what a sample can show
+    body: |
+      **Entropy, not length.** The cheat sheet: "Although session ID length matters, it's the entropy that
+      ensures security." Each random position in an alphabet of size *n* adds log2(*n*) bits - 4 for hex, about
+      6 for base64url. So:
+
+      | Id format | Characters for 64 bits | Characters for 128 bits |
+      | --- | --- | --- |
+      | hex (16 symbols, 4 bits each) | 16 | 32 |
+      | base64url (64 symbols, 6 bits each) | 11 (66 bits) | 22 (132 bits, of which 128 are real for 16 random bytes) |
+
+      **Fixed parts do not count.** The cheat sheet's own example: "if half of a 16-character hexadecimal session
+      ID is fixed, only the remaining 8 characters are random, providing just 32 bits of entropy — which is
+      insufficient for strong security."
+
+      **How long is safe?** The cheat sheet estimates that with 64 bits "an attacker can expect to spend
+      approximately 585 years to successfully guess a valid session ID, assuming the attacker can try 10,000
+      guesses per second with 100,000 valid simultaneous sessions". ASVS 5.0.0 7.2.3 asks more of reference
+      tokens: "generated using a cryptographically secure pseudo-random number generator (CSPRNG) and possess at
+      least 128 bits of entropy". Python's `secrets.token_urlsafe(16)` gives 16 random bytes - 128 bits - as 22
+      base64url characters.
+
+      **Meaningless content.** "The session ID content (or value) must be meaningless to prevent information
+      disclosure attacks" - no user id, email, role or timestamp inside it. An id that base64-decodes to
+      `user=alice;role=merchant` is a finding even if it is long.
+
+      **What a tester can and cannot show.** The WSTG's session analysis checks "randomness, uniqueness,
+      resistance to statistical and cryptographic analysis and information leakage". From a sample you can
+      prove **weakness**: too few varying characters, counting ids, repeats, decodable content. You cannot
+      prove **strength**: an id from a seeded ordinary random generator can look perfect in a sample of fifty
+      and still be predictable. Report "no weakness found in N samples" and, for a real verdict, ask how the ids
+      are generated (a grey-box question). The estimate in this lesson's exercise is an upper bound for that
+      reason.
+
+  - id: when
+    kind: when
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: When to run each test - and what it does not cover
+    body: |
+      | Situation | Run |
+      | --- | --- |
+      | Any site with sign-in | fixation (if a session exists before sign-in), logout replay, id analysis |
+      | Role switch, "act as merchant", password change | rotation at the privilege change, then replay the old id |
+      | Links or redirects carry `;jsessionid=`, `?sid=`, `?token=` | exposed-id tests, Referer leakage |
+      | Money, admin or personal data behind the session | idle and absolute timeout tests with an agreed window |
+      | Single sign-on | logout in the app and in the identity provider, then replay in each (WSTG-SESS-06 single sign-off) |
+      | Several cookies set at sign-in | find which ones actually authenticate (remove them one by one) before testing any |
+
+      **What these tests do not replace:**
+
+      - Cookie attributes (`Secure`, `HttpOnly`, `SameSite`) - a separate test, WSTG-SESS-02.
+      - Stealing the id in the first place: XSS, network attackers, logs. The WSTG hijacking test (SESS-09)
+        assumes a network attacker and "only needs to be applied to sites without full HSTS adoption".
+      - Self-contained tokens (JWTs) - their expiry and revocation need their own checks; the WSTG timeout page
+        warns that editing a JWT's `exp` "only breaks the signature", so "replay the token after its `exp` time
+        has passed" instead.
+      - Session puzzling (SESS-08) - the WSTG says "The most effective way to detect these vulnerabilities is via a
+        source code review"; black-box it needs luck and many entry-point orders.
+
+      **When not to:** never run a timeout test on production without an agreed window - an absolute-timeout
+      test keeps a real session busy for hours. And never test fixation against other people's sessions; the
+      WSTG uses two **test** accounts, a victim and an attacker.
+
+  - id: visual
+    kind: visual
+    concepts: [sec-sess-rotation-exposure]
+    title: Session fixation, step by step
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant A as Attacker
+        participant V as Victim browser
+        participant S as SandPay sign-in service
+        A->>S: GET /login (no cookie)
+        S-->>A: Set-Cookie sid=s0003e9 (anonymous session)
+        A->>V: plants sid=s0003e9 (link with sid in the URL, or a cookie set by a related site)
+        V->>S: POST /login alice and password, Cookie sid=s0003e9
+        S-->>V: 200 - same id s0003e9, now signed in as alice
+        A->>S: GET /account, Cookie sid=s0003e9
+        S-->>A: 200 alice account
+        Note over S: The fix is one step - issue a new id at sign-in and destroy s0003e9
+      ```
+
+      Notice that the attacker never sees the victim's password or cookie - they knew the id before the victim
+      signed in. Notice too how the URL flaw feeds fixation: a server that accepts `?sid=` lets the attacker
+      plant the id with a plain link. Rotation at sign-in breaks the attack whatever the planting route.
+
+  - id: raw-exchanges
+    kind: code
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination]
+    title: The evidence - raw exchanges with the vulnerable and the fixed service
+    body: |
+      The service starts an anonymous session on `GET /login`. Sign in **presenting** that id, then replay the
+      pre-login id. Run on 20 November 2026 (printed by a short `requests` script; the ids are the service's
+      counter-based ones, so yours match):
+
+      ```plaintext
+      === raw fixation exchange (vulnerable)
+      GET /login -> 200 Set-Cookie: sid=s0003e9; Path=/; HttpOnly; SameSite=Lax
+      POST /login -> 200 Set-Cookie: sid=s0003e9; Path=/; HttpOnly; SameSite=Lax
+      GET /account (pre-login id) -> 200 {"email": "alice@shop-a.example"}
+      === raw fixation exchange (fixation fixed)
+      GET /login -> Set-Cookie: sid=s0003e9; Path=/; HttpOnly; SameSite=Lax
+      POST /login -> Set-Cookie: sid=s0003ea; Path=/; HttpOnly; SameSite=Lax
+      GET /account (pre-login id) -> 401 {"error": "session invalid or expired"}
+      ```
+
+      The vulnerable service re-sends the **same** id after sign-in, and the pre-login id opens Alice's account
+      - that 200 is the finding. The fixed service issues `s0003ea` and the old id gets 401. (The cookie here
+      already has `HttpOnly` and `SameSite`; good attributes do not stop fixation - rotation does.)
+
+      Logout, then replay the id from before logout:
+
+      ```plaintext
+      vulnerable logout Set-Cookie: sid=; Path=/; Max-Age=0 | replay old id -> 200 {"email": "alice@shop-a.example"}
+      ['logout-client-only'] logout Set-Cookie: sid=; Path=/; Max-Age=0 | replay old id -> 401 {"error": "session invalid or expired"}
+      ```
+
+      Both logout responses look identical - an empty cookie with `Max-Age=0`. Only the replay tells them apart.
+      This is the WSTG's point: "If the log out function causes session cookies to be set to a new value,
+      restore the old value of the session cookies and reload a page from the authenticated area".
+
+  - id: probes-code
+    kind: code
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: The probes and what they report
+    collapsed: true
+    body: |
+      The fixation probe (`solutions/web/sess_fixation.py`, core):
+
+      ```python
+      def probe_fixation(base_url, email, password, timeout=5):
+          pre = requests.get(f"{base_url}/login", timeout=timeout)
+          pre_id = session_id_from(pre)
+          if pre_id is None:
+              return FixationResult(None, None, False, False, False)
+          login = requests.post(f"{base_url}/login", data={"email": email, "password": password},
+                                cookies={COOKIE: pre_id}, timeout=timeout)
+          if login.status_code != 200:
+              raise RuntimeError(f"sign-in failed: {login.status_code} {login.text[:200]}")
+          post_id = session_id_from(login) or pre_id
+          rotated = post_id != pre_id
+          replay = requests.get(f"{base_url}/account", cookies={COOKIE: pre_id}, timeout=timeout)
+          old_ok = replay.status_code == 200
+          return FixationResult(pre_id, post_id, rotated, old_ok, old_ok)
+      ```
+
+      The timeout check takes a `wait` function - against the practice service it moves the fake clock:
+
+      ```python
+      def verify_timeouts(base_url, email, password, wait, idle_limit_s, absolute_limit_s, margin_s=60, timeout=5):
+          sid = sign_in(base_url, email, password, timeout)
+          wait(idle_limit_s + margin_s)
+          idle_enforced = not is_valid(base_url, sid, timeout)
+
+          sid = sign_in(base_url, email, password, timeout)
+          window = absolute_limit_s + margin_s
+          step = idle_limit_s / 2
+          elapsed = 0.0
+          alive = True
+          while elapsed < window:
+              wait(step)
+              elapsed += step
+              if not is_valid(base_url, sid, timeout):
+                  alive = False
+                  break
+          return TimeoutResult(idle_enforced, not alive, elapsed)
+      ```
+
+      What they printed, vulnerable first, then with the matching flaw fixed:
+
+      ```plaintext
+      probe_fixation vulnerable -> FixationResult(pre_login_id='s0003e9', post_login_id='s0003e9', rotated=False, old_id_authenticated=True, vulnerable=True)
+      probe_fixation ['fixation'] -> FixationResult(pre_login_id='s0003e9', post_login_id='s0003ea', rotated=True, old_id_authenticated=False, vulnerable=False)
+      probe_url_session vulnerable -> UrlSessionResult(id_in_links=True, accepted_from_url=True, vulnerable=True)
+      probe_url_session ['url-session'] -> UrlSessionResult(id_in_links=False, accepted_from_url=False, vulnerable=False)
+      vulnerable -> TimeoutResult(idle_enforced=False, absolute_enforced=False, observed_lifetime_s=14700.0)
+      ['no-idle-timeout'] -> TimeoutResult(idle_enforced=True, absolute_enforced=False, observed_lifetime_s=14700.0)
+      ['no-absolute-timeout'] -> TimeoutResult(idle_enforced=False, absolute_enforced=True, observed_lifetime_s=14700.0)
+      ['no-absolute-timeout', 'no-idle-timeout'] -> TimeoutResult(idle_enforced=True, absolute_enforced=True, observed_lifetime_s=14700.0)
+      ```
+
+      `verify_logout` returned `LogoutResult(cookie_cleared=True, old_id_rejected=False, vulnerable=True)` on the
+      vulnerable service and `LogoutResult(cookie_cleared=True, old_id_rejected=True, vulnerable=False)` with
+      `logout-client-only` fixed. The last four lines are `verify_timeouts`, by the set of flaws fixed.
+
+      The service's limits are 600 s idle and 14 400 s (4 hours) absolute. The busy session was checked every
+      300 s, so `14700.0` means two different things: when the absolute timeout is enforced, it is the first check
+      after 14 400 s, where the id was refused; when it is not, it is the end of the 14 460 s window, with the
+      session still alive. The boolean says which - and in a report the second case is "still valid after
+      14 700 s", not "no absolute timeout".
+
+      Id analysis (`solutions/web/sess_entropy.py`) on samples from each source:
+
+      ```plaintext
+      predictable sample: ['s0003e9', 's0003ea', 's0003eb', 's0003ec', 's0003ed', 's0003ee', 's0003ef', 's0003f0']
+      predictable report: IdReport(count=20, alphabet='base64url', lengths=(7, 7), fixed_positions=[0, 1, 2, 3], estimated_bits=18.0, duplicates=0, sequential=True, findings=['below-64-bits', 'sequential', 'fixed-positions']) weak: True
+      random sample: ['clNwqYhikDmFk0MEdGU_iA', '2-vBwRCJCyh6V-WFkR4WwQ', 'HIhnaopSxI1nJoVPkZzn-Q']
+      random report: alphabet base64url lengths (22, 22) bits 132.0 seq False dups 0 findings [] weak: False
+      half-fixed hex: ['deadbeef1a2b3c4d', 'deadbeef9f8e7d6c'] bits 32.0 fixed [0, 1, 2, 3, 4, 5, 6, 7] findings ['below-64-bits', 'fixed-positions']
+      portal ids: alphabet base64url lengths (32, 32) bits 192.0 findings [] weak: False
+      ```
+
+      Read them honestly. The counter ids score 18 bits only because the `s` makes the alphabet look like
+      base64url; their real unpredictability is close to zero - `sequential` is the finding that matters. The
+      random ids score 132, an upper bound: 16 random bytes are 128 bits. And the shared portal's ids
+      (`secrets.token_urlsafe(24)`, 192 bits) pass - its session weakness is its cookie attributes, tested in
+      [HTTP security for testers](#/lesson/http-security-for-testers), not its ids.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination]
+    title: Why the important lines are written that way
+    body: |
+      - `cookies={COOKIE: pre_id}` on the sign-in request - the probe **plants** the id, exactly as an attacker
+        would. Signing in without it would only show what a fresh browser gets.
+      - `post_id = session_id_from(login) or pre_id` - no `Set-Cookie` after sign-in means the browser keeps
+        the old cookie, so the old id is the one in force. A probe that only looked for a new `Set-Cookie` would
+        miss a server that rotates silently, or report rotation where the old id still works.
+      - `replay = requests.get(... cookies={COOKIE: pre_id})` - the verdict comes from the **replay**, not from
+        comparing ids. `rotated=True` with `old_id_authenticated=True` is still vulnerable: a new id was issued,
+        but the old one was not terminated (only half of ASVS 7.2.4).
+      - `raise RuntimeError` when sign-in fails - a failed sign-in would make every later check look "secure".
+        A probe that cannot set up its precondition must say so, not pass.
+      - `params={COOKIE: signed_in}` with **no** cookie in the URL-session probe - the request must carry the id
+        only in the URL, or a cookie-based success would be read as URL acceptance.
+      - `wait(idle_limit_s + margin_s)` - one silent gap just past the limit. Checking at exactly the limit
+        tests a boundary nobody specified; the margin turns it into a clear yes or no.
+      - `step = idle_limit_s / 2` in the absolute loop - the session must never sit idle long enough for the
+        idle rule to end it, or an idle expiry would be reported as an absolute one (the WSTG warns of exactly
+        this).
+      - `return TimeoutResult(idle_enforced, not alive, elapsed)` - the observed lifetime is part of the result,
+        so the report states what was seen.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Testing a site's session management, step by step
+    body: |
+      1. **Confirm scope and accounts.** Two test accounts (victim and attacker roles), the agreed test window
+         for timeouts, the documented idle and absolute values if there are any.
+      2. **Map the session.** Sign in through a proxy. List every cookie set, which response sets it, and which
+         ones authenticate: remove them one at a time and see which removal gets 401 (WSTG-SESS-01 "cookie
+         collection").
+      3. **Collect ids.** Twenty or more fresh ids; analyse length, alphabet, fixed positions, sequences,
+         duplicates and decodable content. Note the result as "no weakness found in N samples" if clean.
+      4. **Fixation.** Take a pre-login id, sign in presenting it, replay it. Repeat at every other privilege
+         change - role switch, password change.
+      5. **Exposure.** Look for the id in URLs, page source and redirects; send it as a query parameter with no
+         cookie; check that pages carrying it are not cacheable and never go over plain HTTP.
+      6. **Logout.** Save the id, log out, replay it on a protected page - and on other important pages, as the
+         WSTG suggests. With single sign-on, log out in each place and replay in each.
+      7. **Idle timeout.** Silent for longer than the documented idle value, then replay.
+      8. **Absolute timeout.** Keep a session busy at intervals shorter than the idle value until past the
+         documented absolute value (or the agreed window), then replay. Report the observed lifetime.
+      9. **Report with evidence.** For each finding: the request, the response, the replay and its status code.
+      10. **Automate the fix check.** Each probe becomes a regression test that must stay quiet after the fix.
+
+  - id: example
+    kind: example
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination]
+    title: "Example: the shop-floor tablet"
+    body: |
+      SandPay merchants run the portal on a shared tablet at the shop counter. A cashier, Ana, signs in to issue
+      a refund, taps **Sign out** and hands the tablet to a colleague. The release candidate adds a "switch to
+      manager" button that raises a cashier's session to manager rights after a PIN.
+
+      What the tester checks, and why:
+
+      - **Logout replay** - the tablet keeps its browser history. If logout only clears the cookie, the next
+        person can restore the old id from the proxy log or a session-restore feature. Evidence: the old id
+        replayed on `/account` after logout, with its status code.
+      - **Idle timeout** - Ana forgets to sign out. The documented idle value is 5 minutes (a high-value
+        application, per the cheat sheet's range); the tester replays after 6 minutes of silence.
+      - **Rotation at "switch to manager"** - a privilege change, so the cheat sheet requires a new id. Test:
+        record the cashier's id, switch to manager, replay the *cashier* id on a manager-only action. If it
+        works, anyone who had the cashier's id now has manager rights.
+      - **Fixation at sign-in** - the tablet's pre-login session is created when the page loads; whoever used
+        the tablet before Ana could have noted it.
+
+      The two findings that block the release are the manager switch keeping the old id and logout leaving the
+      server session alive; both have one-line fixes in most frameworks (regenerate and invalidate), and both
+      become regression tests.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Test cases with expected results and evidence
+    body: |
+      | # | Case | Steps | Expected (secure) | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Rotation at sign-in | get pre-login id, sign in with it, replay it | new id issued; old id gets 401 | three exchanges with ids and statuses |
+      | 2 | Rotation at privilege change | record id, switch role, replay old id on a privileged action | old id refused | replay request and response |
+      | 3 | Id in URL | send the id as `?sid=` with no cookie | 401; id never appears in links or redirects | request without Cookie, page source search |
+      | 4 | Logout | record id, log out, replay on two protected pages | 401 on both | logout response, replays |
+      | 5 | Idle timeout | silent for idle + margin, replay | 401 | timestamps and replay |
+      | 6 | Absolute timeout | busy every half-idle until absolute + margin, replay | refused by the absolute limit | timeline of checks, observed lifetime |
+      | 7 | Id strength | collect 20+ ids, analyse | 64+ bits varying, no sequence, no duplicates, nothing decodable | the sample and the report |
+      | 8 | Negative control | run cases 1-7 against a build with the fix | no findings | the same probes, quiet |
+
+      Case 8 is what makes the others trustworthy: a probe that also fires against the fixed build is measuring
+      something else.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Judging logout by the cookie.** `Set-Cookie: sid=; Max-Age=0` appears on the vulnerable and the fixed
+        service alike. Replay the old id.
+      - **Calling "new id issued" a pass.** The old id must also stop working (ASVS 7.2.4 "terminates the current
+        session token").
+      - **Letting the idle timeout end the absolute test.** Requests must come more often than the idle limit,
+        or you measure the wrong timeout.
+      - **Concluding "no absolute timeout".** The WSTG: "report the observed lifetime (for example "session still
+        valid after nine hours of continuous use") rather than concluding that no absolute timeout exists".
+      - **Editing a JWT's `exp` to test expiry.** It only proves the signature is checked; replay after `exp`.
+      - **Testing only one cookie.** Sites often set several; the one that authenticates may not be the one
+        called `session`. Remove them one at a time first.
+      - **Treating a clean sample as proof of randomness.** It shows no weakness in that sample; ask how ids are
+        generated.
+      - **Forgetting single sign-on.** Logging out of the app may leave the identity provider session alive, and
+        the next visit signs the user straight back in.
+
+      **Debugging method** when a probe says "vulnerable" and the developers disagree:
+
+      1. Reproduce by hand with the raw requests - status codes and `Set-Cookie` headers.
+      2. Check the precondition: did sign-in really succeed? Did the request carry the cookie you think it did?
+      3. Check which id is in force - the cookie jar after the response, not the one you sent.
+      4. Run the same probe against a build with the fix. If it still fires, the probe is wrong.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-sess-termination, sec-sess-token-strength]
+    title: Trade-offs and alternatives
+    body: |
+      - **Short timeouts versus usability.** The WSTG: "The most appropriate timeout should be a balance between
+        security (shorter timeout) and usability (longer timeout)". A 2-minute idle limit on a back-office tool
+        used all day sends people back to sign-in constantly - and they react by keeping a tab busy. Test against
+        the documented, risk-based value (ASVS 7.3.1), not against your own preference.
+      - **Server-side sessions versus self-contained tokens.** A server-side session is easy to end: delete it.
+        A JWT is valid until `exp` unless the server keeps a deny-list - the convenience of no session store is
+        paid for at logout. ASVS 7.4.1 says applications using self-contained tokens "will need a solution" to
+        disallow further use.
+      - **Black-box versus grey-box timeout tests.** Black-box costs hours and can only show a lower bound;
+        reading the session configuration takes minutes. Do both where possible: the configuration says what is
+        intended, the replay shows what happens.
+      - **Fake clocks.** This lesson's service lets the test move time. Real systems do not, so a real timeout
+        test needs the agreed window - or a test environment where the limits are configured short.
+      - **Sample size.** More ids give more confidence in "no pattern", never certainty. Burp Suite's Sequencer
+        and similar tools run statistical tests on thousands of ids; they are stronger evidence, still not proof.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-sess-rotation-exposure, sec-sess-termination, sec-sess-token-strength]
+    title: Quick reference
+    body: |
+      - **The core move:** keep the old id, trigger the event, replay the old id. 401 = good.
+      - **Sign-in and every privilege change:** new id issued **and** old id refused (ASVS 5.0.0 7.2.4).
+      - **Exchange:** cookie only; the id is never accepted from or written into URLs.
+      - **Logout, idle, absolute:** each ends the session on the server; the cookie is irrelevant.
+      - **Timeout values (cheat sheet):** idle 2-5 min (high value) to 15-30 min (low risk); absolute 4-8 h for
+        full-day use - compare with the documented values.
+      - **Absolute test:** stay busy (gaps shorter than the idle limit); report the observed lifetime.
+      - **Id strength:** at least 64 bits of entropy (cheat sheet), 128 bits from a CSPRNG for reference tokens
+        (ASVS 7.2.3); nothing meaningful inside; a sample can show weakness, not prove strength.
+      - **Every probe needs a negative control** - quiet against the fixed build.
+
+exercises:
+  - id: fixation-proof
+    type: mcq
+    concept: sec-sess-rotation-exposure
+    skill: analysis
+    title: Which observation proves session fixation?
+    prompt: |
+      You fetch `/login` and get `sid=k1`, sign in presenting `k1`, and record what happens. Which observation
+      proves a session fixation vulnerability?
+    options:
+      - id: old-works
+        text: After sign-in, a request carrying only `k1` opens the signed-in account.
+        feedback: Correct - whoever knew or planted `k1` before sign-in now holds the victim's session.
+      - id: same-cookie-name
+        text: The cookie is called `sid` both before and after sign-in.
+        feedback: The name does not matter; the value and whether the old value still works do.
+      - id: new-id-set
+        text: The sign-in response sets a new id `k2`.
+        feedback: A new id is the fix's first half - it proves nothing until you check that `k1` stopped working.
+      - id: no-httponly
+        text: The cookie has no `HttpOnly` attribute.
+        feedback: That is a cookie-attribute finding (WSTG-SESS-02); it does not make the id survive sign-in.
+    correct: [old-works]
+    hints:
+      - Fixation is about the id the attacker knew before sign-in.
+      - What must the attacker be able to do afterwards?
+    solution: |
+      Fixation is proven by the replay: the pre-login id authenticates after sign-in. Comparing ids is a clue;
+      the replay is the evidence.
+
+  - id: rotated-but-valid
+    type: mcq
+    concept: sec-sess-rotation-exposure
+    skill: analysis
+    title: A new id - so is it fixed?
+    prompt: |
+      After sign-in the server sets `sid=k2` (the pre-login id was `k1`). Replaying `k1` still returns the
+      account. What is the right verdict?
+    options:
+      - id: still-vuln
+        text: Still vulnerable - a new id was issued but the old one was not terminated.
+        feedback: Correct - ASVS 5.0.0 7.2.4 asks for a new token and that the current one is terminated.
+      - id: fixed
+        text: Fixed - the server rotated the id at sign-in.
+        feedback: Rotation that leaves the old id working protects nothing; the attacker keeps using `k1`.
+      - id: inconclusive
+        text: Inconclusive - you need to test from a second browser.
+        feedback: The replay already came from a request carrying only `k1`; it is conclusive.
+      - id: low
+        text: Not a finding - `k1` was an anonymous session.
+        feedback: It stopped being anonymous when the victim signed in with it - that is the whole attack.
+    correct: [still-vuln]
+    hints:
+      - Rotation has two halves.
+    solution: Issue a new id and destroy the old one; a test checks both halves by replaying the old id.
+
+  - id: url-risk
+    type: mcq
+    concept: sec-sess-rotation-exposure
+    skill: recall
+    title: Why must ids stay out of URLs?
+    prompt: Which is NOT a way a session id in a URL leaks, according to the OWASP Session Management Cheat Sheet?
+    options:
+      - id: httponly
+        text: The browser exposes URL ids to scripts despite HttpOnly.
+        feedback: Correct - this is not on the list; HttpOnly applies to cookies, not URLs. The listed leaks are links, logs, history, bookmarks, the Referer header and search engines.
+      - id: referer
+        text: The Referer header sent to other sites.
+        feedback: Listed by the cheat sheet - a link off the page can carry the full URL with the id.
+      - id: logs
+        text: Web links and server or proxy logs.
+        feedback: Listed - URLs are routinely logged, cookies are not.
+      - id: history
+        text: Browser history and bookmarks.
+        feedback: Listed - anyone with the device can read them.
+    correct: [httponly]
+    hints:
+      - Think of every place a URL is written down.
+    solution: URL ids leak through links, logs, history, bookmarks, the Referer header and search engines; keep ids in cookies only.
+
+  - id: logout-evidence
+    type: mcq
+    concept: sec-sess-termination
+    skill: application
+    title: Evidence that logout works
+    prompt: Which single piece of evidence shows that logout ends the session?
+    options:
+      - id: replay-401
+        text: A request carrying the pre-logout id, sent after logout, gets 401.
+        feedback: Correct - only a replay shows what the server does with the old id.
+      - id: max-age
+        text: 'The logout response contains `Set-Cookie: sid=; Max-Age=0`.'
+        feedback: That only tells the browser to delete its copy; the vulnerable service sends exactly the same header.
+      - id: redirect
+        text: Logout redirects to the sign-in page.
+        feedback: A redirect is user interface; the server may still accept the id.
+      - id: button
+        text: The sign-out button is visible on every page.
+        feedback: That is the logout UI check (also in WSTG-SESS-06), not termination.
+    correct: [replay-401]
+    hints:
+      - Who has to forget the session - the browser or the server?
+    solution: Replay the old id after logout; only a refusal proves server-side termination.
+
+  - id: absolute-method
+    type: mcq
+    concept: sec-sess-termination
+    skill: application
+    title: Testing the absolute timeout
+    prompt: |
+      The documented limits are 10 minutes idle and 4 hours absolute. How do you test the absolute timeout?
+    options:
+      - id: busy
+        text: Sign in, send a request every 5 minutes until past 4 hours, then replay.
+        feedback: Correct - requests more often than the idle limit keep the idle rule from ending the session first.
+      - id: silent
+        text: Sign in and send nothing for 4 hours and 1 minute, then replay.
+        feedback: The idle timeout ends the session after 10 minutes; the test says nothing about the absolute one.
+      - id: every-15
+        text: Sign in, send a request every 15 minutes until past 4 hours.
+        feedback: 15-minute gaps exceed the 10-minute idle limit, so the idle rule ends the session first.
+      - id: cookie-expiry
+        text: Read the cookie's Expires attribute.
+        feedback: The WSTG notes cookie expiry is never sent to the server and only affects the browser.
+    correct: [busy]
+    hints:
+      - Which timeout would end a silent session first?
+    solution: Keep the session busy with gaps shorter than the idle limit until past the absolute limit, then replay.
+
+  - id: lifetime-report
+    type: mcq
+    concept: sec-sess-termination
+    skill: analysis
+    title: Reporting a session that never expired
+    prompt: |
+      Your agreed window was 9 hours of continuous use. The session was still valid at the end. What do you
+      report?
+    options:
+      - id: observed
+        text: The session was still valid after 9 hours of continuous use; the configured absolute limit should be confirmed.
+        feedback: Correct - this is the WSTG's own wording of what a black-box test can show.
+      - id: none
+        text: The application has no absolute timeout.
+        feedback: You only know the limit, if any, is longer than 9 hours; the WSTG warns against this conclusion.
+      - id: pass
+        text: Pass - 9 hours is within the 4-8 hour range.
+        feedback: A session alive after 9 hours is longer than that range, not within it.
+      - id: retest
+        text: Nothing until a 48-hour test is done.
+        feedback: The 9-hour observation is already a finding against a 4-8 hour expectation; report it.
+    correct: [observed]
+    hints:
+      - What can a test window prove about values longer than the window?
+    solution: Report the lower bound you observed and ask for the configured value (a grey-box check).
+
+  - id: entropy-hex
+    type: mcq
+    concept: sec-sess-token-strength
+    skill: application
+    title: How many bits in this id?
+    prompt: |
+      Twenty session ids are all 24 hexadecimal characters. In every sample the first 12 characters are
+      `5a17c0de0042`; the last 12 vary. Estimate the entropy at most.
+    options:
+      - id: b48
+        text: At most 48 bits - below the 64-bit minimum.
+        feedback: Correct - 12 varying hex characters x 4 bits = 48.
+      - id: b96
+        text: 96 bits - 24 characters x 4 bits.
+        feedback: Fixed characters add nothing; the cheat sheet's own example halves the entropy for half-fixed ids.
+      - id: b144
+        text: 144 bits - 24 characters x 6 bits.
+        feedback: Hex characters carry 4 bits each, not 6.
+      - id: b64
+        text: Exactly 64 bits - every session id has 64.
+        feedback: Entropy depends on the generator and the varying characters; nothing guarantees 64.
+    correct: [b48]
+    hints:
+      - Count only the characters that change, and use bits per hex character.
+    solution: 12 varying hex characters give at most 48 bits - a finding below the cheat sheet's 64-bit minimum.
+
+  - id: sample-limit
+    type: mcq
+    concept: sec-sess-token-strength
+    skill: analysis
+    title: What does a clean sample prove?
+    prompt: |
+      Fifty ids are 22 base64url characters, all different, no fixed positions, no sequence. What can you
+      conclude?
+    options:
+      - id: no-weakness
+        text: No weakness found in 50 samples; generation should still be confirmed (for example a CSPRNG in the code or config).
+        feedback: Correct - a sample can show weakness, never prove randomness.
+      - id: proven
+        text: The ids are cryptographically random.
+        feedback: An ordinary seeded generator can produce a sample that looks just like this and still be predictable.
+      - id: weak
+        text: Weak - base64url ids are always predictable.
+        feedback: The encoding says nothing about the generator; Python's secrets.token_urlsafe uses base64url.
+      - id: need-hex
+        text: Inconclusive until the site switches to hex ids.
+        feedback: The encoding does not matter; the unpredictability of the generator does.
+    correct: [no-weakness]
+    hints:
+      - Can any finite sample prove that the next id is unpredictable?
+    solution: State the sample result and confirm the generator by review; that is the honest verdict.
+
+  - id: meaningful-id
+    type: mcq
+    concept: sec-sess-token-strength
+    skill: analysis
+    title: A long id that is still a finding
+    prompt: |
+      A 48-character session id base64-decodes to `merchant=m_100;role=cashier;ts=20261120`. The rest looks
+      random. Which finding applies?
+    options:
+      - id: content
+        text: The id carries meaningful data - it must be meaningless, and changing role= may be worth testing.
+        feedback: Correct - the cheat sheet requires meaningless ids; editable fields invite tampering (WSTG-SESS-01 "modify cookies that are not signed").
+      - id: fine-long
+        text: None - 48 characters is plenty of entropy.
+        feedback: Length is not the issue; the content discloses data and may be editable.
+      - id: fixation
+        text: Session fixation.
+        feedback: Fixation is about the id surviving sign-in; nothing here shows that.
+      - id: timeout
+        text: Missing absolute timeout, because the id contains a date.
+        feedback: A date inside the id does not show how the server enforces timeouts - though a client-side time value is worth a tampering test.
+    correct: [content]
+    hints:
+      - What does the cheat sheet say about the id's content?
+    solution: Ids must be meaningless; decodable fields are information disclosure and a tampering lead.
+
+  - id: puzzling
+    type: mcq
+    concept: sec-sess-rotation-exposure
+    skill: recognition
+    title: Session puzzling
+    prompt: |
+      The password-reset page stores `user=alice@shop-a.example` in the session as soon as an email is typed.
+      The account page treats any session with `user` set as signed in. What is this?
+    options:
+      - id: puzzling
+        text: Session puzzling - one session variable used for two purposes.
+        feedback: Correct - WSTG-SESS-08; the remedy is "Session variables should only be used for a single consistent purpose."
+      - id: fixation
+        text: Session fixation.
+        feedback: The id is not being planted; a public page sets what a protected page trusts.
+      - id: idor
+        text: Insecure direct object reference.
+        feedback: That is about object ids in requests; here the session state itself is confused.
+      - id: hijack
+        text: Session hijacking.
+        feedback: Nobody steals an id; the attacker's own session gains the victim's identity.
+    correct: [puzzling]
+    hints:
+      - Which WSTG test talks about session variables set in one context and used in another?
+    solution: A public entry point setting an identity variable that a protected page trusts is session puzzling.
+
+  - id: lifecycle-order
+    type: order
+    concept: sec-sess-rotation-exposure
+    skill: application
+    title: Run a fixation test in order
+    prompt: Put the steps of a session fixation test in order.
+    items:
+      - id: get-pre
+        text: Request the sign-in page without a cookie and record the session id issued
+      - id: sign-in
+        text: Sign in as the test victim while presenting that id
+      - id: read-post
+        text: Record which id is in force after sign-in (a new Set-Cookie or the old one)
+      - id: replay
+        text: Send a request to a signed-in page carrying only the pre-login id
+      - id: verdict
+        text: Report fixation if the pre-login id opens the account, with the three exchanges as evidence
+      - id: control
+        text: Re-run against the build with rotation fixed and confirm the probe reports nothing
+    hints:
+      - The attacker's id has to exist before the victim signs in.
+      - The negative control comes last.
+    solution: |
+      Get the pre-login id, sign in with it, see which id is in force, replay the old one, report with evidence,
+      then confirm the probe is quiet on the fixed build.
+
+  - id: logout-debug
+    type: debug
+    concept: sec-sess-termination
+    skill: analysis
+    title: Why does this logout check always pass?
+    prompt: |
+      This check reports "logout OK" even on the vulnerable service. Pick the line that makes the check
+      worthless.
+    language: python
+    code: |
+      def logout_ok(base_url, email, password):
+          r = requests.post(f"{base_url}/login", data={"email": email, "password": password})
+          sid = r.cookies["sid"]
+          out = requests.post(f"{base_url}/logout", cookies={"sid": sid})
+          ok = "max-age=0" in out.headers.get("Set-Cookie", "").lower()
+          return ok
+    correctLines: [5]
+    hints:
+      - Which line decides the verdict?
+      - Would the vulnerable service send the same header?
+    lineNotes:
+      - line: 3
+        note: Reading the id from the sign-in response is right; you need it for the replay.
+      - line: 4
+        note: Sending the id to logout is right - the server must know which session to end.
+    solution: |
+      Line 5 judges logout by the cookie header, which the vulnerable and fixed services send alike. Replay `sid`
+      on `/account` after logout and require 401.
+
+  - id: why-replay
+    type: short
+    concept: sec-sess-termination
+    skill: analysis
+    title: Why replay instead of reading cookies?
+    prompt: |
+      A developer says: "Our logout and timeouts work - the cookie disappears from the browser." Explain in a
+      few sentences why that is not evidence, and what evidence you will collect instead.
+    modelAnswer: |
+      The cookie's deletion, `Max-Age` and `Expires` only instruct the browser; the WSTG notes they "are never sent
+      back to the server". The risk is someone who kept a copy of the id - from a proxy log, a stolen cookie, the
+      shared device - and that person's requests are judged by the server alone. So the evidence is a replay:
+      keep the old id, trigger logout or let the timeout pass, send the old id to a protected page and record the
+      status. A 401 proves termination; a 200 proves the session is still alive whatever the browser shows.
+    rubric:
+      - Says cookie deletion and expiry attributes only affect the browser.
+      - Names the threat as someone holding a copy of the id.
+      - Describes replaying the old id after the event and recording the status code.
+    hints:
+      - Who decides whether a request is authenticated?
+    solution: Termination is the server's job; replay the old id after each ending and require a refusal.
+
+  - id: sess-testdesign
+    type: testdesign
+    concept: sec-sess-termination
+    skill: application
+    title: Session tests for the "switch to manager" feature
+    prompt: |
+      SandPay's portal adds "switch to manager": a cashier enters a PIN and the same browser gains manager rights
+      (refunds above 500 EUR). Documented limits: 5 minutes idle, 8 hours absolute. Design the session test
+      cases - preconditions, steps, expected result and evidence for each.
+    modelAnswer: |
+      Preconditions for all: two test accounts (cashier and manager PIN holder), a proxy recording exchanges,
+      written permission for an 8-hour window in the test environment.
+
+      1. **Rotation at the switch** - record cashier id `c1`, switch to manager. Expected: a new id; `c1` gets
+         401 on a manager action and on a cashier page. Evidence: switch response, two replays.
+      2. **No downgrade leak** - switch back to cashier. Expected: a new id again; the manager id is refused.
+         Evidence: replays of the manager id.
+      3. **Fixation at sign-in** - plant a pre-login id, sign in, replay. Expected: 401. Evidence: three exchanges.
+      4. **Logout from manager mode** - record the manager id, log out, replay on a refund. Expected: 401.
+      5. **Idle 5 min** - silent 6 minutes in manager mode, replay. Expected: 401.
+      6. **Absolute 8 h** - busy every 2 minutes, replay past 8 hours. Expected: refused by about 8 hours;
+         report the observed lifetime either way.
+      7. **Id in URL** - send the manager id as a query parameter only. Expected: 401.
+      8. **Negative controls** - each probe against a build where the behaviour is correct reports nothing.
+    rubric:
+      - Covers rotation at the privilege change and the replay of the old id.
+      - Includes logout and both timeouts with replay evidence.
+      - Absolute test keeps the session busy with gaps shorter than the idle limit and reports the observed lifetime.
+      - Every case has preconditions, steps, an expected result and evidence.
+    hints:
+      - The switch is a privilege change - what does the cheat sheet require?
+      - Which events end a session, and how do you prove each one did?
+    solution: |
+      Treat the switch as a privilege change (rotate and terminate), then replay old ids after every ending -
+      each case with evidence and a negative control.
+
+  - id: interview-sessions
+    type: interview
+    concept: sec-sess-rotation-exposure
+    skill: analysis
+    title: 'Interview: how do you test session management?'
+    prompt: '"Walk me through how you would test session management on a web application."'
+    modelAnswer: |
+      I start by mapping the session: which cookies are set, when, and which ones actually authenticate - I
+      remove them one by one. Then I collect a sample of ids and look for short or partly fixed ids, sequences,
+      duplicates and decodable content against the 64-bit minimum, remembering a sample can show weakness but
+      not prove randomness.
+
+      The core technique for everything else is the same: keep the old id, trigger an event, replay the old id.
+      For fixation I take the pre-login id, sign in presenting it, and replay it - if it opens the account, an
+      attacker who planted it owns the session. I repeat that at every privilege change, like a role switch. I
+      check the id is never accepted from or written into URLs. For logout, the cookie being cleared means
+      nothing; the old id must get 401. For timeouts I test idle with a silent gap and absolute with a session
+      kept busy more often than the idle limit, and I report the observed lifetime rather than claiming there is
+      no timeout. Cookie attributes are a separate check. Every probe gets a negative control against the fixed
+      build, and each finding becomes a regression test.
+    rubric:
+      - Maps cookies and identifies the authenticating one first.
+      - States the replay-the-old-id technique.
+      - Covers fixation and rotation at privilege changes.
+      - Covers logout, idle and absolute timeouts server-side, with honest reporting of observed lifetime.
+      - Mentions id strength analysis and its limits.
+    followUps:
+      - How would this change for a JWT-based API?
+      - What would you do if the session is still valid after your whole test window?
+      - How do you test logout with single sign-on?
+    hints:
+      - Structure it as map, analyse ids, then events with replays.
+    solution: Map the cookies, analyse id strength, then replay old ids after sign-in, privilege changes, logout and timeouts - with negative controls.
+
+  - id: fixation-code
+    type: coding
+    concept: sec-sess-rotation-exposure
+    skill: application
+    title: Write the fixation and URL-session probes
+    prompt: |
+      In `practice/security/exercises/web/sess_fixation.py`, implement `session_id_from`, `probe_fixation` and
+      `probe_url_session`. The tests run them against the loopback sign-in service
+      (`support/sess_fixture.py`): they must report fixation and URL ids on `make_app()` and nothing on
+      `make_app({"fixation"})` and `make_app({"url-session"})`.
+    project: security
+    files: [exercises/web/sess_fixation.py]
+    test: tests/web/test_sess_fixation.py
+    command: .venv/bin/python -m pytest tests/web/test_sess_fixation.py
+    modelAnswer: |
+      ```python
+      pre_id = session_id_from(requests.get(f"{base_url}/login"))
+      login = requests.post(f"{base_url}/login", data={...}, cookies={"sid": pre_id})
+      post_id = session_id_from(login) or pre_id
+      old_ok = requests.get(f"{base_url}/account", cookies={"sid": pre_id}).status_code == 200
+      return FixationResult(pre_id, post_id, post_id != pre_id, old_ok, old_ok)
+      ```
+
+      For the URL probe: look for `sid=<id>` in the sign-in page, then request `/account` with
+      `params={"sid": signed_in}` and **no** cookie. The verdict comes from replays, never from comparing ids alone.
+    rubric:
+      - Every test in tests/web/test_sess_fixation.py passes.
+      - The fixation verdict comes from replaying the pre-login id, not from comparing ids.
+      - A failed sign-in raises instead of producing a "secure" result.
+      - The URL check sends the id only in the URL.
+    hints:
+      - Plant the pre-login id on the sign-in request as a cookie.
+      - No Set-Cookie after sign-in means the old id is still the one in force.
+      - A vulnerable result means the old id opens /account.
+    solution: Plant, sign in, replay - and for URL ids, send the id without a cookie.
+
+  - id: termination-code
+    type: coding
+    concept: sec-sess-termination
+    skill: application
+    title: Write the logout and timeout verifiers
+    prompt: |
+      In `practice/security/exercises/web/sess_termination.py`, implement `sign_in`, `is_valid`,
+      `verify_logout` and `verify_timeouts`. The tests pass `wait=app.clock.advance`, so waiting hours takes
+      milliseconds. Your verifier must find a client-only logout and missing timeouts on `make_app()`, and pass
+      each one once it is fixed.
+    project: security
+    files: [exercises/web/sess_termination.py]
+    test: tests/web/test_sess_termination.py
+    command: .venv/bin/python -m pytest tests/web/test_sess_termination.py
+    modelAnswer: |
+      Logout: sign in, confirm the session works, POST `/logout` with it, note whether `Set-Cookie` clears
+      `sid`, then replay - `old_id_rejected = not is_valid(base_url, sid)`.
+
+      Timeouts:
+
+      ```python
+      sid = sign_in(...); wait(idle_limit_s + margin_s); idle_enforced = not is_valid(base_url, sid)
+      sid = sign_in(...); elapsed, alive = 0.0, True
+      while elapsed < absolute_limit_s + margin_s:
+          wait(idle_limit_s / 2); elapsed += idle_limit_s / 2
+          if not is_valid(base_url, sid): alive = False; break
+      return TimeoutResult(idle_enforced, not alive, elapsed)
+      ```
+    rubric:
+      - Every test in tests/web/test_sess_termination.py passes.
+      - Logout is judged by replaying the old id, not by the cookie header.
+      - The absolute test keeps the session busy at intervals shorter than the idle limit.
+      - The result carries the observed lifetime.
+    hints:
+      - is_valid is one GET /account with the id as a cookie.
+      - A fresh session for the absolute test - the idle test already ended the first one.
+      - Step by half the idle limit and count the time you waited.
+    solution: Replay after each ending; for the absolute timeout stay busy and report how long the session lived.
+
+  - id: entropy-code
+    type: coding
+    concept: sec-sess-token-strength
+    skill: analysis
+    title: Write the session id analyser
+    prompt: |
+      In `practice/security/exercises/web/sess_entropy.py`, implement the alphabet classifier, fixed-position
+      finder, sequence detector, `analyse_ids`, `collect_ids` and `is_weak`. The tests include the cheat sheet's
+      half-fixed hex example (32 bits) and real samples from the service: counter ids must be weak, 128-bit
+      random ids must not.
+    project: security
+    files: [exercises/web/sess_entropy.py]
+    test: tests/web/test_sess_entropy.py
+    command: .venv/bin/python -m pytest tests/web/test_sess_entropy.py
+    modelAnswer: |
+      ```python
+      fixed = fixed_positions(ids)
+      varying = min(len(i) for i in ids) - len(fixed)
+      bits = varying * math.log2(size)            # size: 10, 16, 64 or distinct characters
+      findings = ["below-64-bits"] if bits < 64 else []
+      if is_sequential(ids): findings.append("sequential")
+      if len(ids) != len(set(ids)): findings.append("duplicates")
+      ```
+
+      The estimate is an upper bound: it can flag weakness, never prove randomness. `sequential` is what catches
+      `s0003e9`, `s0003ea` ... whose 18-bit estimate already understates how predictable they are.
+    rubric:
+      - Every test in tests/web/test_sess_entropy.py passes.
+      - Fixed positions are excluded from the entropy estimate.
+      - Sequences and duplicates are findings regardless of the bit estimate.
+      - The report is described as a weakness check, not proof of randomness.
+    hints:
+      - Classify the alphabet in the order decimal, hex, base64url, other.
+      - A position is fixed when all ids share the character there.
+      - Read each id's longest hex run as a number to spot counting.
+    solution: Count only varying positions, flag sequences and repeats, and treat a clean result as "no weakness found".
+
+placement:
+  - id: place-fixation
+    type: mcq
+    concept: sec-sess-rotation-exposure
+    skill: analysis
+    title: Is this sign-in safe?
+    prompt: |
+      Before sign-in the site sets `sid=a1`. Sign-in returns `Set-Cookie: sid=b2`. A request carrying only
+      `sid=a1` afterwards returns the signed-in dashboard. Verdict?
+    options:
+      - id: vuln
+        text: Vulnerable to fixation - the old id was not terminated.
+        feedback: Correct - a new id without destroying the old one leaves the planted id usable.
+      - id: safe
+        text: Safe - the id rotated from a1 to b2.
+        feedback: Rotation only counts if a1 stops working; it did not.
+      - id: hijack-only
+        text: Only a problem if the cookie lacks Secure.
+        feedback: Cookie attributes do not affect whether a1 still authenticates.
+    correct: [vuln]
+    solution: Rotation means a new id and the old one refused; replaying a1 proves the second half is missing.
+
+  - id: place-logout
+    type: mcq
+    concept: sec-sess-termination
+    skill: application
+    title: Which logout result is a finding?
+    prompt: Which observation after logout is a session management finding?
+    options:
+      - id: replay-200
+        text: 'The response had `Set-Cookie: sid=; Max-Age=0`, and replaying the old id returned 200.'
+        feedback: Correct - the server still accepts the old id; only the browser was told to forget it.
+      - id: replay-401
+        text: The response had no Set-Cookie, and replaying the old id returned 401.
+        feedback: Not a finding - the server ended the session; clearing the cookie is good practice but not required for security.
+      - id: redirect
+        text: The response redirected to /login, and replaying the old id returned 401.
+        feedback: The replay was refused, so the session is ended.
+    correct: [replay-200]
+    solution: Judge logout by the replay; a 200 for the old id is the finding whatever the headers say.
+
+  - id: place-entropy
+    type: mcq
+    concept: sec-sess-token-strength
+    skill: application
+    title: Which id format meets 64 bits?
+    prompt: Assume every character shown varies and comes from a CSPRNG. Which id format gives at least 64 bits of entropy?
+    options:
+      - id: hex16
+        text: 16 hexadecimal characters
+        feedback: Correct - 16 x 4 = 64 bits, the cheat sheet's stated minimum for hex.
+      - id: hex12
+        text: 12 hexadecimal characters
+        feedback: 12 x 4 = 48 bits, below 64.
+      - id: dec16
+        text: 16 decimal digits
+        feedback: Decimal digits carry about 3.3 bits each - about 53 bits.
+      - id: b64-10
+        text: 10 base64url characters
+        feedback: 10 x 6 = 60 bits, just short.
+    correct: [hex16]
+    solution: Bits = varying characters x log2(alphabet); 16 hex characters is the minimum for 64 bits.
+
+recall:
+  - id: recall-replay
+    concept: sec-sess-termination
+    prompt: What is the core technique for testing session endings?
+    answer: Keep the old id, trigger the event (logout, idle, absolute, privilege change), replay the old id on a protected page. Only a refusal proves the server ended it.
+  - id: recall-fixation
+    concept: sec-sess-rotation-exposure
+    prompt: What is session fixation and how do you prove it?
+    answer: The pre-login id survives sign-in, so an attacker who planted it gets the session. Sign in presenting the pre-login id, then replay it - 200 is the proof.
+  - id: recall-rotation
+    concept: sec-sess-rotation-exposure
+    prompt: When must a session id be rotated, and what are the two halves?
+    answer: At sign-in and every privilege change (role switch, password change). Issue a new id and terminate the old one.
+  - id: recall-timeouts
+    concept: sec-sess-termination
+    prompt: How do you test the absolute timeout without the idle timeout interfering, and how do you report a session that never expired?
+    answer: Keep the session busy with requests more often than the idle limit until past the absolute limit, then replay. Report the observed lifetime ("still valid after N hours"), not "no timeout".
+  - id: recall-entropy
+    concept: sec-sess-token-strength
+    prompt: What entropy do session ids need, and how many hex characters is that?
+    answer: At least 64 bits (cheat sheet), so at least 16 random hex characters; ASVS 5.0.0 asks 128 bits from a CSPRNG for reference tokens. Fixed characters add nothing.
+  - id: recall-sample
+    concept: sec-sess-token-strength
+    prompt: What can a sample of session ids prove?
+    answer: Weakness (short, fixed parts, sequences, duplicates, decodable content), never randomness. Report "no weakness found in N samples" and confirm the generator.
+
+next:
+  - testing-access-control-idor
+  - testing-csrf-and-clickjacking
+  - testing-jwt-and-oauth

@@ -13,6 +13,9 @@ const profiles = { activeUserId: 'loki', profiles: { loki: { firstName: 'Loki' }
 export default defineConfig({
   testDir: 'tests/e2e',
   fullyParallel: true,
+  // Locally the default (half the cores) runs so many browsers at once that the heaviest pages - the service
+  // worker precache, placement and progress across 120+ lessons - time out. CI keeps Playwright's default.
+  workers: process.env.CI ? undefined : 4,
   retries: 0,
   reporter: [['list']],
   use: {
