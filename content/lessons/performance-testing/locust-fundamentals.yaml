@@ -1,0 +1,1288 @@
+id: locust-fundamentals
+title: Locust fundamentals - users, tasks and wait time
+subject: performance-testing
+module: locust
+level: beginner
+status: published
+estimatedMinutes: 130
+summary: 'Write a locustfile - an HttpUser class with weighted @task methods, an on_start login and a wait_time - run it headless with -u, -r and -t, and read the statistics it leaves behind: the console summary, the --csv files and the --json-file output. Real Locust 2.47.0 runs against the SandPay practice API show what each piece does, including what goes wrong without a login, without a wait time and without request names.'
+tags:
+  [
+    Locust,
+    locustfile,
+    HttpUser,
+    task,
+    task weight,
+    on_start,
+    wait_time,
+    constant,
+    between,
+    constant_pacing,
+    constant_throughput,
+    headless,
+    spawn rate,
+    run time,
+    CSV statistics,
+    JSON statistics,
+    percentiles,
+    exit code,
+    CI,
+    load testing,
+  ]
+
+environment: |
+  - **Runs:** Linux, Python 3.12.3, Locust 2.47.0 (`practice/perf/.venv`), all on one machine against
+    `practice/perf/support/sandpay_target.py`, the SandPay practice API on the loopback interface. Every output in
+    this lesson was printed by the code or command shown, on 20 November 2026. Timings depend on the machine -
+    the counts, names, ratios and exit codes are what transfer, not the milliseconds. Locust's log lines are shown
+    as printed; the machine name in them is the author's.
+  - **SandPay is fictional.** The practice API, its merchants (`merchant-1` .. `merchant-50`) and its payments are
+    synthetic. Never point a load test at a system you do not own or have written permission to test.
+  - **Locust documentation**, as documented on 20 November 2026 (each page reports "Locust 2.47.0
+    documentation"): [Your first test](https://docs.locust.io/en/stable/quickstart.html), [Writing a
+    locustfile](https://docs.locust.io/en/stable/writing-a-locustfile.html) (User class, `wait_time`, `weight`
+    and `fixed_count`, `host`, tasks, `on_start` and `on_stop`, `HttpUser` and `client`),
+    [Configuration](https://docs.locust.io/en/stable/configuration.html) (command line options, environment
+    variables, configuration files and their order, CSV statistics) and [Running without the web
+    UI](https://docs.locust.io/en/stable/running-without-web-ui.html) (`--run-time`, `--stop-timeout`, exit
+    codes, CI).
+  - **Locust source at tag 2.47.0**, read where the docs are silent:
+    [`locust/user/wait_time.py`](https://github.com/locustio/locust/blob/2.47.0/locust/user/wait_time.py) (the
+    wait time functions), [`locust/user/users.py`](https://github.com/locustio/locust/blob/2.47.0/locust/user/users.py)
+    (the default `wait_time = constant(0)`), [`locust/stats.py`](https://github.com/locustio/locust/blob/2.47.0/locust/stats.py)
+    (response time buckets, `calculate_response_time_percentile`, `--json-file` output) and
+    [`locust/util/timespan.py`](https://github.com/locustio/locust/blob/2.47.0/locust/util/timespan.py) (the
+    run time format). The behaviour of `--json-file` replacing the printed summary was read in
+    `locust/main.py` 2.47.0 and confirmed by a run.
+  - **Not repeated here:** sizing users and pacing with Little's law - [Little's law and workload
+    models](#/lesson/littles-law-and-workload-models); percentiles in general - [Performance metrics and
+    percentiles](#/lesson/performance-metrics-and-percentiles); response validation and request names in depth -
+    [HTTP sessions, validation and request grouping](#/lesson/locust-http-validation-and-grouping); the JMeter
+    equivalent - [JMeter architecture and test plans](#/lesson/jmeter-architecture-and-test-plans).
+
+prerequisites:
+  - performance-testing-types
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-locust-locustfile
+    name: The locustfile - users and tasks
+    summary: A locustfile is an ordinary Python module that defines at least one User class. Locust creates one instance per simulated user, each in its own greenlet; an HttpUser gets a client (an HttpSession wrapping requests.Session) whose calls are timed and reported. Methods marked @task are picked at random, in proportion to their weights; on_start and on_stop run once per user around the task loop; host is the URL prefix, overridable with --host; weight and fixed_count decide how many users of each class are spawned.
+  - id: perf-locust-wait-time
+    name: Wait time - think time and pacing
+    summary: After each task a user sleeps for its wait_time - constant, between (uniform random), constant_pacing (a fixed time from task start to task start), constant_throughput (at most N task runs per second) or poisson (exponential gaps). The default is constant(0), so a user without one sends requests back to back. Wait time applies to tasks, not requests, and can only slow users down.
+  - id: perf-locust-headless
+    name: Headless runs and the statistics they leave
+    summary: A headless run takes its load from -u (users), -r (spawn rate) and -t (run time, counted from the start, not from the end of ramp-up). It prints a table per request name - requests, failures, average, min, max, median, requests per second - and approximated percentiles; --csv writes periodically refreshed CSV files and --json-file writes the final raw counters once. The process exits 1 if any request failed (--exit-code-on-error changes that), which is how a pipeline notices. Options can also come from LOCUST_* environment variables or locust.conf; the command line wins.
+
+objectives:
+  - Write a locustfile with an HttpUser, weighted tasks, a once-per-user login in on_start and a default host.
+  - Choose a wait_time function for think time or pacing, and predict the task and request rate it produces.
+  - Run Locust headless with the users, spawn rate and run time a test needs, and make it stop by itself.
+  - Read Locust's statistics table, CSV and JSON outputs, and explain where their numbers come from (including approximated percentiles and the requests-per-second span).
+  - Recognise the beginner mistakes that make a Locust run misleading - no login, no wait time, unnamed dynamic URLs, a missing host - from the output alone.
+  - Make a Locust run fail a CI job through its exit code.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-locust-locustfile, perf-locust-wait-time]
+    title: The idea in plain language
+    body: |
+      Imagine you have to rehearse the SandPay merchant dashboard on its busiest morning. You can't hire fifty
+      merchants to click around at 9 o'clock, so you write down **what one merchant does** - log in, look at the
+      list of recent payments, now and then open one, pause to read - and then ask a machine to play that merchant
+      fifty times at once, each copy making its own random choices.
+
+      That is Locust. The "what one merchant does" is a small Python class - a **User**. Its methods marked
+      `@task` are the things a merchant can do, with **weights** saying how often each one happens. The pause
+      between actions is the **wait time**. Locust then starts as many copies of the class as you ask for, at the
+      rate you ask for, keeps them running for as long as you ask for, and **counts** every request they make:
+      how many, how many failed, how long they took.
+
+      Because the script is plain Python, anything Python can do - read a file, pick a random id, compute a
+      signature - can go into a user's behaviour. That flexibility is Locust's selling point compared with tools
+      built from forms and XML, such as JMeter. The other side is that **nothing protects you from writing the
+      wrong user**: forget the login and every request fails; forget the wait time and four users hammer the API
+      like hundreds of real ones. This lesson shows both on real runs.
+
+  - id: what
+    kind: what
+    concepts: [perf-locust-locustfile, perf-locust-wait-time, perf-locust-headless]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **locustfile** | "just a normal Python module" that Locust loads with `-f` (default `locustfile.py`); it "must contain at least one class inheriting from `User`" |
+      | **User class** | one type of user or scenario; Locust "will create an instance per user" you simulate, each running "within their own green gevent thread" |
+      | **HttpUser** | the User for HTTP; it gives each user a `client`, an `HttpSession` - "a subclass/wrapper for `requests.Session`" that adds reporting of each request (success or failure, response time, length, name) and keeps cookies |
+      | **task** | a method decorated with `@task`; the user picks one at random, runs it, waits, and picks again. `@task(3)` gives a weight of 3 |
+      | **on_start / on_stop** | methods a user calls once when it starts running and once when it stops - the place for a login |
+      | **host** | "a URL prefix" added to every request path; set it on the class or with `--host` |
+      | **wait_time** | the delay after each task: `constant`, `between`, `constant_pacing`, `constant_throughput` or `poisson` |
+      | **weight / fixed_count** (class attributes) | how many users of each class to spawn when a file has several User classes |
+      | **users (`-u`)** | the peak number of concurrent simulated users |
+      | **spawn rate (`-r`)** | users started per second until the peak is reached |
+      | **run time (`-t`)** | when to stop, "calculated from the start of the test (not from when ramp up has finished)" |
+      | **headless** | `--headless`: no web UI; the test starts at once and prints text statistics |
+      | **request name** | the row a request is counted under - by default its URL (with the query string); `name=` overrides it |
+
+      Locust is written in Python and "Open source licensed under the MIT license" ([What is
+      Locust?](https://docs.locust.io/en/stable/what-is-locust.html)); version 2.47.0 is used throughout. The web UI on
+      port 8089 is optional - this lesson uses headless runs only, because that is what CI uses and what the
+      practice tests use.
+
+  - id: why
+    kind: why
+    concepts: [perf-locust-locustfile, perf-locust-headless]
+    title: Why testers learn Locust
+    body: |
+      - **User flows are code.** The docs: "A Locust test is essentially just a Python program making requests to
+        the system you want to test. This makes it very flexible and particularly good at implementing complex user
+        flows." Correlation (take an id from one reply, use it in the next), test data and conditional logic are
+        ordinary Python, reviewed like any other code.
+      - **It fits next to the tests you already have.** A locustfile lives in the repository, runs with one command,
+        and needs no GUI. It can import your API client or test-data helpers.
+      - **Cheap users.** Each user is a greenlet (a lightweight coroutine), not an OS thread, so one process can run
+        many users - though one Python process uses one CPU core, which is why bigger runs use `--processes` or
+        distributed workers (later in this module).
+      - **CI-friendly results.** Headless runs stop by themselves (`-t`), write CSV and JSON, and exit non-zero when
+        requests fail. The Locust docs show a GitHub Actions job and a `quitting` hook that fails a build on a
+        failure ratio, an average or a p95 threshold.
+      - **Interviews ask for it.** "Have you written a locustfile? How do you model think time? How did you decide
+        the user count?" are common questions for performance-testing roles; this module answers them with runs you
+        made yourself.
+
+      For a SandPay merchant dashboard - where a payment list that takes 3 seconds at 9 a.m. means support calls - a
+      repeatable Locust run is how the team learns about it before the merchants do.
+
+  - id: internals
+    kind: internals
+    concepts: [perf-locust-locustfile, perf-locust-wait-time]
+    title: What a simulated user actually does
+    body: |
+      When a run starts, Locust creates User instances at the spawn rate until it reaches the user count. Each
+      instance runs this loop in its own greenlet (read in `locust/user/users.py` and the docs):
+
+      1. **`on_start()`** - once. If it raises, the user stops.
+      2. **Pick a task.** Tasks are "picked at random, but you can give them different weighting". With `@task(3)`
+         and `@task(1)`, the first is three times as likely. (For a `tasks` dict the docs say it is "expanded into a
+         list" - `{my_task: 3, another_task: 1}` becomes `[my_task, my_task, my_task, another_task]` - and
+         `random.choice()` picks from it.)
+      3. **Run it.** "Code within a task is executed sequentially (it is just regular Python code)" - a second
+         request waits for the first reply. Each `self.client` call is timed and recorded under its name.
+      4. **Wait** `wait_time()` seconds - "If no wait_time is specified, the next task will be executed as soon as one
+         finishes." In the 2.47.0 source the default is literally `wait_time = constant(0)`.
+      5. Back to 2, until the run time ends or the user is stopped; then **`on_stop()`**.
+
+      **Weights are proportions of task runs, not of time and not of requests.** A task that sends two requests
+      contributes two rows' worth of requests per pick.
+
+      **The wait time functions** (from `wait_time.py`):
+
+      | Function | Wait after each task | Use it for |
+      | --- | --- | --- |
+      | `constant(s)` | always `s` seconds | fixed think time; `constant(0)` = back to back |
+      | `between(a, b)` | uniform random between `a` and `b` | human think time with variation |
+      | `constant_pacing(s)` | `s` minus the task's run time (never below 0) | one task every `s` seconds per user |
+      | `constant_throughput(n)` | the inverse: at most `n` task runs per second per user | a target rate |
+      | `poisson(rate)` | exponential random gaps, average `rate` per second | bursty, realistic arrivals |
+
+      Two sentences from the docs matter more than the table: "Wait time can only constrain the throughput, not
+      launch new Users to reach the target" and "Wait times apply to tasks, not requests" - with
+      `constant_throughput(2)` and two requests per task, "your request rate/RPS will be 4 per User".
+
+      **How statistics are kept.** Every request adds to a stats entry keyed by **method and name**: a request
+      count, a failure count, the total response time, min and max, and a histogram of response times. To keep it
+      small, `stats.py` rounds each time into a bucket "to ~2 significant digits, so that 147 becomes 150, 3432
+      becomes 3400" (times under 100 ms are rounded to the millisecond). That is why the printed percentile table is
+      headed "Response time percentiles (approximated)".
+
+  - id: percentiles-and-rates
+    kind: internals
+    concepts: [perf-locust-headless]
+    title: Where the numbers in the table come from
+    body: |
+      **Percentiles.** `calculate_response_time_percentile` in `stats.py` walks the histogram from the slowest
+      bucket down, adding up counts, and returns the first bucket where no more than `int(n × percent)` requests are
+      left below it. With 100 requests - 50 at 10 ms, 45 at 20 ms and 5 at 300 ms - Locust's p95 is **300**, not 20:
+      after counting the 5 slowest, 95 are left, and 95 is "no more than" 95. Run on Locust's own function:
+
+      ```text
+      >>> from locust.stats import calculate_response_time_percentile as p
+      >>> t = {10: 50, 20: 45, 300: 5}
+      >>> p(t, 100, 0.95), p(t, 100, 0.94), p(t, 100, 0.5)
+      (300, 20, 20)
+      ```
+
+      So Locust's percentiles are bucketed and lean towards the slower value at a boundary. Compare percentiles
+      across Locust runs, but don't expect them to equal another tool's to the millisecond.
+
+      **Requests per second.** The final `req/s` column is the request count divided by the span from the first
+      request to the last one of the **whole run** (`total_rps` uses the run's `start_time` and
+      `last_request_timestamp`), not by the nominal `-t`. During the run, the periodically printed `req/s` is a
+      recent-window rate instead. When you compute rates yourself, use the active span too: short runs on a busy
+      machine lose part of their nominal time to start-up.
+
+      **Which file to trust for totals.** `--csv` files are rewritten "periodically" (the CSV interval defaults to
+      1 second), while `--json-file` is written once, at shutdown, from the final counters. On the 5-second run in the
+      example section, the final `_stats.csv` said 75 `GET /v1/payments` requests while the JSON said 82 - the CSV
+      had not caught up. For final totals, read the JSON.
+
+  - id: when
+    kind: when
+    concepts: [perf-locust-locustfile, perf-locust-headless]
+    title: When Locust fits - and when it doesn't
+    body: |
+      **Good fit:**
+      - HTTP APIs and web back ends where the user flow has logic - login, pick an id from the last reply, branch.
+      - Teams who already write Python tests and want load tests in the same repository and review process.
+      - CI smoke-load stages: a few users for a minute, failing the build on errors or a percentile threshold.
+      - Non-HTTP systems, through a custom client (covered later in this module).
+
+      **Think twice:**
+      - Very high request rates from one process: one Python process uses one core. The docs have pages on
+        "Increasing the request rate", "Distributed load generation" and "Increase performance with a more efficient
+        HTTP client" (`FastHttpUser`).
+      - Browser rendering: "HttpUser is not a real browser, and thus will not parse an HTML response to load
+        resources or render the page." Page-load experience needs browser tools (Lighthouse, Web Vitals field data).
+      - Teams that want a GUI recorder and no code: JMeter's GUI and recorder suit them better.
+
+      **In this track:** the fundamentals module gave you the workload and the targets; this lesson is how to
+      express a workload as a Locust user and run it. The following Locust lessons add validation and naming, flows,
+      events, load shapes and distributed runs.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-locust-locustfile, perf-locust-wait-time]
+    title: The life of one simulated user
+    body: |
+      ```mermaid
+      flowchart LR
+        S["Spawned at the spawn rate"] --> OS["on_start - log in once"]
+        OS --> P["Pick a task by weight"]
+        P --> T["Run it - client calls are timed and counted"]
+        T --> W["Sleep wait_time"]
+        W -- "time left" --> P
+        W -- "run time over" --> OE["on_stop"]
+        T -- "counts per method and name" --> ST["Statistics - table, CSV, JSON"]
+      ```
+
+      Read the loop from left to right: the login sits **outside** the loop, so it happens once per user; the wait
+      sits **inside** it, after every task; and every request feeds the statistics on its way through. Most beginner
+      mistakes are one of these boxes in the wrong place - a login inside a task, a missing wait, or requests
+      counted under thousands of different names.
+
+  - id: code
+    kind: code
+    concepts: [perf-locust-locustfile, perf-locust-wait-time]
+    title: A first SandPay locustfile
+    body: |
+      This is the reference solution of the first practice exercise
+      (`practice/perf/solutions/locust/lc_fund_locustfile.py`). A merchant logs in once, mostly lists recent
+      payments and sometimes opens one:
+
+      ```python
+      import random
+
+      from locust import HttpUser, constant_throughput, task
+
+
+      class MerchantUser(HttpUser):
+          host = "http://127.0.0.1:8090"  # the default; --host on the command line overrides it
+          wait_time = constant_throughput(2)  # at most 2 task runs per second per user
+
+          def on_start(self):
+              # Runs once per simulated user, before its first task - not counted as a task.
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task(3)
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=10", name="/v1/payments")
+
+          @task(1)
+          def view_payment(self):
+              payment_id = f"pay_{random.randint(100001, 100250)}"
+              self.client.get(f"/v1/payments/{payment_id}", name="/v1/payments/[id]")
+      ```
+
+      Before running load, ask Locust what mix the file will produce. `--show-task-ratio` prints it without
+      sending a request:
+
+      ```text
+      $ .venv/bin/locust -f solutions/locust/lc_fund_locustfile.py --show-task-ratio
+
+       Task ratio per User class
+      --------------------------------------------------------------------------------
+       100.0      MerchantUser
+         75.0       list_payments
+         25.0       view_payment
+
+       Total task ratio
+      --------------------------------------------------------------------------------
+       100.0      MerchantUser
+         75.0       list_payments
+         25.0       view_payment
+      ```
+
+      (`--show-task-ratio-json` prints the same as JSON, which the practice test reads.)
+
+  - id: headless-run
+    kind: code
+    concepts: [perf-locust-headless]
+    title: Running it headless and reading the result
+    body: |
+      With the practice API started on port 8093 with a 20 ms service time
+      (`.venv/bin/python support/sandpay_target.py --port 8093 --latency-ms 20`), four users for ten seconds:
+
+      ```text
+      $ .venv/bin/locust -f solutions/locust/lc_fund_locustfile.py --headless -u 4 -r 4 -t 10s \
+          --host http://127.0.0.1:8093 --only-summary; echo EXIT=$?
+      [2026-11-20 21:30:33,767] MTPL-LT-DE-646/INFO/locust.main: Starting Locust 2.47.0
+      [2026-11-20 21:30:33,768] MTPL-LT-DE-646/INFO/locust.main: Run time limit set to 10 seconds
+      [2026-11-20 21:30:33,768] MTPL-LT-DE-646/INFO/locust.runners: Ramping to 4 users at a rate of 4.00 per second
+      [2026-11-20 21:30:33,768] MTPL-LT-DE-646/INFO/locust.runners: All users spawned: {"MerchantUser": 4} (4 total users)
+      [2026-11-20 21:30:43,647] MTPL-LT-DE-646/INFO/locust.main: --run-time limit reached, shutting down
+      [2026-11-20 21:30:43,696] MTPL-LT-DE-646/INFO/locust.main: Shutting down (exit code 0)
+      Type     Name                  # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+      --------|---------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+      POST     /auth/token                4     0(0.00%) |     25      24      26     26 |    0.42        0.00
+      GET      /v1/payments              59     0(0.00%) |     23      22      26     24 |    6.19        0.00
+      GET      /v1/payments/[id]         21     0(0.00%) |     23      22      26     24 |    2.20        0.00
+      --------|---------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+               Aggregated                84     0(0.00%) |     23      22      26     24 |    8.82        0.00
+
+      Response time percentiles (approximated)
+      Type     Name                     50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+      --------|---------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+      POST     /auth/token               26     26     26     26     26     26     26     26     26     26     26      4
+      GET      /v1/payments              24     24     24     24     25     26     26     26     26     26     26     59
+      GET      /v1/payments/[id]         24     24     24     24     25     25     26     26     26     26     26     21
+      --------|---------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+               Aggregated                24     24     24     25     25     26     26     26     26     26     26     84
+      EXIT=0
+      ```
+
+      (The Name column is printed 76 characters wide; it is narrowed here to fit the page. Nothing else is changed.)
+
+      How to read it:
+
+      - **4 logins** - one per user, because the login is in `on_start`.
+      - **80 tasks in about 10 s from 4 users** - `constant_throughput(2)` lets each user run its first task at once
+        and then one every 0.5 s: 4 × (1 + 2 × 9.9) ≈ 83. The pacing worked.
+      - **59 : 21** - close to 3 : 1 (60 : 20). The task choice is random, so the split varies a little per run.
+      - **Two names, not hundreds** - every payment id is counted under `/v1/payments/[id]`.
+      - **0 failures and exit code 0** - with any failure the process would have exited 1.
+      - **Avg 23 ms against a 20 ms service time** - the rest is Python, HTTP and the loopback network. That is a
+        number about *this machine*; don't compare it across machines.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-locust-locustfile, perf-locust-wait-time]
+    title: The locustfile line by line
+    body: |
+      - **`from locust import HttpUser, constant_throughput, task`** - the three names a first locustfile needs.
+        Import only inside locustfiles: importing Locust patches Python's networking for gevent, which is why the
+        practice tests run Locust in a subprocess and never import it.
+      - **`class MerchantUser(HttpUser)`** - one class, one kind of user. The class name appears in the logs
+        (`{"MerchantUser": 4}`) and can be selected on the command line: `locust -f file.py MerchantUser`.
+      - **`host = ...`** - the URL prefix. `--host` (or `LOCUST_HOST`) overrides it, so the same file can run
+        against any environment you are allowed to load.
+      - **`wait_time = constant_throughput(2)`** - a target rate per user, in task runs per second. Without this line
+        the user would use the default `constant(0)`.
+      - **`def on_start(self)`** - called once per user. The token goes on `self.client.headers`, so every later
+        request from this user carries it - like a real merchant's session. The token request is counted in the
+        statistics (`POST /auth/token`), but it is not a task, so it doesn't affect the 3 : 1 mix.
+      - **`@task(3)` / `@task(1)`** - weights. Only methods with `@task` are picked; helper methods are free.
+      - **`self.client.get("/v1/payments?limit=10", name="/v1/payments")`** - without `name=` the row would be
+        named by the URL including `?limit=10`. Naming it keeps one row per *transaction*.
+      - **`name="/v1/payments/[id]"`** - the docs' own example groups `/item?id=…` requests "under an entry named
+        `/item`" for the same reason: "the stats is grouped on the URL". Without it you get one row per payment id,
+        as the mistakes section shows.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-locust-locustfile, perf-locust-headless]
+    title: Steps for a first Locust test
+    body: |
+      1. **Start from the workload model**, not from the tool: which transactions, in which proportions, with which
+         think time or target rate (from the fundamentals module).
+      2. **Write one User class** per kind of user. Put one-off setup (login) in `on_start`, one transaction per
+         `@task`, weights from the model, and request names for every URL with an id or a query string.
+      3. **Pick the wait time** from the model - `between` for think time, `constant_throughput` or
+         `constant_pacing` for a target rate.
+      4. **Check the mix offline** with `--show-task-ratio`.
+      5. **Smoke it**: 1-2 users for a few seconds against a non-production target you may load. Expect zero
+         failures and the names you chose.
+      6. **Run the real test headless** with `-u`, `-r` and `-t`, plus `--csv` and/or `--json-file` for the record.
+      7. **Read the result**: logins = users? Mix ≈ weights? Rate ≈ users × task rate? Failures explained? Exit
+         code as expected?
+      8. **Keep the command** - in a script, a `locust.conf` or CI job - so the next run is the same test.
+
+  - id: example
+    kind: example
+    concepts: [perf-locust-headless]
+    title: "Worked example: the files a run leaves behind"
+    body: |
+      A 5-second run of a three-task merchant user (list, create, settlement report) against the practice API with
+      a 40 ± 30 ms service time and 10 % injected payment errors, with both outputs on:
+
+      ```text
+      $ .venv/bin/locust -f sample.py --headless -u 5 -r 5 -t 5s --host http://127.0.0.1:8092 \
+          --csv sample --json-file sample --only-summary > out.txt 2>&1; echo EXIT=$?
+      EXIT=1
+      $ ls
+      out.txt  sample.json  sample_exceptions.csv  sample_failures.csv  sample.py  sample_stats.csv
+      sample_stats_history.csv
+      ```
+
+      Three surprises are worth remembering:
+
+      1. **Exit code 1** - some payment creations got the injected 500, and "By default the locust process will give
+         an exit code of 1 if there were any failed samples".
+      2. **No summary table in `out.txt`.** With `--json-file`, Locust 2.47.0 writes the JSON *instead of* printing the
+         final summary (`main.py`: `if options.json_file: ... save_stats_json(...)` / `elif ...: print_stats(...)`).
+         Use `--csv` or no file option when you want the table in the log.
+      3. **The CSV lags.** Final counts for the same run:
+
+      ```text
+      sample_stats.csv (periodic)        sample.json (written at shutdown)
+      GET  /v1/payments            75    GET  /v1/payments            82
+      POST /v1/payments            31    POST /v1/payments            36
+      GET  /v1/reports/settlement   7    GET  /v1/reports/settlement  10
+      ```
+
+      `sample_failures.csv` says what failed:
+
+      ```text
+      Method,Name,Error,Occurrences,First Seen,Last Seen
+      POST,/v1/payments,HTTPError('500 Server Error: Internal Server Error for url: /v1/payments'),4,2026-11-20T15:55:16Z,2026-11-20T15:55:18Z
+      ```
+
+      4 occurrences - while the JSON for the same run counts 5 failures. The failures file is refreshed on the same
+      interval as the stats file, so it lags too. (The injected errors come from a shared random generator, so the
+      count also varies a little between runs.)
+
+      One entry of `sample.json`, trimmed to the fields the second exercise reads (floats rounded to 3 decimals):
+
+      ```json
+      {
+        "method": "POST", "name": "/v1/payments",
+        "num_requests": 36, "num_none_requests": 0, "num_failures": 5,
+        "total_response_time": 2873.652,
+        "start_time": 1795190115.622, "last_request_timestamp": 1795190119.541,
+        "response_times": {"23": 1, "25": 1, "...": "...", "130": 3, "140": 2}
+      }
+      ```
+
+      From these raw counters the second exercise recomputes Locust's own numbers - average 79.8 ms, p50 86, p95
+      140 - and the aggregated row: 133 requests, 5 failures (3.76 %), p95 390 ms. Against the docs' CI thresholds
+      (failure ratio 1 %, average 200 ms, p95 800 ms) that run fails on the failure ratio alone.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-locust-locustfile, perf-locust-wait-time, perf-locust-headless]
+    title: Checks that prove a locustfile does what you meant
+    body: |
+      Before anyone reads a response time, prove the *load* was right. The practice tests for this lesson do
+      exactly this:
+
+      | # | Check | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | Task ratio, offline | equals the model's weights | `--show-task-ratio-json` |
+      | 2 | Request names | one row per transaction; no ids or query strings in names | names in the JSON or table |
+      | 3 | Login count | = number of users | `POST /auth/token` count |
+      | 4 | Failures in a smoke run | 0 - or each one explained | `# fails`, `_failures.csv` |
+      | 5 | Rate | ≈ users × task rate, over the active span | counts and timestamps from `--json-file` |
+      | 6 | Server agrees | server's count ≥ Locust's, within a few requests | target's `/metrics` route counts |
+      | 7 | Exit code | 1 with failures, 0 without (or as configured) | the process exit status |
+
+      Check 6 has a detail worth knowing: "By default, Locust will stop your tasks immediately (without even waiting
+      for requests to finish)", so a request in flight at the end can be answered by the server but never recorded
+      by Locust. The server count can be a little **higher**, never lower. `--stop-timeout` lets tasks finish
+      instead.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-locust-locustfile, perf-locust-wait-time, perf-locust-headless]
+    title: Common mistakes, seen on real runs
+    body: |
+      (In the outputs below the Name column is narrowed and the separator lines are left out; the numbers are as
+      printed.)
+
+      **1. No login.** A payment user without `on_start`, 2 users for 2 seconds, no wait time:
+
+      ```text
+      POST     /v1/payments                 4207 4207(100.00%) |      0       0      13      1 | 2230.06     2230.06
+      ...
+      Error report
+      # occurrences      Error
+      4207               POST /v1/payments: HTTPError('401 Client Error: Unauthorized for url: /v1/payments')
+      ```
+
+      Every request failed and the run exited 1. Fast 401s also make the averages meaningless - an average of 0 ms
+      is a *rejection* time, not a payment time. Always smoke-run with 1-2 users and look at `# fails` first.
+
+      **2. No wait time.** The same run shows the other mistake: two users sent **2230 requests per second**,
+      because the default `wait_time` is `constant(0)`. Real merchants don't click 1000 times a second; a run like
+      this is a stress test of the load generator, not a model of users. Choose `between`, `constant_throughput` or
+      `constant_pacing` on purpose.
+
+      **3. Dynamic URLs without `name=`.** Without a name, every payment id gets its own row:
+
+      ```text
+      GET      /v1/payments/pay_100038?expand=merchant        1     0(0.00%) |     39      39      39     39 |    0.62        0.00
+      GET      /v1/payments/pay_100043?expand=merchant        1     0(0.00%) |     28      28      28     28 |    0.62        0.00
+      GET      /v1/payments/pay_100091?expand=merchant        1     0(0.00%) |     14      14      14     14 |    0.62        0.00
+      ...
+      ```
+
+      One request per row gives no percentiles worth reading. Name each transaction.
+
+      **4. No host.** Without `host` on the class and without `--host`, the users die at spawn with:
+
+      ```text
+      locust.exception.StopTest: You must specify the base host. Either in the host attribute in the User class, or on the command line using the --host option.
+      ```
+
+      **5. No run time in CI.** `--headless` without `-t` logs "No run time limit set, use CTRL+C to interrupt." - a
+      pipeline job waits until its own timeout. Always pass `-t`.
+
+      **6. Login inside a task.** Then logins are part of the weighted mix, run once per iteration, and can hit the
+      token rate limit. Put once-per-user setup in `on_start`.
+
+      **7. Reading totals from the periodic CSV.** It can lag the real totals (75 vs 82 above). Use `--json-file` for
+      final counts.
+
+      **8. Reading `-t` as "time at full load".** Run time counts from the start, including ramp-up. With `-u 100 -r 5
+      -t 60s`, the last users start at 20 s, so full load lasts about 40 s.
+
+      **Debugging method:** smoke-run with 1 user → read the error report → check names and the login count → check
+      the rate against users × task rate → only then scale up.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-locust-wait-time, perf-locust-headless]
+    title: Trade-offs and choices
+    body: |
+      | Choice | Option A | Option B | Pick by |
+      | --- | --- | --- | --- |
+      | Think time | `between(a, b)` - human-like, rate drifts with response time | `constant_throughput(n)` - fixed rate while the server keeps up | what the requirement states: user behaviour or a rate |
+      | Arrivals | constant gaps - repeatable | `poisson(rate)` - bursts like real users | realism vs run-to-run comparability |
+      | Output | console table (readable in the log) | `--json-file` (exact final totals, no table) | use `--csv` for a table and files, JSON for machine checks |
+      | Configuration | command line - visible in the job | `locust.conf` / `LOCUST_*` - shared defaults | keep the load (`-u`, `-r`, `-t`) visible next to the result |
+      | Stop | immediate (default) - requests in flight are lost | `--stop-timeout` - tasks finish their iteration | whether the last iteration's work matters |
+      | Pass or fail | exit code on any failure (default) | a `quitting` hook setting `process_exit_code` from thresholds | how strict a CI stage should be |
+
+      The configuration order from the docs: "`./pyproject.toml` -> `./locust.conf` -> (file specified using
+      `--config`) -> env vars -> cmd args" - each overrides the one before. Not every option has an environment
+      variable: the docs' table lists `LOCUST_CSV` but none for `--json-file`, so the practice test configures
+      its environment-only run with `--csv`.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-locust-locustfile, perf-locust-wait-time, perf-locust-headless]
+    title: Quick reference
+    body: |
+      - **Locustfile:** a Python module with at least one `User` class. `HttpUser` → `self.client` (requests-based,
+        timed, keeps cookies).
+      - **Tasks:** `@task(weight)`; picked at random by weight; code inside runs sequentially.
+      - **Once per user:** `on_start` (login), `on_stop`.
+      - **Host:** class attribute or `--host` / `LOCUST_HOST`.
+      - **Wait time:** default `constant(0)`; `between`, `constant`, `constant_pacing`, `constant_throughput`,
+        `poisson`. Per task, not per request; only slows users down.
+      - **Headless:** `locust -f file.py --headless -u USERS -r SPAWN_RATE -t RUN_TIME --host URL`; run time counts
+        from the start, formats `20`, `20s`, `3m`, `1h30m`.
+      - **Outputs:** table + approximated percentiles; `--csv PREFIX` (periodic); `--json-file PREFIX` → `PREFIX.json`
+        (final, replaces the printed summary).
+      - **Names:** stats are keyed by method + name; name every dynamic URL.
+      - **Exit code:** 1 if any request failed; `--exit-code-on-error N` to change; `quitting` hook for thresholds.
+      - **Check first:** logins = users, mix ≈ weights, rate ≈ users × task rate, failures explained.
+
+exercises:
+  - id: lcfund-mcq-minimum
+    type: mcq
+    concept: perf-locust-locustfile
+    skill: recall
+    title: What makes a file a locustfile
+    prompt: According to the Locust docs, what must a Python file contain to be a valid locustfile?
+    options:
+      - id: user-class
+        text: At least one class inheriting from User
+        feedback: Correct - "For a file to be a valid locustfile it must contain at least one class inheriting from User."
+      - id: main
+        text: A main() function that starts the load
+        feedback: Locust itself starts the run; the file only describes users.
+      - id: task-function
+        text: At least one module-level function decorated with @task
+        feedback: Tasks belong to a User class (as methods or in its tasks attribute); a file with only functions has no users.
+      - id: config
+        text: A locust.conf next to it
+        feedback: Configuration files are optional; the command line works alone.
+    correct: [user-class]
+    hints:
+      - Locust creates instances of something per simulated user.
+    solution: |
+      At least one User subclass - usually an HttpUser. Locust creates one instance per simulated user.
+
+  - id: lcfund-mcq-weights
+    type: mcq
+    concept: perf-locust-locustfile
+    skill: application
+    title: Task weights
+    prompt: |
+      ```python
+      class Merchant(HttpUser):
+          @task(6)
+          def list_payments(self): ...
+
+          @task(3)
+          def create_payment(self): ...
+
+          @task(1)
+          def settlement_report(self): ...
+      ```
+
+      Over a long run, what share of task runs is `create_payment`?
+    options:
+      - id: thirty
+        text: About 30 %
+        feedback: Correct - 3 of 6 + 3 + 1 = 10.
+      - id: third
+        text: About 33 % - each task runs equally often, the weight sets its order
+        feedback: Weights are relative probabilities of being picked, not an order.
+      - id: three
+        text: About 3 %
+        feedback: The weight is a relative number, not a percentage.
+      - id: fifty
+        text: 50 %
+        feedback: That compares it with list_payments only; settlement_report shares the picks too.
+    correct: [thirty]
+    hints:
+      - Add the weights.
+    solution: |
+      3 / (6 + 3 + 1) = 30 %. `--show-task-ratio` prints these shares before you run any load.
+
+  - id: lcfund-mcq-on-start
+    type: mcq
+    concept: perf-locust-locustfile
+    skill: analysis
+    title: How many logins?
+    prompt: |
+      A locustfile logs in inside `on_start` and has two tasks. You run `-u 25 -r 5 -t 2m`. How many
+      `POST /auth/token` requests do you expect in the statistics (with no failures and no restarts)?
+    options:
+      - id: users
+        text: '25'
+        feedback: Correct - on_start runs once per simulated user.
+      - id: per-task
+        text: One per task run
+        feedback: That is what happens when the login is inside a task - the mistake on_start avoids.
+      - id: spawn
+        text: '5'
+        feedback: The spawn rate is users started per second, not the number of users.
+      - id: zero
+        text: None - on_start requests are not counted
+        feedback: They are counted like any other client request; they are just not tasks.
+    correct: [users]
+    hints:
+      - When does on_start run?
+    solution: |
+      25. A login count that differs from the user count means a login in the wrong place, users that died, or
+      users that never started.
+
+  - id: lcfund-mcq-default-wait
+    type: mcq
+    concept: perf-locust-wait-time
+    skill: recall
+    title: The default wait time
+    prompt: A User class sets no wait_time. What happens between its tasks?
+    options:
+      - id: none
+        text: Nothing - the next task starts as soon as the previous one finishes
+        feedback: Correct - the docs say exactly that, and in the 2.47.0 source the default is constant(0).
+      - id: one
+        text: A one-second pause
+        feedback: There is no built-in pause; that is why runs without a wait time can send thousands of requests per second.
+      - id: error
+        text: Locust refuses to start the run
+        feedback: It starts; the result is just a very aggressive user.
+      - id: random
+        text: A random wait between 1 and 5 seconds
+        feedback: That is between(1, 5) from the docs' example, which you have to set yourself.
+    correct: [none]
+    hints:
+      - Look at what two users without a wait time did in the mistakes section.
+    solution: |
+      No wait: `wait_time = constant(0)`. Two users sent about 2230 requests per second in the mistakes section.
+
+  - id: lcfund-mcq-throughput-rate
+    type: mcq
+    concept: perf-locust-wait-time
+    skill: application
+    title: Predict the request rate
+    prompt: |
+      20 users, `wait_time = constant_throughput(0.5)`, and every task sends **three** requests. The server answers
+      in 50 ms. What request rate do you expect?
+    options:
+      - id: thirty
+        text: About 30 requests per second
+        feedback: Correct - 0.5 task runs per second × 3 requests × 20 users.
+      - id: ten
+        text: About 10 requests per second
+        feedback: That counts task runs, but "Wait times apply to tasks, not requests".
+      - id: half
+        text: About 0.5 requests per second
+        feedback: The argument is per user, and per task.
+      - id: unlimited
+        text: As many as the server can answer
+        feedback: constant_throughput limits each user's task runs; the server is fast enough for the target.
+    correct: [thirty]
+    hints:
+      - Per user - task runs per second times requests per task.
+    solution: |
+      Per user 0.5 × 3 = 1.5 requests per second; × 20 users = 30.
+
+  - id: lcfund-mcq-pacing-limit
+    type: mcq
+    concept: perf-locust-wait-time
+    skill: analysis
+    title: Pacing against a slow server
+    prompt: |
+      10 users with `constant_pacing(1)` (one task per second each). Under load each task takes 4 seconds. What
+      happens to the task rate?
+    options:
+      - id: drops
+        text: It drops to about 2.5 per second - pacing can't start tasks faster than they finish
+        feedback: Correct - the wait becomes 0 and each user manages one task per 4 s. "Wait time can only constrain the throughput."
+      - id: holds
+        text: It stays at 10 per second because pacing compensates
+        feedback: Pacing only shortens the wait; once the wait is 0 there is nothing left to shorten.
+      - id: more-users
+        text: Locust starts extra users to keep 10 per second
+        feedback: The docs say wait time cannot "launch new Users to reach the target".
+      - id: error
+        text: Locust reports pacing errors as failures
+        feedback: Missing the pace is not a failure - which is exactly why you must check the achieved rate.
+    correct: [drops]
+    hints:
+      - What is the wait when the task already took longer than the pace?
+    solution: |
+      `constant_pacing` returns max(0, pace - run time). At 4 s per task the wait is 0, so 10 users make 10 / 4 =
+      2.5 tasks per second - with no error to warn you.
+
+  - id: lcfund-mcq-run-time
+    type: mcq
+    concept: perf-locust-headless
+    skill: application
+    title: How long at full load?
+    prompt: '`locust --headless -u 200 -r 10 -t 5m` - for about how long do all 200 users run together?'
+    options:
+      - id: four-forty
+        text: About 4 min 40 s
+        feedback: Correct - spawning takes 200 / 10 = 20 s, and run time counts from the start.
+      - id: five
+        text: 5 min - the run time starts when ramp-up has finished
+        feedback: The docs say the opposite - "Time is calculated from the start of the test (not from when ramp up has finished)."
+      - id: three-twenty
+        text: About 3 min 20 s
+        feedback: That would be a 100-second ramp-up; 200 users at 10 per second take 20 s.
+      - id: twenty
+        text: 20 s
+        feedback: That is the ramp-up itself.
+    correct: [four-forty]
+    hints:
+      - Users divided by spawn rate gives the ramp-up.
+    solution: |
+      Ramp-up 20 s, then 4 min 40 s at 200 users. If a requirement says "5 minutes at 200 users", use `-t 5m20s`.
+
+  - id: lcfund-mcq-json-file
+    type: mcq
+    concept: perf-locust-headless
+    skill: analysis
+    title: Where did the summary go?
+    prompt: |
+      A CI job runs `locust ... --headless -t 5m --json-file results --only-summary`. The job log shows the start and
+      stop lines but no statistics table. Why?
+    options:
+      - id: replaced
+        text: In Locust 2.47.0, --json-file writes results.json instead of printing the final summary
+        feedback: Correct - main.py prints the summary only in the elif branch when no JSON file is requested.
+      - id: only-summary
+        text: --only-summary turns off all statistics output
+        feedback: It disables the periodic printing during the run; the final summary normally still prints.
+      - id: failed
+        text: The run failed, and Locust prints no table for failed runs
+        feedback: Failed runs print a table and an error report (as in the mistakes section).
+      - id: loglevel
+        text: The table is a DEBUG log message
+        feedback: The table is printed to the console, not logged at DEBUG.
+    correct: [replaced]
+    hints:
+      - Compare the worked example's out.txt with the first headless run.
+    solution: |
+      With `--json-file` the summary goes to `results.json` instead. Add `--csv` too, or print the table from the
+      JSON in a later step, if people need to read it in the log.
+
+  - id: lcfund-mcq-csv-lag
+    type: mcq
+    concept: perf-locust-headless
+    skill: analysis
+    title: Two files, two totals
+    prompt: |
+      For the same run, `run_stats.csv` reports 75 requests for `GET /v1/payments` and `run.json` reports 82. Which
+      number do you put in the report?
+    options:
+      - id: json
+        text: '82 - the JSON is written once at shutdown from the final counters'
+        feedback: Correct - the CSV is rewritten periodically and can miss the last moments.
+      - id: csv
+        text: '75 - CSV is the official format'
+        feedback: Both are official; the CSV is just refreshed on an interval.
+      - id: average
+        text: '78.5 - average the two'
+        feedback: One of them is simply out of date; averaging hides that.
+      - id: neither
+        text: Neither - the run is invalid when outputs disagree
+        feedback: The run is fine; the outputs were written at different times.
+    correct: [json]
+    hints:
+      - When is each file written?
+    solution: |
+      82. "periodically save" for CSV versus one write at shutdown for JSON. For an exact cross-check, compare with
+      the server's own count.
+
+  - id: lcfund-mcq-exit-code
+    type: mcq
+    concept: perf-locust-headless
+    skill: recall
+    title: Exit codes
+    prompt: A headless Locust run ends normally, but 3 of 10 000 requests failed. What is the process exit code by default?
+    options:
+      - id: one
+        text: '1'
+        feedback: Correct - "the locust process will give an exit code of 1 if there were any failed samples".
+      - id: zero
+        text: 0 - three failures are under any sensible threshold
+        feedback: Locust has no built-in threshold; any failure gives 1 unless you change it.
+      - id: two
+        text: '2'
+        feedback: In 2.47.0 code 2 is for an unhandled greenlet exception, not failed requests.
+      - id: three
+        text: '3 - the number of failures'
+        feedback: The exit code is not a count.
+    correct: [one]
+    hints:
+      - The docs' section "Controlling the exit code of the Locust process".
+    solution: |
+      1. Use `--exit-code-on-error 0` to ignore failures, or a `quitting` hook that sets
+      `environment.process_exit_code` from your own thresholds.
+
+  - id: lcfund-order-first-test
+    type: order
+    concept: perf-locust-headless
+    skill: application
+    title: From model to first real run
+    prompt: Put the steps for a first Locust test in order.
+    items:
+      - id: model
+        text: Take the transactions, weights and think time or rate from the workload model
+      - id: write
+        text: Write the User class with on_start, weighted tasks, request names and a wait_time
+      - id: ratio
+        text: Check the mix offline with --show-task-ratio
+      - id: smoke
+        text: Smoke-run 1-2 users for a few seconds and read the failures and names
+      - id: run
+        text: Run headless with -u, -r and -t, writing --csv or --json-file
+      - id: verify
+        text: Check logins, mix, rate and failures before reading response times
+    hints:
+      - Cheap checks come before expensive ones.
+    solution: |
+      Model, code, offline mix, smoke, real run, then evidence that the load was the load you meant.
+
+  - id: lcfund-debug-hammer
+    type: debug
+    concept: perf-locust-wait-time
+    skill: analysis
+    title: Twenty users, eight hundred requests per second
+    prompt: |
+      The team wanted 20 merchants who each look at the payment list about every 2-4 seconds. The run sent about
+      800 requests per second with no failures. Which line is the defect?
+    language: python
+    code: |
+      from locust import HttpUser, between, task
+
+
+      class Merchant(HttpUser):
+          think = between(2, 4)
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=10", name="/v1/payments")
+    correctLines: [5]
+    lineNotes:
+      - line: 7
+        note: The login in on_start is correct - once per user.
+      - line: 13
+        note: The request and its name are fine.
+      - line: 1
+        note: between is the right function for think time; the problem is where its result goes.
+    hints:
+      - Locust looks for one specific attribute name.
+      - What is the default wait time?
+    solution: |
+      Line 5 assigns the wait to an attribute Locust doesn't read. It must be `wait_time = between(2, 4)`. Without it
+      the default `constant(0)` applies, so each user loops as fast as the server answers.
+
+  - id: lcfund-short-names
+    type: short
+    concept: perf-locust-locustfile
+    skill: analysis
+    title: A report with 4000 rows
+    prompt: |
+      A colleague's Locust report has about 4000 rows like `GET /v1/payments/pay_100038?expand=merchant`, each with
+      one or two requests, and the percentiles "look random". Explain what happened and how to fix it.
+    modelAnswer: |
+      Locust groups statistics by method and name, and the default name is the URL, including the id and the query
+      string. Each payment id therefore got its own row with one or two samples, so its percentiles are just those
+      one or two values - meaningless - and the real transaction ("view a payment") has no row at all. Fix: pass
+      `name="/v1/payments/[id]"` (any fixed label) on the request, as the docs do with `name="/item"`, so all of
+      them are counted together; then the row has hundreds of samples and usable percentiles. Check the names in a
+      smoke run before every real run.
+    rubric:
+      - Says statistics are grouped by the URL (method plus name) by default.
+      - Explains why one sample per row makes percentiles meaningless.
+      - Gives the fix - a fixed name= for the dynamic URL.
+      - Suggests checking names in a smoke run.
+    hints:
+      - What is a request's default name?
+    solution: |
+      Default names are full URLs, so each id is its own row. Use `name=` to group them into one transaction.
+
+  - id: lcfund-testdesign-locustfile
+    type: testdesign
+    concept: perf-locust-headless
+    skill: application
+    title: Prove a locustfile before the real run
+    prompt: |
+      A new locustfile models SandPay merchants: login once, list payments (weight 3), view a payment (weight 1),
+      `constant_throughput(2)`. Before the 30-minute test at 200 users, design the checks that prove the script
+      generates the intended load. Give preconditions, steps, expected results and evidence.
+    modelAnswer: |
+      Preconditions: a non-production target we are allowed to load, with its own request counters; the model
+      (weights, rate) written down.
+
+      1. **Mix offline** - `--show-task-ratio-json`. Expected 0.75 / 0.25. Evidence: the JSON.
+      2. **Smoke run** - 2 users, 10 s. Expected 0 failures; names exactly `POST /auth/token`, `GET /v1/payments`,
+         `GET /v1/payments/[id]`. Evidence: table and `_failures.csv`.
+      3. **Login count** - expected = users (2). Evidence: `POST /auth/token` count.
+      4. **Rate** - 4 users, 10 s. Expected about 8 tasks per second over the active span (users × 2). Evidence:
+         `--json-file` counts and timestamps.
+      5. **Server agreement** - target's route counts ≥ Locust's and within a few requests. Evidence: `/metrics`.
+      6. **Exit code** - a run against a target with injected errors exits 1. Evidence: process status in CI.
+      7. **Ramp-up plan** - for 200 users, choose `-r` and add the ramp time to `-t`. Evidence: the command.
+    rubric:
+      - Checks the task mix before sending load.
+      - Smoke-runs at tiny scale and checks failures and request names.
+      - Verifies once-per-user setup with the login count.
+      - Checks the achieved rate against users times task rate, over the active span.
+      - Cross-checks with server-side counts or checks the exit code behaviour.
+    hints:
+      - Which numbers can you predict exactly before the run?
+    solution: |
+      Ratio offline, smoke run, logins = users, rate ≈ users × 2, server counts agree, exit code on failure - each
+      with its evidence.
+
+  - id: lcfund-interview-explain
+    type: interview
+    concept: perf-locust-locustfile
+    skill: analysis
+    title: "Interview: walk me through a locustfile you wrote"
+    prompt: |
+      "You list Locust on your CV. Walk me through a locustfile for an API you tested and how you ran it."
+    modelAnswer: |
+      For a payments API I wrote one HttpUser per kind of user - here, a merchant. In `on_start` it gets an OAuth
+      token once and puts it on `self.client.headers`, so every request carries it, like a real session. The tasks
+      come from the workload model: listing payments with weight 3 and opening one with weight 1, and I named the
+      dynamic URL `/v1/payments/[id]` so the statistics have one row per transaction. The requirement was a request
+      rate, so I used `constant_throughput` and sized users with Little's law; for user-behaviour tests I'd use
+      `between` for think time.
+
+      Before the real run I checked the mix with `--show-task-ratio` and smoke-ran two users to check failures and
+      names. The real run was headless: `-u`, `-r` and `-t`, with `--csv` for the record and `--json-file` for the
+      pipeline, which read the final totals and failed the stage on the failure ratio and the p95. Locust also
+      exits 1 on any failed request, which we kept for the smoke stage.
+
+      Then I checked the load before the results: logins equal to users, the mix close to the weights, the achieved
+      rate close to users times the task rate - because pacing can't push past a slow server - and the server's
+      own counts agreeing.
+    rubric:
+      - Describes the User class, on_start login and weighted tasks clearly.
+      - Mentions request naming for dynamic URLs.
+      - Chooses a wait_time function for a stated reason (think time or rate).
+      - Describes a headless run with -u, -r, -t and machine-readable output.
+      - Verifies the delivered load (logins, mix, rate) before judging response times.
+    followUps:
+      - How would you fail the CI job if p95 goes over 800 ms?
+      - Why might Locust's p95 differ from your APM's p95 for the same run?
+      - What changes when one process can't generate enough load?
+    hints:
+      - Structure - the user, the run, the evidence.
+    solution: |
+      User class (login, weighted named tasks, wait time) → headless run with outputs → proof the load was right →
+      then the results.
+
+  - id: lcfund-locustfile-code
+    type: coding
+    concept: perf-locust-locustfile
+    skill: application
+    title: Your first SandPay locustfile
+    prompt: |
+      Complete `exercises/locust/lc_fund_locustfile.py`: a `MerchantUser` with a default host, a once-per-user login
+      in `on_start`, `list_payments` (weight 3, named `/v1/payments`) and `view_payment` (weight 1, a random id from
+      `pay_100001` .. `pay_100250`, named `/v1/payments/[id]`), at most 2 task runs per second per user. The tests
+      read `--show-task-ratio-json`, then run 4 users for 4 s against the practice API and check the names, the
+      login count, failures and the paced rate.
+    project: perf
+    files:
+      - exercises/locust/lc_fund_locustfile.py
+    test: tests/locust/test_lc_fund_locustfile.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_fund_locustfile.py
+    hints:
+      - The token goes on self.client.headers["Authorization"] as "Bearer <token>".
+      - constant_throughput takes task runs per second per user.
+      - Use name= on both GET requests.
+    modelAnswer: |
+      ```python
+      class MerchantUser(HttpUser):
+          host = "http://127.0.0.1:8090"
+          wait_time = constant_throughput(2)
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task(3)
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=10", name="/v1/payments")
+
+          @task(1)
+          def view_payment(self):
+              payment_id = f"pay_{random.randint(100001, 100250)}"
+              self.client.get(f"/v1/payments/{payment_id}", name="/v1/payments/[id]")
+      ```
+    rubric:
+      - Every test in tests/locust/test_lc_fund_locustfile.py passes.
+      - The login happens in on_start, not in a task.
+      - Both GET requests have fixed names.
+      - The wait time is constant_throughput(2), not a hand-tuned constant.
+    solution: |
+      on_start for the login, @task(3) and @task(1) with names, constant_throughput(2) - see the code section.
+
+  - id: lcfund-stats-code
+    type: coding
+    concept: perf-locust-headless
+    skill: application
+    title: Read Locust's JSON statistics and judge a run
+    prompt: |
+      In `exercises/locust/lc_fund_stats.py`, implement `entry_key`, `load_stats`, `percentile` (Locust's own
+      algorithm), `aggregate`, `summarise` and `ci_verdict` (the docs' three CI thresholds, reporting every broken
+      one). The tests use the real run from the worked example - your numbers must match Locust's - and a fresh 2 s
+      run with 30 % injected errors, cross-checked against the practice API's own counters.
+    project: perf
+    files:
+      - exercises/locust/lc_fund_stats.py
+    test: tests/locust/test_lc_fund_stats.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_fund_stats.py
+    hints:
+      - JSON object keys are strings - convert histogram keys with int() before sorting.
+      - Walk the buckets from the slowest; stop when num_requests - counted <= int(num_requests * percent).
+      - The average divides by num_requests - num_none_requests.
+    modelAnswer: |
+      ```python
+      def percentile(response_times, num_requests, percent):
+          if not 0.0 <= percent <= 1.0:
+              raise ValueError("percent must be between 0.0 and 1.0")
+          allowed_below = int(num_requests * percent)
+          processed = 0
+          for rt in sorted((int(k) for k in response_times), reverse=True):
+              processed += response_times[str(rt)] if str(rt) in response_times else response_times[rt]
+              if num_requests - processed <= allowed_below:
+                  return rt
+          return 0
+      ```
+
+      `aggregate` sums the counters and merges the histograms; `summarise` divides by the active span for `rps`;
+      `ci_verdict` returns one message per broken threshold.
+    rubric:
+      - Every test in tests/locust/test_lc_fund_stats.py passes.
+      - The percentile matches Locust's, including the boundary case.
+      - Rates use the active span, not the nominal run time.
+      - The verdict lists every broken threshold, not just the first.
+    solution: |
+      Recompute from the raw counters: histogram walk for percentiles, sums for the aggregate, active span for rps.
+
+  - id: lcfund-cli-code
+    type: coding
+    concept: perf-locust-headless
+    skill: application
+    title: Build headless runs from code
+    prompt: |
+      In `exercises/locust/lc_fund_cli.py`, implement `parse_run_time` (Locust's time span format),
+      `headless_command` (the argv for a run that stops by itself and writes CSV and JSON) and `locust_env`
+      (LOCUST_* variables). The tests run real Locust twice with what you build - once with a failing script that
+      must exit 1, once configured only through environment variables with `--exit-code-on-error 0`.
+    project: perf
+    files:
+      - exercises/locust/lc_fund_cli.py
+    test: tests/locust/test_lc_fund_cli.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_fund_cli.py
+    hints:
+      - Use re.fullmatch with optional hours, minutes and seconds groups; a bare number is seconds.
+      - Every argv item must be a str.
+      - LOCUST_ + the long option name, upper case, dashes as underscores.
+    modelAnswer: |
+      ```python
+      _TIMESPAN = re.compile(r"((?P<hours>\d+?)h)?((?P<minutes>\d+?)m)?((?P<seconds>\d+?)s)?")
+
+      def parse_run_time(text):
+          if not text:
+              raise ValueError("empty run time")
+          if re.fullmatch(r"\d+", text):
+              return int(text)
+          match = _TIMESPAN.fullmatch(text)
+          if not match or not any(match.groupdict().values()):
+              raise ValueError(f"invalid run time {text!r}")
+          parts = {k: int(v) for k, v in match.groupdict().items() if v}
+          return parts.get("hours", 0) * 3600 + parts.get("minutes", 0) * 60 + parts.get("seconds", 0)
+      ```
+
+      `headless_command` refuses zero users, a zero spawn rate and a zero run time - a headless run without a time
+      limit never ends in CI.
+    rubric:
+      - Every test in tests/locust/test_lc_fund_cli.py passes.
+      - The run time parser accepts the documented formats and rejects the rest.
+      - The command always includes -t, --csv and --json-file.
+      - Can explain why the environment-configured run exits 0 although every request fails.
+    solution: |
+      A Locust-compatible time span parser, an argv that always stops and leaves files, and LOCUST_* names from
+      the long options.
+
+placement:
+  - id: lcfund-place-login
+    type: mcq
+    concept: perf-locust-locustfile
+    skill: application
+    title: Where does the login go?
+    prompt: Each simulated SandPay merchant should get a token once and use it for all its requests. Where do you put the token request?
+    options:
+      - id: on-start
+        text: In on_start, storing the token on self.client.headers
+        feedback: Correct - on_start runs once per user before its tasks.
+      - id: task
+        text: In a @task with a high weight
+        feedback: Then it is part of the random mix and runs again and again.
+      - id: module
+        text: At module level, shared by all users
+        feedback: One shared token makes every user the same session - not realistic, and it may hit per-client limits.
+      - id: each
+        text: Before every request inside each task
+        feedback: That doubles the requests and measures login cost everywhere.
+    correct: [on-start]
+    hints:
+      - Which method runs once per user?
+    solution: |
+      `on_start`. The statistics then show exactly one login per user.
+
+  - id: lcfund-place-wait
+    type: mcq
+    concept: perf-locust-wait-time
+    skill: application
+    title: A rate per user
+    prompt: Each user should run its task at most 4 times per second, whatever the response time (as long as the server keeps up). Which wait_time?
+    options:
+      - id: throughput
+        text: constant_throughput(4)
+        feedback: Correct - at most 4 task runs per second per user.
+      - id: constant
+        text: constant(0.25)
+        feedback: That waits 0.25 s after each task, so the rate falls as response times grow.
+      - id: pacing
+        text: constant_pacing(4)
+        feedback: That is one task every 4 seconds - the inverse.
+      - id: between
+        text: between(0, 0.5)
+        feedback: An average wait of 0.25 s plus the task time - below 4 per second, and variable.
+    correct: [throughput]
+    hints:
+      - constant_pacing and constant_throughput are inverses.
+    solution: |
+      `constant_throughput(4)`, equivalently `constant_pacing(0.25)`.
+
+  - id: lcfund-place-run
+    type: mcq
+    concept: perf-locust-headless
+    skill: analysis
+    title: The job that never finished
+    prompt: A CI job runs `locust -f load.py --headless -u 50 -r 10 --host https://staging.sandpay.example` and hangs until the CI timeout kills it. What is missing?
+    options:
+      - id: run-time
+        text: -t / --run-time - without it a headless run continues until interrupted
+        feedback: Correct - Locust logs "No run time limit set, use CTRL+C to interrupt."
+      - id: users
+        text: -u must be at least 100 in headless mode
+        feedback: Any positive user count works.
+      - id: csv
+        text: --csv - without an output file Locust waits for someone to read the web UI
+        feedback: The web UI is off with --headless; output files are optional.
+      - id: exit
+        text: --exit-code-on-error
+        feedback: That changes the exit code, not when the run ends.
+    correct: [run-time]
+    hints:
+      - Which option makes a run end by itself?
+    solution: |
+      Add `-t` (for example `-t 5m`). Run time counts from the start, including ramp-up.
+
+recall:
+  - id: lcfund-recall-file
+    concept: perf-locust-locustfile
+    prompt: What does a minimal HTTP locustfile contain?
+    answer: A class inheriting from HttpUser with at least one @task method that uses self.client; usually also a wait_time, an on_start login and a host.
+  - id: lcfund-recall-weights
+    concept: perf-locust-locustfile
+    prompt: How does Locust choose the next task?
+    answer: At random, in proportion to the @task weights; then the user waits its wait_time and picks again.
+  - id: lcfund-recall-default-wait
+    concept: perf-locust-wait-time
+    prompt: What is the default wait_time, and what does that mean?
+    answer: constant(0) - the next task starts as soon as the previous one finishes, so users run as fast as the server answers.
+  - id: lcfund-recall-per-task
+    concept: perf-locust-wait-time
+    prompt: constant_throughput(2) with three requests per task - requests per second per user?
+    answer: 6 - wait times apply to tasks, not requests.
+  - id: lcfund-recall-headless
+    concept: perf-locust-headless
+    prompt: Which three options set the load of a headless run, and what does the third count from?
+    answer: -u users, -r spawn rate, -t run time; run time counts from the start of the test, including ramp-up.
+  - id: lcfund-recall-outputs
+    concept: perf-locust-headless
+    prompt: --csv or --json-file for final totals, and why?
+    answer: --json-file - written once at shutdown from the final counters; the CSV is refreshed periodically and can lag. (--json-file replaces the printed summary.)
+  - id: lcfund-recall-exit
+    concept: perf-locust-headless
+    prompt: When does a Locust run exit with code 1?
+    answer: By default whenever any request failed; --exit-code-on-error N changes that code, and a quitting hook can set process_exit_code.
+
+next:
+  - locust-http-validation-and-grouping
+  - locust-task-sets-and-user-flows
+  - locust-load-shapes
+  - locust-distributed-and-ci

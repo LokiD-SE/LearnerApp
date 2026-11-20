@@ -1,0 +1,1358 @@
+id: jmeter-html-dashboard-and-ci
+title: The JMeter HTML dashboard and CI runs
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 130
+summary: Turn a JTL into JMeter's HTML dashboard with -e -o or -g, configure it with -J properties (Apdex thresholds, percentiles, filters, title) and read its numbers from statistics.json and the dashboard tables. Then put JMeter in a pipeline - knowing that a CLI run exits 0 however many samples failed, so the pass/fail decision is a gate you write over the report, with an exit code for "could not judge" and the report kept as an artifact. Every run shown is real JMeter 5.6.3 against a local SandPay practice API with deterministic failures.
+tags:
+  [
+    JMeter,
+    HTML dashboard,
+    report generator,
+    statistics.json,
+    dashboard.js,
+    Apdex,
+    percentiles,
+    reportgenerator.properties,
+    sample_filter,
+    series_filter,
+    aggregate_rpt_pct1,
+    CLI mode,
+    exit code,
+    quality gate,
+    CI,
+    GitHub Actions,
+    artifacts,
+    SLO,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Apache JMeter 5.6.3 (`practice/perf/tools/apache-jmeter-5.6.3`, fetched by `scripts/get-jmeter.sh`)
+    on OpenJDK 17 in CLI mode; Python 3.12.3 and pytest in `practice/perf/.venv` for the exercises and the gate.
+    Every JMeter run and every gate output in this lesson was produced on Linux on 20 November 2026.
+  - **Target:** `practice/perf/support/jm_assert_fixture.py` (from
+    [Assertions, listeners and results files](#/lesson/jmeter-assertions-and-listeners)) and its reference plan
+    `solutions/jmeter/jm_assert_plan.jmx`, run with 2 threads x 10 loops and `report_ms=1000`. Its failures come
+    from a request counter, so every run has exactly 62 samples and 11 failures: 5 soft errors on
+    `GET /v1/payments`, 4 x `500` and 2 declined payments on `POST /v1/payments`. The settlement report takes
+    about 150 ms. **Timings and throughput depend on the machine**; the counts do not.
+  - **Output edits:** JMeter's console start and end lines contain a 13-digit epoch-millisecond timestamp, shown as
+    `(epoch ms elided)`. The `WARN StatusConsoleListener` plugin-scanning lines JMeter 5.6.3 prints at start-up are
+    left out. Floats from `statistics.json` and `dashboard.js` are rounded to two decimals where marked; the
+    gate prints its own two decimals.
+  - **Synthetic data:** SandPay is a fictional payments company; its merchants, tokens and payments are invented.
+  - **Sources, as documented on 20 November 2026:** Apache JMeter User Manual -
+    [Generating Report Dashboard](https://jmeter.apache.org/usermanual/generating-dashboard.html) (14.1 Overview,
+    14.2 Configuring Dashboard Generation, 14.2.4.4 Filtering mechanisms, 14.3 Generating reports),
+    [Getting Started](https://jmeter.apache.org/usermanual/get-started.html) (1.4.4 CLI Mode, 1.4.6 Overview of
+    the command-line options, 1.4.9 CLI mode shutdown, the `HEAP` environment variable) and
+    [Best Practices](https://jmeter.apache.org/usermanual/best-practices.html) (16.7 Reducing resource
+    requirements, 16.11 Parameterising tests). Quotations are from those pages.
+  - **JMeter source, tag `rel/v5.6.3` on github.com/apache/jmeter** (read for what the manual does not say):
+    [`bin/reportgenerator.properties`](https://github.com/apache/jmeter/blob/rel/v5.6.3/bin/reportgenerator.properties),
+    `ReportGenerator.java` (`createNameFilter`: a sample is kept when the `sample_filter` pattern
+    `matcher(name).matches()` - the **whole** name) and `ErrorsSummaryConsumer.java` (`getErrorKey`: the error type
+    is `code/message`, and the assertion's failure message is used only when the code is a success code or empty).
+    The installed `bin/jmeter.properties` was read for `aggregate_rpt_pct1..3`.
+  - **Measured here, not documented:** the exit code of `jmeter -n` with failed samples (0), of `-g` into a non-empty
+    folder or from a missing file (1), the effect of a prefixed `aggregate_rpt_pct1` (ignored) and of a
+    `sample_filter` that matches nothing (generation fails).
+  - **GitHub Actions** (the CI example; **from the docs, not run here**):
+    [Expressions - status check functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions)
+    (`always()`: "Causes the step to always execute, and returns true, even when canceled") and
+    [Store and share data with workflow artifacts](https://docs.github.com/en/actions/tutorials/store-and-share-data)
+    (`actions/upload-artifact@v4`, the major version those docs and this repository use).
+  - **Not repeated here:** how percentiles and Apdex are calculated -
+    [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles); how to write SLOs -
+    [Performance requirements and SLOs](#/lesson/performance-requirements-and-slos).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - jmeter-assertions-and-listeners
+  - performance-metrics-and-percentiles
+  - performance-requirements-and-slos
+
+concepts:
+  - id: perf-jmdash-generate
+    name: Generating the dashboard
+    summary: JMeter builds an HTML dashboard from a CSV JTL either right after a CLI run (-e -o folder) or later from a results file (-g file -o folder). The output folder "must not exist or be empty"; -f deletes an existing one first. The report is configured with JMeter properties - most with the jmeter.reportgenerator. prefix (Apdex thresholds, apdex_per_transaction, report_title, sample_filter, overall_granularity) but the three percentiles are aggregate_rpt_pct1..3 with no prefix - passed with -J so a pipeline needs no edited properties file. The folder holds index.html, content/ (pages and dashboard.js) and statistics.json.
+  - id: perf-jmdash-read
+    name: Reading the dashboard's numbers
+    summary: statistics.json has one object per label plus Total - sampleCount, errorCount, errorPct, mean, median, min, max, pct1ResTime..pct3ResTime, throughput and KB/s. The percentile keys are positional - pct1 is whatever aggregate_rpt_pct1 was. Apdex, the Errors table and Top 5 Errors are not in statistics.json but in content/js/dashboard.js. The Errors table names a failure by its response code and message when the code is not a success code, so a 500 shows as 500/Internal Server Error even with a custom assertion message. sample_filter is a whole-name regex applied before the calculations (it changes Total); series_filter only hides series and rows afterwards.
+  - id: perf-jmdash-ci
+    name: JMeter in a pipeline
+    summary: A CLI run that completes exits 0 however many samples failed (this lesson's run - 17.74 % errors, exit code 0), so a pipeline needs a gate that reads the report and compares it with the SLOs. A good gate prints one line per check, exits 1 when a check fails and a distinct code (2 here) when it cannot judge - missing file, unknown label, a percentile the report does not have, too few samples. The plan takes its load from -J properties (__P), the job pins the JMeter version, keeps the JTL, log and dashboard as artifacts even when the gate fails, and runs against an environment it is allowed to load.
+
+objectives:
+  - Generate the HTML dashboard after a run (-e -o) and from an existing JTL (-g -o), and explain the empty-folder rule and -f.
+  - Configure Apdex thresholds (overall and per transaction), percentiles, title and sample filter with -J properties, avoiding the two silent traps (prefixed percentile properties, partial-match filters).
+  - Read statistics.json and the dashboard.js tables correctly, mapping positional percentile keys to the percentiles the report was generated with.
+  - Explain why JMeter's exit code cannot be the pass/fail signal of a load test, and write a gate with distinct exit codes for pass, fail and cannot judge.
+  - Design a CI job that runs JMeter, gates the result and keeps the evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmdash-generate, perf-jmdash-ci]
+    title: The idea in plain language
+    body: |
+      A load test produces a results file - for JMeter, a JTL with one line per request. Thousands of lines are
+      evidence, not an answer. Two different readers need two different summaries of them:
+
+      - **People** want a report they can open: tables per request type, percentiles, error types, graphs over
+        time. JMeter's **HTML dashboard** is that report, and JMeter can write it at the end of every run.
+      - **The pipeline** wants a single decision: may this build go on? Here is the surprise. JMeter in CLI mode
+        answers "the test ran", not "the test passed". In this lesson's run, 11 of 62 requests failed, and the
+        shell still saw exit code **0**.
+
+      So the job of a CI performance step is: run the test, build the report, and let a small **gate** - code you
+      own - read the report's numbers, compare them with the agreed limits (SLOs) and set the exit code. Then keep
+      the report whatever the verdict, because a red build with no evidence helps nobody.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmdash-generate, perf-jmdash-read, perf-jmdash-ci]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Dashboard (HTML report)** | "dashboard report generation to get graphs and statistics from a test plan" - a static folder of HTML, JS and JSON built from a CSV JTL (manual 14) |
+      | **`-e -o <folder>`** | "generate report dashboard after load test", into the output folder |
+      | **`-g <file> -o <folder>`** | "generate report dashboard only, from a test results file" - no test runs |
+      | **`-f`** | "force delete existing results files and web report folder if present before starting the test" |
+      | **Report generator properties** | settings in `reportgenerator.properties`, overridden in `user.properties` or with `-J`; most start with `jmeter.reportgenerator.` |
+      | **Apdex thresholds** | `apdex_satisfied_threshold` (T, default 500 ms) and `apdex_tolerated_threshold` (F, default 1500 ms); `apdex_per_transaction` sets them per sample name or regex |
+      | **`aggregate_rpt_pct1..3`** | the three percentiles of the Statistics table, defaults 90, 95, 99 - **no** `jmeter.reportgenerator.` prefix |
+      | **`sample_filter`** | regex of sample names to keep "for generating graphs and statistics" - before any calculation |
+      | **`series_filter`** | regex of series (graph lines, table rows) to show - after the calculations |
+      | **`statistics.json`** | the Statistics table as JSON: one object per label plus `Total` |
+      | **`dashboard.js`** | `content/js/dashboard.js`: the Apdex, Requests Summary, Statistics, Errors and Top 5 Errors tables as JSON literals |
+      | **Exit code** | the number a process returns to the shell (`$?`); CI fails a step when it is not 0 |
+      | **Quality gate** | a step that compares measured results with limits and fails the job when they are broken |
+      | **Artifact** | a file a CI job keeps after it ends (here the JTL, the log and the dashboard) |
+
+  - id: why
+    kind: why
+    concepts: [perf-jmdash-generate, perf-jmdash-read, perf-jmdash-ci]
+    title: Why it matters
+    body: |
+      - **The dashboard is the shared language of a JMeter test.** It is what developers, managers and other
+        testers open; knowing exactly what each number means (which percentile, which samples, which errors) is
+        what lets you defend a conclusion in a review.
+      - **Reports can lie quietly.** Two settings in this lesson fail without an error: a percentile property with
+        the wrong prefix is ignored (you think you see the median; it is the 90th percentile), and positional keys
+        in `statistics.json` mean a script reading `pct1ResTime` reads whichever percentile was configured.
+      - **"JMeter passed" is not a verdict.** The manual describes CLI mode shutdown: JMeter "no longer invokes
+        System.exit() for a normal test completion". A completed run is a normal completion, whatever its error
+        rate. A pipeline that trusts the exit code ships regressions.
+      - **Performance regressions are cheaper to catch per change.** A short, gated load test in CI tells you
+        which commit made `POST /v1/payments` slower; a big test before release only tells you something did. The
+        full story is in [Performance testing in CI/CD](#/lesson/performance-testing-in-ci-cd); this lesson gives
+        you the JMeter pieces.
+      - **Interviews ask it.** "How do you integrate JMeter with Jenkins / GitHub Actions?" and "How do you fail a
+        build on response time?" are common questions; the expected answer is a gate, not "JMeter fails the build".
+
+  - id: internals-generate
+    kind: internals
+    concepts: [perf-jmdash-generate]
+    title: How the report is generated
+    body: |
+      The generator reads the CSV JTL sample by sample, passes each through filters (date range, then the
+      `sample_filter` name filter) into "consumers" that compute the tables and graphs, and then an exporter writes
+      the HTML. Three practical consequences:
+
+      1. **It needs a CSV JTL with the default columns.** The manual (14.2.1.2) lists the save-service settings it
+         needs - `time`, `label`, `response_code`, `response_message`, `successful`, `thread_counts`, `latency`,
+         `connect_time`, `assertion_results_failure_message`, `bytes` and a timestamp format that "must include the
+         time and should include the date". If you trimmed columns in
+         [Assertions, listeners and results files](#/lesson/jmeter-assertions-and-listeners), check them before a
+         run you want a dashboard for.
+      2. **The output folder must be new or empty.** Getting Started: "Folder must not exist or be empty". With
+         `-f` JMeter deletes it first; in CI a fresh folder per run is simpler.
+      3. **Everything is a property.** The manual: "To customize these properties, you should copy them in
+         user.properties file and modify them." A pipeline usually passes them with `-J` instead, so the settings
+         live in the job definition next to the run.
+
+      The properties you will use most:
+
+      | Property | Default | Notes |
+      | --- | --- | --- |
+      | `jmeter.reportgenerator.apdex_satisfied_threshold` | 500 | T, ms |
+      | `jmeter.reportgenerator.apdex_tolerated_threshold` | 1500 | F, ms |
+      | `jmeter.reportgenerator.apdex_per_transaction` | - | `name:T\|F;` per sample name or regex |
+      | `aggregate_rpt_pct1` / `2` / `3` | 90 / 95 / 99 | in `jmeter.properties`, **no prefix** |
+      | `jmeter.reportgenerator.report_title` | "Apache JMeter Dashboard" | page title |
+      | `jmeter.reportgenerator.sample_filter` | "" (off) | regex, whole sample name, before calculations |
+      | `jmeter.reportgenerator.overall_granularity` | 60000 | ms per point in over-time graphs; "must be higher than 1 second (1000)" |
+      | `jmeter.reportgenerator.exporter.html.series_filter` | "" (off) | regex, should end with `(-success\|-failure)?$`; after calculations |
+
+      The manual lists `aggregate_rpt_pct1..3` in the "General settings" section, right after the sentence "All
+      properties must be prefixed with jmeter.reportgenerator." - but in 5.6.3 they live, unprefixed, in
+      `bin/jmeter.properties`, and the prefixed form is ignored without a warning. The run in the next section
+      shows it.
+
+      One more caveat from the manual: the dashboard's percentiles "might differ from those from the Aggregate
+      Report in the GUI" because they use a different estimator (`backend_metrics_percentile_estimator`, LEGACY by
+      default). Why, and by how much, is worked through in
+      [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles).
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmdash-generate, perf-jmdash-ci]
+    title: From test plan to build verdict
+    body: |
+      ```mermaid
+      flowchart LR
+        P["Test plan (.jmx) with __P properties"] -- "jmeter -n -t -l -e -o" --> J["results.jtl"]
+        J --> D["report folder"]
+        D --> S["statistics.json"]
+        D --> H["index.html and dashboard.js"]
+        S --> G{"Gate: SLO checks"}
+        G -- "all pass" --> OK["exit 0 - build continues"]
+        G -- "a check fails" --> F["exit 1 - build fails"]
+        G -- "cannot judge" --> E["exit 2 - build fails, fix the setup"]
+        J --> A["Artifacts: JTL, log, report"]
+        H --> A
+      ```
+
+      JMeter's own exit code only says whether the run happened. The verdict arrow starts at `statistics.json`, and
+      the artifacts are kept on every path.
+
+  - id: code-run
+    kind: code
+    concepts: [perf-jmdash-generate, perf-jmdash-ci]
+    title: A real run with the dashboard, and its exit code
+    body: |
+      The reference plan from the assertions lesson, against the deterministic practice API, with the dashboard
+      generated at the end (`$PORT` is the fixture's port):
+
+      ```bash
+      jmeter -n -t solutions/jmeter/jm_assert_plan.jmx -Jport=$PORT -Jreport_ms=1000 \
+        -l run.jtl -e -o report > console.txt 2>&1
+      echo "exit=$?"
+      ```
+
+      ```plaintext
+      exit=0
+      Creating summariser <summary>
+      Created the tree successfully using .../practice/perf/solutions/jmeter/jm_assert_plan.jmx
+      Starting standalone test @ 2026 Nov 20 21:25:06 IST (epoch ms elided)
+      Waiting for possible Shutdown/StopTestNow/HeapDump/ThreadDump message on port 4445
+      summary =     62 in 00:00:02 =   35.4/s Avg:    50 Min:     0 Max:   152 Err:    11 (17.74%)
+      Tidying up ...    @ 2026 Nov 20 21:25:08 IST (epoch ms elided)
+      ... end of run
+      ```
+
+      **17.74 % errors, exit code 0.** The folder `report/` now holds `index.html`, `content/` (the `css`, `js`
+      and `pages` folders), `sbadmin2-1.0.7/` and `statistics.json` - about 3.3 MB, almost all of it static
+      JavaScript and CSS.
+
+      `report/statistics.json` for two of the five entries (floats rounded to two decimals for display):
+
+      ```json
+      {
+        "GET /v1/payments" : {
+          "transaction" : "GET /v1/payments",
+          "sampleCount" : 20,
+          "errorCount" : 5,
+          "errorPct" : 25.0,
+          "meanResTime" : 1.35,
+          "medianResTime" : 1.0,
+          "minResTime" : 1.0,
+          "maxResTime" : 2.0,
+          "pct1ResTime" : 2.0,
+          "pct2ResTime" : 2.0,
+          "pct3ResTime" : 2.0,
+          "throughput" : 14.15,
+          "receivedKBytesPerSec" : 2.84,
+          "sentKBytesPerSec" : 2.9
+        },
+        "Total" : {
+          "transaction" : "Total",
+          "sampleCount" : 62,
+          "errorCount" : 11,
+          "errorPct" : 17.74,
+          "meanResTime" : 50.97,
+          "medianResTime" : 2.0,
+          "minResTime" : 0.0,
+          "maxResTime" : 152.0,
+          "pct1ResTime" : 152.0,
+          "pct2ResTime" : 152.0,
+          "pct3ResTime" : 152.0,
+          "throughput" : 37.85,
+          "receivedKBytesPerSec" : 7.49,
+          "sentKBytesPerSec" : 8.48
+        }
+      }
+      ```
+
+      The other entries are `POST /v1/payments` (20 samples, 6 errors, 30.0 %), `POST /auth/token` (2, 0) and
+      `GET /v1/reports/settlement` (20, 0, every sample 151-152 ms). Notice `Total`'s 90th percentile: **152 ms**,
+      although 42 of 62 samples took 2 ms or less. A third of the samples are the slow report, so the overall tail
+      *is* the report - read percentiles per label.
+
+      The Apdex and Errors tables come from `content/js/dashboard.js` (Apdex rounded to two decimals):
+
+      ```plaintext
+      apdexTable  Total 0.82 (T 500, F 1500)
+                  GET /v1/payments 0.75 | POST /v1/payments 0.7 | POST /auth/token 1.0 | GET /v1/reports/settlement 1.0
+      errorsTable 500/Internal Server Error                                                         4
+                  No results for path: $['data']                                                    5
+                  Value in json path '$.status' expected to be 'captured', but found 'declined'    2
+      ```
+
+      With the default T = 500 ms every sample here is fast enough, so each label's Apdex is just its success
+      rate (15 of 20 = 0.75; 14 of 20 = 0.7; 51 of 62 = 0.82): failed samples are never satisfied or tolerating.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmdash-generate, perf-jmdash-read]
+    title: The details that matter
+    body: |
+      - `-l run.jtl -e -o report` - the dashboard is generated from the JTL just written, after the test ends. It
+        costs nothing during the test, unlike a GUI listener.
+      - `> console.txt 2>&1` then `echo "exit=$?"` - `$?` is JMeter's exit code, not a pipe's. (`jmeter ... | grep
+        ...` would give you `grep`'s exit code - a classic way to "prove" the wrong thing.)
+      - `Err: 11 (17.74%)` - the summariser line agrees with `statistics.json`; both count assertion failures and
+        `500`s alike.
+      - `"pct1ResTime"` - the key does not say which percentile it is. Here it is the 90th because nothing changed
+        `aggregate_rpt_pct1`; the HTML column header says "90th pct", the JSON does not.
+      - `"throughput" : 14.15` - samples per second over that label's own span, not over the whole test.
+      - `500/Internal Server Error` with 4 errors - those samples also failed the plan's Response Assertion with the
+        custom message `payment not created: expected HTTP 201`, yet the Errors table names them by status code.
+        `ErrorsSummaryConsumer.getErrorKey` (5.6.3) builds `code/message` and uses the assertion message only when
+        the code is a success code (or empty). For the soft errors (code 200) the assertion message is the key.
+
+  - id: internals-read
+    kind: internals
+    concepts: [perf-jmdash-read]
+    title: Where each number lives, and which samples it counts
+    body: |
+      | You want | Read it from | Watch out |
+      | --- | --- | --- |
+      | samples, errors, error %, mean, median, min, max, throughput per label | `statistics.json` | `Total` is over every sample kept by `sample_filter` |
+      | percentiles | `statistics.json` `pct1ResTime`..`pct3ResTime` | positional - know `aggregate_rpt_pct1..3` |
+      | Apdex per label | `dashboard.js` `apdexTable` (or the HTML) | T and F are in each row; failed samples count as frustrated |
+      | error types | `dashboard.js` `errorsTable` | non-2xx codes are keyed by `code/message`, not by assertion message |
+      | errors per sampler | `dashboard.js` `top5ErrorsBySamplerTable` | "excluding Transaction Controller by default" |
+      | anything over time | the "Charts" pages | one point per `overall_granularity` (default one minute) |
+
+      `dashboard.js` is JavaScript, but each table is passed as a JSON literal:
+      `createTable($("#apdexTable"), {"supportsControllersDiscrimination": true, "overall": {"data": [0.82..., 500,
+      1500, "Total"], ...}, "items": [...]}, function(index, item){ ...`. Python's
+      `json.JSONDecoder().raw_decode(text, start)` parses one JSON value starting at an index and ignores the rest,
+      which is exactly what you need (exercise 2). It is an internal file, not an API - pin your JMeter version and
+      let a test tell you if a new version changes it.
+
+      **Two filters, two moments** (manual 14.2.4.4: unlike `sample_filter`, which "discards data before
+      calculations, here the filtering is performed after the calculations and serves to simplify the final
+      report"):
+
+      - `sample_filter` removes samples before anything is counted. With `(GET|POST) /v1/.*` the two token samples
+        disappear and `Total` becomes 60 samples, 11 errors.
+      - `series_filter` hides lines and rows after the counting; `Total` is unchanged.
+
+      **Transaction Controllers** add their own samples to the JTL. The manual notes, chart by chart, whether
+      "Transaction Controller Sample Results" are included, and recommends leaving "Generate parent sample"
+      unchecked. That is covered with the controllers themselves in
+      [Logic controllers and transactions](#/lesson/jmeter-logic-controllers).
+
+  - id: code-properties
+    kind: code
+    concepts: [perf-jmdash-generate, perf-jmdash-read]
+    title: Configuring the report - and two silent traps
+    body: |
+      Regenerating the dashboard from the same JTL with `-g` (no new test run). First, Apdex thresholds, a title,
+      and a percentile written **with** the report-generator prefix:
+
+      ```bash
+      jmeter -g run.jtl -o report2 \
+        -Jjmeter.reportgenerator.apdex_satisfied_threshold=100 \
+        -Jjmeter.reportgenerator.apdex_tolerated_threshold=400 \
+        -Jjmeter.reportgenerator.aggregate_rpt_pct1=50 \
+        -Jjmeter.reportgenerator.report_title="SandPay checkout"
+      ```
+
+      Exit code 0, `<title>SandPay checkout` in `index.html`, Apdex `Total` 0.66 with T = 100 and F = 400 (the
+      150 ms reports are now only "tolerating") - and the Statistics table headers are still **"90th pct", "95th
+      pct", "99th pct"**. The prefixed `aggregate_rpt_pct1` was ignored without a message. Without the prefix:
+
+      ```bash
+      jmeter -g run.jtl -o report4 -Jaggregate_rpt_pct1=50 \
+        "-Jjmeter.reportgenerator.sample_filter=^(GET|POST) /v1/payments$" \
+        "-Jjmeter.reportgenerator.apdex_per_transaction=GET /v1/payments:1|2;"
+      ```
+
+      ```plaintext
+      exit=0
+      statistics.json  {'GET /v1/payments': (20, 5, 2.0, 2.0), 'POST /v1/payments': (20, 6, 1.0, 1.0), 'Total': (40, 11, 1.0, 1.0)}
+                       (sampleCount, errorCount, medianResTime, pct1ResTime)
+      headers          "Median", "50th pct", "95th pct", "99th pct"
+      apdexTable       Total 0.725 (500, 1500) | GET /v1/payments 0.475 (1, 2) | POST /v1/payments 0.7 (500, 1500)
+      ```
+
+      Now `pct1ResTime` equals the median, the filter left only the two payment labels (so `Total` is 40 samples),
+      and `GET /v1/payments` has its own thresholds of 1 and 2 ms (absurdly low on purpose, so its Apdex moves).
+
+      **The second trap** - a filter that is a correct regex but does not match a whole name:
+
+      ```bash
+      jmeter -g run.jtl -o r "-Jjmeter.reportgenerator.sample_filter=^(GET|POST) /v1/"
+      ```
+
+      ```plaintext
+      An error occurred: Cannot invoke "org.apache.jmeter.report.processor.MapResultData.getResult(String)" because "resultData" is null
+      exit=1
+      ```
+
+      `ReportGenerator.createNameFilter` keeps a sample when `pattern.matcher(name).matches()` - the whole name, as
+      if the regex were wrapped in `^...$`. `^(GET|POST) /v1/` matches no complete name, every sample is filtered
+      out, and generation fails with an error that never mentions the filter. `(GET|POST) /v1/.*` works and keeps 60
+      samples.
+
+      And the empty-folder rule, measured:
+
+      ```plaintext
+      $ jmeter -g run.jtl -o report
+      An error occurred: Cannot write to '.../jm_dash_run/report' as folder is not empty
+      exit=1
+      $ jmeter -g run.jtl -o report -f
+      exit=0
+      $ jmeter -g nope.jtl -o report3
+      An error occurred: Cannot read test results file : nope.jtl
+      exit=1
+      ```
+
+  - id: when
+    kind: when
+    concepts: [perf-jmdash-generate, perf-jmdash-ci]
+    title: When to use what
+    body: |
+      | Situation | Use |
+      | --- | --- |
+      | every CLI run you will look at later | `-l run.jtl -e -o report-<run id>` |
+      | the run is over and you want other thresholds or percentiles | `-g run.jtl -o new-folder -J...` - no re-run |
+      | a long run, live view while it runs | the Backend Listener to InfluxDB/Graphite (assertions lesson); the dashboard comes after |
+      | a merged JTL from several load generators | `-g merged.jtl` - see [Distributed testing with JMeter](#/lesson/jmeter-distributed-testing) |
+      | pass/fail in a pipeline | a gate over `statistics.json` (and `dashboard.js` for Apdex) |
+      | comparing two builds | the same plan, load and properties; compare per-label numbers, not two screenshots |
+      | a report for people outside the team | the dashboard with a clear `report_title`, plus a short written conclusion |
+
+      **When not to gate on it:** runs of a few seconds (as in these exercises) prove the pipeline works, not the
+      system's capacity. Gate a short smoke load on every change, and a real load test on a schedule or before a
+      release, against an environment sized and reserved for it.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmdash-ci]
+    title: Putting JMeter in a pipeline, step by step
+    body: |
+      1. **Parameterise the plan.** Threads, ramp-up, duration, host and port as `${__P(name,default)}` - Best
+         Practices 16.11: "This uses the value of the property "loops", defaulting to 10 if the property is not
+         found." The job passes `-Jthreads=... -Jduration=...`.
+      2. **Pin the tools.** A fixed JMeter version (here 5.6.3, checksum-verified by `get-jmeter.sh`) and Java
+         version; plugins pinned too. Report formats and percentile estimators are version-specific.
+      3. **Run in CLI mode** with `-n -t plan.jmx -l run.jtl -j jmeter.log -e -o report`, a fresh output folder and
+         an explicit heap (the `HEAP` environment variable; Getting Started gives the default as `-Xms1g -Xmx1g`).
+      4. **Check that the run happened.** A non-zero exit, a missing JTL or an empty one is an infrastructure
+         failure: fail the job and say so.
+      5. **Gate.** Compare `statistics.json` with the SLO file: exit 0 pass, 1 SLO broken, 2 cannot judge.
+      6. **Keep the evidence** - the JTL, `jmeter.log`, the report and the gate's output - as artifacts, with a step
+         condition that runs even when the gate failed.
+      7. **Make the result visible** - the gate's PASS/FAIL lines in the job log, a link to the report artifact.
+
+  - id: example
+    kind: example
+    concepts: [perf-jmdash-ci]
+    title: 'Example: a GitHub Actions job (from the docs, not run here)'
+    body: |
+      A sketch of steps 3-6 as GitHub Actions steps. It was **not run here**; the `always()` condition and
+      `actions/upload-artifact@v4` are from the GitHub docs listed in the environment notes. JMeter and Python
+      setup steps are omitted.
+
+      ```yaml
+      - name: Load test (smoke)
+        run: |
+          jmeter -n -t perf/checkout.jmx -Jthreads=20 -Jduration=120 \
+            -l out/run.jtl -j out/jmeter.log -e -o out/report
+      - name: Gate on SLOs
+        run: python perf/gate.py out/report/statistics.json --slo perf/slo.json --percentiles 90,95,99 --min-samples 200
+      - name: Keep the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-report
+          path: out/
+      ```
+
+      Why each part is there: the first step fails only if JMeter could not run; the gate step is what turns an
+      SLO breach into a red build; `always()` keeps the report when the gate fails - exactly when you need it.
+      Without the condition the step gets the default: "A default status check of success() is applied unless you
+      include one of these functions" - so it is skipped after the gate fails. `--min-samples` stops a gate from
+      "passing" a run that hardly sent any traffic.
+
+      The gate in this lesson, on the real `statistics.json` of the run above, with the SLO
+      `{"Total": {"error_pct": 1.0, "p95_ms": 300}, "GET /v1/payments": {"p99_ms": 200}}`:
+
+      ```plaintext
+      $ python -m jmeter.jm_dash_gate report/statistics.json --slo slo.json
+      FAIL Total error_pct 17.74 (limit 1)
+      PASS Total p95_ms 152.00 (limit 300)
+      PASS GET /v1/payments p99_ms 2.00 (limit 200)
+      2 passed, 1 failed
+      exit=1
+      $ python -m jmeter.jm_dash_gate report/statistics.json --slo slo.json --percentiles 50,95,99 --min-samples 30
+      ERROR GET /v1/payments: 20 samples, the gate needs at least 30
+      exit=2
+      $ python -m jmeter.jm_dash_gate report/statistics.json --slo slo2.json     # {"Total": {"p75_ms": 100}}
+      ERROR p75_ms: the report has percentiles 90, 95, 99
+      exit=2
+      ```
+
+      Where JMeter said 0, the gate says 1 - and when it cannot judge it says 2 instead of guessing.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmdash-generate, perf-jmdash-read, perf-jmdash-ci]
+    title: Testing the reporting and the gate
+    body: |
+      A gate decides whether code ships, so it deserves tests of its own. The practice tests check:
+
+      | Check | How | Evidence |
+      | --- | --- | --- |
+      | properties are named exactly as JMeter reads them | unit test, plus a real `-g` run whose headers say "50th pct" | `dashboard.js` titles |
+      | the filter keeps whole names | real `-g` with `(GET\|POST) /v1/.*` gives 60 samples | `statistics.json` |
+      | per-transaction Apdex applies | the report label has T = 400, F = 1600 | `apdexTable` |
+      | a non-empty folder is refused before JMeter starts | unit test | `FileExistsError` |
+      | positional percentiles map to names | statistics generated with 50/95/99 | `p50_ms` present, `p90_ms` absent |
+      | the Errors table is read and ordered | real dashboard: 5, 4, 2 | `errorsTable` |
+      | the gate fails a broken SLO | real `statistics.json`: error % 17.74 > 1 | exit 1, `FAIL` line |
+      | the gate cannot be fooled | missing file, bad JSON, empty SLO, unknown label or percentile, too few samples | exit 2, `ERROR` on stderr |
+      | limits are inclusive | `actual == limit` passes | `Check.ok` |
+
+      The counts are exact on any machine because the practice API's failures come from a request counter; the
+      tests never check an absolute response time.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmdash-generate, perf-jmdash-read, perf-jmdash-ci]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | trusting JMeter's exit code | green build with 17.74 % errors | a gate over the report |
+      | `jmeter ... \| tee log` and then `$?` | the exit code of `tee` | redirect to a file, or `set -o pipefail` |
+      | `-Jjmeter.reportgenerator.aggregate_rpt_pct1=50` | headers still "90th pct"; "median" numbers are the 90th | `-Jaggregate_rpt_pct1=50` (no prefix) |
+      | reading `pct2ResTime` as "p95" without knowing the settings | wrong SLO comparisons after someone changes percentiles | pass the percentiles to the gate |
+      | `sample_filter=^POST` | generation fails with `"resultData" is null` | match the whole name: `POST .*` |
+      | `sample_filter` to tidy the report | `Total` changes - hides failures of the filtered samples | `series_filter` for display, `sample_filter` only to exclude by intent |
+      | reusing the output folder | "folder is not empty", exit 1 | a fresh folder per run, or `-f` |
+      | trimmed JTL columns | missing or empty tables | the defaults in manual 14.2.1.2 |
+      | reading `Total` percentiles | a "slow system" that is one slow endpoint | per-label percentiles |
+      | a gate that passes when it finds nothing | a renamed label silently skipped | unknown label = cannot judge (exit 2) |
+      | no artifact on failure | a red build nobody can explain | upload with `always()` |
+      | a few-second CI run judged against production SLOs | flaky builds | small smoke gates per change; real load tests on a schedule |
+
+      **Debugging method** when the dashboard and your expectations disagree:
+
+      1. Check the JTL: header row, columns, sample count (`wc -l`), and the labels you expect.
+      2. Regenerate with `-g` into a new folder with explicit `-J` settings - no need to re-run the test.
+      3. Check the Statistics table headers for the percentiles, and the Apdex rows for T and F.
+      4. Compare `Total` with and without `sample_filter`; read per-label rows.
+      5. Read `jmeter.log` (`-j`) for report-generator errors.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmdash-read, perf-jmdash-ci]
+    title: Trade-offs and alternatives
+    body: |
+      - **`-e -o` vs `-g` later.** `-e` gives a report with no extra step; `-g` lets you change thresholds,
+        percentiles and filters without another (expensive) run. Keep the JTL either way - it is the evidence; the
+        dashboard is a view of it.
+      - **Gate on `statistics.json` vs on the raw JTL.** `statistics.json` is quick and matches what people see in
+        the report, but has three fixed percentiles and no Apdex. Computing from the JTL (as in
+        [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles)) gives any percentile
+        and full control, at the cost of re-implementing JMeter's estimator if numbers must match the report.
+      - **Absolute SLOs vs regression against a baseline.** Absolute limits are simple and tie to the business;
+        comparing with the last good build catches gradual drift but needs stable environments and a noise
+        allowance. Many teams use both.
+      - **Error rate vs Apdex as the gate.** Apdex is one number but hides which requests suffered and depends on
+        T; error rate plus per-label percentiles are easier to act on.
+      - **Hosted CI runners vs dedicated load generators.** Hosted runners are convenient for smoke loads; their
+        CPU and network vary, so do not read capacity from them. A shared staging environment needs its owners'
+        agreement before every pipeline starts loading it.
+      - **Other tools.** Locust writes its own statistics (`--csv`, `--json-file`) and sets its process exit code
+        to 1 when any request failed (configurable); see
+        [Distributed runs and CI with Locust](#/lesson/locust-distributed-and-ci). Commercial and plugin dashboards
+        add trends across runs; the gate idea is the same.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmdash-generate, perf-jmdash-read, perf-jmdash-ci]
+    title: Quick reference
+    body: |
+      - Dashboard after a run: `jmeter -n -t plan.jmx -l run.jtl -e -o report`; later: `jmeter -g run.jtl -o
+        new-folder`. Output folder "must not exist or be empty"; `-f` deletes it first.
+      - Settings are properties, passed with `-J`: `jmeter.reportgenerator.apdex_satisfied_threshold` /
+        `apdex_tolerated_threshold` (500 / 1500), `apdex_per_transaction` (`name:T|F;`), `report_title`,
+        `sample_filter`; percentiles `aggregate_rpt_pct1..3` with **no** prefix.
+      - `sample_filter` matches the **whole** name and filters before counting (changes `Total`); a filter that
+        matches nothing breaks generation. `series_filter` only hides rows and lines.
+      - `statistics.json`: per label + `Total`; `pct1ResTime..pct3ResTime` are positional. Apdex and error tables
+        are in `content/js/dashboard.js`. Non-2xx errors are keyed `code/message`.
+      - `jmeter -n` exits 0 when the run completes, whatever the error rate. Gate it yourself: exit 0 pass, 1 SLO
+        broken, a distinct code for cannot judge; keep JTL, log and report as artifacts with `always()`.
+
+exercises:
+  - id: exit-code-mcq
+    type: mcq
+    concept: perf-jmdash-ci
+    skill: application
+    title: What does the pipeline see?
+    prompt: |
+      A CI step runs `jmeter -n -t checkout.jmx -l run.jtl -e -o report`. The summariser prints
+      `Err: 11 (17.74%)` and the report is written. What exit code does the step get, and what follows?
+    options:
+      - id: zero
+        text: 0 - the step passes, so the pipeline needs its own gate over the results
+        feedback: Correct - this lesson's run had 17.74 % errors and exit code 0. A completed run is a normal completion.
+      - id: one
+        text: 1 - JMeter fails when any sample fails
+        feedback: JMeter does not judge results. The measured exit code with 11 failed samples was 0.
+      - id: threshold
+        text: 1 if the error rate is above the Apdex threshold
+        feedback: Apdex thresholds are times used by the report, not exit conditions.
+      - id: depends-e
+        text: 0 without -e, 1 with -e because the report shows errors
+        feedback: Generating the report does not change the verdict; it fails only if generation itself fails.
+    correct: [zero]
+    hints:
+      - Since 2.5.1 JMeter does not call System.exit() for a normal test completion.
+    solution: |
+      Exit code 0 - "the test ran". Add a gate that reads `statistics.json` and returns non-zero when an SLO is
+      broken.
+
+  - id: empty-folder-mcq
+    type: mcq
+    concept: perf-jmdash-generate
+    skill: application
+    title: The second run fails
+    prompt: |
+      A nightly job always writes the dashboard to `out/report`. The first night works; the second night the job
+      prints `Cannot write to '.../out/report' as folder is not empty`. What is the right fix?
+    options:
+      - id: fresh
+        text: A fresh folder per run (for example out/report-<run id>), or -f to delete the old one first
+        feedback: Correct - the output folder "must not exist or be empty"; -f "force delete[s] existing results files and web report folder".
+      - id: append
+        text: Add -Jjmeter.reportgenerator.append=true
+        feedback: There is no such property; JMeter refuses a non-empty folder.
+      - id: ignore
+        text: Ignore it - the old report is still valid
+        feedback: The old report describes last night's run. And the exit code was 1, so the job is red for the wrong reason.
+      - id: xml
+        text: Switch the JTL to XML so the report overwrites itself
+        feedback: The dashboard reads CSV; the format does not change the folder rule.
+    correct: [fresh]
+    hints:
+      - Read the -o rule in Getting Started 1.4.4.
+    solution: |
+      Use a new folder each run or `-f`. A per-run folder also keeps old reports for comparison.
+
+  - id: prefix-mcq
+    type: mcq
+    concept: perf-jmdash-generate
+    skill: analysis
+    title: The median that is not a median
+    prompt: |
+      A colleague generates the report with `-Jjmeter.reportgenerator.aggregate_rpt_pct1=50` and reports "median
+      latency 152 ms" from the first percentile column. JMeter printed no warning. What happened?
+    options:
+      - id: ignored
+        text: The prefixed property was ignored; the column is still the 90th percentile
+        feedback: Correct - in 5.6.3 the percentile properties are aggregate_rpt_pct1..3 without a prefix; the headers still say "90th pct".
+      - id: applied
+        text: The property worked; 152 ms is the median
+        feedback: The real run shows headers "90th pct" with the prefixed property and "50th pct" without it.
+      - id: needs-file
+        text: Percentiles can only be set in user.properties, not with -J
+        feedback: -Jaggregate_rpt_pct1=50 works; it is the prefix that is wrong.
+      - id: rounding
+        text: The dashboard rounds the median up to the nearest bucket
+        feedback: Nothing is bucketed; the setting simply did not apply.
+    correct: [ignored]
+    hints:
+      - Look at the column header, not only the number.
+    solution: |
+      Use `-Jaggregate_rpt_pct1=50` (no prefix) and check the "50th pct" header before quoting numbers.
+
+  - id: positional-mcq
+    type: mcq
+    concept: perf-jmdash-read
+    skill: application
+    title: What is pct2ResTime?
+    prompt: The report was generated with `-Jaggregate_rpt_pct1=50 -Jaggregate_rpt_pct2=90`. In `statistics.json`, what is `pct2ResTime`?
+    options:
+      - id: p90
+        text: The 90th percentile - the second configured percentile
+        feedback: Correct - the keys are positional; pct2 is whatever aggregate_rpt_pct2 was.
+      - id: p95
+        text: The 95th percentile - pct2 always means 95
+        feedback: 95 is only the default for aggregate_rpt_pct2.
+      - id: p2
+        text: The 2nd percentile
+        feedback: The number in the key is a position, not a percentile.
+      - id: median
+        text: The median, because pct1 moved to 50
+        feedback: The median has its own key, medianResTime. pct1 is now 50, pct2 is 90.
+    correct: [p90]
+    hints:
+      - The JSON key never contains the percentile's value.
+    solution: |
+      `pct2ResTime` = the second configured percentile, here the 90th. A gate must be told the percentiles.
+
+  - id: sample-filter-mcq
+    type: mcq
+    concept: perf-jmdash-read
+    skill: analysis
+    title: The filter that breaks the report
+    prompt: |
+      `-Jjmeter.reportgenerator.sample_filter=^(GET|POST) /v1/` makes `jmeter -g` fail with
+      `Cannot invoke "...MapResultData.getResult(String)" because "resultData" is null`. Why?
+    options:
+      - id: whole
+        text: The filter must match the whole sample name, so this one keeps no samples
+        feedback: Correct - ReportGenerator keeps a sample when pattern.matcher(name).matches(); with nothing left, generation fails.
+      - id: syntax
+        text: Java does not support ^ in regular expressions
+        feedback: It does; the regex is valid. It just does not match any complete name.
+      - id: quoting
+        text: The | in the regex must be escaped on the command line
+        feedback: Inside quotes the shell passes | through; the same regex with .* at the end works.
+      - id: series
+        text: sample_filter must end with (-success|-failure)?$
+        feedback: That rule is for series_filter, which works on series names.
+    correct: [whole]
+    hints:
+      - Compare matches() with find() in Java.
+    solution: |
+      Write `(GET|POST) /v1/.*` - a whole-name match. Check `Total`'s sample count after filtering.
+
+  - id: filter-stage-mcq
+    type: mcq
+    concept: perf-jmdash-read
+    skill: application
+    title: Hiding the token request
+    prompt: |
+      You want the token request out of the report's graphs and tables, but `Total` must still count every
+      request, including failed token calls. Which property?
+    options:
+      - id: series
+        text: jmeter.reportgenerator.exporter.html.series_filter
+        feedback: Correct - it filters "after the calculations and serves to simplify the final report".
+      - id: sample
+        text: jmeter.reportgenerator.sample_filter
+        feedback: That "discards data before calculations" - Total would lose the token samples, as the 62 to 60 change shows.
+      - id: grep
+        text: Delete the token lines from the JTL first
+        feedback: That changes the evidence and Total. Keep the JTL intact.
+      - id: none
+        text: Neither - the dashboard always shows every label
+        feedback: Both filters exist; they differ in when they apply.
+    correct: [series]
+    hints:
+      - One filter runs before the counting, the other after.
+    solution: |
+      `series_filter` hides rows and series after calculation; `sample_filter` removes samples before it.
+
+  - id: errors-table-mcq
+    type: mcq
+    concept: perf-jmdash-read
+    skill: analysis
+    title: Where did the custom message go?
+    prompt: |
+      Your Response Assertion on `POST /v1/payments` has the custom message `payment not created: expected HTTP
+      201`, and the JTL shows it for the four `500` responses. The dashboard's Errors table lists them as
+      `500/Internal Server Error`. Why?
+    options:
+      - id: code-wins
+        text: For a non-success response code the error type is code/message; the assertion message is used only when the code is a success code or empty
+        feedback: Correct - ErrorsSummaryConsumer.getErrorKey in 5.6.3. Soft errors (200) are keyed by their assertion message.
+      - id: bug
+        text: The assertion did not run on 500 responses
+        feedback: It ran - the JTL's failureMessage shows its message.
+      - id: setting
+        text: assertion_results_failure_message is off in the JTL
+        feedback: Then the JTL would not show the message either, and the soft errors would not be named by message.
+      - id: top5
+        text: The Errors table only lists the top 5 errors
+        feedback: There are only three error types here; the naming rule is the reason.
+    correct: [code-wins]
+    hints:
+      - Compare how the 500s and the soft errors (code 200) are named.
+    solution: |
+      A non-2xx sample is keyed by `code/message`. Group by `failureMessage` in the JTL when you need the assertion
+      view.
+
+  - id: apdex-where-mcq
+    type: mcq
+    concept: perf-jmdash-read
+    skill: recall
+    title: Where is the Apdex?
+    prompt: Your gate needs the Apdex of `GET /v1/payments` from a generated report. Where is it?
+    options:
+      - id: js
+        text: In content/js/dashboard.js, in the apdexTable data (and in the HTML page)
+        feedback: Correct - each row is [apdex, T, F, label]; statistics.json has no Apdex.
+      - id: stats
+        text: In statistics.json, key apdex
+        feedback: statistics.json holds the Statistics table only - no Apdex.
+      - id: jtl
+        text: In the JTL, one Apdex column per sample
+        feedback: Apdex is a summary over many samples; the JTL has none.
+      - id: log
+        text: In jmeter.log at the end of the run
+        feedback: The log has the run's events, not the report tables.
+    correct: [js]
+    hints:
+      - Which file holds the tables other than Statistics?
+    solution: |
+      `content/js/dashboard.js`, `createTable($("#apdexTable"), {...})`.
+
+  - id: per-transaction-mcq
+    type: mcq
+    concept: perf-jmdash-generate
+    skill: application
+    title: A slower budget for one report
+    prompt: |
+      The settlement report has an agreed T of 2000 ms and F of 8000 ms; everything else keeps the defaults. Which
+      setting does it?
+    options:
+      - id: right
+        text: '-Jjmeter.reportgenerator.apdex_per_transaction=GET /v1/reports/settlement:2000|8000;'
+        feedback: Correct - name (or regex), colon, satisfied|tolerated, semicolon.
+      - id: global
+        text: -Jjmeter.reportgenerator.apdex_satisfied_threshold=2000
+        feedback: That changes T for every label.
+      - id: order
+        text: '-Jjmeter.reportgenerator.apdex_per_transaction=2000|8000:GET /v1/reports/settlement;'
+        feedback: The format is sample_name:satisfaction|tolerance - name first.
+      - id: duration
+        text: A Duration Assertion of 2000 ms on the report sampler
+        feedback: That fails samples; it does not set the Apdex thresholds.
+    correct: [right]
+    hints:
+      - The manual's format is sample_name:satisfaction|tolerance[;].
+    solution: |
+      `apdex_per_transaction=GET /v1/reports/settlement:2000|8000;` - the other labels keep 500 / 1500.
+
+  - id: artifact-mcq
+    type: mcq
+    concept: perf-jmdash-ci
+    skill: application
+    title: The report is missing when it matters
+    prompt: |
+      A GitHub Actions job runs JMeter, then the gate, then `actions/upload-artifact`. Reports are uploaded on
+      green builds, but never when the gate fails. What fixes it?
+    options:
+      - id: always
+        text: 'if: ${{ always() }} on the upload step'
+        feedback: Correct - after a failed step the following steps are skipped by default; always() runs the step anyway.
+      - id: order
+        text: Upload before running JMeter
+        feedback: There is nothing to upload yet.
+      - id: continue
+        text: Make the gate never fail, and read its output instead
+        feedback: Then the build is green with broken SLOs - the gate's whole purpose is lost.
+      - id: success
+        text: 'if: ${{ success() }} on the upload step'
+        feedback: success() is the default behaviour - that is what skips it.
+    correct: [always]
+    hints:
+      - Which status check function runs a step "even when canceled"?
+    solution: |
+      `if: ${{ always() }}` on the upload step keeps the evidence on red builds.
+
+  - id: gate-cannot-judge-mcq
+    type: mcq
+    concept: perf-jmdash-ci
+    skill: analysis
+    title: The renamed label
+    prompt: |
+      Someone renames the sampler `GET /v1/payments` to `List payments`. The SLO file still has a p99 limit for
+      `GET /v1/payments`. What should a good gate do?
+    options:
+      - id: two
+        text: Fail with a distinct "cannot judge" code and name the missing label
+        feedback: Correct - silence would let the endpoint go unchecked from now on.
+      - id: skip
+        text: Skip the check and pass, because the label is not in this report
+        feedback: A gate that passes what it cannot see stops checking without telling anyone.
+      - id: total
+        text: Check the limit against Total instead
+        feedback: Total mixes every label; the limit was agreed for one endpoint.
+      - id: one
+        text: Fail with the same code as an SLO breach
+        feedback: Better than passing, but the team will hunt for a performance problem that is really a setup problem.
+    correct: [two]
+    hints:
+      - What is the difference between "slow" and "not measured"?
+    solution: |
+      Exit 2 with `label 'GET /v1/payments' is not in the report`. Fix the SLO file or the label, then re-run.
+
+  - id: pipeline-order
+    type: order
+    concept: perf-jmdash-ci
+    skill: application
+    title: The CI job, in order
+    prompt: Put the steps of a gated JMeter CI job in order.
+    items:
+      - id: setup
+        text: Install the pinned Java and JMeter versions
+      - id: run
+        text: Run the plan in CLI mode with -J load properties, -l, -j and -e -o into a fresh folder
+      - id: sanity
+        text: Check that the run happened - exit code 0 and a non-empty JTL
+      - id: gate
+        text: Run the gate over statistics.json against the SLO file
+      - id: upload
+        text: Upload the JTL, log and report as artifacts (always)
+    hints:
+      - The gate needs the report; the upload must happen whatever the gate says.
+    solution: |
+      Setup, run, sanity check, gate, upload with `always()` - the upload is last but runs on every outcome.
+
+  - id: ci-script-debug
+    type: debug
+    concept: perf-jmdash-ci
+    skill: analysis
+    title: The script that always says "passed"
+    prompt: |
+      This CI script is meant to run a 10-minute load test, report the median and p95 and 99th percentiles, and fail
+      when an SLO is broken. Click **every** line that is a defect.
+    language: bash
+    code: |
+      #!/usr/bin/env bash
+      set -e
+      jmeter -n -t checkout.jmx -l results.jtl -e -o "report-$RUN_ID" \
+        -Jthreads=50 -Jduration=600 \
+        -Jjmeter.reportgenerator.aggregate_rpt_pct1=50 \
+        "-Jjmeter.reportgenerator.sample_filter=^POST"
+      echo "JMeter exited $? - load test passed"
+      python gate.py "report-$RUN_ID/statistics.json" --slo slo.json --percentiles 50,95,99
+    correctLines: [5, 6, 7]
+    lineNotes:
+      - line: 2
+        note: set -e is fine - it stops the script if JMeter itself cannot run.
+      - line: 3
+        note: A per-run output folder avoids the "folder is not empty" error.
+      - line: 4
+        note: Load passed as properties for __P in the plan - good practice.
+      - line: 8
+        note: The gate is the right verdict - but line 5 makes it read the 90th percentile as p50.
+    hints:
+      - Which of these JMeter silently ignores, and which makes generation fail?
+      - What does JMeter's exit code tell you?
+    solution: |
+      Line 5: the prefixed percentile property is ignored (use `-Jaggregate_rpt_pct1=50`), so the gate's p50 is the
+      90th. Line 6: `^POST` matches no whole name, so generation fails - write `POST .*` (or no filter). Line 7: JMeter
+      exits 0 whatever the error rate; "passed" is not known until the gate has run.
+
+  - id: gate-codes-short
+    type: short
+    concept: perf-jmdash-ci
+    skill: analysis
+    title: Why three exit codes?
+    prompt: |
+      Your gate returns 0 (pass), 1 (an SLO is broken) and 2 (cannot judge). A teammate says "just use 0 and 1".
+      Explain why 2 is worth having, with two concrete cases from this lesson.
+    modelAnswer: |
+      Both 1 and 2 fail the build, but they send people to different places. 1 means the system broke an agreed
+      limit - investigate performance. 2 means the gate could not measure what it was asked to - fix the setup.
+      Cases: the SLO names `GET /v1/payments` but the label was renamed, so it is not in the report; the SLO asks for
+      `p75_ms` but the report was generated with 90/95/99; the report has 20 samples where at least 30 were required;
+      the statistics file is missing because generation failed (for example a filter that matched nothing). Folding
+      these into 1 sends people hunting for a slowdown; folding them into 0 silently stops checking.
+    rubric:
+      - Distinguishes "the system broke a limit" from "the gate could not measure".
+      - Gives at least two concrete cannot-judge cases (missing label, missing percentile, too few samples, missing or bad file).
+      - Says why passing (0) in those cases is dangerous.
+      - Keeps both 1 and 2 as failing exit codes in CI.
+    hints:
+      - Who acts on each outcome, and what do they do first?
+    solution: |
+      1 = performance problem, 2 = measurement/setup problem; both fail CI, but 2 must never be a silent pass.
+
+  - id: gate-testdesign
+    type: testdesign
+    concept: perf-jmdash-ci
+    skill: application
+    title: Test cases for the SLO gate
+    prompt: |
+      Before the team relies on the gate (`gate.py statistics.json --slo slo.json --percentiles ... --min-samples
+      N`), design its test cases. For each: precondition (report and SLO), action, expected exit code and output,
+      and the evidence.
+    modelAnswer: |
+      | # | Precondition | Expected | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | real report, error % 17.74; SLO `Total.error_pct = 1` | exit 1, `FAIL Total error_pct 17.74 (limit 1)` | stdout, exit code |
+      | 2 | same report; SLO `Total.error_pct = 20`, `p95_ms = 300` | exit 0, two PASS lines | stdout, exit code |
+      | 3 | actual exactly equal to the limit (p95 152, limit 152) | PASS (limits inclusive, agreed in advance) | unit test |
+      | 4 | report generated with 50/95/99; SLO `p50_ms` with `--percentiles 50,95,99` | p50 read from `pct1ResTime` | unit test |
+      | 5 | same, but `--percentiles` left at 90,95,99 | exit 2, names `p50_ms` | stderr |
+      | 6 | SLO label not in the report | exit 2, names the label and lists the labels present | stderr |
+      | 7 | label with 20 samples, `--min-samples 30` | exit 2 | stderr |
+      | 8 | statistics file missing / not JSON | exit 2, `ERROR` | stderr |
+      | 9 | empty SLO `{}` or `{"Total": {}}` | exit 2 - no checks must never pass | stderr |
+      | 10 | unknown metric (`apdex`, `max_ms`) | exit 2 | stderr |
+      | 11 | end to end in CI: a known-bad build (stub with 30 % errors) | the job is red and the report artifact exists | CI run, artifact |
+
+      Cases 1-10 use a fixed `statistics.json` (a real one kept as a fixture), so they are fast and exact; case 11
+      proves the wiring once.
+    rubric:
+      - Covers pass, fail and the boundary (equal to the limit).
+      - Covers cannot-judge cases - missing label, missing percentile, too few samples, bad file, empty SLO.
+      - Checks the percentile mapping for non-default percentiles.
+      - Uses fixed fixtures for the logic and one end-to-end run for the wiring.
+      - States the evidence (exit code, stdout/stderr, artifact).
+    hints:
+      - Think of every way the gate could pass when it should not.
+    solution: |
+      Pass, fail, boundary, percentile mapping, every cannot-judge case on fixtures, plus one known-bad end-to-end
+      run that turns the build red and keeps the report.
+
+  - id: ci-interview
+    type: interview
+    concept: perf-jmdash-ci
+    skill: analysis
+    title: 'Interview: JMeter in your pipeline'
+    prompt: |
+      "How would you run JMeter in a CI/CD pipeline and make the build fail when performance regresses?"
+    modelAnswer: |
+      I run the plan in CLI mode - `jmeter -n -t plan.jmx -l run.jtl -j jmeter.log -e -o report` - with load,
+      duration and host as `-J` properties read by `__P` in the plan, and with pinned JMeter and Java versions.
+      JMeter's exit code only tells me the run completed; it is 0 even with a high error rate, so the decision is a
+      gate step: it reads `statistics.json` from the dashboard (per-label error %, percentiles), compares them with
+      an SLO file in the repo and exits 1 on a breach. It exits with a different non-zero code when it cannot judge -
+      missing label, a percentile the report was not generated with, too few samples - so a renamed sampler cannot
+      silently pass. The percentile keys in `statistics.json` are positional, so the gate is told which percentiles
+      `aggregate_rpt_pct1..3` were set to (no `jmeter.reportgenerator.` prefix on those).
+
+      The JTL, log and HTML report are uploaded as artifacts on every outcome (`always()` in GitHub Actions). Per
+      change I run a short smoke load with conservative limits; the real load test runs on a schedule or before a
+      release on a dedicated, agreed environment, and can also compare against a baseline from the last good build.
+    rubric:
+      - CLI mode with -l, -j, -e -o and parameterised load (-J / __P).
+      - Says JMeter's exit code does not reflect the error rate, so a gate is needed.
+      - Gate reads per-label numbers from statistics.json (or the JTL) against versioned SLOs.
+      - Distinguishes breach from cannot judge; mentions positional percentiles or the property names.
+      - Keeps artifacts even on failure; separates smoke gates from full load tests and respects shared environments.
+    followUps:
+      - Where would you get the Apdex from, if the team gates on it?
+      - How would you compare against the previous build instead of fixed limits?
+      - How do you stop a few-second CI run from producing flaky failures?
+    hints:
+      - Start with what JMeter's exit code means.
+    solution: |
+      CLI run with -J load and -e -o; a gate over statistics.json with pass/breach/cannot-judge exit codes; artifacts
+      kept with always(); small smoke gates per change, real load tests on a schedule.
+
+  - id: report-code
+    type: coding
+    concept: perf-jmdash-generate
+    skill: application
+    title: Build the report properties and the -g command
+    prompt: |
+      Implement `jmeter/jm_dash_report.py`:
+
+      - `report_properties(satisfied_ms=500, tolerated_ms=1500, percentiles=(90, 95, 99), title=None,
+        sample_filter=None, per_transaction=None)` - the JMeter property names and values (all strings), with the
+        percentile properties under their real names; reject impossible settings with ValueError.
+      - `report_command(jmeter, jtl, out_dir, props)` - the `jmeter -g ... -o ... -J...` argument list; refuse a
+        missing JTL and a non-empty output folder before JMeter starts.
+
+      The last test runs your command with real JMeter on a fresh JTL and checks the dashboard: the "50th pct"
+      header, the filtered labels, the per-transaction Apdex thresholds and the title.
+    project: perf
+    files:
+      - exercises/jmeter/jm_dash_report.py
+    test: tests/jmeter/test_jm_dash_report.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dash_report.py
+    modelAnswer: |
+      ```python
+      props = {
+          PREFIX + "apdex_satisfied_threshold": str(satisfied_ms),
+          PREFIX + "apdex_tolerated_threshold": str(tolerated_ms),
+      }
+      for name, p in zip(PERCENTILE_PROPS, percentiles):   # aggregate_rpt_pct1..3 - no prefix
+          props[name] = f"{p:g}"
+      if title:
+          props[PREFIX + "report_title"] = title
+      if sample_filter:
+          re.compile(sample_filter)                         # wrapped to raise ValueError
+          props[PREFIX + "sample_filter"] = sample_filter
+      if per_transaction:
+          props[PREFIX + "apdex_per_transaction"] = "".join(
+              f"{name}:{t}|{f};" for name, (t, f) in per_transaction.items())
+
+      def report_command(jmeter, jtl, out_dir, props):
+          if not Path(jtl).is_file():
+              raise FileNotFoundError(f"results file not found: {jtl}")
+          if Path(out_dir).exists() and any(Path(out_dir).iterdir()):
+              raise FileExistsError(f"report folder is not empty: {out_dir}")
+          return [str(jmeter), "-g", str(jtl), "-o", str(out_dir),
+                  *(f"-J{k}={v}" for k, v in sorted(props.items()))]
+      ```
+
+      Plus the validation: 0 < T < F (also per transaction), exactly three distinct increasing percentiles between
+      0 and 100, and per-transaction names without `;` or `|`.
+    rubric:
+      - Every test in tests/jmeter/test_jm_dash_report.py passes.
+      - The percentile properties have no jmeter.reportgenerator. prefix.
+      - Impossible settings fail early with a message, before a JVM starts.
+      - The command is a list of arguments, not a shell string.
+    hints:
+      - "The percentile properties are aggregate_rpt_pct1..3 - check bin/jmeter.properties."
+      - "f\"{95.0:g}\" is \"95\"; f\"{99.9:g}\" is \"99.9\"."
+      - "The test's filter is (GET|POST) /v1/.* - JMeter matches the whole sample name."
+    solution: |
+      Name every property exactly as JMeter reads it, validate before running, and pass the command as a list.
+
+  - id: stats-code
+    type: coding
+    concept: perf-jmdash-read
+    skill: application
+    title: Read statistics.json and the dashboard tables
+    prompt: |
+      Implement `jmeter/jm_dash_stats.py`:
+
+      - `load_statistics(path, percentiles=(90, 95, 99))` - statistics.json with readable keys (`samples`, `errors`,
+        `error_pct`, `mean_ms`, `median_ms`, `min_ms`, `max_ms`, `throughput_per_s`) and the positional percentile
+        keys renamed to `p<N>_ms` for the given percentiles.
+      - `read_dashboard_table(dashboard_js, table_id)` - the JSON object passed to `createTable($("#<id>"), ...)`.
+      - `apdex_by_label(dashboard_js)` and `error_types(dashboard_js)`.
+
+      Tests use a synthetic `dashboard.js` and one real dashboard generated with percentiles 50/95/99 and T = 100,
+      F = 1000.
+    project: perf
+    files:
+      - exercises/jmeter/jm_dash_stats.py
+    test: tests/jmeter/test_jm_dash_stats.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dash_stats.py
+    modelAnswer: |
+      ```python
+      def load_statistics(path, percentiles=(90, 95, 99)):
+          if len(percentiles) != 3:
+              raise ValueError("a JMeter dashboard has exactly three percentiles")
+          raw = json.loads(Path(path).read_text())
+          if "Total" not in raw:
+              raise ValueError(f"{path} has no 'Total' entry")
+          out = {}
+          for label, entry in raw.items():
+              row = {name: entry[key] for key, name in FIELDS.items()}
+              for key, p in zip(PCT_KEYS, percentiles):
+                  row[percentile_name(p)] = entry[key]
+              out[label] = row
+          return out
+
+      def read_dashboard_table(dashboard_js, table_id):
+          marker = f'createTable($("#{table_id}"), '
+          start = dashboard_js.find(marker)
+          if start < 0:
+              raise ValueError(f"table {table_id!r} not found in dashboard.js")
+          return json.JSONDecoder().raw_decode(dashboard_js, start + len(marker))[0]
+
+      def apdex_by_label(dashboard_js):
+          table = read_dashboard_table(dashboard_js, "apdexTable")
+          rows = [table["overall"]["data"], *(item["data"] for item in table["items"])]
+          return {label: {"apdex": a, "t_ms": t, "f_ms": f} for a, t, f, label in rows}
+      ```
+
+      On the real dashboard: 62 samples and 11 errors in `Total`; the report label's Apdex is 0.5 (every ~150 ms
+      sample is between T = 100 and F = 1000); the Errors table reads 5, 4, 2.
+    rubric:
+      - Every test in tests/jmeter/test_jm_dash_stats.py passes.
+      - Percentile keys are mapped from the settings, never assumed to be 90/95/99.
+      - The JSON is parsed, not scraped with regular expressions.
+      - Missing tables or a missing Total are reported, not ignored.
+    hints:
+      - "json.JSONDecoder().raw_decode(text, index) returns (value, end_index)."
+      - "Each Apdex row is [apdex, T, F, label]; Total is the table's overall row."
+    solution: |
+      Rename statistics.json keys with the known percentiles, and parse the dashboard.js tables as JSON from the
+      createTable marker.
+
+  - id: gate-code
+    type: coding
+    concept: perf-jmdash-ci
+    skill: application
+    title: Write the CI gate
+    prompt: |
+      Implement `jmeter/jm_dash_gate.py`:
+
+      - `metric_key(metric, percentiles)` - `error_pct`, `mean_ms` or `p<N>_ms` to the `statistics.json` key.
+      - `evaluate(statistics, slo, percentiles, min_samples)` - one `Check(label, metric, limit, actual)` per SLO
+        entry; `GateInputError` when it cannot judge.
+      - `main(argv)` - the command line: PASS/FAIL lines, a summary, exit 0 / 1, and `ERROR ...` on stderr with
+        exit 2 when it cannot judge.
+
+      The tests use the real `statistics.json` of the lesson's run (17.74 % errors, during which JMeter exited 0).
+    project: perf
+    files:
+      - exercises/jmeter/jm_dash_gate.py
+    test: tests/jmeter/test_jm_dash_gate.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dash_gate.py
+    modelAnswer: |
+      ```python
+      def metric_key(metric, percentiles):
+          if metric in PLAIN:
+              return PLAIN[metric]
+          if metric.startswith("p") and metric.endswith("_ms"):
+              try:
+                  p = float(metric[1:-3])
+              except ValueError:
+                  raise GateInputError(f"unknown metric {metric!r}") from None
+              for key, have in zip(PCT_KEYS, percentiles):
+                  if float(have) == p:
+                      return key
+              raise GateInputError(f"{metric}: the report has percentiles ...")
+          raise GateInputError(f"unknown metric {metric!r}")
+
+      def evaluate(statistics, slo, percentiles=(90, 95, 99), min_samples=1):
+          checks = []
+          for label, limits in slo.items():
+              if label not in statistics:
+                  raise GateInputError(f"label {label!r} is not in the report")
+              entry = statistics[label]
+              if entry["sampleCount"] < min_samples:
+                  raise GateInputError(f"{label}: {entry['sampleCount']} samples, ...")
+              for metric, limit in limits.items():
+                  checks.append(Check(label, metric, float(limit),
+                                      float(entry[metric_key(metric, percentiles)])))
+          if not checks:
+              raise GateInputError("the SLO has no checks")
+          return checks
+      ```
+
+      `main` catches `OSError` and `ValueError` (which covers bad JSON and `GateInputError`), prints `ERROR` to
+      stderr and returns 2; otherwise it prints a line per check and returns 1 if any failed.
+    rubric:
+      - Every test in tests/jmeter/test_jm_dash_gate.py passes.
+      - A breach exits 1 and "cannot judge" exits 2 - never 0.
+      - Percentiles are mapped from the report's settings.
+      - The output names label, metric, actual and limit, so the job log explains the verdict.
+    hints:
+      - "A dataclass with an ok property keeps the comparison in one place (limits are inclusive)."
+      - "json.JSONDecodeError is a subclass of ValueError."
+    solution: |
+      Map metrics to keys, refuse anything the report cannot answer, print one line per check and return 0, 1 or 2.
+
+placement:
+  - id: place-exit-code
+    type: mcq
+    concept: perf-jmdash-ci
+    skill: application
+    title: Green build, failing test
+    prompt: |
+      A Jenkins job runs `jmeter -n -t plan.jmx -l run.jtl` and marks the build green whenever the command exits 0.
+      Last night's JTL has 20 % failed samples and the build was green. What is the fix?
+    options:
+      - id: gate
+        text: Add a step that reads the results (statistics.json or the JTL), compares them with the SLOs and exits non-zero on a breach
+        feedback: Correct - JMeter exits 0 when the run completes, whatever its error rate.
+      - id: flag
+        text: Add -e so JMeter fails the run on errors
+        feedback: -e generates the dashboard; it does not change the exit code for failed samples.
+      - id: assert
+        text: Add more assertions to the plan
+        feedback: Assertions mark samples as failed - which already happened - but JMeter still exits 0.
+      - id: gui
+        text: Run it in GUI mode so someone sees the errors
+        feedback: Load tests run in CLI mode; the problem is the missing verdict.
+    correct: [gate]
+    solution: |
+      The exit code says the run completed. A gate over the results gives the verdict.
+
+  - id: place-percentile-prop
+    type: mcq
+    concept: perf-jmdash-generate
+    skill: application
+    title: Setting the first percentile
+    prompt: Which JMeter 5.6.3 option makes the dashboard's first percentile column the 50th?
+    options:
+      - id: plain
+        text: -Jaggregate_rpt_pct1=50
+        feedback: Correct - the percentile properties have no jmeter.reportgenerator. prefix.
+      - id: prefixed
+        text: -Jjmeter.reportgenerator.aggregate_rpt_pct1=50
+        feedback: In 5.6.3 this is ignored silently; the column stays "90th pct".
+      - id: g
+        text: -g 50
+        feedback: -g takes the results file to generate the report from.
+      - id: apdex
+        text: -Jjmeter.reportgenerator.apdex_satisfied_threshold=50
+        feedback: That sets Apdex T in milliseconds.
+    correct: [plain]
+    solution: |
+      `-Jaggregate_rpt_pct1=50`, then check the "50th pct" header.
+
+  - id: place-sample-filter
+    type: mcq
+    concept: perf-jmdash-read
+    skill: analysis
+    title: Total changed
+    prompt: |
+      A report generated with `sample_filter=(GET|POST) /v1/.*` shows `Total` = 60 samples; without the filter it was
+      62. Why?
+    options:
+      - id: before
+        text: sample_filter removes samples before the statistics are calculated, so Total excludes the two token requests
+        feedback: Correct - it "discards data before calculations"; series_filter would only hide rows.
+      - id: errors
+        text: Two samples failed and were dropped
+        feedback: Failed samples are counted; the filter dropped the samples whose names did not match.
+      - id: random
+        text: The dashboard samples 1 in 30 requests
+        feedback: The dashboard reads every sample of the JTL.
+      - id: window
+        text: statistic_window cut off the last two samples
+        feedback: statistic_window bounds the percentile window, not the counts.
+    correct: [before]
+    solution: |
+      `sample_filter` acts before counting; use `series_filter` to hide labels without changing `Total`.
+
+recall:
+  - id: recall-generate
+    concept: perf-jmdash-generate
+    prompt: How do you generate the JMeter dashboard after a run, and from an existing JTL?
+    answer: After a run - jmeter -n -t plan.jmx -l run.jtl -e -o folder. From a JTL - jmeter -g run.jtl -o folder. The folder must not exist or be empty; -f deletes it first.
+  - id: recall-properties
+    concept: perf-jmdash-generate
+    prompt: Name the properties for Apdex thresholds and the three percentiles, with their defaults.
+    answer: jmeter.reportgenerator.apdex_satisfied_threshold (500 ms) and apdex_tolerated_threshold (1500 ms); apdex_per_transaction as name:T|F; ; percentiles aggregate_rpt_pct1..3 (90, 95, 99) with NO jmeter.reportgenerator. prefix.
+  - id: recall-statistics
+    concept: perf-jmdash-read
+    prompt: What is in statistics.json, and what is not?
+    answer: One object per label plus Total - sampleCount, errorCount, errorPct, mean/median/min/max, pct1ResTime..pct3ResTime (positional), throughput, KB/s. Apdex and the error tables are not; they are in content/js/dashboard.js.
+  - id: recall-filters
+    concept: perf-jmdash-read
+    prompt: sample_filter versus series_filter?
+    answer: sample_filter is a regex that must match the whole sample name; it discards samples before calculations, so Total changes, and a filter matching nothing breaks generation. series_filter hides series and rows after the calculations.
+  - id: recall-exit-code
+    concept: perf-jmdash-ci
+    prompt: What exit code does jmeter -n return when 17.74 % of samples failed?
+    answer: 0 - a completed run is a normal completion. The pass/fail verdict needs a gate over the results.
+  - id: recall-gate
+    concept: perf-jmdash-ci
+    prompt: What makes a CI performance gate trustworthy?
+    answer: One line per check (label, metric, actual, limit); exit 1 on a breach and a distinct non-zero code when it cannot judge (missing file, label or percentile, too few samples, empty SLO); percentiles mapped from the report settings; artifacts kept with always().
+
+next:
+  - jmeter-distributed-testing
+  - reading-load-test-results
+  - performance-testing-in-ci-cd
+  - locust-distributed-and-ci

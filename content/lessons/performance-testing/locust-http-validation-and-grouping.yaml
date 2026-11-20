@@ -1,0 +1,1469 @@
+id: locust-http-validation-and-grouping
+title: HTTP sessions, validation and request grouping
+subject: performance-testing
+module: locust
+level: intermediate
+status: published
+estimatedMinutes: 130
+summary: 'Make a Locust test count the right things. HttpSession keeps cookies and default headers, so a user logs in once in on_start and stays logged in; catch_response turns a 200 that is really a decline or an HTML error page into a failure, and an expected 404 into a success; name= and rename_request() group dynamic URLs into one statistics row; and correlation carries the id from one response into the next request - stopping the flow when a step fails. Every run shown is real Locust 2.47.0 against local SandPay practice targets whose wrong answers come from a counter, so the counts are exact.'
+tags:
+  [
+    Locust,
+    HttpUser,
+    HttpSession,
+    catch_response,
+    response.success,
+    response.failure,
+    soft errors,
+    request names,
+    name grouping,
+    rename_request,
+    request_name,
+    on_start,
+    authentication,
+    cookies,
+    bearer token,
+    correlation,
+    idempotency,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Locust 2.47.0 on Python 3.12.3 with pytest 9.2.0, in `practice/perf/.venv`. Locust always runs
+    headless in a subprocess (`support/load_tools.py` -> `run_locust`), with `--csv` and `--json-file`; final
+    counts are read from the JSON file (`read_locust_stats`). Every output in this lesson was produced on Linux on
+    20 November 2026.
+  - **Targets (loopback only, synthetic data):**
+    - `practice/perf/support/lc_valid_fixture.py` - a SandPay *legacy acquirer gateway* written for this lesson.
+      It answers every charge with HTTP `200`; charge call number c is an HTML error page when c is divisible by 7,
+      otherwise a `"declined"` body when c is divisible by 4, otherwise `"approved"`. Login sets a `gw_session`
+      cookie; a voided charge then answers `404`. Because the outcome comes from a counter, the gateway's own
+      counters are exact on any machine.
+    - `practice/perf/support/sandpay_target.py` - the shared SandPay practice API (bearer tokens, payments with
+      `Idempotency-Key`, `Idempotent-Replayed: true` on a replay, `/metrics` counters).
+  - **What varies:** how many requests run in 3 seconds depends on the machine, so the request **counts** in the
+    outputs differ run to run; the **relationships** (failures = declines + HTML pages, one login per user, no
+    404s) do not. A request still in flight when Locust stops is counted by the server but not by Locust, so the
+    server can be ahead by at most one request per user.
+  - **Synthetic data:** SandPay is a fictional payments company; `merchant-1` ... `merchant-50`, their secrets,
+    cookies, tokens, charge ids (`ch_...`) and payment ids (`pay_...`) are invented for this practice project.
+  - **Sources, as documented on 20 November 2026:** Locust 2.47.0 documentation -
+    [Writing a locustfile](https://docs.locust.io/en/2.47.0/writing-a-locustfile.html) (on_start and on_stop
+    methods; client attribute / HttpSession; Validating responses; REST/JSON APIs; Grouping requests; Connection
+    reuse) and the [API reference](https://docs.locust.io/en/2.47.0/api.html) (HttpSession, ResponseContextManager
+    `success()` and `failure()`, RescheduleTask). Quotations are from those pages.
+  - **Read from Locust 2.47.0 itself, not from the docs:** what happens when an exception other than a Locust
+    `ResponseError` escapes a `catch_response` block (`ResponseContextManager.__exit__` in `locust/clients.py`
+    lets it propagate without reporting the request), shown by a real run below.
+  - **Not repeated here:** users, tasks, `wait_time` and running headless -
+    [Locust fundamentals](#/lesson/locust-fundamentals); TaskSets and longer flows -
+    [Task sets, weights and realistic user flows](#/lesson/locust-task-sets-and-user-flows); the same ideas in
+    JMeter - [Correlation and extractors in JMeter](#/lesson/jmeter-correlation-and-extractors) and
+    [Assertions, listeners and results files](#/lesson/jmeter-assertions-and-listeners); why a retry must reuse
+    its key - [Idempotency keys](#/lesson/idempotency-keys).
+
+prerequisites:
+  - locust-fundamentals
+  - jmeter-assertions-and-listeners
+  - performance-metrics-and-percentiles
+
+concepts:
+  - id: perf-lcvalid-catch-response
+    name: Validating responses with catch_response
+    summary: 'Locust counts a request as successful when the status is below 400 and nothing raised. With catch_response=True the request call returns a context manager; inside the with-block you call response.failure("why") to fail a request whose status looks fine (a 200 decline, an HTML error page instead of JSON) or response.success() to accept an expected non-2xx (a 404 for something you deleted). The failure text becomes the error in the failures report. If neither is called, the status decides. An unhandled exception inside the block is not a failure - the request is not recorded at all and the exception goes to the exceptions report, so parse defensively.'
+  - id: perf-lcvalid-grouping
+    name: Request names and grouping
+    summary: 'Locust keeps one statistics row per request name, and the default name is the URL path. A path or query that contains an id makes one row per id - hundreds of rows of one request each and percentiles that mean nothing. name= on the request, client.request_name, or the client.rename_request() context manager give dynamic URLs one name such as "GET /v1/payments/{id}". Names are also how a test, a dashboard and a workload model line up, so choose them deliberately and keep them stable.'
+  - id: perf-lcvalid-session-correlation
+    name: Sessions, authentication and correlation
+    summary: 'Each HttpUser has its own HttpSession - a requests.Session that keeps cookies and default headers and its own connection pool. Log in once per simulated user in on_start - a session cookie is then sent automatically, and a bearer token goes into self.client.headers. Correlation means taking a value from one response (a payment id) and using it in the next request; validate the step that produces it with catch_response and stop the flow when it fails, so the next request never runs with a value you do not have.'
+
+objectives:
+  - Explain which responses Locust counts as failures on its own and which it reports as successes until you check them.
+  - Use catch_response with response.failure() and response.success() to fail soft errors and accept expected error statuses, with failure messages someone can act on.
+  - Name requests with name=, request_name or rename_request() so dynamic URLs form one statistics row, and find ungrouped rows in a results file.
+  - Log in once per simulated user with on_start, using a session cookie or a bearer token in the session headers.
+  - Chain correlated requests - create, read back, replay - and stop the flow when a step fails.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: The idea in plain language
+    body: |
+      Imagine a mystery shopper paid by the number of shops they visit. They walk into a bank, say "I'd like to
+      open an account", hear "sorry, the system is down", and tick **visited**. Next they write down every
+      customer's account number as a separate line in their report, so the summary is a thousand lines of "one
+      visit". And every morning they queue at the security desk again, because nobody gave them a badge.
+
+      A Locust script written without care is that shopper:
+
+      1. **It ticks "visited" for a bad answer.** Some payment gateways answer `200 OK` and write
+         `"status": "declined"` - or an HTML error page - in the body. Locust only looks at the status code, so
+         the report says 0 % failures.
+      2. **It writes one line per id.** Every `GET /gateway/charges/ch_7001`, `ch_7002`, ... becomes its own row
+         in the statistics. Seven hundred rows of one request each tell you nothing about how fast "get a charge"
+         is.
+      3. **It does not keep its badge.** A real merchant logs in once and then works. The test user should too -
+         and keep the id it was just given, so the next step reads *its* payment, not a guess.
+
+      This lesson fixes all three: **check each answer** (`catch_response`), **name each kind of request once**
+      (`name=`), and **keep the session and the values a flow needs** (`on_start`, headers, cookies, correlation).
+
+  - id: what
+    kind: what
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: Terms you need
+    body: |
+      | Term | Meaning (Locust 2.47.0 documentation) |
+      | --- | --- |
+      | **HttpUser** | a User class that makes HTTP requests through its `client` attribute |
+      | **HttpSession** (`self.client`) | "a subclass/wrapper for requests.Session"; it adds "reporting of the request results into Locust (success/fail, response time, response length, name)" |
+      | **Base URL** | a request may give only the path; "the host part of the URL will be prepended" from the user's `host` (or `--host`) |
+      | **Default success rule** | "Requests are considered successful if the HTTP response code is OK (<400)" |
+      | **`catch_response=True`** | makes the request "return a context manager" so it can be "marked as a fail based on the content of the response, even if the response code is ok (2xx)" - or marked successful even if it was 500 or 404 |
+      | **`response.failure(exc)`** | "Report the response as a failure"; a string is wrapped in a `CatchResponseError` |
+      | **`response.success()`** | "Report the response as successful" |
+      | **`name=`** | "use as label in Locust's statistics instead of the URL path" - groups different URLs into one entry |
+      | **`client.request_name` / `client.rename_request(name)`** | set the name for every request until reset; the context manager form resets it for you |
+      | **`on_start`** | called "for each simulated user when they start" - the place for a login |
+      | **Session cookie** | `HttpSession` "preserves cookies between requests so it can easily be used to log in to websites" |
+      | **Correlation** | taking a dynamic value (token, id, cursor) from one response and sending it in a later request |
+      | **Soft error** | a response whose status says success but whose content says failure |
+      | **Failures report** | `--csv` writes `<prefix>_failures.csv` (method, name, error, occurrences); unhandled task errors go to `<prefix>_exceptions.csv` |
+
+  - id: why
+    kind: why
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping]
+    title: Why it matters - the same gateway, measured twice
+    body: |
+      Here is a locustfile that a lot of first load tests look like: it logs in, charges a card, and reads the
+      charge back. No `catch_response`, no `name=`:
+
+      ```python
+      """Demo: no catch_response, no name= - what the statistics look like."""
+      import itertools
+      from locust import HttpUser, constant, task
+
+      _numbers = itertools.count(1)
+
+
+      class NaiveMerchant(HttpUser):
+          wait_time = constant(0)
+
+          def on_start(self):
+              n = next(_numbers)
+              self.client.post("/gateway/login", json={"username": f"merchant-{n}", "password": f"secret-{n}"})
+
+          @task
+          def charge(self):
+              r = self.client.post("/gateway/charges", json={"amount_minor": 1250, "currency": "EUR"})
+              if r.headers.get("Content-Type") == "application/json" and r.json().get("status") == "approved":
+                  self.client.get(f"/gateway/charges/{r.json()['id']}")
+      ```
+
+      Run for 3 seconds with 4 users against the legacy gateway (the runner script is in "The code" below; the
+      middle of the output is cut):
+
+      ```text
+      $ .venv/bin/python show_run.py naive_locustfile.py out-naive
+      748 statistics rows
+      /gateway/charges                         requests= 1160 failures=0
+      /gateway/charges/ch_7001                 requests=    1 failures=0
+      /gateway/charges/ch_7002                 requests=    1 failures=0
+      /gateway/charges/ch_7003                 requests=    1 failures=0
+      ...
+      /gateway/login                           requests=    4 failures=0
+      gateway counters: {'logins': 4, 'charges': 1161, 'html_errors': 165, 'declined': 249, 'approved': 747, 'voids': 0, 'lookups_found': 746, 'lookups_missing': 0, 'unauthenticated': 0}
+      ```
+
+      Read the two halves against each other:
+
+      - Locust says **0 failures**. The gateway sent 165 HTML error pages and 249 declines - **414 of 1161 charges,
+        about 36 %, were not payments**. Every one was a `200`, so Locust counted it as a success. A team reading
+        this report would sign off a gateway that fails a third of its charges.
+      - Locust made **748 rows**: one for login, one for charges, and **746 rows for "get a charge"** - one per
+        charge id, one request each. There is no p95 for "get a charge"; there are 746 single measurements.
+      - The bad answers are also the *cheap* ones (an error page needs no ledger write), so mixing them in makes the
+        response times look better than real payments are.
+
+      The fixed locustfile in this lesson reports the same gateway as 4 rows, with `POST /gateway/charges` failing
+      exactly as often as the gateway sent a bad answer. Nothing about the system changed - only what the test
+      checks and how it names things.
+
+  - id: internals-catch
+    kind: internals
+    concepts: [perf-lcvalid-catch-response]
+    title: How catch_response decides success or failure
+    body: |
+      Without `catch_response`, `self.client.post(...)` sends the request, records it and returns the response.
+      The verdict was made before your code saw the body: below 400 and no connection error means success.
+
+      With `catch_response=True` the request returns a `ResponseContextManager` and **recording waits** until the
+      `with` block ends. Inside the block you decide:
+
+      | Inside the block | Recorded as |
+      | --- | --- |
+      | `response.failure("declined: insufficient_funds")` | failure; the text is the error in the failures report |
+      | `response.success()` | success, even for a 404 or 500 |
+      | neither | the status decides, as without `catch_response` |
+      | a Locust `ResponseError` raised | failure with that error |
+      | any other exception (`KeyError`, `JSONDecodeError` ...) | **not recorded at all**; the exception propagates and the task stops |
+
+      The last row is not in the docs' prose; it is what `ResponseContextManager.__exit__` in Locust 2.47.0 does
+      (it returns `False` for "other unknown exceptions", which re-raises them). The docs' REST example avoids it by
+      catching the exceptions itself:
+
+      ```python
+      from json import JSONDecodeError
+      ...
+      with self.client.post("/", json={"foo": 42, "bar": None}, catch_response=True) as response:
+          try:
+              if response.json()["greeting"] != "hello":
+                  response.failure("Did not get expected value in greeting")
+          except JSONDecodeError:
+              response.failure("Response could not be decoded as JSON")
+          except KeyError:
+              response.failure("Response did not contain expected key 'greeting'")
+      ```
+
+      Here is what happens if you don't. This user calls `r.json()` without a `try`, so the gateway's HTML page
+      raises inside the block:
+
+      ```python
+      @task
+      def charge(self):
+          with self.client.post("/gateway/charges", json={"amount_minor": 1250, "currency": "EUR"},
+                                name="POST /gateway/charges", catch_response=True) as r:
+              if r.json()["status"] == "declined":  # the HTML page raises JSONDecodeError here
+                  r.failure("declined")
+      ```
+
+      ```text
+      $ .venv/bin/python show_run.py vanish_locustfile.py out-vanish
+      2 statistics rows
+      POST /gateway/charges                    requests=  251 failures=62
+      POST /gateway/login                      requests=    4 failures=0
+      gateway counters: {'logins': 4, 'charges': 294, 'html_errors': 42, 'declined': 63, 'approved': 189, 'voids': 0, 'lookups_found': 0, 'lookups_missing': 0, 'unauthenticated': 0}
+      failure: POST POST /gateway/charges | CatchResponseError('declined') | x36
+      ```
+
+      The gateway served 294 charges; Locust recorded 251. The missing 43 are the 42 HTML pages (they **vanished**
+      from the statistics, so neither the request count nor the error rate includes them) plus one request in
+      flight at the stop. The exception went to `locust_exceptions.csv` instead:
+
+      ```text
+      Count,Message,Traceback,Nodes
+      23,Expecting value: line 1 column 1 (char 0),"  File ""/home/.../locust/user/task.py"", line 363, in run
+      ```
+
+      Two more details in that output:
+
+      - The failures line says `x36`, but the statistics say 62 failures. The `_failures.csv` and
+        `_exceptions.csv` files, like `_stats.csv`, are rewritten about once a second during the run and were
+        last written before the final requests (the 23 is low for the same reason). Read final **counts** from the
+        JSON file; use the failures CSV for the **messages**.
+      - The error text is `CatchResponseError('declined')` - the string you passed to `failure()`. Locust groups
+        failures by name and message, so put the *reason* in the message ("declined: insufficient_funds") but not
+        an id or a timestamp, or every failure becomes its own line.
+
+  - id: internals-grouping
+    kind: internals
+    concepts: [perf-lcvalid-grouping]
+    title: How names make statistics rows
+    body: |
+      Locust's statistics are keyed by **(name, method)**. Without `name=`, the name is the URL path as you wrote
+      it - including the id and any query string - so every distinct URL is a new row. The docs give three ways to
+      choose the name:
+
+      ```python
+      # 1. per request - the usual way
+      for i in range(10):
+          self.client.get("/blog?id=%i" % i, name="/blog?id=[id]")
+
+      # 2. on the session, for code that calls the client for you (an SDK that wraps the session)
+      self.client.request_name = "/blog?id=[id]"
+      for i in range(10):
+          self.client.get("/blog?id=%i" % i)
+      self.client.request_name = None
+
+      # 3. a context manager that resets the name when the block ends
+      with self.client.rename_request("/blog?id=[id]"):
+          for i in range(10):
+              self.client.get("/blog?id=%i" % i)
+      ```
+
+      In Locust 2.47.0, `rename_request` sets `request_name` and resets it to `None` in a `finally`, so the name
+      cannot leak into later requests even if the block raises - the reason to prefer it over setting the attribute
+      by hand. The docs add that inside a `catch_response` block you can set `resp.request_meta["name"]` to rename
+      a request from something in its response.
+
+      Naming conventions are yours. The practice project uses `"<METHOD> <path with {placeholders}>"` - for example
+      `GET /v1/payments/{id}` - because the method is then visible in every report, the names match the workload
+      model from [Workload modelling from production](#/lesson/workload-modelling-from-production), and the JMeter
+      lessons use the same labels. Two rules matter more than the format:
+
+      - **One name per kind of work.** Requests that do the same work at the same cost share a name; requests that
+        do different work don't, even on the same path - a read-back and a replay of `POST /v1/payments` cost
+        different amounts, so the flow in this lesson names them `POST /v1/payments` and `POST /v1/payments
+        (replay)`.
+      - **Low cardinality.** A name never contains an id, a timestamp, a user name or a query value.
+
+  - id: internals-session
+    kind: internals
+    concepts: [perf-lcvalid-session-correlation]
+    title: One session per simulated user
+    body: |
+      Each `HttpUser` instance gets its own `HttpSession`, and the docs note that "every user instance has its own
+      connection pool. This is similar to how real users (browsers) would interact with a web server." Because it is
+      a `requests.Session`, three things carry from request to request for that user only:
+
+      - **Cookies.** A `Set-Cookie` from a login response is sent on every later request - nothing to code. The
+        legacy gateway logs in this way (`gw_session=...`).
+      - **Default headers.** `self.client.headers["Authorization"] = "Bearer ..."` adds the header to every later
+        request. The shared practice API uses bearer tokens.
+      - **Connections.** "By default, connections are reused by an HttpUser, even across tasks runs." Send
+        `Connection: close` or call `self.client.close()` only if you mean to test new connections - the docs warn
+        that closing has CPU overhead.
+
+      **Where to log in.** `on_start` runs once per simulated user before its first task, so a token or cookie is
+      fetched once - like a real merchant who logs in and then works. Logging in inside the task makes every
+      iteration a login, which tests the login service at a rate no real user produces (and with a rate limit on
+      the token endpoint, as `sandpay_target` has, it turns into `429`s).
+
+      **Correlation** is ordinary Python: read the value from one response, keep it in a local variable (one flow)
+      or on `self` (the rest of this user's life), and use it in the next request. The flow in this lesson creates a
+      payment, keeps its id, reads it back and replays the create with the same `Idempotency-Key`. The rule that
+      makes the statistics honest: **validate the step that produces the value, and return when it fails.** A
+      failed create has no id; sending `GET /v1/payments/None` would add a second, misleading failure - a `404` that
+      looks like a read bug.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-session-correlation]
+    title: One user's flow, and where each verdict is made
+    body: |
+      ```mermaid
+      flowchart TD
+        S["on_start: POST /auth/token"] --> H["self.client.headers: Authorization"]
+        H --> C["POST /v1/payments with a new Idempotency-Key"]
+        C --> V1{"201 and an id?"}
+        V1 -- "no: failure, return" --> E["next iteration"]
+        V1 -- "yes: keep payment_id" --> R["GET /v1/payments/{id}"]
+        R --> V2{"200, same id, my merchant?"}
+        V2 -- "no: failure, return" --> E
+        V2 -- "yes" --> P["POST /v1/payments (replay) with the same key"]
+        P --> V3{"Idempotent-Replayed true, same id?"}
+        V3 -- "no: failure" --> E
+        V3 -- "yes: success" --> E
+        E --> C
+      ```
+
+      Each diamond is a `catch_response` block. The `no` arrows all **return**: the flow never sends a request
+      with a value it did not get. The names on the boxes are the statistics rows - four for the whole run, however
+      many payments are made.
+
+  - id: code-gateway
+    kind: code
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: 'The code: validating the legacy gateway'
+    body: |
+      The solution for the first exercise (`practice/perf/solutions/locust/lc_valid_gateway_locustfile.py`, the
+      docstring shortened):
+
+      ```python
+      import itertools
+      from json import JSONDecodeError
+
+      from locust import HttpUser, constant, task
+
+      _numbers = itertools.count(1)
+
+
+      class GatewayMerchant(HttpUser):
+          wait_time = constant(0)  # the exercise counts outcomes; a real test paces users (see locust-fundamentals)
+
+          def on_start(self):
+              n = next(_numbers)
+              with self.client.post("/gateway/login", json={"username": f"merchant-{n}", "password": f"secret-{n}"},
+                                    name="POST /gateway/login", catch_response=True) as r:
+                  if r.status_code != 200 or "gw_session" not in self.client.cookies:
+                      r.failure(f"login failed: HTTP {r.status_code}")
+
+          @task
+          def charge_and_void(self):
+              charge_id = None
+              with self.client.post("/gateway/charges", json={"amount_minor": 1250, "currency": "EUR"},
+                                    name="POST /gateway/charges", catch_response=True) as r:
+                  try:
+                      body = r.json()
+                  except JSONDecodeError:
+                      r.failure(f"not JSON: HTTP {r.status_code} {r.headers.get('Content-Type')}")
+                      return
+                  if body.get("status") == "declined":
+                      r.failure(f"declined: {body.get('decline_code')}")
+                      return
+                  if body.get("status") != "approved" or "id" not in body:
+                      r.failure(f"unexpected charge body: {body}")
+                      return
+                  charge_id = body["id"]
+                  r.success()
+
+              self.client.post(f"/gateway/charges/{charge_id}/void", name="POST /gateway/charges/{id}/void")
+              with self.client.get(f"/gateway/charges/{charge_id}", name="GET /gateway/charges/{id} (voided)",
+                                   catch_response=True) as r:
+                  if r.status_code == 404:
+                      r.success()
+                  else:
+                      r.failure(f"voided charge still visible: HTTP {r.status_code}")
+      ```
+
+      The runner used for every gateway output in this lesson (`show_run.py`, kept outside the repo; it uses the
+      practice project's helpers):
+
+      ```python
+      """Runs a locustfile against the legacy gateway and prints the statistics rows and failures."""
+      import csv, sys
+      from pathlib import Path
+      sys.path.insert(0, "support")
+      from lc_valid_fixture import metrics, serve
+      from load_tools import read_locust_stats, run_locust
+
+      locustfile, out = Path(sys.argv[1]), Path(sys.argv[2])
+      with serve() as base:
+          prefix = run_locust(locustfile, base, users=4, spawn_rate=4, run_time="3s", out_dir=out)
+          served = metrics(base)
+      stats = read_locust_stats(prefix)
+      print(f"{len(stats)} statistics rows")
+      for name, e in sorted(stats.items()):
+          print(f"{name:40} requests={e['num_requests']:5} failures={e['num_failures']}")
+      print("gateway counters:", served)
+      with open(f"{prefix}_failures.csv", newline="") as f:
+          for row in csv.DictReader(f):
+              print(f"failure: {row['Method']} {row['Name']} | {row['Error']} | x{row['Occurrences']}")
+      ```
+
+      The run (from `practice/perf`, 20 November 2026):
+
+      ```text
+      $ .venv/bin/python show_run.py solutions/locust/lc_valid_gateway_locustfile.py out-sol
+      4 statistics rows
+      GET /gateway/charges/{id} (voided)       requests=  382 failures=0
+      POST /gateway/charges                    requests=  597 failures=213
+      POST /gateway/charges/{id}/void          requests=  383 failures=0
+      POST /gateway/login                      requests=    4 failures=0
+      gateway counters: {'logins': 4, 'charges': 598, 'html_errors': 85, 'declined': 128, 'approved': 385, 'voids': 384, 'lookups_found': 0, 'lookups_missing': 383, 'unauthenticated': 0}
+      failure: POST POST /gateway/charges | CatchResponseError('declined: insufficient_funds') | x103
+      failure: POST POST /gateway/charges | CatchResponseError('not JSON: HTTP 200 text/html') | x69
+      ```
+
+      Check it the way the tests do:
+
+      - **Failures match the gateway exactly:** 85 HTML pages + 128 declines = **213**, and Locust reports 213
+        failures for `POST /gateway/charges`. (The gateway counted 598 charges, Locust 597: the last one was in
+        flight when the run stopped.)
+      - **Four rows**, whatever the number of charges.
+      - **The expected 404 is a success:** 382 lookups after a void, 0 failures; the gateway answered 404 every time
+        (`lookups_found` is 0).
+      - **One login per user**, and no request arrived without the cookie (`unauthenticated` 0).
+      - The failures CSV shows the two reasons by message. Its occurrence counts (103 + 69 = 172) are lower than the
+        final 213 because that file was last rewritten before the end of the run - read counts from the JSON.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: The lines that matter
+    body: |
+      - **`with self.client.post(..., catch_response=True) as r:`** - the request is sent at once, but recorded only
+        when the block ends, with your verdict.
+      - **`"gw_session" not in self.client.cookies`** - the session's cookie jar. After this check nothing else is
+        needed: the cookie goes with every later request of this user.
+      - **`try: body = r.json()` / `except JSONDecodeError`** - the HTML page is caught and *reported*. Without the
+        `try`, the request would vanish from the statistics (see "How catch_response decides").
+      - **`r.failure(f"declined: {body.get('decline_code')}")`** - the message names the reason, with a value of low
+        cardinality (`insufficient_funds`), never the charge id.
+      - **`return` inside the block** - leaving the `with` still records the request; it also skips the void, which
+        has no charge to act on.
+      - **`r.success()` after an approved charge** - optional here (the status was 200), but it says "I checked".
+      - **`name="POST /gateway/charges/{id}/void"`** - the id is in the URL, not in the name.
+      - **`if r.status_code == 404: r.success()`** - the docs' pattern for an expected error status. A 200 here would
+        mean the void did not work, so it is the failure.
+      - **`wait_time = constant(0)`** - only because the exercise counts outcomes. A real test paces users from
+        the workload model.
+
+  - id: code-flow
+    kind: code
+    concepts: [perf-lcvalid-session-correlation, perf-lcvalid-catch-response]
+    title: 'The code: a correlated payment flow with a bearer token'
+    body: |
+      The solution for the second exercise (`solutions/locust/lc_valid_flow_locustfile.py`, docstring
+      shortened) runs against the shared practice API. Merchants 4 and up have no seeded payments, so any payment
+      such a user can read must be one it created - a `404` would prove the id was not correlated.
+
+      ```python
+      import itertools
+      import random
+      import uuid
+
+      from locust import HttpUser, constant, task
+
+      _numbers = itertools.count(4)
+
+
+      class PaymentFlowUser(HttpUser):
+          wait_time = constant(0)
+
+          def on_start(self):
+              n = next(_numbers)
+              self.merchant = f"merchant-{n}"
+              r = self.client.post("/auth/token", json={"client_id": self.merchant, "client_secret": f"secret-{n}"},
+                                   name="POST /auth/token")
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task
+          def payment_flow(self):
+              key = str(uuid.uuid4())
+              order = {"amount_minor": random.randint(100, 50000), "currency": "EUR"}
+
+              with self.client.post("/v1/payments", json=order, headers={"Idempotency-Key": key},
+                                    name="POST /v1/payments", catch_response=True) as r:
+                  if r.status_code != 201:
+                      r.failure(f"create: HTTP {r.status_code}")
+                      return
+                  payment_id = r.json().get("id")
+                  if not payment_id:
+                      r.failure("create: no id in the response")
+                      return
+
+              with self.client.get(f"/v1/payments/{payment_id}", name="GET /v1/payments/{id}", catch_response=True) as r:
+                  if r.status_code != 200:
+                      r.failure(f"read back: HTTP {r.status_code}")
+                      return
+                  body = r.json()
+                  if body.get("id") != payment_id or body.get("merchant") != self.merchant:
+                      r.failure(f"read back: got {body.get('id')} for {body.get('merchant')}")
+                      return
+
+              with self.client.post("/v1/payments", json=order, headers={"Idempotency-Key": key},
+                                    name="POST /v1/payments (replay)", catch_response=True) as r:
+                  if r.headers.get("Idempotent-Replayed") != "true":
+                      r.failure(f"replay: not marked as replayed (HTTP {r.status_code})")
+                  elif r.json().get("id") != payment_id:
+                      r.failure("replay: a different payment id - the retry created a second payment")
+      ```
+
+      The runner (`show_flow.py`, outside the repo) serves the shared API with `latency_ms=0` and an `error_rate`
+      from the command line, runs 4 users for 3 seconds and prints Locust's rows and the API's `/metrics`:
+
+      ```python
+      """Runs the payment-flow locustfile against the shared practice API and prints Locust's rows and the API's counters."""
+      import json, sys, urllib.request
+      from pathlib import Path
+      sys.path.insert(0, "support")
+      from load_tools import read_locust_stats, run_locust
+      from sandpay_target import TargetConfig, serve
+
+      locustfile, out, error_rate = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+      with serve(TargetConfig(latency_ms=0, capacity=32, error_rate=error_rate)) as base:
+          prefix = run_locust(locustfile, base, users=4, spawn_rate=4, run_time="3s", out_dir=out)
+          served = json.loads(urllib.request.urlopen(f"{base}/metrics", timeout=5).read())
+      for name, e in sorted(read_locust_stats(prefix).items()):
+          print(f"{name:30} requests={e['num_requests']:5} failures={e['num_failures']}")
+      print("API statuses:", served["statuses"])
+      print("API payments_created:", served["payments_created"], "idempotent_replays:", served["idempotent_replays"])
+      ```
+
+      With no injected errors, then with 25 % of creates failing with `500`:
+
+      ```text
+      $ .venv/bin/python show_flow.py solutions/locust/lc_valid_flow_locustfile.py out-flow 0
+      GET /v1/payments/{id}          requests=  340 failures=0
+      POST /auth/token               requests=    4 failures=0
+      POST /v1/payments              requests=  342 failures=0
+      POST /v1/payments (replay)     requests=  339 failures=0
+      API statuses: {'200': 346, '201': 683}
+      API payments_created: 343 idempotent_replays: 340
+
+      $ .venv/bin/python show_flow.py solutions/locust/lc_valid_flow_locustfile.py out-flow2 0.25
+      GET /v1/payments/{id}          requests=  103 failures=0
+      POST /auth/token               requests=    4 failures=0
+      POST /v1/payments              requests=  138 failures=35
+      POST /v1/payments (replay)     requests=  101 failures=0
+      API statuses: {'200': 107, '201': 205, '500': 36}
+      API payments_created: 103 idempotent_replays: 102
+      ```
+
+      What the numbers prove:
+
+      - **Authentication:** 4 token requests for 4 users, and no `401` anywhere - the header went with every request.
+      - **Correlation:** no `404` in either run, so every read used an id this merchant created.
+      - **Idempotency under load:** 683 `201` answers but only 343 payments created - the 340 replays returned the
+        stored `201` and created nothing (the counters differ by at most one per user because of in-flight requests
+        at the stop).
+      - **Stopping the flow:** with errors on, 138 creates - 35 failures = **103** good creates, and exactly **103**
+        reads. No read was sent for a failed create. (The API saw 36 `500`s: one more create was in flight at the
+        stop. The error draws come from the API's shared random generator, so their number varies a little between
+        runs; the "reads = good creates" relationship does not.)
+
+  - id: when
+    kind: when
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: When to use which
+    body: |
+      | Situation | Use |
+      | --- | --- |
+      | the status code alone tells good from bad (`201` vs `4xx`/`5xx`) | nothing extra - the default rule is right |
+      | a `2xx` can still be a failure (error body, declined status, empty list where data must exist, HTML instead of JSON) | `catch_response` + `failure()` on the one field that proves success |
+      | an error status is the *expected* answer (404 after delete, 409 on a duplicate, 429 you are testing for) | `catch_response` + `success()` for that status only |
+      | you want the request out of the statistics entirely | raise `RescheduleTask` inside the block, as the docs show - rarely right in a load test, since the request still loaded the server |
+      | a URL contains an id, a cursor or a query value | `name=` on the request |
+      | a library calls `self.client` for you, or several requests in a block share one name | `with self.client.rename_request(...)` |
+      | the site logs in with a cookie | log in once in `on_start`; the session keeps the cookie |
+      | the API uses a bearer token | get it in `on_start`, put it in `self.client.headers`; refresh it only when it expires |
+      | a step needs a value from an earlier response | keep it in a variable; validate the earlier step and `return` when it fails |
+
+      **How much to check:** one or two fields that prove the work was done (`status == "approved"`, an `id`
+      present). Every check runs for every request and costs CPU on the load generator; a full schema validation per
+      request belongs in the functional API tests, not in the load test.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: Making an existing locustfile trustworthy, step by step
+    body: |
+      1. **Run it briefly and count the rows.** More rows than kinds of request means ungrouped names - fix them first
+         with `name=` (the third exercise finds them automatically).
+      2. **List what "success" means for each request** - from the API contract, not from the status code: which
+         field proves the work was done, and which error statuses are expected.
+      3. **Wrap those requests in `catch_response`.** Parse inside `try`, call `failure()` with a reason that has no
+         ids in it, call `success()` for expected error statuses.
+      4. **Move logins to `on_start`.** Cookie: nothing else to do. Token: set `self.client.headers`.
+      5. **Correlate and stop on failure.** Take ids from the response that created them; `return` when that step
+         fails.
+      6. **Prove the checks fail.** Run against a target that gives known bad answers (like the legacy gateway) and
+         confirm the failures equal the bad answers - a check that never fails proves nothing.
+      7. **Compare with the server.** The server's counters (or logs) and Locust's statistics should agree to within
+         the requests in flight at the stop. Requests missing from Locust point to unhandled exceptions - look in
+         `_exceptions.csv`.
+
+  - id: example
+    kind: example
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping]
+    title: 'Worked example: a "0 % errors" report that was wrong'
+    body: |
+      A team load-tests a checkout that calls the legacy gateway. The report: 0 % errors, p95 fine, 748 request
+      rows. The review goes like this:
+
+      1. **748 rows** for a script with three kinds of request: the read-back has no name. After adding
+         `name="GET /gateway/charges/{id}"` it is one row with a real p95.
+      2. **0 % errors from a gateway that declines cards** is suspicious. A spot check of one response shows
+         `200 {"status": "declined", "decline_code": "insufficient_funds"}`. The charge request gets
+         `catch_response` with `failure(f"declined: {code}")`.
+      3. The next run shows failures - but fewer requests than the gateway logged. `_exceptions.csv` has `Expecting
+         value: line 1 column 1 (char 0)`: an HTML error page made `r.json()` raise inside the block, so those
+         requests were never recorded. A `try/except JSONDecodeError` turns them into `not JSON` failures.
+      4. Final run: failures equal the gateway's declines plus HTML pages, exactly. About a third of charges fail -
+         that is the finding, and it was there all along.
+
+      The team also learns why "test declines in a load test at all" is a fair question: declines may be *expected*
+      for the test cards used. Then the right check is `success()` for a decline on a decline-test card and
+      `failure()` for one on an approve-test card - the rule comes from the test data, not from the status code.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: How the exercises are tested
+    body: |
+      - `tests/locust/test_lc_valid_gateway.py` runs your gateway locustfile with real Locust (4 users, 3 s) against
+        `support/lc_valid_fixture.py` and compares Locust's JSON totals with the gateway's counters: exactly the four
+        names, one login per user and no `401`, `POST /gateway/charges` failures equal to declines + HTML pages
+        (minus at most one in-flight request per user), both reasons in the failure messages, and zero failures for
+        the expected `404`.
+      - `tests/locust/test_lc_valid_flow.py` runs your flow locustfile twice against the shared API: once clean (no
+        failures, four names, no `401`/`404`, replays create nothing) and once with `error_rate=0.25` (create
+        failures are reported, no `404`, reads equal the successful creates).
+      - `tests/locust/test_lc_valid_names.py` checks your naming functions on a table shaped like the real
+        ungrouped run above.
+
+      None of the tests check response times - they depend on the machine. They check what was sent, what was
+      counted and how the counts relate.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/locust/test_lc_valid_gateway.py tests/locust/test_lc_valid_flow.py tests/locust/test_lc_valid_names.py
+      ```
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: Common mistakes
+    body: |
+      - **Trusting the status code for an API that hides errors in the body.** The naive run reported 0 failures for
+        a gateway that failed 36 % of charges.
+      - **Parsing without `try` inside `catch_response`.** The request vanishes from the statistics, the error rate
+        is understated, and the only trace is `_exceptions.csv`.
+      - **Ids in failure messages.** `failure(f"declined {charge_id}")` makes one failures line per charge. Put the
+        reason in the message and the id in a log, if anywhere.
+      - **No `name=` on dynamic URLs**, including query strings (`?starting_after=pay_9`) - hundreds of rows of one
+        request each.
+      - **One name for different work** - a create and a replay, or a list and a report - so the row's percentiles
+        mix two cost profiles.
+      - **Setting `client.request_name` and forgetting to reset it.** Every later request takes that name. Use
+        `rename_request()`.
+      - **Logging in in every task.** The test hammers the login service and the token endpoint's rate limit, not the
+        API you meant to test.
+      - **Sharing one token or cookie across users** (a module-level variable) - every simulated user becomes the
+        same merchant, which hides per-merchant locking, caching and rate limits.
+      - **Continuing after a failed step.** A failed create followed by `GET /v1/payments/None` adds a fake `404`
+        to a second row and blames the wrong endpoint.
+      - **Reading final counts from `_failures.csv` or `_stats.csv`.** They are rewritten about once a second; the
+        JSON file (`--json-file`) is written at the end.
+      - **`import locust` in a pytest process.** Locust's gevent monkey-patching changes the whole interpreter - the
+        practice project always runs Locust in a subprocess.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: Trade-offs
+    body: |
+      - **Checks versus load-generator cost.** Parsing JSON and comparing fields for every response costs CPU on the
+        generator; a busy generator under-reports throughput and inflates response times. Check the one or two
+        fields that prove success; watch the generator's CPU (Locust warns when it is high).
+      - **Strict versus tolerant checks.** A strict check (`status == "approved"`) catches a gateway that starts
+        declining good cards; a tolerant one (`status in {"approved", "pending"}`) avoids false failures when async
+        processing is normal. Write down which you chose and why.
+      - **Fine versus coarse names.** One row per endpoint is easy to read; splitting by meaningful variants (first
+        page vs next page, small vs large report) shows different costs. Split only when the costs differ.
+      - **Per-user sessions versus a shared pool.** Per-user sessions and connection pools resemble real clients;
+        `pool_manager` (a shared `urllib3.PoolManager`) limits total connections when you are modelling a client
+        that really shares them - a backend calling the API through one pool, for example.
+      - **Expected errors as success versus excluded.** `success()` keeps the request and its time in the
+        statistics - right when the expected error still costs the server work. `RescheduleTask` removes it -
+        right only for requests you made for set-up, not for load.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-lcvalid-catch-response, perf-lcvalid-grouping, perf-lcvalid-session-correlation]
+    title: Summary
+    body: |
+      - Default rule: status below 400 and no connection error = success. A `200` with an error body is a success
+        until you check it.
+      - `with self.client.get(..., catch_response=True) as r:` then `r.failure("reason")` or `r.success()`; neither
+        = the status decides; an unhandled exception = **not recorded**. Parse inside `try`.
+      - Failure messages name the reason, never an id. Read final counts from `--json-file`; the CSVs lag.
+      - Statistics rows are keyed by name; the default name is the URL. Use `name=` or `rename_request()` for every
+        dynamic URL - one name per kind of work.
+      - One `HttpSession` per user: cookies and `self.client.headers` persist. Log in once in `on_start`.
+      - Correlate: take the id from the response that created it, validate that step, `return` when it fails.
+      - Prove the checks: failures should equal the bad answers a known target sent.
+
+exercises:
+  - id: default-rule-mcq
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: recall
+    title: What Locust fails on its own
+    prompt: Without `catch_response`, which of these responses does Locust record as a failure?
+    options:
+      - id: status-500
+        text: '`500` with a JSON error body'
+        feedback: Correct - a status of 400 or above is a failure by default ("successful if the HTTP response code is OK (<400)").
+      - id: declined-200
+        text: '`200` with `{"status": "declined"}`'
+        feedback: The status is below 400, so Locust records a success. Only a check of the body can fail it.
+      - id: html-200
+        text: '`200` with an HTML error page instead of JSON'
+        feedback: Still a 200 - Locust does not parse the body unless your code does.
+      - id: slow-200
+        text: '`200` after 4 seconds'
+        feedback: Slowness is not a failure by default; it shows in the response times. You could fail it with catch_response, but usually the SLO is judged on percentiles afterwards.
+    correct: [status-500]
+    hints:
+      - The docs give a single rule based on the status code.
+    solution: |
+      Status below 400 (and no connection error) = success. Only the `500` fails without your help.
+
+  - id: soft-error-mcq
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: Failing a 200
+    prompt: |
+      The gateway answers `200 {"status": "declined", "decline_code": "insufficient_funds"}`. Which code records
+      that request as a failure with a useful message?
+    options:
+      - id: catch
+        text: '`with self.client.post(url, json=b, catch_response=True) as r:` then `if r.json()["status"] == "declined": r.failure("declined: insufficient_funds")`'
+        feedback: Correct - catch_response delays recording until the block ends, and failure() sets the verdict and the message.
+      - id: raise-status
+        text: '`r = self.client.post(url, json=b)` then `r.raise_for_status()`'
+        feedback: raise_for_status only raises for 4xx/5xx; the request was already recorded as a success anyway.
+      - id: assert
+        text: '`r = self.client.post(url, json=b)` then `assert r.json()["status"] != "declined"`'
+        feedback: The request was already recorded as a success; the AssertionError only stops the task and lands in the exceptions report.
+      - id: name
+        text: '`self.client.post(url, json=b, name="declined")`'
+        feedback: name= changes the statistics row, not the verdict.
+    correct: [catch]
+    hints:
+      - When is a request recorded without catch_response?
+    solution: |
+      Only with `catch_response=True` can the body change the verdict, through `r.failure(...)`.
+
+  - id: expected-404-mcq
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: The 404 you want
+    prompt: |
+      After voiding a charge, the test reads it back to prove it is gone; the correct answer is `404`. How do you
+      record the read-back?
+    options:
+      - id: success-404
+        text: '`catch_response=True`; `r.success()` if the status is 404, else `r.failure("voided charge still visible")`'
+        feedback: Correct - the docs' own pattern for an expected error status, plus a failure for the wrong answer.
+      - id: plain
+        text: A plain `self.client.get(...)` - Locust knows a 404 is fine here
+        feedback: Locust only knows the status rule - every 404 would be a failure.
+      - id: reschedule
+        text: Raise `RescheduleTask` when the status is 404
+        feedback: That removes the request from the statistics entirely; the read still loaded the server and the 200 case would not fail.
+      - id: success-all
+        text: '`catch_response=True` and always call `r.success()`'
+        feedback: Then a voided charge that is still visible (200) would pass - the bug you are testing for.
+    correct: [success-404]
+    hints:
+      - Which answer is the bug here - 404 or 200?
+    solution: |
+      `success()` for the expected 404 and `failure()` for anything else. In the lesson's run: 382 read-backs, 0
+      failures, and the gateway answered 404 every time.
+
+  - id: vanish-mcq
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: analysis
+    title: Where did 42 requests go?
+    prompt: |
+      The gateway served 294 charges, Locust recorded 251, and `_exceptions.csv` shows `Expecting value: line 1
+      column 1 (char 0)`. The task calls `r.json()["status"]` inside a `catch_response` block. What happened?
+    options:
+      - id: unrecorded
+        text: The HTML responses raised a JSON error inside the block; Locust re-raised it and never recorded those requests
+        feedback: Correct - only a Locust ResponseError is turned into a failure; other exceptions propagate and the request is not reported.
+      - id: dropped-server
+        text: The server dropped 42 connections
+        feedback: The gateway counted 294 charges it answered; the requests arrived and were answered.
+      - id: failures-file
+        text: They are counted as failures, just in the exceptions file
+        feedback: The statistics show 251 requests in total - the 42 are in no count at all.
+      - id: csv-lag
+        text: The stats CSV lagged by a second
+        feedback: These numbers come from the JSON file, which is written at the end. The gap is the unhandled exception.
+    correct: [unrecorded]
+    hints:
+      - Which content type does the gateway's error page have?
+      - Compare the gap with the gateway's html_errors counter (42).
+    solution: |
+      An unhandled exception inside the block is not a failure - the request is not recorded. Catch
+      `JSONDecodeError` and call `r.failure("not JSON ...")`.
+
+  - id: failure-message-mcq
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: A message that groups well
+    prompt: Which failure message is best for a declined charge in a load test?
+    options:
+      - id: reason
+        text: '`r.failure(f"declined: {body[''decline_code'']}")`'
+        feedback: Correct - the reason has few distinct values, so the failures report stays one line per reason.
+      - id: with-id
+        text: '`r.failure(f"charge {body[''id'']} declined")`'
+        feedback: Every charge id makes a new failures line - thousands of lines with one occurrence each.
+      - id: generic
+        text: '`r.failure("error")`'
+        feedback: It groups, but tells nobody what went wrong - declines and HTML pages look the same.
+      - id: whole-body
+        text: '`r.failure(r.text)`'
+        feedback: The body usually holds an id, so every line is unique; HTML pages make it unreadable too.
+    correct: [reason]
+    hints:
+      - Locust groups failures by request name and error text.
+    solution: |
+      Name the reason with a low-cardinality value; keep ids out of the message.
+
+  - id: grouping-mcq
+    type: mcq
+    concept: perf-lcvalid-grouping
+    skill: application
+    title: 748 rows
+    prompt: |
+      A 3-second run produced 748 statistics rows, 746 of them like `/gateway/charges/ch_7001` with 1 request each.
+      What is the fix?
+    options:
+      - id: name-arg
+        text: Add `name="GET /gateway/charges/{id}"` to that request
+        feedback: Correct - one name per kind of work; the id stays in the URL, not in the name.
+      - id: fewer-users
+        text: Run fewer users so fewer ids are made
+        feedback: Fewer rows, same problem - each row still has one request and no meaningful percentile.
+      - id: csv
+        text: Read the results from `_stats.csv` instead of the JSON file
+        feedback: Both have one row per name.
+      - id: no-ids
+        text: Read the same charge id every time
+        feedback: That changes what the test does (one hot record) instead of how it is reported.
+    correct: [name-arg]
+    hints:
+      - What is the default name of a request?
+    solution: |
+      The default name is the URL path. `name=` (or `rename_request()`) groups all the ids into one row.
+
+  - id: rename-request-mcq
+    type: mcq
+    concept: perf-lcvalid-grouping
+    skill: analysis
+    title: The name that leaked
+    prompt: |
+      A task sets `self.client.request_name = "GET /v1/payments/{id}"`, loops over ten ids, then calls
+      `self.client.get("/v1/reports/settlement")`. The report shows no settlement row, and the payments row is
+      slower than expected. Why, and what is the better pattern?
+    options:
+      - id: leak
+        text: The name was never reset, so the report request was recorded under the payments name; use `with self.client.rename_request(...)`
+        feedback: Correct - request_name applies until set back to None; rename_request() resets it in a finally block.
+      - id: cache
+        text: Locust cached the report response
+        feedback: Locust does not cache responses; the request ran and was recorded under the wrong name.
+      - id: method
+        text: Names must include the method, so the report was dropped
+        feedback: Names are free text; nothing was dropped - it was mislabelled.
+      - id: order
+        text: request_name only works on the first request of a task
+        feedback: It applies to every request until reset - that is the problem here.
+    correct: [leak]
+    hints:
+      - When does request_name stop applying?
+    solution: |
+      `request_name` stays set until you reset it; the slow report was mixed into the payments row.
+      `rename_request()` scopes the name to its block.
+
+  - id: replay-name-mcq
+    type: mcq
+    concept: perf-lcvalid-grouping
+    skill: analysis
+    title: Same URL, different work
+    prompt: |
+      The flow sends `POST /v1/payments` twice per iteration: a create, then a replay with the same
+      `Idempotency-Key`. Why does the lesson give them different names?
+    options:
+      - id: cost
+        text: A replay returns the stored answer without creating a payment, so it costs the server less; one row would mix two cost profiles
+        feedback: Correct - in the target a create takes twice the service time, a replay none. One row would average them.
+      - id: required
+        text: Locust refuses two requests with the same name in one task
+        feedback: Locust allows any number of requests with the same name.
+      - id: method
+        text: Locust needs different names for requests with different headers
+        feedback: Headers do not affect naming; names are what you choose.
+      - id: failure
+        text: Replays always fail, so they must be separate
+        feedback: Replays succeed when idempotency works; the reason is cost, not failure.
+    correct: [cost]
+    hints:
+      - Does a replay do the same work as a create?
+    solution: |
+      Name by kind of work. A create and a replay cost different amounts, so they get separate rows.
+
+  - id: cookie-mcq
+    type: mcq
+    concept: perf-lcvalid-session-correlation
+    skill: recall
+    title: After the login
+    prompt: |
+      `on_start` posts to `/gateway/login`, which answers with `Set-Cookie: gw_session=...`. What must the tasks do
+      to stay logged in?
+    options:
+      - id: nothing
+        text: Nothing - each user's HttpSession keeps the cookie and sends it with every later request
+        feedback: Correct - "it preserves cookies between requests so it can easily be used to log in to websites".
+      - id: header
+        text: Copy the cookie into a Cookie header on every request
+        feedback: Not needed; the session's cookie jar does it.
+      - id: login-each
+        text: Log in again at the start of every task
+        feedback: That tests the login service at a rate no real user produces.
+      - id: global
+        text: Store the cookie in a module variable so all users share it
+        feedback: Then every simulated user is the same merchant, and the per-user session is wasted.
+    correct: [nothing]
+    hints:
+      - What is HttpSession a subclass of?
+    solution: |
+      `HttpSession` is a `requests.Session`; cookies persist for that user.
+
+  - id: token-mcq
+    type: mcq
+    concept: perf-lcvalid-session-correlation
+    skill: application
+    title: Where the bearer token goes
+    prompt: 'The API needs `Authorization: Bearer <token>` on every request. Where do you put it?'
+    options:
+      - id: headers
+        text: In `on_start`, after getting the token - `self.client.headers["Authorization"] = f"Bearer {token}"`
+        feedback: Correct - a default header on this user's session, sent with every later request.
+      - id: class-attr
+        text: In a class attribute `headers = {...}` on the HttpUser
+        feedback: HttpUser has no such attribute; set the header on the session (self.client.headers).
+      - id: each-task
+        text: Fetch a new token in each task and pass it with headers=
+        feedback: Works, but one login per request is a different (and unrealistic) workload.
+      - id: host
+        text: Put the token in the --host URL
+        feedback: The host is the base URL; tokens do not go there.
+    correct: [headers]
+    hints:
+      - The session is a requests.Session.
+    solution: |
+      Get it once in `on_start`; set `self.client.headers["Authorization"]`.
+
+  - id: stop-flow-mcq
+    type: mcq
+    concept: perf-lcvalid-session-correlation
+    skill: analysis
+    title: Two failures for one fault
+    prompt: |
+      A flow creates a payment and reads it back. With 25 % create errors, the report shows failures on
+      `POST /v1/payments` **and** 404 failures on `GET /v1/payments/{id}`. The read endpoint has no bug. What is
+      wrong with the script?
+    options:
+      - id: no-return
+        text: It sends the read even when the create failed, with an id it never got
+        feedback: Correct - validate the create and return when it fails; the lesson's run shows reads = good creates and no 404.
+      - id: name
+        text: The read is missing `name=`
+        feedback: Naming changes rows, not 404s.
+      - id: cookie
+        text: The session lost its cookie after the 500
+        feedback: A 500 does not clear the session's cookies or headers.
+      - id: replay
+        text: The create should be retried until it succeeds
+        feedback: Retrying hides the failure rate you are measuring; stop the flow and let the iteration start again.
+    correct: [no-return]
+    hints:
+      - Where does the id for the read come from?
+    solution: |
+      Correlated steps must stop when the step that produces the value fails; otherwise one fault shows up as two.
+
+  - id: steps-order
+    type: order
+    concept: perf-lcvalid-session-correlation
+    skill: application
+    title: One user, in order
+    prompt: Put one simulated user's actions in the order the payment-flow locustfile runs them.
+    items:
+      - id: token
+        text: on_start - POST /auth/token
+      - id: header
+        text: Set self.client.headers Authorization
+      - id: create
+        text: POST /v1/payments with a new Idempotency-Key, inside catch_response
+      - id: keep
+        text: Keep payment_id from the 201 response
+      - id: read
+        text: GET /v1/payments/{id} and check the id and merchant
+      - id: replay
+        text: POST /v1/payments (replay) with the same key and body
+    hints:
+      - The id must exist before it can be read.
+    solution: |
+      Token, header, create, keep the id, read it back, replay. Each check `return`s on failure, so later steps
+      never run without the value they need.
+
+  - id: flow-debug
+    type: debug
+    concept: perf-lcvalid-catch-response
+    skill: analysis
+    title: Four defects in one task
+    prompt: |
+      This task is meant to create a payment and read it back, with validation and grouped names. Click every line
+      that is a defect.
+    language: python
+    code: |
+      @task
+      def flow(self):
+          self.client.post("/auth/token", json=CREDS, name="POST /auth/token")
+          with self.client.post("/v1/payments", json=ORDER, headers=KEY,
+                                name="POST /v1/payments", catch_response=True) as r:
+              if r.status_code != 201:
+                  r.failure(f"create failed for {r.json()['id']}")
+              pid = r.json()["id"]
+          self.client.get(f"/v1/payments/{pid}")
+    correctLines: [3, 7, 8, 9]
+    lineNotes:
+      - line: 3
+        note: A login in every task - it belongs in on_start, once per user, with the token in self.client.headers.
+      - line: 7
+        note: An id in the message (and a failed create may have no id - KeyError, so the request vanishes).
+      - line: 8
+        note: Runs even after a failure - no return, so a failed create raises or continues with a bad id.
+      - line: 9
+        note: No name= - one statistics row per payment id.
+    hints:
+      - Look for work in the wrong place, a message with an id, a missing return and a missing name.
+    solution: |
+      Line 3 belongs in `on_start`. Line 7 must not use an id (and must not parse a failure body). After a failure,
+      `return` (line 8). Line 9 needs `name="GET /v1/payments/{id}"` and its own validation.
+
+  - id: csv-lag-short
+    type: short
+    concept: perf-lcvalid-catch-response
+    skill: analysis
+    title: 172 or 213?
+    prompt: |
+      In the lesson's gateway run, `_failures.csv` lists 103 declines and 69 "not JSON" failures (172), but the
+      statistics say 213 failures for `POST /gateway/charges`. Which number is right, why do they differ, and how
+      should a report use each file?
+    modelAnswer: |
+      213 is right: it comes from the JSON file, written once at the end of the run, and it equals the gateway's
+      128 declines + 85 HTML pages. The CSV files (`_stats.csv`, `_failures.csv`, `_exceptions.csv`) are rewritten
+      about once a second while the test runs, so the last write missed the final second of failures. Use the JSON
+      for counts and rates, and the failures CSV for the messages - the reasons and their rough proportions.
+    rubric:
+      - Says 213 (the JSON total) is right and matches the gateway's counters.
+      - Explains the CSV is rewritten periodically and lags at the end of a run.
+      - Uses JSON for counts and the failures CSV for messages.
+    hints:
+      - When is each file written?
+    solution: |
+      JSON = final counts (213); the failures CSV lags but names the reasons.
+
+  - id: refund-testdesign
+    type: testdesign
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: Validation for a refund flow
+    prompt: |
+      SandPay adds `POST /v1/refunds` (body: `payment_id`, `amount_minor`; answer `201` with `{"id": "rf_...",
+      "status": "pending" | "succeeded"}`; `409` if the payment is already fully refunded). Design the Locust
+      validation and names for a flow "create a payment, refund it, try to refund it again", and the checks that
+      prove your validation works.
+    modelAnswer: |
+      **Flow and names (catch_response on each):**
+
+      1. `POST /v1/payments` - 201 and an id, else `failure("create: HTTP n")` and return.
+      2. `POST /v1/refunds` - 201, `status` in {pending, succeeded}, `payment_id` matches; else failure with the
+         reason ("refund: status failed", "refund: HTTP 500") and return. Parse inside `try`.
+      3. `POST /v1/refunds (duplicate)` - the expected answer is `409`: `success()` for 409, `failure("duplicate
+         refund accepted")` for 201, failure with the status for anything else.
+
+      Names have no ids; the duplicate gets its own row because it does different (cheaper) work. Login in
+      `on_start`, token in `self.client.headers`; merchants without seeded data so a 404 proves a correlation bug.
+
+      **Proving the checks** against a stub with counter-driven answers:
+
+      | Stub answer | Expected in Locust | Evidence |
+      | --- | --- | --- |
+      | refund 201 `succeeded` | success | JSON totals |
+      | refund 200 with an HTML page | failure "not JSON" (not missing) | failures CSV message, totals = stub count |
+      | refund 201 `failed` | failure "refund: status failed" | message |
+      | duplicate 409 | success | 0 failures on the duplicate row |
+      | duplicate 201 | failure "duplicate refund accepted" | message |
+      | create 500 | create failure, no refund sent | refund count = good creates |
+
+      Locust's totals must equal the stub's counters to within one in-flight request per user.
+    rubric:
+      - Validates each step with catch_response and stops the flow on failure.
+      - Treats 409 on the duplicate as success and 201 as the failure.
+      - Names without ids; a separate name for the duplicate.
+      - Handles non-JSON responses so they are recorded, not lost.
+      - Proves the checks against known stub answers by comparing counts.
+    hints:
+      - Which response is the bug for the second refund?
+      - How do you show a check can fail?
+    solution: |
+      catch_response on all three steps, success() for the 409, failure messages with reasons, return on failure,
+      and a counter-driven stub whose counts Locust must match.
+
+  - id: validation-interview
+    type: interview
+    concept: perf-lcvalid-catch-response
+    skill: analysis
+    title: 'Interview: can you trust this Locust report?'
+    prompt: |
+      "A colleague's Locust run against our payment API shows 0 % failures and good percentiles. What would you check
+      before trusting it, and how do you write a Locust test whose numbers you can trust?"
+    modelAnswer: |
+      First, what counts as a failure: by default only a status of 400 or above or a connection error. Payment
+      APIs often return 200 or 201 for a declined charge or an error body, and gateways sometimes return HTML error
+      pages, so I spot-check responses and compare Locust's request and failure counts with the server's own counts
+      or logs. If Locust has fewer requests than the server, something inside a catch_response block raised and
+      those requests were never recorded - I look at the exceptions report.
+
+      Second, the names: if there are many rows with a few requests each, dynamic URLs are ungrouped and the
+      percentiles are meaningless. Every dynamic URL gets name= or rename_request(), one name per kind of work.
+
+      Then I write the test so it can be trusted: login once per user in on_start, token in self.client.headers or
+      the session cookie; catch_response on requests whose status doesn't prove success, checking one or two key
+      fields inside a try, failure messages with reasons but no ids, success() only for expected error statuses;
+      correlated steps take ids from the response and return when that step fails. Final counts from the JSON
+      results, not the periodically rewritten CSVs. And I prove the checks against a stub with known bad answers -
+      the failures must match what it sent.
+    rubric:
+      - States Locust's default success rule and the soft-error problem.
+      - Compares Locust's counts with the server's and knows unhandled exceptions drop requests.
+      - Checks name grouping and cardinality.
+      - Describes catch_response with failure()/success(), try/except, and good messages.
+      - Login once per user and correlation that stops on failure.
+      - Proves the checks against known bad answers.
+    followUps:
+      - How would you make an expected 404 count as a success?
+      - What does it cost to validate every response, and how do you keep that cost down?
+      - Why might fixing soft errors make the response times worse?
+    hints:
+      - Start with what Locust counts as a failure by default.
+    solution: |
+      Check the default rule, compare counts with the server, fix names, then validate with catch_response, login
+      once, correlate and stop on failure, and prove the checks on a known-bad stub.
+
+  - id: gateway-code
+    type: coding
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: Validate the legacy gateway
+    prompt: |
+      Complete `locust/lc_valid_gateway_locustfile.py`. The SandPay legacy gateway answers every charge with `200`;
+      your user must:
+
+      1. log in once in `on_start` (`POST /gateway/login` with `merchant-<n>` / `secret-<n>`), failing the request
+         unless it is `200` and set the `gw_session` cookie;
+      2. charge with `catch_response=True`: `failure("not JSON: ...")` for the HTML error page,
+         `failure("declined: <decline_code>")` for a decline, `success()` for an approval;
+      3. for approved charges only, void the charge and read it back, where `404` is a success and anything else a
+         failure.
+
+      Use exactly the names `POST /gateway/login`, `POST /gateway/charges`, `POST /gateway/charges/{id}/void` and
+      `GET /gateway/charges/{id} (voided)`. The test runs your file with real Locust against the gateway and checks
+      that Locust's failures equal the gateway's bad answers.
+    project: perf
+    files:
+      - exercises/locust/lc_valid_gateway_locustfile.py
+    test: tests/locust/test_lc_valid_gateway.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_valid_gateway.py
+    modelAnswer: |
+      See "The code: validating the legacy gateway". The details the tests check:
+
+      - `r.json()` inside `try ... except JSONDecodeError`, so HTML pages are recorded as failures, not lost.
+      - Messages `declined: insufficient_funds` and `not JSON: ...` - reasons, no ids.
+      - `return` after a failed charge, so only approved charges are voided.
+      - `success()` for the 404 after the void.
+      - Names with `{id}`, never the charge id.
+
+      On the practice gateway: four rows, charge failures = declines + HTML pages, 0 failures on the read-back,
+      one login per user and no `401`.
+    rubric:
+      - Every test in tests/locust/test_lc_valid_gateway.py passes.
+      - JSON parsing is inside try/except so no request vanishes from the statistics.
+      - Failure messages name the reason without ids.
+      - The expected 404 is a success and a 200 there is a failure.
+    hints:
+      - "Without try/except, the HTML page raises inside the block and the request is not recorded."
+      - The session keeps the login cookie - check it with `"gw_session" in self.client.cookies`.
+      - A `return` inside the `with` block still records the request.
+    solution: |
+      catch_response on login, charge and read-back; try/except around `r.json()`; failure messages with reasons;
+      `return` on a failed charge; `success()` for the 404; names with `{id}`.
+
+  - id: flow-code
+    type: coding
+    concept: perf-lcvalid-session-correlation
+    skill: application
+    title: A correlated payment flow
+    prompt: |
+      Complete `locust/lc_valid_flow_locustfile.py` against the shared practice API:
+
+      1. `on_start`: `POST /auth/token` for this user's merchant (`merchant-4`, `merchant-5`, ...) and set
+         `self.client.headers["Authorization"]`;
+      2. each iteration: create a payment with a new `Idempotency-Key` (expect `201`, keep the id), read it back
+         (`200`, same id, this merchant), then replay the create with the same key and body (expect
+         `Idempotent-Replayed: true` and the same id);
+      3. mark a failed step with `failure()` and `return` - never send a later step without the value it needs.
+
+      Names: `POST /auth/token`, `POST /v1/payments`, `GET /v1/payments/{id}`, `POST /v1/payments (replay)`. The
+      test runs the file twice - once clean and once with 25 % of creates failing - and checks the API's counters.
+    project: perf
+    files:
+      - exercises/locust/lc_valid_flow_locustfile.py
+    test: tests/locust/test_lc_valid_flow.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_valid_flow.py
+    modelAnswer: |
+      See "The code: a correlated payment flow with a bearer token". The details the tests check:
+
+      - One token per user, set as a default header - 4 token requests, no `401`.
+      - The read-back uses the id from the create response - no `404` (merchants 4+ have no seeded payments).
+      - The replay reuses the key and body - replays create nothing (`payments_created` tracks creates only).
+      - A failed create is reported and stops the flow - with errors on, reads equal the successful creates.
+    rubric:
+      - Every test in tests/locust/test_lc_valid_flow.py passes.
+      - The token is fetched once per user in on_start and sent as a default header.
+      - Each step takes its id from the previous response and returns when that step fails.
+      - The replay checks the Idempotent-Replayed header and the id.
+    hints:
+      - "`itertools.count(4)` at module level gives each new user the next merchant number."
+      - "`uuid.uuid4()` makes a fresh Idempotency-Key per flow; keep it for the replay."
+      - The response headers are a case-insensitive dict - `r.headers.get("Idempotent-Replayed")`.
+    solution: |
+      Token in `on_start` into `self.client.headers`; create, read back and replay with catch_response, each
+      returning on failure; names with `{id}` and `(replay)`.
+
+  - id: names-code
+    type: coding
+    concept: perf-lcvalid-grouping
+    skill: analysis
+    title: Find and fix ungrouped rows
+    prompt: |
+      Implement `locust/lc_valid_names.py`, which works on Locust's JSON results (a dict of name -> entry with
+      `method`, `num_requests`, `num_failures`):
+
+      - `group_name(method, url)` - replace id segments (all digits, a UUID, or `<letters>_<digits>` such as
+        `pay_7001`) with `{id}`; keep query parameter names sorted, each value replaced by `{<name>}`; return
+        `"<METHOD> <path>"` with an upper-case method.
+      - `ungrouped(stats)` - for rows whose name is a URL (starts with `/`), map each group name to the sorted list
+        of rows that collapse into it, keeping groups of more than one row or rows whose name changes.
+      - `regroup(stats)` - merged `num_requests` and `num_failures` per group; hand-named rows keep their name.
+    project: perf
+    files:
+      - exercises/locust/lc_valid_names.py
+    test: tests/locust/test_lc_valid_names.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_valid_names.py
+    modelAnswer: |
+      ```python
+      _ID = re.compile(r"^(\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[A-Za-z]+_\d+)$")
+
+      def group_name(method, url):
+          path, _, query = url.partition("?")
+          parts = ["{id}" if _ID.match(seg) else seg for seg in path.split("/")]
+          name = f"{method.upper()} {'/'.join(parts)}"
+          if query:
+              params = sorted({p.partition("=")[0] for p in query.split("&") if p})
+              name += "?" + "&".join(f"{p}={{{p}}}" for p in params)
+          return name
+      ```
+
+      `ungrouped` collects URL rows by `group_name(entry["method"], name)` and keeps groups with more than one row or
+      a changed name; `regroup` sums the two counts per group, leaving hand-named rows as they are. Note `v2` is not
+      an id (letters and digits without `_`), and `/refunds/12` is.
+    rubric:
+      - Every test in tests/locust/test_lc_valid_names.py passes.
+      - Query parameter order does not create separate groups.
+      - Hand-named rows are left alone and their counts kept.
+    hints:
+      - "`str.partition(\"?\")` splits the path from the query."
+      - One regular expression with three alternatives covers the id rule.
+      - Sort the parameter names so `?b=1&a=2` and `?a=3&b=4` group together.
+    solution: |
+      Normalise ids and query values into placeholders, group URL rows by the result, and sum the counts per group.
+
+placement:
+  - id: place-soft-error
+    type: mcq
+    concept: perf-lcvalid-catch-response
+    skill: application
+    title: Green, but declined
+    prompt: |
+      A Locust run against a payment API shows 0 % failures, but the API answers `200 {"status": "declined"}` for
+      some charges. What change makes those count as failures?
+    options:
+      - id: catch
+        text: '`catch_response=True` on the charge request and `r.failure(...)` when the status is declined'
+        feedback: Correct - only catch_response lets the body change the verdict.
+      - id: name
+        text: Add `name="declined"` to the request
+        feedback: Names change the row, not the verdict.
+      - id: users
+        text: Run more users so the errors show up
+        feedback: More users would make more declines, all still counted as successes.
+      - id: csv
+        text: Read the failures from `_failures.csv`
+        feedback: Nothing is in that file - Locust never recorded those requests as failures.
+    correct: [catch]
+    solution: |
+      By default a status below 400 is a success. `catch_response` + `failure()` fails a 200 by its body.
+
+  - id: place-grouping
+    type: mcq
+    concept: perf-lcvalid-grouping
+    skill: application
+    title: One row per id
+    prompt: The statistics have a row for every `/v1/payments/pay_...` URL. What groups them?
+    options:
+      - id: name
+        text: '`name="GET /v1/payments/{id}"` on the request (or `rename_request()`)'
+        feedback: Correct - the name, not the URL, keys the statistics.
+      - id: host
+        text: A different `--host`
+        feedback: The host is not part of the name.
+      - id: wait
+        text: A longer `wait_time`
+        feedback: Pacing changes the rate, not the names.
+      - id: json
+        text: Reading results from the JSON file
+        feedback: The JSON has the same one-row-per-name structure.
+    correct: [name]
+    solution: |
+      The default name is the URL path; give dynamic URLs a fixed name.
+
+  - id: place-session
+    type: mcq
+    concept: perf-lcvalid-session-correlation
+    skill: application
+    title: Login per user
+    prompt: Where should a Locust user get its bearer token, and how should it be sent?
+    options:
+      - id: on-start
+        text: Once in `on_start`, then `self.client.headers["Authorization"] = f"Bearer {token}"`
+        feedback: Correct - once per simulated user, sent on every later request by the session.
+      - id: each-request
+        text: Before every request, passed with headers=
+        feedback: That makes every request a login - a different workload.
+      - id: module
+        text: Once at import, shared by all users
+        feedback: Every simulated user would be the same client.
+      - id: url
+        text: In the query string of each URL
+        feedback: The API expects the Authorization header, and it would also break the names.
+    correct: [on-start]
+    solution: |
+      `on_start` runs once per user; the session's default headers carry the token.
+
+recall:
+  - id: recall-default-rule
+    concept: perf-lcvalid-catch-response
+    prompt: Without catch_response, when does Locust record an HTTP request as a failure?
+    answer: When the status is 400 or above, or the request raised a connection error or timeout (status 0). A 200 with an error body is a success.
+  - id: recall-catch-response
+    concept: perf-lcvalid-catch-response
+    prompt: The four outcomes of a catch_response block?
+    answer: failure("msg") = failure with that message; success() = success even for 404/500; neither = the status decides; any non-Locust exception = the request is not recorded and the exception goes to the exceptions report.
+  - id: recall-grouping
+    concept: perf-lcvalid-grouping
+    prompt: Three ways to name requests in Locust?
+    answer: name= on the request; self.client.request_name (reset it to None yourself); with self.client.rename_request(name) (resets for you). Default name = the URL path.
+  - id: recall-session
+    concept: perf-lcvalid-session-correlation
+    prompt: What does each user's HttpSession keep between requests?
+    answer: Cookies, default headers (self.client.headers) and its own connection pool - it is a requests.Session. Log in once in on_start.
+  - id: recall-correlation
+    concept: perf-lcvalid-session-correlation
+    prompt: The rule for correlated steps in a Locust flow?
+    answer: Take the value from the response that produced it, validate that step with catch_response, and return when it fails - never send the next step without the value.
+  - id: recall-results
+    concept: perf-lcvalid-catch-response
+    prompt: Which Locust output has the final counts, and which has failure messages?
+    answer: The --json-file output is written at the end - use it for counts. _stats.csv, _failures.csv and _exceptions.csv are rewritten about once a second and lag; use _failures.csv for messages.
+
+next:
+  - locust-task-sets-and-user-flows
+  - locust-events-and-custom-clients
+  - locust-load-shapes

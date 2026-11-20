@@ -1,0 +1,1334 @@
+id: jmeter-logic-controllers
+title: Logic controllers and transactions
+subject: performance-testing
+module: jmeter
+level: intermediate
+status: published
+estimatedMinutes: 120
+summary: Shape what each virtual user does in each iteration. Sign in once with a Once Only Controller, send the settlement report on a fixed share of iterations with a Throughput Controller (a deterministic rule, not a dice roll), fetch a payment only when it was created with an If Controller and __groovy, and measure "Checkout" as one Transaction Controller sample. Real JMeter runs against a fixture with exact failures show the counts you can predict before the run - and two silent traps, a broken If condition that skips its children and a hand-written nested Loop Controller that runs only once.
+tags:
+  [
+    JMeter,
+    logic controllers,
+    Transaction Controller,
+    If Controller,
+    Loop Controller,
+    Once Only Controller,
+    Throughput Controller,
+    Interleave Controller,
+    While Controller,
+    __jexl3,
+    __groovy,
+    JMeterThread.last_sample_ok,
+    workload mix,
+    user journey,
+    load testing,
+  ]
+
+environment: |
+  - **Runs:** Linux, Python 3.12.3, Apache JMeter 5.6.3 on OpenJDK 17.0.21, in CLI mode. All runs were made on
+    20 November 2026 against `practice/perf/support/jm_logic_fixture.py`, a loopback-only SandPay fixture whose
+    failures come from a request counter (every 4th payment is a `500`), so every count in this lesson is exact
+    and repeats on any machine. Every output shown was printed by the plan or code shown. Timings are not shown:
+    they depend on the machine. Plans that are not in the practice project (the throughput, loop and broken-condition
+    demonstrations) are small variations of the solution plans, described where they are used.
+  - **SandPay is fictional.** The fixture knows clients `merchant-1` .. `merchant-50` with secrets `secret-1` ..
+    `secret-50`; data is synthetic. Never point a load test at a system you do not own or have written
+    permission to test.
+  - **JMeter documentation, as documented on 20 November 2026 (the site covers JMeter 5.6.3):**
+    [Component Reference, 18.2 Logic Controllers](https://jmeter.apache.org/usermanual/component_reference.html#logic_controllers) -
+    Simple, Loop, Once Only, Interleave, Random, Random Order, Throughput, Runtime, If, While, Switch, ForEach,
+    Module, Include and Transaction Controller;
+    [Elements of a Test Plan](https://jmeter.apache.org/usermanual/test_plan.html), 3.2.2 "Logic Controllers" and
+    3.9 "Execution order";
+    [Functions and Variables](https://jmeter.apache.org/usermanual/functions.html) - `__jexl3` and `__groovy`.
+    Quotations are from those pages.
+  - **Read from JMeter 5.6.3 itself, not the manual** (with `javap` on `lib/ext/ApacheJMeter_core.jar`): the `.jmx`
+    property names (`TransactionController.parent`, `TransactionController.includeTimers`,
+    `IfController.condition`, `IfController.useExpression`, `IfController.evaluateAll`,
+    `ThroughputController.style` with `0` = total executions and `1` = percent executions,
+    `ThroughputController.perThread`, `ThroughputController.maxThroughput`,
+    `ThroughputController.percentThroughput`, `LoopController.loops`, `LoopController.continue_forever`); the
+    Throughput Controller's percent rule `(100 x executions + 50) / (passes + 1) < percent`; and that a Loop
+    Controller with `continue_forever` false marks itself done when its count ends. Each was then confirmed by a run.
+  - **Not repeated here:** thread groups and the iteration loop - [Thread groups, ramp-up and
+    timers](#/lesson/jmeter-thread-groups-and-timers); extracting `payment_id` - [Correlation and extractors in
+    JMeter](#/lesson/jmeter-correlation-and-extractors); assertions and listeners - [Assertions and listeners in
+    JMeter](#/lesson/jmeter-assertions-and-listeners); where a mix comes from - [Workload modelling from
+    production](#/lesson/workload-modelling-from-production); Groovy scripting in depth - [Scripting JMeter with
+    JSR223 and Groovy](#/lesson/jmeter-jsr223-and-groovy).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - jmeter-thread-groups-and-timers
+  - jmeter-correlation-and-extractors
+  - workload-modelling-from-production
+
+concepts:
+  - id: perf-jmlogic-flow
+    name: Controllers that decide how often - Loop, Once Only, Throughput
+    summary: Logic controllers decide when and how often their children run inside each thread's iteration. A Loop Controller repeats its children (multiplying with the thread group's loops); a Once Only Controller runs its children only in the first iteration of its looping parent, which makes it the place for a sign-in; a Throughput Controller runs its children in a percentage of passes or a total number of times, per user or for all users. JMeter 5.6.3 decides the percentage by a deterministic rule, so the mix of a plan can be predicted and checked against the results.
+  - id: perf-jmlogic-if
+    name: The If Controller and its conditions
+    summary: An If Controller runs its children only when its condition is true. With "Interpret Condition as Variable Expression?" ticked (the advised mode) the condition must evaluate to the string true, ignoring case - a variable such as ${JMeterThread.last_sample_ok} or a ${__jexl3(...)} / ${__groovy(...)} function; the unticked JavaScript mode can cost a lot under load. The condition is evaluated once on entry unless "Evaluate for all children" is ticked, and a condition that errors counts as false, so its children silently never run.
+  - id: perf-jmlogic-transaction
+    name: Transaction Controller - one sample for a user action
+    summary: A Transaction Controller generates an extra sample that measures its nested samples together, so a multi-request user action such as "Checkout" gets its own response time and error rate. The sample succeeds only if all its sub-samples succeed. By default it is added after its samples (they stay separate rows); in parent mode it becomes their parent. Timers and pre/post-processor time are excluded unless you include them, and transaction rows sit beside sampler rows in the results, so analysis must not count them twice.
+
+objectives:
+  - Choose the logic controller for a requirement - once per user, a share of iterations, a fixed number of runs, a condition, a repeated step - and place it in the tree.
+  - Predict how many samples of each label a plan with Loop, Once Only and Throughput Controllers produces, and check the prediction against a real run.
+  - Write If Controller conditions in variable-expression mode with __jexl3 or __groovy, and know why the JavaScript mode and ${var} inside __groovy are slow.
+  - Measure a multi-request user action with a Transaction Controller and read its samples in a results file.
+  - Diagnose controllers that silently skip work - a failing condition, a nested Loop Controller that is done, a transaction counted twice.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: The idea in plain language
+    body: |
+      A thread group gives each virtual user a script and says "play it N times". Read top to bottom, that script
+      makes every user do every step in every iteration: sign in, pay, look the payment up, download the settlement
+      report - eight times each. Real merchants do not behave like that. They sign in once, pay many times, look up
+      a payment only if it was created, and open the slow report now and then.
+
+      **Logic controllers** are the stage directions in the script. They do not send requests; they decide which of
+      their children run, how often and in what order:
+
+      - **"Only the first time"** - a *Once Only Controller* around the sign-in.
+      - **"One time in four"** - a *Throughput Controller* at 25% around the report.
+      - **"Only if it worked"** - an *If Controller* around the look-up.
+      - **"Three times in a row"** - a *Loop Controller* around a status poll.
+
+      And one controller changes what you *measure* rather than what you send: a **Transaction Controller** wraps
+      "pay, then look up" and reports it as one user action, *Checkout*, with its own time and its own pass/fail.
+
+      Without them, a test of 3 merchants x 8 iterations sends 24 sign-ins and 24 reports. With them it sends 3 and
+      6 - the mix the workload model asked for - and you can say exactly how many before you press start.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Terms you need
+    body: |
+      | Term | Meaning (JMeter 5.6.3 manual) |
+      | --- | --- |
+      | **Logic Controller** | Logic controllers "determine the order in which Samplers are processed". They "can change the order of requests coming from their child elements", "modify the requests themselves, cause JMeter to repeat requests, etc." |
+      | **Simple Controller** | Groups elements; it "provides no functionality beyond that of a storage device". Useful as a scope for config elements and assertions. |
+      | **Loop Controller** | Loops its children "a certain number of times, in addition to the loop value you specified for the Thread Group". Its index is `${__jm__<name>__idx}`, starting at 0. `-1` means forever. |
+      | **Once Only Controller** | Runs its children "only once per Thread", and on later iterations passes over them. Under a Loop Controller it runs on that loop's first iteration. |
+      | **Throughput Controller** | Runs its children in a **percentage** of the passes, or a **total** number of times; *per user* decides per thread, otherwise for all threads. "This controller is badly named, as it does not control throughput." |
+      | **Interleave / Random Controller** | Runs **one** child per pass - in turn (Interleave) or picked at random (Random). |
+      | **Random Order Controller** | Runs **each** child at most once per pass, in a random order. |
+      | **Runtime Controller** | Runs its children until a number of seconds has passed. |
+      | **If Controller** | Runs its children only if its condition is true. |
+      | **While Controller** | Runs its children "until the condition is "false"" (blank or `LAST` also stop it on a failed last sample). |
+      | **Switch / ForEach Controller** | Switch runs the child chosen by a number or name; ForEach loops over variables such as `id_1`, `id_2` ... (for example from an extractor with match number -1). |
+      | **Module / Include Controller** | Reuse a fragment of this plan (Module) or another `.jmx` file (Include). |
+      | **Transaction Controller** | "generates an additional sample which measures the overall time taken to perform the nested test elements". |
+      | **Parent mode** | *Generate Parent Sample*: the transaction sample becomes the parent of its samples instead of a separate sample after them. |
+      | **`__jexl3` / `__groovy`** | Functions that evaluate a Commons JEXL 3 expression or an Apache Groovy script and return the result - the advised way to write If and While conditions. |
+      | **`JMeterThread.last_sample_ok`** | A variable that is `true` if the thread's last sample succeeded. |
+
+      Logic controllers and samplers "are processed in the order in which they appear in the tree". The thread
+      group itself contains a loop controller - the one that runs your iterations.
+
+  - id: why
+    kind: why
+    concepts: [perf-jmlogic-flow, perf-jmlogic-transaction]
+    title: Why the shape of an iteration matters
+    body: |
+      A load test answers "how does the system behave under *this* workload?". If the plan sends the wrong mix, it
+      answers a different question - with confidence. Here is the same journey, 3 threads x 8 iterations, first
+      flat (every sampler in every iteration) and then with logic controllers, counted by the server itself:
+
+      ```plaintext
+      flat plan:        server saw: {'POST /auth/token': 24, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 24, 'GET /v1/reports/settlement': 24}
+      with controllers: server saw: {'POST /auth/token': 3, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 24, 'GET /v1/reports/settlement': 6}
+      ```
+
+      The flat plan sends **8x the sign-ins** and **4x the reports** for the same number of payments. Sign-ins
+      hash secrets and write tokens; the report is the most expensive read in SandPay (10x the service time in the
+      shared practice target). The flat test would find the report's limit and call it the payment API's limit.
+
+      Three more reasons the controllers matter:
+
+      - **Correctness of the flow.** Looking up a payment that was never created sends a request no real user
+        sends and adds a `404` that is the test's fault. An If Controller removes it.
+      - **What the business asks.** Requirements are written per user action ("checkout p95 under 800 ms"), not per
+        HTTP request. A Transaction Controller gives that number directly.
+      - **Predictability.** A plan whose counts you can predict is a plan you can check. If the results do not match
+        the prediction, the plan is wrong - find out before you report a single percentile.
+
+  - id: internals-flow
+    kind: internals
+    concepts: [perf-jmlogic-flow]
+    title: "How often: Loop, Once Only and Throughput Controllers"
+    body: |
+      **Loop Controller.** Children run `loops` times *each time the controller is reached*. The manual's arithmetic:
+      "if you add one HTTP Request to a Loop Controller with a loop count of two, and configure the Thread Group loop
+      count to three, JMeter will send a total of 2 * 3 = 6 HTTP Requests." Two warnings from the manual: a function
+      in the loop count "may be evaluated multiple times" (a `__Random` there gives a different count for each child),
+      and the thread group's own loop "behaves slightly different" - "Unless set to forever, it stops the test after
+      the given number of iterations".
+
+      That special case has a cost if you write `.jmx` files by hand. In JMeter 5.6.3, a `LoopController` whose
+      `LoopController.continue_forever` is `false` marks itself **done** when its count runs out - exactly what the
+      thread group's loop needs to end the test. A nested Loop Controller saved with `false` therefore runs during
+      the first iteration only. Real run, 1 thread x 3 iterations, a 3-pass `Poll` loop inside each checkout:
+
+      ```plaintext
+      continue_forever=false:
+        3  Checkout                                 success=true
+        1  GET /v1/payments/{id} poll 0             success=true
+        1  GET /v1/payments/{id} poll 1             success=true
+        1  GET /v1/payments/{id} poll 2             success=true
+      continue_forever=true:
+        3  Checkout                                 success=true
+        3  GET /v1/payments/{id} poll 0             success=true
+        3  GET /v1/payments/{id} poll 1             success=true
+        3  GET /v1/payments/{id} poll 2             success=true
+      ```
+
+      Nested loops need `continue_forever` set to `true`; the thread group's loop keeps `false`. The labels use
+      `${__jm__Poll__idx}`, the loop index the manual describes, which is why they read `poll 0`, `poll 1`, `poll 2`.
+
+      **Once Only Controller.** It "will execute always during the first iteration of any looping parent
+      controller". Directly under the thread group that means once per thread per test - the manual's own advice:
+      "For testing that requires a login, consider placing the login request in this controller since each thread
+      only needs to login once to establish a session." Under a Loop Controller of 5, it runs on the loop's first
+      pass, every time the loop starts.
+
+      **Throughput Controller.** Two modes, stored as `ThroughputController.style`:
+
+      - *Total executions* (`0`): run until the children have run `maxThroughput` times, then never again. Per user,
+        "the total number of executions would be the number of users times the number given".
+      - *Percent executions* (`1`): run in that share of the passes - "50 means the controller will execute during
+        half the iterations through the test plan".
+
+      How it picks the passes is not in the manual. JMeter 5.6.3's `ThroughputController` decides before each pass:
+      run if `(100 x executions + 50) / (passes + 1) < percent`, where both counters start at 0. It is a
+      **deterministic** spreading rule, not a random draw. At 25% over 8 passes it runs on passes 3 and 7; at 50% on
+      passes 2, 4, 6 and 8. *Per user* keeps one pair of counters per thread; unticked, one pair is shared by all
+      threads. Real run, 3 threads x 5 iterations, a 25% controller of each kind:
+
+      ```plaintext
+        4  GET /v1/reports/settlement               success=true     <- 25%, all users: 15 passes -> 4
+        3  GET report per-user                      success=true     <- 25%, per user: 5 passes -> 1 each
+      ```
+
+      Like the Once Only Controller, the Throughput Controller's counting "is reset when a parent Loop Controller
+      restarts". And it does **not** set a rate: for requests per second use the Constant Throughput Timer from
+      [Thread groups, ramp-up and timers](#/lesson/jmeter-thread-groups-and-timers).
+
+  - id: internals-if
+    kind: internals
+    concepts: [perf-jmlogic-if]
+    title: "Whether: the If Controller and its conditions"
+    body: |
+      The If Controller has three settings (`.jmx` names in brackets):
+
+      - **Condition** (`IfController.condition`).
+      - **Interpret Condition as Variable Expression?** (`IfController.useExpression`). The manual: "The best option
+        (default one)". The condition must then evaluate to `true` - "the condition is only checked to see if it
+        matches "true" (case is ignored)". Two forms: a variable that holds `true`/`false`, such as
+        `${JMeterThread.last_sample_ok}`, or a function - "`${__jexl3()}` is advised".
+      - **Evaluate for all children** (`IfController.evaluateAll`): "If not checked, then the condition is only
+        evaluated on entry." Ticked, it is re-checked before each child, so a later child can be skipped when an
+        earlier one changed the variable.
+
+      Unticked, the condition is JavaScript: "If Controller will internally use javascript to evaluate the condition
+      which has a performance penalty that can be very big and make your test less scalable." It still works - our
+      JavaScript-mode copy of the exercise plan (`"${payment_id}" != "NOT_FOUND"`) produced the same 18 look-ups -
+      but every evaluation pays for a script engine.
+
+      With `__groovy`, the manual adds: "take care to not use variable replacement in the string, otherwise if using
+      a variable that changes the script cannot be cached. Instead get the variable using: `vars.get("myVar")`." So:
+
+      ```plaintext
+      ${__groovy(vars.get("payment_id") != "NOT_FOUND")}     good - one script text, compiled once
+      ${__groovy("${payment_id}" != "NOT_FOUND")}            works, but the text changes with every id
+      ${__jexl3("${payment_id}" != "NOT_FOUND")}             the manual's advised function, ${} is normal here
+      ```
+
+      Two behaviours that bite:
+
+      - **An error means false.** The manual says it for JavaScript ("If there is an error interpreting the code,
+        the condition is assumed to be false, and a message is logged in jmeter.log"); a broken `__groovy`
+        expression behaves the same way in practice. We deleted the right-hand side of the exercise's condition
+        (`!= )`) and ran 1 thread x 2 iterations: no look-up ran, the run reported **0 errors**, and the only trace
+        was in `jmeter.log`:
+
+        ```plaintext
+        2  Checkout                                 success=true
+        1  POST /auth/token                         success=true
+        2  POST /v1/payments                        success=true
+        WARN o.a.j.f.Groovy: Error running groovy script
+        ```
+
+        (`jmeter.log` timestamps removed.) Every checkout "passed" with one sample instead of two.
+      - **Case does not matter, spelling does.** A `__groovy` condition returning `"TRUE"` ran its children (3 of 4
+        look-ups, the 4th payment being the fixture's 500); anything other than some casing of `true` is false.
+
+  - id: internals-transaction
+    kind: internals
+    concepts: [perf-jmlogic-transaction]
+    title: "What you measure: the Transaction Controller"
+    body: |
+      The Transaction Controller adds a sample named after itself. Its settings:
+
+      - **Generate Parent Sample** (`TransactionController.parent`, default false). Off: the "additional sample is
+        added after the nested samples". On: it "is added as a parent of the nested samples".
+      - **Include duration of timer and pre-post processors in generated sample**
+        (`TransactionController.includeTimers`, default false). The generated time is "all the times for the
+        nested samplers excluding by default (since 2.11) timers and processing time of pre/post processors". It
+        "may be slightly longer than the sum of the individual samplers" because of clock resolution.
+
+      Success is all-or-nothing: "The generated sample is only regarded as successful if all its sub-samples are
+      successful." Its response message counts them. Rows from one thread of the solved journey (3 x 8), in default
+      mode, columns label, code, success and message:
+
+      ```plaintext
+      POST /v1/payments              201  true   Created
+      GET /v1/payments/{id}          200  true   OK
+      Checkout                       200  true   Number of samples in transaction : 2, number of failing samples : 0
+      POST /v1/payments              500  false  Internal Server Error
+      GET /v1/payments/{id}          404  false  Not Found
+      Checkout                       -    false  Number of samples in transaction : 2, number of failing samples : 2
+      GET /v1/reports/settlement     200  true   OK
+      ```
+
+      (`-` = empty response code: the failed transaction row had none.) Note the transaction row comes **after**
+      its samples, and the report is outside it.
+
+      In **parent mode** the manual says the sub-samples "no longer appear as separate entries in other Listeners"
+      and "do not appear in CSV log files, but they can be saved to XML files". Our JMeter 5.6.3 run with the
+      default properties still wrote them to the CSV file, after the parent:
+
+      ```plaintext
+      Checkout                       200  true   Number of samples in transaction : 4, number of failing samples : 0
+      POST /v1/payments              201  true   Created
+      GET /v1/payments/{id} poll 0   200  true   OK
+      GET /v1/payments/{id} poll 1   200  true   OK
+      GET /v1/payments/{id} poll 2   200  true   OK
+      ```
+
+      `bin/jmeter.properties` lists `jmeter.save.saveservice.subresults=true` as the default, which is the likely
+      reason; check your own version before relying on either behaviour. The manual also warns that "Parent mode
+      controllers do not currently properly support nested transaction controllers of either type", and that in
+      parent mode assertions added to the controller apply "to both the individual samples and the overall
+      transaction sample".
+
+      **Counting.** Transaction rows are samples too. The solved 3 x 8 journey wrote 81 rows - 57 requests and 24
+      checkouts - and 18 failures: 6 payments, 6 look-ups and the 6 checkouts that contain them. An error rate over
+      all rows mixes requests and user actions; report them separately.
+
+  - id: when
+    kind: when
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Which controller for which requirement
+    body: |
+      | Requirement | Controller | Watch out for |
+      | --- | --- | --- |
+      | Sign in once per user, then work | Once Only | Under a Loop Controller it runs once per loop start, not once per test. |
+      | "20% of sessions download the report" | Throughput, percent, per user | The share is of the passes that *reach* it; deterministic, so the same passes every run. |
+      | "Exactly 100 refunds in the whole test" | Throughput, total executions, per user off | Per user on means 100 per thread. |
+      | Only if the previous step worked | If, `${JMeterThread.last_sample_ok}` or `__jexl3`/`__groovy` | An error in the condition is false - check the counts. |
+      | Repeat a step a fixed number of times | Loop | Nested loops need `continue_forever` true in a hand-written `.jmx`. |
+      | Poll until a status changes | While, with a counter limit | Condition evaluated twice per pass; always cap the loop. |
+      | Rotate through search terms or pages | Interleave or Random | One child per pass, not all of them. |
+      | Report a user action, not its requests | Transaction | Not counted twice in error rates; timers excluded by default. |
+      | Choose a flow by a value from a file | Switch | Out-of-range numbers run child 0. |
+
+      Logic controllers shape **what each user does**. The *rate* comes from threads and timers, the *mix of users*
+      from several thread groups or weighted paths. If a requirement says "per second", reach for a timer, not a
+      Throughput Controller.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: One iteration of the checkout journey
+    body: |
+      ```mermaid
+      flowchart TD
+        S(["Iteration starts"]) --> O{"Once Only: first iteration?"}
+        O -- "yes" --> L["POST /auth/token"]
+        O -- "no" --> T
+        L --> T
+        subgraph T["Transaction Controller: Checkout"]
+          P["POST /v1/payments"] --> I{"If: payment_id is not NOT_FOUND"}
+          I -- "true" --> G["GET /v1/payments/{id}"]
+          I -- "false" --> X["skip"]
+        end
+        T --> R{"Throughput: this pass in the 25%?"}
+        R -- "yes" --> Q["GET /v1/reports/settlement"]
+        R -- "no" --> E(["Iteration ends"])
+        Q --> E
+      ```
+
+      Read it per thread. Over 8 iterations: 1 sign-in, 8 payments, a look-up for each created payment, 8
+      *Checkout* samples and 2 reports - and the counts multiply by the number of threads.
+
+  - id: code
+    kind: code
+    concepts: [perf-jmlogic-flow, perf-jmlogic-transaction]
+    title: "Real runs: the journey with and without controllers"
+    body: |
+      A small script runs a plan against the fixture and counts samples per label, plus what the fixture itself
+      saw (`practice/perf`, the plan and output folder as arguments, then `-J` properties):
+
+      ```python
+      import sys
+      from collections import Counter
+      from pathlib import Path
+
+      sys.path.insert(0, "support")
+      from jm_logic_fixture import metrics, serve
+      from load_tools import read_jtl, run_jmeter
+
+      plan, out, *settings = sys.argv[1:]
+      with serve() as base:
+          props = {"port": base.rsplit(":", 1)[1], **dict(s.split("=", 1) for s in settings)}
+          rows = read_jtl(run_jmeter(Path(plan), props, Path(out)))
+          seen = metrics(base)["routes"]
+      for (label, ok), n in sorted(Counter((r["label"], r["success"]) for r in rows).items()):
+          print(f"{n:>3}  {label:<40} success={ok}")
+      print("server saw:", seen)
+      ```
+
+      The unsolved exercise plan - every sampler in every iteration, 3 threads x 8:
+
+      ```plaintext
+      $ .venv/bin/python count_labels.py exercises/jmeter/jm_logic_journey.jmx out threads=3 loops=8
+        6  GET /v1/payments/{id}                    success=false
+       18  GET /v1/payments/{id}                    success=true
+       24  GET /v1/reports/settlement               success=true
+       24  POST /auth/token                         success=true
+        6  POST /v1/payments                        success=false
+       18  POST /v1/payments                        success=true
+      server saw: {'POST /auth/token': 24, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 24, 'GET /v1/reports/settlement': 24}
+      ```
+
+      The solved plan - Once Only around the sign-in, a *Checkout* transaction, the report at the default 25% per
+      user:
+
+      ```plaintext
+      $ .venv/bin/python count_labels.py solutions/jmeter/jm_logic_journey.jmx out threads=3 loops=8
+        6  Checkout                                 success=false
+       18  Checkout                                 success=true
+        6  GET /v1/payments/{id}                    success=false
+       18  GET /v1/payments/{id}                    success=true
+        6  GET /v1/reports/settlement               success=true
+        3  POST /auth/token                         success=true
+        6  POST /v1/payments                        success=false
+       18  POST /v1/payments                        success=true
+      server saw: {'POST /auth/token': 3, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 24, 'GET /v1/reports/settlement': 6}
+      ```
+
+      The same plan with `report_percent=50` - the only change is the report count, 4 per thread:
+
+      ```plaintext
+      $ .venv/bin/python count_labels.py solutions/jmeter/jm_logic_journey.jmx out threads=3 loops=8 report_percent=50
+       12  GET /v1/reports/settlement               success=true
+      server saw: {'POST /auth/token': 3, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 24, 'GET /v1/reports/settlement': 12}
+      ```
+
+      (Other lines unchanged, left out.) The six failed look-ups are the problem the second plan fixes: they ask for
+      `/v1/payments/NOT_FOUND` after a failed payment. With the If Controller added
+      (`solutions/jmeter/jm_logic_created.jmx`, no report):
+
+      ```plaintext
+      $ .venv/bin/python count_labels.py solutions/jmeter/jm_logic_created.jmx out threads=3 loops=8
+        6  Checkout                                 success=false
+       18  Checkout                                 success=true
+       18  GET /v1/payments/{id}                    success=true
+        3  POST /auth/token                         success=true
+        6  POST /v1/payments                        success=false
+       18  POST /v1/payments                        success=true
+      server saw: {'POST /auth/token': 3, 'POST /v1/payments': 24, 'GET /v1/payments/<id>': 18}
+      ```
+
+      Six checkouts still fail - each now with "Number of samples in transaction : 1, number of failing samples : 1",
+      the payment itself. That is the real failure; the 404s were noise.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: The controllers in the .jmx, line by line
+    body: |
+      From the solution plans, with the samplers inside each controller's `hashTree` left out:
+
+      ```xml
+      <OnceOnlyController guiclass="OnceOnlyControllerGui" testclass="OnceOnlyController" testname="Sign in once per thread"/>
+      <hashTree> ... POST /auth/token and its JSON extractor ... </hashTree>
+
+      <TransactionController guiclass="TransactionControllerGui" testclass="TransactionController" testname="Checkout">
+        <boolProp name="TransactionController.parent">false</boolProp>
+        <boolProp name="TransactionController.includeTimers">false</boolProp>
+      </TransactionController>
+      <hashTree> ... POST /v1/payments, If Controller with GET /v1/payments/{id} ... </hashTree>
+
+      <IfController guiclass="IfControllerPanel" testclass="IfController" testname="Only if the payment was created">
+        <stringProp name="IfController.condition">${__groovy(vars.get("payment_id") != "NOT_FOUND")}</stringProp>
+        <boolProp name="IfController.evaluateAll">false</boolProp>
+        <boolProp name="IfController.useExpression">true</boolProp>
+      </IfController>
+
+      <ThroughputController guiclass="ThroughputControllerGui" testclass="ThroughputController" testname="Settlement report in ${__P(report_percent,25)}% of iterations">
+        <intProp name="ThroughputController.style">1</intProp>
+        <boolProp name="ThroughputController.perThread">true</boolProp>
+        <intProp name="ThroughputController.maxThroughput">1</intProp>
+        <stringProp name="ThroughputController.percentThroughput">${__P(report_percent,25)}</stringProp>
+      </ThroughputController>
+      ```
+
+      - **`OnceOnlyController` has no settings.** Its position does the work: directly under the thread group, so
+        "first iteration" means once per thread.
+      - **`TransactionController.parent` false** - the default mode: the *Checkout* row follows its samples, which
+        stay rows of their own, so sampler and transaction numbers can be read side by side.
+      - **`includeTimers` false** - the checkout time is request time only. Tick it if think time inside the action
+        is part of what the user waits for.
+      - **The If condition uses `vars.get`**, not `${payment_id}`, so the Groovy text is the same every time and
+        can be cached. `NOT_FOUND` is the JSON extractor's default value - it is what `payment_id` holds after a
+        `500`, which has no `id`.
+      - **`useExpression` true** - variable-expression mode; the result just has to be `true`.
+      - **`evaluateAll` false** - checked once on entry; the If Controller has one child, so it would not matter.
+      - **`style` 1** is percent executions (`0` is total executions); `maxThroughput` is ignored in this mode.
+      - **`percentThroughput` is a `stringProp`** because it holds `${__P(...)}`; JMeter parses the number when the
+        run starts. The test passes `-Jreport_percent=50` to prove the property is read.
+      - **The If Controller sits inside the transaction**, so a skipped look-up shortens the transaction to one
+        sample instead of failing it.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Shaping a journey, step by step
+    body: |
+      1. **Write the journey as a user would describe it**, with frequencies: "signs in once, pays every visit,
+         checks the payment if it went through, opens the report one visit in four". Take the frequencies from
+         the workload model, not a guess.
+      2. **Mark each step**: every iteration, once per user, a share of iterations, a fixed total, conditional,
+         repeated.
+      3. **Pick the controller for each mark** (see *when*) and build the tree: Once Only first, transactions
+         around user actions, If Controllers around dependent steps.
+      4. **Name things for the results.** Transaction names are the user actions in the requirement; sampler labels
+         stay stable (no ids in labels) so they group.
+      5. **Write down the expected count per label** for a small run - threads x iterations x frequency, with the
+         Throughput rule for percentages.
+      6. **Run small (2-3 threads, 5-10 iterations) and compare** the results file and the server's own counts with
+         the prediction. Any difference is a plan bug: a condition that errors, a nested loop that is done, a
+         controller in the wrong scope.
+      7. **Scan `jmeter.log` for WARN and ERROR** - a failing condition only shows there.
+      8. **Analyse transactions and samplers separately** when you report error rates and percentiles.
+
+  - id: example
+    kind: example
+    concepts: [perf-jmlogic-if, perf-jmlogic-transaction]
+    title: "Example: the checkout that got faster when it broke"
+    body: |
+      A SandPay team adds a payment-status check to the checkout plan: an If Controller around
+      `GET /v1/payments/{id}`, so the look-up only runs for created payments. The next nightly run reports *Checkout*
+      p95 down by almost half and 0% errors. The release notes say "checkout latency improved".
+
+      A tester compares the run with the prediction before anyone celebrates. 400 checkouts should give about 300
+      look-ups (the 75% that succeed). The results have **none**. `jmeter.log` has one line per checkout:
+
+      ```plaintext
+      WARN o.a.j.f.Groovy: Error running groovy script
+      ```
+
+      The condition had a typo. An If condition that errors is false, so the look-up never ran; every checkout
+      became a one-request transaction - faster, and "successful". Nothing in the summary report could show it,
+      because skipping a sampler is not an error.
+
+      What the tester changes in the team's routine:
+
+      - **Count per label against a prediction** for every plan change, on a short run (`predict_journey` in the
+        exercise does this for the practice plan).
+      - **Read the transaction message**, not just its status: `Number of samples in transaction : 1` where the
+        design says 2 is a red flag.
+      - **Fail the pipeline on WARN lines** from functions in `jmeter.log`.
+      - **Compare with the server's counts** - the fixture's `/metrics`, or the application's own request logs.
+
+      The look-up count also matters the other way: the earlier plan, without the If Controller, sent six look-ups
+      for payments that did not exist, and its checkout error rate included the test's own 404s.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Tests for a plan's logic
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | - | ---- | ----- | -------- | -------- |
+      | 1 | Sign in once | 3 threads x 8 | 3 sign-in samples; server counts 3 | label counts, fixture `/metrics` |
+      | 2 | Report share | 3 x 8 at 25%, then at 50% | 6, then 12 reports | label counts vs `throughput_passes` |
+      | 3 | Property drives the share | `-Jreport_percent=50` | 12 reports, not the default 6 | label counts |
+      | 4 | Checkout measured | 3 x 8 | 24 *Checkout* samples, each with 2 sub-samples | `transaction_report` |
+      | 5 | Checkout fails with its payment | fixture fails every 4th payment | 6 failed checkouts | `transaction_report` |
+      | 6 | Look-up only after a payment | If Controller, 3 x 8 | 18 look-ups, all 200, no 404; server saw 18 | label and code counts |
+      | 7 | Broken condition is caught | delete part of the condition | look-ups drop to 0; WARN in `jmeter.log` | counts vs prediction, log |
+      | 8 | Nested loop repeats | Loop Controller of 3 inside the iteration, 1 x 3 | 9 polls, not 3 | label counts |
+      | 9 | Global vs per-user percent | 3 x 5 at 25%, per user off and on | 4 and 3 reports | label counts |
+
+      The practice tests automate cases 1-6 against real JMeter. Cases 7 and 8 are the negative controls for your
+      own counting check: run them once, see the check fail, then trust it.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Common mistakes and how to find them
+    body: |
+      - **Expecting a Throughput Controller to set a rate.** "This controller is badly named, as it does not control
+        throughput." It sets *which passes* run its children. For requests per second, use a timer.
+      - **Assuming the percentage is random.** In JMeter 5.6.3 it is a deterministic rule: the same passes run in
+        every run (at 25%: passes 3 and 7 of 8). Good for repeatable mixes; it also means short runs can never show
+        a share that needs more passes (25% of 2 passes is 0 runs).
+      - **Per user ticked when the requirement is a total** - 100 per thread instead of 100 overall - or the other
+        way round.
+      - **A condition that errors.** It is false, the children never run, and the run shows fewer samples and fewer
+        errors. Find it by counting per label and reading `jmeter.log`.
+      - **JavaScript-mode conditions under load.** Untick "Interpret Condition as Variable Expression?" and every
+        evaluation goes through a JavaScript engine - the manual's "performance penalty that can be very big".
+      - **`${var}` inside `__groovy`.** It works, but each different value is a new script text that cannot be
+        reused from the cache. Use `vars.get("var")`.
+      - **Forgetting the extractor's default.** If the extractor has no default value, a failed response leaves the
+        *previous* iteration's id in the variable, so the condition is true and the look-up fetches an old payment.
+        Give extractors a default such as `NOT_FOUND` and test for it.
+      - **A hand-written nested Loop Controller with `continue_forever` false.** It runs in the first iteration only.
+      - **Once Only under a Loop Controller** - it runs every time that loop starts, not once per test.
+      - **Counting transaction rows as requests.** Error rates and throughput over all rows mix two units; one failed
+        payment shows up as two failures (the request and its checkout).
+      - **Timers inside a transaction, then surprise at its time.** Excluded by default; included if you tick the
+        option - decide which number the requirement means.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmlogic-flow, perf-jmlogic-transaction]
+    title: Trade-offs
+    body: |
+      - **Controllers vs separate thread groups.** One thread group with a Throughput Controller gives every user
+        the same journey with an occasional report. Two thread groups (payers and report readers) give separate
+        user types with their own thread counts and pacing. Choose by what the workload model says: a share of
+        *actions* or a share of *users*.
+      - **Deterministic vs random mixes.** The Throughput Controller's spread repeats exactly, which makes runs
+        comparable. A Random Controller or `__Random` conditions are closer to real variation but need longer runs
+        to reach the intended mix.
+      - **Default vs parent-mode transactions.** Default mode keeps every request visible next to the action - best
+        for diagnosis. Parent mode gives a cleaner action-level view in listeners, with the caveats about nesting and
+        assertions.
+      - **Conditions in controllers vs in code.** An If Controller with `__jexl3` is readable in the tree; a JSR223
+        sampler can express anything but hides the flow in a script. Keep the flow in controllers and the
+        calculations in small functions.
+      - **Rich logic vs a checkable plan.** Every controller adds a way for the mix to be wrong. Prefer the simplest
+        tree that matches the model, and keep the predicted counts with the plan.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmlogic-flow, perf-jmlogic-if, perf-jmlogic-transaction]
+    title: Summary
+    body: |
+      - Logic controllers decide which children run, how often and in what order; they send nothing themselves.
+      - Loop multiplies (`2 x 3 = 6`); a hand-written nested Loop Controller needs `continue_forever` true.
+      - Once Only runs on the first iteration of its looping parent - sign in there.
+      - Throughput: percent (`style` 1) or total (`0`), per user or global; JMeter 5.6.3 picks passes by
+        `(100 x executions + 50) / (passes + 1) < percent` - deterministic. It does not set a rate.
+      - If: tick variable-expression mode, use `__jexl3` or `__groovy` with `vars.get`; the result must be `true`
+        (any case). An error is false - children silently skipped.
+      - Transaction: one extra sample per user action, successful only if all sub-samples are; added after its
+        samples by default; timers excluded by default; do not count its rows as requests.
+      - Predict the count per label, run small, compare with the results and the server, read `jmeter.log`.
+
+exercises:
+  - id: jm-logic-mcq-loop
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: application
+    title: How many requests?
+    prompt: |
+      A thread group has 4 threads and 5 loops. Inside it, a Loop Controller with a loop count of 3 holds one HTTP
+      Request. How many requests does that sampler send?
+    options:
+      - id: sixty
+        text: '60'
+        feedback: Correct - 3 per iteration, 5 iterations, 4 threads.
+      - id: twelve
+        text: '12'
+        feedback: That ignores the thread group's 5 loops.
+      - id: fifteen
+        text: '15'
+        feedback: That is one thread's count; there are 4 threads.
+      - id: twenty
+        text: '20'
+        feedback: That ignores the Loop Controller's 3 passes.
+    correct: [sixty]
+    hints:
+      - The manual's example is "2 * 3 = 6" for one thread.
+    solution: |
+      Loop counts multiply: 3 (Loop Controller) x 5 (thread group loops) x 4 threads = 60.
+
+  - id: jm-logic-mcq-once
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Once Only under a loop
+    prompt: |
+      A Once Only Controller holding a sign-in is placed inside a Loop Controller of 5, which is inside a thread
+      group of 1 thread x 4 loops. How many sign-ins does the run send?
+    options:
+      - id: four
+        text: '4'
+        feedback: Correct - it runs on the first pass of its looping parent, and that loop starts 4 times.
+      - id: one
+        text: '1'
+        feedback: That is the behaviour directly under the thread group, not under a Loop Controller.
+      - id: twenty
+        text: '20'
+        feedback: Then it would not be "once only" at all; it skips passes 2-5 of each loop.
+      - id: five
+        text: '5'
+        feedback: It runs on the first of the 5 passes, each time the loop starts.
+    correct: [four]
+    hints:
+      - The manual - it "will execute always during the first iteration of any looping parent controller".
+    solution: |
+      Under a Loop Controller the Once Only Controller runs on that loop's first pass. The loop starts once per
+      thread group iteration: 4 sign-ins. Put it directly under the thread group for once per test.
+
+  - id: jm-logic-mcq-throughput-rate
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: analysis
+    title: 30 reports a minute
+    prompt: |
+      A requirement says the settlement report is requested 30 times a minute during the test. A colleague adds a
+      Throughput Controller set to 30 around the report sampler. What is wrong?
+    options:
+      - id: not-rate
+        text: The Throughput Controller chooses which passes run; it does not set a rate - use a timer for that
+        feedback: Correct - "This controller is badly named, as it does not control throughput."
+      - id: percent
+        text: Nothing, 30 means 30 per minute
+        feedback: In percent mode 30 means 30% of passes; in total mode 30 runs in total.
+      - id: per-user
+        text: It needs "per user" ticked
+        feedback: Per user changes the counting scope, not the unit.
+      - id: style
+        text: It needs total executions mode
+        feedback: Then the report runs 30 times in the whole test and stops.
+    correct: [not-rate]
+    hints:
+      - What unit does the Throughput Controller's number have?
+    solution: |
+      The Throughput Controller sets a share of passes or a total count. A rate needs a Constant Throughput Timer
+      (or a separate thread group paced to 30 per minute).
+
+  - id: jm-logic-mcq-percent
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Which passes?
+    prompt: |
+      A per-user Throughput Controller at 25% is reached once per iteration. One thread runs 8 iterations. Using
+      JMeter 5.6.3's rule - run if (100 x executions + 50) / (passes + 1) < percent, both counters starting at 0 -
+      on which iterations does it run?
+    options:
+      - id: three-seven
+        text: 3 and 7
+        feedback: Correct - 50/3 < 25 at pass 3, then 150/7 < 25 at pass 7.
+      - id: four-eight
+        text: 4 and 8
+        feedback: At pass 4 the value is 150/4 = 37.5, not below 25.
+      - id: random
+        text: Two random iterations, different each run
+        feedback: The rule is deterministic - the same passes every run.
+      - id: one-five
+        text: 1 and 5
+        feedback: At pass 1 the value is 50/1 = 50.
+    correct: [three-seven]
+    hints:
+      - Compute the left side for passes 1, 2, 3 ... with executions starting at 0.
+    solution: |
+      Pass 1: 50 - no. Pass 2: 25 - not below 25, no. Pass 3: 16.7 - yes (1 execution). Then 150/4 = 37.5,
+      150/5 = 30, 150/6 = 25 - no; 150/7 = 21.4 - yes. Passes 3 and 7.
+
+  - id: jm-logic-mcq-global
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Exactly 100 refunds
+    prompt: |
+      A test must issue exactly 100 refunds across all 20 threads, then no more. How do you set the Throughput
+      Controller around the refund sampler?
+    options:
+      - id: total-global
+        text: Total executions, 100, per user unticked
+        feedback: Correct - one counter for all threads, stops after 100.
+      - id: total-per-user
+        text: Total executions, 100, per user ticked
+        feedback: That is 100 per thread - 2,000 refunds.
+      - id: percent-global
+        text: Percent executions, 100
+        feedback: That runs on every pass - no limit.
+      - id: total-five
+        text: Total executions, 5, per user unticked
+        feedback: Unticked, 5 is the total for the whole test.
+    correct: [total-global]
+    hints:
+      - The manual - "If per user is checked, then the total number of executions would be the number of users times the number given".
+    solution: |
+      Total executions mode, 100, per user unticked: one shared count, so the refunds stop at 100.
+
+  - id: jm-logic-mcq-if-mode
+    type: mcq
+    concept: perf-jmlogic-if
+    skill: application
+    title: The advised condition
+    prompt: Which If Controller setup does the JMeter manual advise for a condition on the variable COUNT?
+    options:
+      - id: jexl
+        text: 'Variable expression ticked, condition ${__jexl3(${COUNT} < 10)}'
+        feedback: Correct - "Checking this and using __jexl3 or __groovy function in Condition is advised for performances".
+      - id: js
+        text: 'Variable expression unticked, condition ${COUNT} < 10'
+        feedback: That is JavaScript mode, which "has a performance penalty that can be very big".
+      - id: groovy-replace
+        text: 'Variable expression ticked, condition ${__groovy(${COUNT} < 10)}'
+        feedback: It works, but ${COUNT} inside __groovy stops the script being cached - use vars.get.
+      - id: plain
+        text: 'Variable expression ticked, condition COUNT < 10'
+        feedback: In expression mode the text itself must evaluate to "true"; this is just a string.
+    correct: [jexl]
+    hints:
+      - Two things - which mode, and which function.
+    solution: |
+      Tick "Interpret Condition as Variable Expression?" and use `${__jexl3(...)}` (or `__groovy` with
+      `vars.get`).
+
+  - id: jm-logic-mcq-if-error
+    type: mcq
+    concept: perf-jmlogic-if
+    skill: analysis
+    title: Fewer samples, no errors
+    prompt: |
+      After an edit to a plan, the GET /v1/payments/{id} sampler (inside an If Controller) has 0 samples, and the
+      run reports 0 errors. Where do you look first?
+    options:
+      - id: log
+        text: jmeter.log, for a warning from the condition's function
+        feedback: Correct - an erroring condition is treated as false and only leaves a log line.
+      - id: listener
+        text: The View Results Tree for failed samples
+        feedback: There are no samples to fail - the children never ran.
+      - id: server
+        text: The server's error log
+        feedback: The server never received the request.
+      - id: assertions
+        text: The assertions on the sampler
+        feedback: Assertions only run on samples that exist.
+    correct: [log]
+    hints:
+      - Skipping a sampler is not an error. What records why it was skipped?
+    solution: |
+      A condition that throws is false, so the children are skipped silently. `jmeter.log` holds the WARN line
+      (for `__groovy`, "Error running groovy script").
+
+  - id: jm-logic-mcq-evaluate-all
+    type: mcq
+    concept: perf-jmlogic-if
+    skill: application
+    title: Evaluate for all children
+    prompt: |
+      An If Controller with condition ${JMeterThread.last_sample_ok} holds three samplers: reserve, pay, confirm.
+      You want pay and confirm to be skipped as soon as the sampler before them fails. What do you set?
+    options:
+      - id: all
+        text: Tick "Evaluate for all children"
+        feedback: Correct - the condition is then checked before each child, not only on entry.
+      - id: default
+        text: Nothing - the condition is checked before each sampler by default
+        feedback: By default "the condition is only evaluated on entry".
+      - id: js
+        text: Untick variable expression
+        feedback: That only changes the language, and makes it slower.
+      - id: three-ifs
+        text: It cannot be done with one If Controller
+        feedback: It can - that is what the option is for (three nested If Controllers would also work).
+    correct: [all]
+    hints:
+      - When is the condition evaluated by default?
+    solution: |
+      Tick "Evaluate for all children" (`IfController.evaluateAll` true). The condition is then re-checked before
+      pay and confirm.
+
+  - id: jm-logic-mcq-tx-success
+    type: mcq
+    concept: perf-jmlogic-transaction
+    skill: application
+    title: When does a transaction fail?
+    prompt: |
+      A Transaction Controller wraps three samplers. In one iteration the first two succeed and the third returns a
+      404. What does the transaction sample show?
+    options:
+      - id: fail
+        text: 'Failed, with "Number of samples in transaction : 3, number of failing samples : 1"'
+        feedback: Correct - successful only if all sub-samples are.
+      - id: pass
+        text: Successful, because most of its samples passed
+        feedback: There is no majority rule.
+      - id: missing
+        text: No transaction sample is written for that iteration
+        feedback: It is written - and it is failed.
+      - id: last
+        text: The status of the last sample only
+        feedback: All sub-samples count.
+    correct: [fail]
+    hints:
+      - The manual - "only regarded as successful if all its sub-samples are successful".
+    solution: |
+      The transaction fails, and its message counts 3 samples with 1 failing.
+
+  - id: jm-logic-mcq-tx-count
+    type: mcq
+    concept: perf-jmlogic-transaction
+    skill: analysis
+    title: Error rate over the whole file
+    prompt: |
+      A 3 x 8 run has 57 request samples and 24 Checkout transaction samples (default mode). Six payments failed,
+      their six look-ups failed, and so did the six checkouts. A dashboard over all rows shows 18 errors in 81
+      samples (22%). What should the report say instead?
+    options:
+      - id: split
+        text: Requests 12 of 57 failed (21%); checkouts 6 of 24 failed (25%)
+        feedback: Correct - two units, two rates.
+      - id: keep
+        text: 22% errors - the dashboard is right
+        feedback: It mixes requests and user actions and counts each failure twice.
+      - id: drop
+        text: 6 of 81 failed (7%)
+        feedback: That divides user-action failures by all rows.
+      - id: requests-only
+        text: 18 of 57 requests failed
+        feedback: Six of the 18 are transaction rows, not requests.
+    correct: [split]
+    hints:
+      - Which rows are requests and which are user actions?
+    solution: |
+      Report requests and transactions separately: 12 of 57 request samples failed, 6 of 24 checkouts failed.
+
+  - id: jm-logic-order
+    type: order
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Shape and prove a journey
+    prompt: Put the steps in order.
+    items:
+      - id: describe
+        text: Write the journey with frequencies taken from the workload model
+      - id: mark
+        text: Mark each step - every iteration, once, share, total, conditional, repeated
+      - id: build
+        text: Build the tree with Once Only, Transaction, If and Throughput Controllers
+      - id: predict
+        text: Predict the sample count per label for a small run
+      - id: run-small
+        text: Run 2-3 threads for a few iterations
+      - id: compare
+        text: Compare results and server counts with the prediction, and read jmeter.log
+      - id: load
+        text: Run the load test and report requests and transactions separately
+    hints:
+      - You cannot predict counts for a tree you have not built, or check a run you have not predicted.
+    solution: |
+      Describe, mark, build, predict, run small, compare (results, server, log), then run the load and analyse the
+      two units separately.
+
+  - id: jm-logic-debug
+    type: debug
+    concept: perf-jmlogic-if
+    skill: analysis
+    title: The look-up that never runs
+    prompt: |
+      This If Controller should run GET /v1/payments/{id} only for created payments. In a 3 x 8 run there are 0
+      look-ups, 0 errors, and jmeter.log has "WARN o.a.j.f.Groovy: Error running groovy script". Which line is the
+      defect?
+    language: xml
+    code: |
+      <IfController guiclass="IfControllerPanel" testclass="IfController" testname="Only if created">
+        <stringProp name="IfController.condition">${__groovy(vars.get("payment_id") != )}</stringProp>
+        <boolProp name="IfController.evaluateAll">false</boolProp>
+        <boolProp name="IfController.useExpression">true</boolProp>
+      </IfController>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /v1/payments/{id}">
+          <stringProp name="HTTPSampler.path">/v1/payments/${payment_id}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree/>
+      </hashTree>
+    correctLines: [2]
+    lineNotes:
+      - line: 3
+        note: Evaluating once on entry is fine for a single child.
+      - line: 4
+        note: Variable-expression mode is the advised one.
+      - line: 8
+        note: The path is right - it never gets used because the controller never runs its child.
+    hints:
+      - What does an If Controller do when its condition cannot be evaluated?
+    solution: |
+      The Groovy expression is incomplete (`!= )`), so it throws; an erroring condition is false and the child
+      never runs. Fix it to `${__groovy(vars.get("payment_id") != "NOT_FOUND")}`.
+
+  - id: jm-logic-short
+    type: short
+    concept: perf-jmlogic-flow
+    skill: analysis
+    title: The poll that stopped polling
+    prompt: |
+      A hand-written plan has a Loop Controller of 3 around a status poll, inside a thread group of 1 thread x 3
+      loops. The results show poll 0, poll 1 and poll 2 once each - 3 polls, not 9 - and no errors. Explain the
+      likely cause, how to confirm it, and the fix.
+    modelAnswer: |
+      The nested Loop Controller was saved with `LoopController.continue_forever` false. In JMeter 5.6.3 a loop
+      controller with that setting marks itself done when its count runs out - the behaviour the thread group's
+      own loop uses to end the test - so the nested loop runs only in the first iteration. Confirm it by opening
+      the `.jmx` and checking the property, or by counting poll samples per iteration (only iteration 1 has them).
+      Fix: set `continue_forever` true on the nested Loop Controller (the thread group's stays false), rerun the
+      1 x 3 check and expect 9 polls.
+    rubric:
+      - Identifies continue_forever false on the nested Loop Controller.
+      - Explains it makes the controller done after its first full pass.
+      - Confirms from the .jmx or from per-iteration counts.
+      - Fixes it and states the expected count (9).
+    hints:
+      - Which Loop Controller is supposed to stop the test after its count?
+    solution: |
+      `continue_forever` false makes the nested loop finish for good after iteration 1. Set it to true and expect
+      9 polls.
+
+  - id: jm-logic-testdesign
+    type: testdesign
+    concept: perf-jmlogic-transaction
+    skill: application
+    title: Prove the checkout plan before the load run
+    prompt: |
+      Before a 200-user load test of the SandPay checkout plan (sign in once, Checkout transaction with an If-guarded
+      look-up, report at 20% per user), design the checks that prove the plan's logic. Give preconditions, steps,
+      expected results and evidence.
+    modelAnswer: |
+      Preconditions: a test environment with deterministic or known failures (or the fixture), the plan with
+      threads, loops and the report share as properties, server-side request counts available.
+
+      1. **Counts per label** - 3 threads x 10. Expected: 3 sign-ins, 30 payments, 30 checkouts, 6 reports
+         (20% per user: passes 3 and 8 of 10), look-ups = created payments. Evidence: label counts vs a written
+         prediction; server counts.
+      2. **Report share from the property** - rerun with the share at 50%. Expected: 15 reports. Evidence: counts.
+      3. **Transaction content** - Expected: every checkout has 2 sub-samples when the payment succeeded, 1 when it
+         failed; failed checkouts = failed payments. Evidence: transaction messages.
+      4. **If Controller negative control** - break the condition once. Expected: look-ups drop to 0 and a WARN
+         appears; the counting check flags it. Evidence: check output, `jmeter.log`.
+      5. **No test-made errors** - Expected: no 404 on look-ups. Evidence: response codes per label.
+      6. **Log clean** - Expected: no WARN or ERROR from functions. Evidence: `jmeter.log`.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence.
+      - Predicts per-label counts, including the Throughput Controller's share, before running.
+      - Checks transaction sub-sample counts, not just transaction status.
+      - Includes a negative control for the If condition.
+      - Uses the server's own counts and jmeter.log, not only JMeter's summary.
+    hints:
+      - Which failures of a plan's logic show up as fewer samples rather than errors?
+    solution: |
+      Predict per-label counts, check transactions' sub-sample counts, prove the If guard with a negative control,
+      and confirm with server counts and a clean log.
+
+  - id: jm-logic-interview
+    type: interview
+    concept: perf-jmlogic-transaction
+    skill: analysis
+    title: "Interview: model a user journey in JMeter"
+    prompt: |
+      "A user signs in, adds items, pays, and sometimes downloads an invoice. How would you model that in JMeter so
+      the load is realistic and the results answer 'how fast is checkout'?"
+    modelAnswer: |
+      I take the journey and its frequencies from the workload model, then shape each thread's iteration with
+      logic controllers. The sign-in goes in a Once Only Controller directly under the thread group, so each user
+      signs in once. Adding items and paying go in a Transaction Controller called Checkout, so the requirement's
+      unit - checkout time - is a sample of its own; it is successful only if every request inside succeeded, and
+      by default it excludes timers, which I decide on deliberately. Steps that depend on a previous result - for
+      example fetching the order only if payment returned an id - go in an If Controller in variable-expression
+      mode with `__jexl3`, or `__groovy` using `vars.get`, never the JavaScript mode under load. The occasional
+      invoice goes in a Throughput Controller at the measured percentage, per user; I know it does not set a rate
+      - for that I would use a timer or a separate thread group.
+
+      Before the load run I predict the sample count per label for a small run and compare it with the results and
+      the server's counts, and I read `jmeter.log`, because an If condition that errors is just false and silently
+      skips steps. In the analysis I report checkout transactions and individual requests separately, so failures
+      are not counted twice.
+    rubric:
+      - Uses Once Only for sign-in and explains its scope.
+      - Uses a Transaction Controller for the user action and knows its success rule and timer handling.
+      - Uses an If Controller in expression mode with __jexl3/__groovy.
+      - Uses a Throughput Controller for the share and knows it is not a rate.
+      - Verifies the mix with predicted counts, server counts and the log; separates transactions from requests.
+    followUps:
+      - When would you use two thread groups instead of a Throughput Controller?
+      - What changes in parent mode?
+      - How would you poll for an asynchronous payment status without an endless loop?
+    hints:
+      - Answer step by step through the journey, then say how you prove the plan.
+    solution: |
+      Once Only for sign-in, a Checkout transaction, If Controllers with __jexl3/__groovy for dependent steps, a
+      Throughput Controller for the share - then prove the mix with predicted counts and the log.
+
+  - id: jm-logic-code-journey
+    type: coding
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Shape the checkout journey
+    prompt: |
+      `exercises/jmeter/jm_logic_journey.jmx` sends every request in every iteration. Following the TODO comment,
+      wrap the sign-in in a Once Only Controller, wrap the payment and its look-up in a Transaction Controller named
+      `Checkout` (not parent mode), and wrap the settlement report in a per-user Throughput Controller in percent
+      mode whose percentage comes from `${__P(report_percent,25)}`. Edit the XML by hand or in the JMeter GUI. The
+      test runs 3 threads x 8 iterations at 50% against the deterministic fixture and expects exactly 3 sign-ins,
+      24 payments, 24 look-ups, 24 checkouts (6 failed) and 12 reports.
+    project: perf
+    files:
+      - exercises/jmeter/jm_logic_journey.jmx
+    test: tests/jmeter/test_jm_logic_journey.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_logic_journey.py
+    hints:
+      - In a .jmx an element's children are the hashTree right after it - move the sampler and its hashTree inside the controller's hashTree.
+      - ThroughputController.style 1 is percent executions; perThread true is "per user".
+      - The percentage holds a function, so save it as a stringProp.
+    modelAnswer: |
+      ```xml
+      <OnceOnlyController guiclass="OnceOnlyControllerGui" testclass="OnceOnlyController" testname="Sign in once per thread"/>
+      <hashTree> POST /auth/token + its hashTree </hashTree>
+      <TransactionController guiclass="TransactionControllerGui" testclass="TransactionController" testname="Checkout">
+        <boolProp name="TransactionController.parent">false</boolProp>
+        <boolProp name="TransactionController.includeTimers">false</boolProp>
+      </TransactionController>
+      <hashTree> POST /v1/payments + its hashTree, GET /v1/payments/{id} + its hashTree </hashTree>
+      <ThroughputController guiclass="ThroughputControllerGui" testclass="ThroughputController" testname="Settlement report">
+        <intProp name="ThroughputController.style">1</intProp>
+        <boolProp name="ThroughputController.perThread">true</boolProp>
+        <intProp name="ThroughputController.maxThroughput">1</intProp>
+        <stringProp name="ThroughputController.percentThroughput">${__P(report_percent,25)}</stringProp>
+      </ThroughputController>
+      <hashTree> GET /v1/reports/settlement + its hashTree </hashTree>
+      ```
+
+      At 50% the per-user rule runs the report on passes 2, 4, 6 and 8: 4 per thread, 12 in all.
+    rubric:
+      - Every test in tests/jmeter/test_jm_logic_journey.py passes.
+      - Only the sign-in is inside the Once Only Controller.
+      - The Throughput Controller reads its percentage from a property and is per user.
+      - Can explain why the run has 12 reports and 6 failed checkouts.
+    solution: |
+      Once Only around the sign-in, a default-mode Checkout transaction around payment and look-up, and a per-user
+      percent Throughput Controller reading report_percent - 3 / 24 / 24 / 24 / 12 samples.
+
+  - id: jm-logic-code-created
+    type: coding
+    concept: perf-jmlogic-if
+    skill: application
+    title: Look up only what was created
+    prompt: |
+      In `exercises/jmeter/jm_logic_created.jmx`, every 4th payment fails and the look-up then asks for
+      `/v1/payments/NOT_FOUND`. Wrap the look-up in an If Controller in variable-expression mode whose condition
+      uses `__jexl3` or `__groovy` to run it only when `payment_id` is not `NOT_FOUND`. The test expects 18
+      look-ups (all 200, none 404), the fixture to have seen 18, and 6 failed checkouts of one sample each.
+    project: perf
+    files:
+      - exercises/jmeter/jm_logic_created.jmx
+    test: tests/jmeter/test_jm_logic_created.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_logic_created.py
+    hints:
+      - NOT_FOUND is the JSON extractor's default value - what payment_id holds after a 500.
+      - With __groovy, read the variable with vars.get("payment_id") rather than ${payment_id}.
+      - Keep the If Controller inside the Checkout transaction.
+    modelAnswer: |
+      ```xml
+      <IfController guiclass="IfControllerPanel" testclass="IfController" testname="Only if the payment was created">
+        <stringProp name="IfController.condition">${__groovy(vars.get("payment_id") != "NOT_FOUND")}</stringProp>
+        <boolProp name="IfController.evaluateAll">false</boolProp>
+        <boolProp name="IfController.useExpression">true</boolProp>
+      </IfController>
+      <hashTree> GET /v1/payments/{id} + its hashTree </hashTree>
+      ```
+
+      `${__jexl3("${payment_id}" != "NOT_FOUND")}` passes too.
+    rubric:
+      - Every test in tests/jmeter/test_jm_logic_created.py passes.
+      - The condition uses variable-expression mode with __jexl3 or __groovy.
+      - The look-up count equals the created payments, confirmed by the server's count.
+      - Can explain why the failed checkouts now contain one sample.
+    solution: |
+      An If Controller with `${__groovy(vars.get("payment_id") != "NOT_FOUND")}` in expression mode skips the
+      look-up after a failed payment: 18 look-ups, 0 404s.
+
+  - id: jm-logic-code-counts
+    type: coding
+    concept: perf-jmlogic-transaction
+    skill: analysis
+    title: Predict the counts, read the transactions
+    prompt: |
+      In `exercises/jmeter/jm_logic_counts.py`, implement `throughput_passes` (JMeter 5.6.3's percent rule, given in
+      the module docstring), `predict_journey` (expected samples per label for the solved journey) and
+      `transaction_report` (per transaction label - count, failed, total sub-samples and failing sub-samples - parsed
+      from the response message). The last test runs a reference copy of the solved plan, 2 threads x 10 at 30%,
+      and compares your prediction with what JMeter recorded.
+    project: perf
+    files:
+      - exercises/jmeter/jm_logic_counts.py
+    test: tests/jmeter/test_jm_logic_counts.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_logic_counts.py
+    hints:
+      - Keep an executions counter; the pass number is the list index.
+      - At 30% over 10 passes the rule runs on 3 passes.
+      - 'Split the message on ", number of failing samples : " after removing the prefix.'
+    modelAnswer: |
+      ```python
+      def throughput_passes(percent, iterations):
+          if not 0 <= percent <= 100:
+              raise ValueError("percent must be between 0 and 100")
+          if iterations < 0:
+              raise ValueError("iterations must not be negative")
+          runs, executions = [], 0
+          for seen in range(iterations):
+              run = (100 * executions + 50) / (seen + 1) < percent
+              runs.append(run)
+              executions += run
+          return runs
+
+
+      def predict_journey(threads, loops, report_percent):
+          reports = sum(throughput_passes(report_percent, loops))
+          counts = Counter({TOKEN: threads, CREATE: threads * loops, FETCH: threads * loops,
+                            CHECKOUT: threads * loops, REPORT: threads * reports})
+          return +counts
+      ```
+
+      `transaction_report` keeps rows whose message starts with the prefix, splits the rest into the two numbers
+      and adds them up per label.
+    rubric:
+      - Every test in tests/jmeter/test_jm_logic_counts.py passes.
+      - throughput_passes follows the rule exactly and rejects impossible input.
+      - The prediction matches a real run label for label.
+      - Can explain why the real run has 5 failed checkouts with 10 failing sub-samples.
+    solution: |
+      Simulate the percent rule pass by pass, multiply per-iteration counts by threads, and parse transaction
+      messages - the prediction then matches JMeter's results exactly.
+
+placement:
+  - id: jm-logic-place-once
+    type: mcq
+    concept: perf-jmlogic-flow
+    skill: application
+    title: Sign in once
+    prompt: Each of 50 virtual users must sign in once and then pay 20 times. Where does the sign-in sampler go?
+    options:
+      - id: once-tg
+        text: In a Once Only Controller directly under the thread group
+        feedback: Correct - first iteration only, once per thread.
+      - id: throughput5
+        text: In a Throughput Controller at 5%
+        feedback: That runs it on a share of passes, not exactly the first.
+      - id: setup
+        text: In a Loop Controller of 1
+        feedback: A loop of 1 runs every iteration.
+      - id: once-loop
+        text: In a Once Only Controller inside a Loop Controller of 20
+        feedback: Then it runs once each time that loop starts.
+    correct: [once-tg]
+    hints:
+      - Which controller is "once per Thread"?
+    solution: |
+      A Once Only Controller directly under the thread group runs on the first iteration only - once per user.
+
+  - id: jm-logic-place-if
+    type: mcq
+    concept: perf-jmlogic-if
+    skill: application
+    title: Only after a success
+    prompt: You want a sampler to run only if the previous sample succeeded. Which If Controller condition fits, in variable-expression mode?
+    options:
+      - id: last-ok
+        text: '${JMeterThread.last_sample_ok}'
+        feedback: Correct - the manual's example for "check if the last sample succeeded".
+      - id: js-ok
+        text: 'prev.isSuccessful() in JavaScript mode'
+        feedback: JavaScript mode is the slow one, and expression mode needs no script here.
+      - id: true-literal
+        text: 'true'
+        feedback: That always runs the sampler.
+      - id: rc
+        text: '${responseCode} == 200'
+        feedback: There is no such variable by default, and the text is not evaluated in expression mode.
+    correct: [last-ok]
+    hints:
+      - JMeter keeps a variable for exactly this.
+    solution: |
+      `${JMeterThread.last_sample_ok}` holds `true` or `false` for the thread's last sample.
+
+  - id: jm-logic-place-tx
+    type: mcq
+    concept: perf-jmlogic-transaction
+    skill: application
+    title: Checkout time
+    prompt: |
+      The requirement is "checkout (create payment, then confirm it) p95 under 800 ms". How do you get that number
+      from a JMeter run?
+    options:
+      - id: tx
+        text: Wrap both samplers in a Transaction Controller named Checkout and read its p95
+        feedback: Correct - one sample per checkout, measuring both requests.
+      - id: sum
+        text: Add the two samplers' p95 values
+        feedback: Percentiles do not add - the slowest payments and confirmations are not always in the same checkout.
+      - id: slowest
+        text: Use the slower sampler's p95
+        feedback: That ignores the other request's time.
+      - id: throughput
+        text: Put both in a Throughput Controller at 100%
+        feedback: That changes nothing about measurement.
+    correct: [tx]
+    hints:
+      - Which controller generates an additional sample?
+    solution: |
+      A Transaction Controller generates one sample per checkout that measures both requests; its p95 answers the
+      requirement.
+
+recall:
+  - id: jm-logic-recall-loop
+    concept: perf-jmlogic-flow
+    prompt: How many requests does one sampler in a Loop Controller of 2 send in a thread group of 1 thread x 3 loops?
+    answer: 6 - loop counts multiply (2 x 3).
+  - id: jm-logic-recall-once
+    concept: perf-jmlogic-flow
+    prompt: When does a Once Only Controller run its children?
+    answer: On the first iteration of its looping parent - once per thread directly under the thread group, once per loop start under a Loop Controller.
+  - id: jm-logic-recall-throughput
+    concept: perf-jmlogic-flow
+    prompt: What are the Throughput Controller's two modes, and does it set a rate?
+    answer: Percent executions (a share of passes) and total executions (a fixed count), per user or global. It does not set a rate - use a timer for that.
+  - id: jm-logic-recall-if-mode
+    concept: perf-jmlogic-if
+    prompt: How should an If Controller condition be written for performance?
+    answer: Tick "Interpret Condition as Variable Expression?" and use a variable or ${__jexl3(...)} / ${__groovy(...)} with vars.get - not the JavaScript mode.
+  - id: jm-logic-recall-if-error
+    concept: perf-jmlogic-if
+    prompt: What happens when an If Controller's condition throws an error?
+    answer: It counts as false, the children are skipped, and only a warning in jmeter.log shows it.
+  - id: jm-logic-recall-tx
+    concept: perf-jmlogic-transaction
+    prompt: When is a Transaction Controller's sample successful, and does its time include timers?
+    answer: Only if all its sub-samples succeed. Timers and pre/post-processor time are excluded unless "Include duration of timer and pre-post processors" is ticked.
+
+next:
+  - jmeter-jsr223-and-groovy
+  - jmeter-html-dashboard-and-ci
+  - jmeter-distributed-testing
+  - locust-task-sets-and-user-flows

@@ -1,0 +1,1352 @@
+id: jmeter-distributed-testing
+title: Distributed testing with JMeter
+subject: performance-testing
+module: jmeter
+level: advanced
+status: published
+estimatedMinutes: 140
+summary: Drive one test from several JMeter load generators - a controller (the client) and remote servers that each run the whole plan. Real loopback runs with two servers show the traps - threads multiply per server, data files are not sent, so one copied file signs every merchant in twice while a split file signs each in once - and why RMI over SSL is not optional. Size a fleet from a measured per-generator limit, read the combined results, and decide when one machine is enough.
+tags:
+  [
+    JMeter,
+    distributed testing,
+    remote testing,
+    jmeter-server,
+    controller,
+    load generator,
+    RMI,
+    RMI over SSL,
+    keystore,
+    -R,
+    -r,
+    -G,
+    -X,
+    remote_hosts,
+    server.rmi.localport,
+    client.rmi.localport,
+    sample sender,
+    StrippedBatch,
+    CSV Data Set Config,
+    test data,
+    load generator sizing,
+    results merging,
+    load testing,
+  ]
+
+environment: |
+  - **Runs:** Linux, Python 3.12.3, Apache JMeter 5.6.3 on OpenJDK 17.0.21, in CLI mode, against
+    `practice/perf/support/sandpay_target.py`, the SandPay practice API on the loopback interface. The "two
+    machines" are two JMeter servers started on the same machine, each in its own folder and on its own ports,
+    all bound to `127.0.0.1`; `practice/perf/support/jm_dist_fixture.py` starts them. All runs were made on 20
+    November 2026. Every output shown was printed by the commands or code shown; console lines keep their text but
+    the 13-digit epoch-millisecond timestamps JMeter prints are replaced by `<epoch ms elided>`, the long RMI object
+    ids in "Created remote object" lines are shortened to `...`, and `ss` lines lose their `users:(...)` column. Ports
+    are chosen at random per run, so yours differ; timings depend on the machine.
+  - **SandPay is fictional.** The practice API knows clients `merchant-1` .. `merchant-50` with secrets `secret-1`
+    .. `secret-50`. Never point a load test - distributed or not - at a system you do not own or have written
+    permission to test, and never expose a JMeter server on a network you do not control: it runs whatever test
+    plan it is sent.
+  - **JMeter documentation, as documented on 20 November 2026 (the site covers JMeter 5.6.3):**
+    [13. Remote Testing](https://jmeter.apache.org/usermanual/remote-test.html) - steps 0 to 3b, 13.1 Setting up
+    SSL, 13.3 Tips, 13.4 Using a different port, 13.5 Using a different sample sender, 13.6 Dealing with nodes that
+    failed starting, 13.7 Using a security-manager;
+    [25. Apache JMeter Distributed Testing Step-by-step](https://jmeter.apache.org/usermanual/jmeter_distributed_testing_step_by_step.html)
+    - terminology and 25.5 Limitations;
+    [1. Getting Started](https://jmeter.apache.org/usermanual/get-started.html) - 1.4.4 CLI Mode, 1.4.5 Server
+    Mode, 1.4.6 Overriding Properties Via The Command Line and the command-line option list;
+    [16. Best Practices](https://jmeter.apache.org/usermanual/best-practices.html) - 16.2 Use the correct Number of
+    Threads; [Component Reference](https://jmeter.apache.org/usermanual/component_reference.html) - CSV Data Set
+    Config. Quotations are from those pages.
+  - **Read from JMeter 5.6.3 itself, not the manual:** the property names and defaults in `bin/jmeter.properties`
+    (`remote_hosts=127.0.0.1`, `server.rmi.ssl.disable`, `server.rmi.ssl.keystore.file`, `mode`,
+    `num_sample_threshold`, `time_threshold`, `jmeterengine.nongui.port`) and the `bin/jmeter-server` and
+    `bin/create-rmi-keystore.sh` scripts. **Observed here, not stated in the manual:** with
+    `server.rmi.ssl.disable=true`, JMeter 5.6.3's `RmiUtils.createServerSocketFactory()` returns no factory, so the
+    RMI ports listened on all interfaces (`*:port` in `ss -ltn`); with SSL on, its `SSLRMIServerSocketFactory` bound
+    to the RMI host, `127.0.0.1`. That was read from the class files in `lib/ext/ApacheJMeter_core.jar` with
+    `javap` and confirmed with `ss`. Also observed: thread names prefixed with the server, `allThreads` counted per
+    server, servers started one after another, and a relative CSV path resolving in each server's own folder.
+  - **Not repeated here:** CSV Data Set Config modes and end of file -
+    [Parameterisation - CSV data, properties and functions](#/lesson/jmeter-parameterisation-and-data); thread
+    groups and ramp-up - [Thread groups, ramp-up and timers](#/lesson/jmeter-thread-groups-and-timers); why the load
+    generator itself must not be the bottleneck - [Test environments and test
+    data](#/lesson/performance-test-environments-and-data); Locust's own distributed mode -
+    [Locust distributed runs and CI](#/lesson/locust-distributed-and-ci).
+
+prerequisites:
+  - jmeter-architecture-and-test-plans
+  - jmeter-thread-groups-and-timers
+  - jmeter-parameterisation-and-data
+  - performance-test-environments-and-data
+
+concepts:
+  - id: perf-jmdist-remote
+    name: Controller and remote servers
+    summary: In JMeter's remote mode one controller (the client, started with -r or -R) sends the same test plan to every JMeter server (started with jmeter-server) over Java RMI and collects their samples into one results file. JMeter does not divide the load - every server runs the full plan, so the plan's thread count is per server and the total is threads x servers. Since JMeter 4.0 RMI uses SSL by default and needs a shared keystore; properties for the servers are sent with -G and -X stops them at the end.
+  - id: perf-jmdist-data
+    name: Data and settings on every server
+    summary: The controller sends the plan and -G properties, but not data files. Each server reads a CSV file from its own disk, relative to the directory the server was started in, so copying one file to every server reuses every row once per server. Unique data needs the file divided between servers, each slice large enough for that server's threads x iterations; per-server differences can also come from each server's user.properties.
+  - id: perf-jmdist-when
+    name: When one machine is enough - sizing and results
+    summary: Distribute only when a measured load generator cannot produce the load (its CPU, memory or network saturates first) - remote mode costs more than independent CLI runs and the controller can become the bottleneck. Size the fleet from a measured per-generator limit, keep generators near the system under test, and read the combined results knowing each sample's thread name carries its server and allThreads is counted per server. Independent CLI runs whose result files are merged afterwards are the other way to scale.
+
+objectives:
+  - Explain the roles of the controller, the remote servers and the target, and what travels between them over RMI.
+  - Start JMeter servers and drive them from a CLI controller with -R, -G and -X, with RMI over SSL and fixed ports.
+  - Calculate the threads a distributed run injects and choose -Gthreads for a target load and a measured per-generator limit.
+  - Divide test data between servers so no row is used twice, and explain why a copied file repeats every row.
+  - Read a distributed run's results - per-server samples, per-server allThreads - and merge results from independent runs.
+  - Decide, from measurements, whether one load generator is enough and which scaling option fits.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: The idea in plain language
+    body: |
+      One laptop can only shout so loudly. When a load test needs more virtual users than one machine can drive - or
+      more network bandwidth than one network card has - you add more machines and have them shout together.
+
+      JMeter's built-in way to do that is **remote (distributed) testing**. One JMeter is the **controller**: it
+      holds the test plan, presses start, and collects the results. Every other JMeter runs as a **server** - a load
+      generator waiting for orders. The controller hands each server a copy of the script, they all perform it at
+      the same time, and the samples flow back to the controller's results file.
+
+      Three things surprise almost everyone the first time:
+
+      - **Every server performs the whole script.** Ask for 1,000 threads with 6 servers and you get 6,000. The
+        controller does not split the load; you do, by choosing the per-server count.
+      - **The script travels, its props do not.** The test plan and the `-G` properties are sent; the CSV files
+        the plan reads are not. Each server reads whatever file sits on its own disk. Put the same file everywhere
+        and every customer logs in once per server.
+      - **More machines is not automatically better.** The controller has to receive every sample, the machines
+        have to be configured, secured and watched, and timings from a mixed fleet are harder to trust. If one
+        machine can do the job, one machine is better.
+
+  - id: what
+    kind: what
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: Terms you need
+    body: |
+      | Term | Meaning (JMeter 5.6.3) |
+      | --- | --- |
+      | **Controller node** (the "client" in chapter 13) | "the system running JMeter GUI, which controls the test" - in practice a CLI run started with `-r` or `-R`. It sends the plan and collects every server's samples. |
+      | **Worker node / JMeter server** | "the system running jmeter-server, which takes commands from the GUI and send requests to the target system(s)". |
+      | **Target** | "the webserver we plan to stress test" - here, the SandPay practice API. |
+      | **`jmeter-server`** | The script that starts JMeter in server mode (`jmeter -s`); "The JMeter server application starts the RMI registry itself". |
+      | **RMI** | Java Remote Method Invocation, the channel between controller and servers. Registry port 1099 by default. |
+      | **`remote_hosts`** | The property listing the servers ("host:port if required"); `bin/jmeter.properties` ships with `remote_hosts=127.0.0.1`. |
+      | **`-r`** | "Start remote servers (as defined in remote_hosts)". |
+      | **`-R host1,host2`** | "Start these remote servers (overrides remote_hosts)" - and "does not define the property". |
+      | **`-G name=value`** | "defines a JMeter property to be sent to all remote servers"; `-G file` sends a property file. |
+      | **`-X`** | "Exit the remote servers at end of test (CLI mode)". |
+      | **`server.rmi.localport`** | The server engine's RMI port - fixed instead of dynamic, for firewalls. |
+      | **`client.rmi.localport`** | Base port for the controller's callback ports, which receive the samples. |
+      | **RMI keystore** | Since JMeter 4.0 "the default transport mechanism for RMI will use SSL"; `bin/create-rmi-keystore.sh` makes `rmi_keystore.jks` for every node. |
+      | **Sample sender (`mode`)** | How servers return samples; "default is StrippedBatch since 2.9". |
+
+  - id: why
+    kind: why
+    concepts: [perf-jmdist-remote, perf-jmdist-when]
+    title: Why distribute - and why the manual is cautious about it
+    body: |
+      The manual gives the reason in its first sentence: "In the event that your JMeter client machine is unable,
+      performance-wise, to simulate enough users to stress your server or is limited at network level, an option
+      exists to control multiple, remote JMeter engines from a single JMeter client."
+
+      A load generator that is itself saturated produces wrong numbers: its threads queue for CPU, requests leave
+      late, and response times include time spent inside JMeter. Best Practices 16.2 names the risk - size threads
+      badly and "you will face the 'Coordinated Omission' problem which can give you wrong or inaccurate results" -
+      and the cure: "If you need large-scale load testing, consider running multiple CLI JMeter instances on multiple
+      machines using distributed mode (or not)."
+
+      Note the "(or not)". The same chapter that introduces remote mode warns:
+
+      - "remote mode does use more resources than running the same number of CLI mode tests independently."
+      - "If many server instances are used, the client JMeter can become overloaded, as can the client network
+        connection."
+      - All nodes must run "exactly the same version of JMeter" and should use the same Java version.
+
+      And the step-by-step tutorial puts a rough number on what one machine can do: "A single JMeter client running
+      on a 2-3 GHz CPU (recent CPU) can handle 1000-2000 threads depending on the type of test." That is a guide, not
+      a limit - your plan, your think times and how fast the target answers decide it, which is why you measure it.
+
+  - id: internals-rmi
+    kind: internals
+    concepts: [perf-jmdist-remote]
+    title: What happens when the controller presses start
+    body: |
+      The manual's steps, with what the controller's log said in this lesson's run:
+
+      1. **Configure the nodes** (step 0): same JMeter and Java everywhere, and "a valid keystore for RMI over SSL,
+         or you have disabled the use of SSL". Data files: "these are not sent across by the client".
+      2. **Start the servers** (step 1): `jmeter-server` on each. "there can only be one JMeter server on each node
+         unless different RMI ports are used." The registry listens on 1099 unless `SERVER_PORT` (the script) or
+         `server_port` says otherwise; the engine uses a dynamic port unless `server.rmi.localport` is set.
+      3. **Name the servers** (step 2): `remote_hosts` in the controller's properties, or `-R` on the command line.
+      4. **Run the controller** (step 3b): `jmeter -n -t script.jmx -R server1,server2`. The controller connects to
+         each server's registry, then sends the plan and the properties:
+
+         ```plaintext
+         INFO o.a.j.e.ClientJMeterEngine: sent test to 127.0.0.1:33031 basedir='.'
+         INFO o.a.j.e.ClientJMeterEngine: Sending properties {port=45345, threads=2, loops=3}
+         INFO o.a.j.e.ClientJMeterEngine: sent run command to 127.0.0.1:33031
+         ```
+
+      5. **Samples come back** over a second, reverse RMI connection: "JMeter/RMI also requires a reverse connection
+         in order to return sample results from the server to the client. These will use high-numbered ports."
+         `client.rmi.localport` fixes them; "JMeter will open up to three ports beginning with the port defined".
+         By default each server batches stripped samples:
+
+         ```plaintext
+         INFO o.a.j.s.BatchSampleSender: Using batching (client settings) for this run. Thresholds: num=100, time=60000
+         INFO o.a.j.s.DataStrippingSampleSender: Using DataStrippingSampleSender for this run
+         ```
+
+         That is `StrippedBatch`: response data removed from successful samples, sent every 100 samples or 60
+         seconds. "the mode is currently resolved on the client; other properties (e.g. time_threshold) are resolved
+         on the server" (`jmeter.properties`).
+      6. **The end:** "The command-line client will exit when all the remote servers have stopped"; with `-X` it also
+         tells them to exit.
+
+      **Every server runs everything.** "The same test plan is run by all the servers. JMeter does not distribute the
+      load between servers, each runs the full test plan. So if you set 1000 Threads and have 6 JMeter server, you end
+      up injecting 6000 Threads."
+
+      **SSL.** Since JMeter 4.0 RMI uses SSL, so every node needs the same key: run `create-rmi-keystore.sh` once (a
+      key pair named `rmi`, "valid for seven days, with a default passphrase of value 'changeit'") and copy
+      `rmi_keystore.jks` to every server and the controller. You can set `server.rmi.ssl.disable=true` instead - and
+      here is what that did on this machine, in `ss -ltn` while two servers were waiting:
+
+      ```plaintext
+      # server.rmi.ssl.disable=true
+      LISTEN 0      50                      *:21100            *:*
+      LISTEN 0      50                      *:21099            *:*
+      LISTEN 0      50                      *:21200            *:*
+      LISTEN 0      50                      *:21199            *:*
+
+      # SSL on (shared keystore), java.rmi.server.hostname=127.0.0.1
+      LISTEN 0      50     [::ffff:127.0.0.1]:21191            *:*
+      LISTEN 0      50     [::ffff:127.0.0.1]:21192            *:*
+      LISTEN 0      50     [::ffff:127.0.0.1]:21091            *:*
+      LISTEN 0      50     [::ffff:127.0.0.1]:21092            *:*
+      ```
+
+      `*` means every network interface. With SSL off, JMeter 5.6.3 passes no socket factory to Java's RMI, which
+      then listens everywhere - an unauthenticated service that runs any test plan it is sent. Section 13.7 says it
+      plainly: "JMeter is basically a remote execution agent on both the server and client side." Keep SSL on and
+      keep the ports reachable only from the controller.
+
+  - id: internals-data
+    kind: internals
+    concepts: [perf-jmdist-data]
+    title: What reaches each server - and what does not
+    body: |
+      | Travels from the controller | Does not travel |
+      | --- | --- |
+      | The test plan ("No need to copy the test plan to each server - the client sends it to all the servers") | Data files: CSV credentials, payload files, keystores the plan uses |
+      | `-G` properties ("define a property in all the servers") | `-J` properties - those stay on the controller |
+      | The start, stop and exit commands | Plugins and extra jars - every node needs the same `lib/ext` |
+
+      So a CSV Data Set Config on a server opens a file on **that server's** disk. The component reference: "the CSV
+      file must be stored on the server host system in the correct relative directory to where the JMeter server is
+      started." The controller's log even says it: `sent test to ... basedir='.'` - the server resolves relative
+      paths from its own working directory. In this lesson's runs the plan reads `merchants.csv`, and each server
+      found the one in its own folder.
+
+      Step 0 gives the two ways to make servers behave differently:
+
+      - "you can define different values for properties by editing the user.properties or system.properties files
+        on each server" - for example a different region or tenant per server;
+      - "Alternatively use different content in any datafiles used by the test (e.g. if each server must use unique
+        ids, divide these between the data files)".
+
+      **Rows needed.** With a shared CSV Data Set Config ("All threads") each server consumes one row per thread per
+      iteration *from its own file*. A server with `-Gthreads=250` and 40 loops needs 10,000 rows in its own file;
+      four such servers need 40,000 rows in total, divided four ways.
+
+  - id: internals-results
+    kind: internals
+    concepts: [perf-jmdist-when]
+    title: How the results come back
+    body: |
+      The controller writes one results file with every server's samples. Three things in it are specific to remote
+      runs - all observed in this lesson's runs:
+
+      ```plaintext
+      <ts>,50,POST /auth/token merchant-7,200,127.0.0.1:33597-Merchants 1-1,2,2
+      <ts>,50,POST /auth/token merchant-8,200,127.0.0.1:33597-Merchants 1-2,2,2
+      ```
+
+      (columns: timeStamp, elapsed, label, responseCode, threadName, grpThreads, allThreads)
+
+      - **`threadName` carries the server:** `127.0.0.1:33597-Merchants 1-2` is thread 2 of thread group 1 on the
+        server at `127.0.0.1:33597`. Group by that prefix to compare servers - one slow or failing generator shows up
+        immediately.
+      - **`grpThreads` and `allThreads` are per server.** Two servers with two threads each: every row said
+        `allThreads` 2, never 4. The concurrency the target saw is up to the *sum* of each server's peak.
+      - **Servers do not start at the same instant.** The controller starts them one after another; in a three-second
+        test on this machine the first server had finished before the second started:
+
+        ```plaintext
+        INFO o.a.j.JMeter: Started remote host:  127.0.0.1:33031 (<epoch ms elided>)
+        INFO o.a.j.JMeter: Finished remote host: 127.0.0.1:33031 (<epoch ms elided>)
+        INFO o.a.j.JMeter: Started remote host:  127.0.0.1:55351 (<epoch ms elided>)
+        ```
+
+        In a real test the ramp-up and steady state are long enough for this not to matter - but measure only the
+        window in which every server was at full load.
+
+      **Sample senders.** `StrippedBatch` keeps the controller's network and CPU load down. `Standard` sends each
+      sample synchronously ("the sample result has to be sent back before the thread can continue"); `Statistical`
+      sends summaries and loses per-sample detail; `Asynch` queues samples ("asynch.batch.queue.size (default 100)").
+      Stripped modes remove `responseData`, so "some Elements that rely on the previous responseData being available
+      will not work" - another reason to extract values with post-processors on the server, not in listeners.
+
+      **Independent runs instead.** Best Practices 16.2: "When using distributed mode the result file is combined on
+      the Controller node, if using multiple autonomous instances, the sample result files can be combined for
+      subsequent analysis." Plain CLI runs started at the same time on each machine need no RMI and no controller, but
+      you merge the files yourself - and they carry no server prefix, so add one.
+
+  - id: when
+    kind: when
+    concepts: [perf-jmdist-when, perf-jmdist-remote]
+    title: One machine, remote mode or independent runs?
+    body: |
+      | Situation | Choice | Why |
+      | --- | --- | --- |
+      | A calibration run shows one generator stays well below its CPU, memory and network limits at the target load | **One machine, CLI mode** | Simplest, cheapest, the results are easiest to trust. |
+      | The generator saturates before the target load, or one network card cannot carry the traffic | **More generators** | A saturated generator makes the system look slower than it is. |
+      | You want one start button, one live summary and one results file, and the fleet is modest | **Remote mode** (`-R`, `-G`, `-X`) | The controller sends the plan and collects samples. |
+      | Many generators, high sample rates, or nodes in different networks (RMI "cannot communicate across subnets without a proxy") | **Independent CLI runs**, started together by your CI or orchestration, results merged | No controller bottleneck, no RMI ports, but you coordinate start times and merge files. |
+      | Load must come from several regions | Generators per region (either way), results tagged by region | One region's latency would distort the others. |
+
+      **Where to put generators:** "The recommended approach is to have one or more machines on the same Ethernet
+      segment as your application server that you configure to run the JMeter Engine." Running JMeter on the
+      application server "will be adding processing overhead on the application server and thus your testing
+      results will be somewhat tainted."
+
+      **What distributing does not fix:** a plan with no think time, a workload model that does not match production
+      (see [Little's law and workload models](#/lesson/littles-law-and-workload-models)), or a target environment that
+      is not like production. More generators only produce more of the same load.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-jmdist-remote, perf-jmdist-data]
+    title: Controller, servers and target
+    body: |
+      ```mermaid
+      flowchart LR
+        C["Controller: jmeter -n -t plan.jmx -R s1,s2 -Gthreads=2 -X"]
+        S1["Server 1: jmeter-server, own merchants.csv"]
+        S2["Server 2: jmeter-server, own merchants.csv"]
+        T["Target: SandPay practice API"]
+        R["results.jtl on the controller"]
+        C -- "RMI over SSL: plan + -G properties" --> S1
+        C -- "RMI over SSL: plan + -G properties" --> S2
+        S1 -- "HTTP: the full plan, 2 threads" --> T
+        S2 -- "HTTP: the full plan, 2 threads" --> T
+        S1 -- "samples, StrippedBatch" --> C
+        S2 -- "samples, StrippedBatch" --> C
+        C --> R
+      ```
+
+      Notice what is *not* drawn: no arrow carries `merchants.csv`. Each server reads its own file, and the target
+      receives 2 + 2 = 4 threads.
+
+  - id: code
+    kind: code
+    concepts: [perf-jmdist-remote, perf-jmdist-data]
+    title: "Real runs: two servers, one copied file versus a split file"
+    body: |
+      The commands, as `support/jm_dist_fixture.py` runs them (JDK 17, paths shortened). First a throwaway keystore,
+      the same command `bin/create-rmi-keystore.sh` runs, with the answers given on the command line:
+
+      ```bash
+      keytool -genkeypair -keyalg RSA -alias rmi -keystore rmi_keystore.jks -storepass changeit -keypass changeit \
+        -validity 7 -keysize 2048 -dname "CN=rmi, OU=Practice, O=SandPay Practice, C=XY"
+      ```
+
+      ```plaintext
+      Generating 2,048 bit RSA key pair and self-signed certificate (SHA256withRSA) with a validity of 7 days
+      	for: CN=rmi, OU=Practice, O=SandPay Practice, C=XY
+      ```
+
+      Then each server, in its own folder (`server-1/`, `server-2/`), on its own registry and engine ports:
+
+      ```bash
+      cd server-1
+      jmeter -Djava.rmi.server.hostname=127.0.0.1 -Dserver_port=21091 -s -j server.log \
+        -Jserver.rmi.ssl.keystore.file=../rmi_keystore.jks -Jserver.rmi.ssl.truststore.file=../rmi_keystore.jks \
+        -Jserver.rmi.localport=21191
+      ```
+
+      ```plaintext
+      Using local port: 21191
+      Created remote object: UnicastServerRef2 [liveRef: [endpoint:[127.0.0.1:21191,SSLRMIServerSocketFactory(host=/127.0.0.1, ...
+      ```
+
+      `bin/jmeter-server` is exactly `jmeter ${RMI_HOST_DEF} -Dserver_port=${SERVER_PORT:-1099} -s -j
+      jmeter-server.log "$@"`; calling `jmeter -s` directly lets two servers share one machine on different ports.
+      Finally the controller, from a third folder:
+
+      ```bash
+      jmeter -Djava.rmi.server.hostname=127.0.0.1 -n -t jm_dist_login.jmx \
+        -R 127.0.0.1:21091,127.0.0.1:21092 \
+        -Jserver.rmi.ssl.keystore.file=../rmi_keystore.jks -Jserver.rmi.ssl.truststore.file=../rmi_keystore.jks \
+        -l results.jtl -X -Jjmeterengine.nongui.port=0 \
+        -Gport=<target port> -Gthreads=2 -Gloops=3
+      ```
+
+      The plan (`tests/jmeter/fixtures/jm_dist_login.jmx`) is the sign-in plan from the parameterisation lesson:
+      `${__P(threads,2)}` threads, `${__P(loops,3)}` loops, a shared CSV Data Set Config reading
+      `${__P(csv,merchants.csv)}` with recycle off and stop thread on, and one sampler labelled
+      `POST /auth/token ${client_id}`. `-Jjmeterengine.nongui.port=0` turns off the controller's UDP shutdown listener
+      ("To disable, set the port to 1000 or less"), which otherwise listens on port 4445 on every interface.
+
+      **Run 1 - the same 12-row file copied to both servers:**
+
+      ```plaintext
+      Configuring remote engine: 127.0.0.1:48755
+      Configuring remote engine: 127.0.0.1:49767
+      Starting distributed test with remote engines: [127.0.0.1:48755, 127.0.0.1:49767] @ 2026 Nov 20 21:30:43 IST (<epoch ms elided>)
+      summary =      6 in 00:00:01 =    8.6/s Avg:    31 Min:     4 Max:    87 Err:     0 (0.00%)
+      Remote engines have been started:[127.0.0.1:48755, 127.0.0.1:49767]
+      summary +      6 in 00:00:01 =    7.9/s Avg:    21 Min:     4 Max:    56 Err:     0 (0.00%) Active: 0 Started: 4 Finished: 4
+      summary =     12 in 00:00:01 =    8.2/s Avg:    26 Min:     4 Max:    87 Err:     0 (0.00%)
+      Tidying up remote @ 2026 Nov 20 21:30:46 IST (<epoch ms elided>)
+      Exiting remote servers:[ClientJMeterEngine [hostAndPort=127.0.0.1:48755], ClientJMeterEngine [hostAndPort=127.0.0.1:49767]]
+      ... end of run
+      ```
+
+      ```plaintext
+      samples per server {'127.0.0.1:48755': 6, '127.0.0.1:49767': 6}
+      sign-ins per merchant {'merchant-2': 2, 'merchant-1': 2, 'merchant-3': 2, 'merchant-4': 2, 'merchant-5': 2, 'merchant-6': 2}
+      distinct merchants 6 max allThreads 2
+      ```
+
+      Twelve sign-ins, 0% errors - and only six merchants, each twice. `Started: 4` confirms 2 threads x 2 servers.
+      Each server read rows 1-6 of its own copy.
+
+      **Run 2 - the same file split with `write_server_files` (rows 1-6 to server 1, 7-12 to server 2):**
+
+      ```plaintext
+      samples per server {'127.0.0.1:33597': 6, '127.0.0.1:54085': 6}
+      sign-ins per merchant {'merchant-7': 1, 'merchant-8': 1, 'merchant-9': 1, 'merchant-10': 1, 'merchant-11': 1, 'merchant-12': 1, 'merchant-2': 1, 'merchant-1': 1, 'merchant-3': 1, 'merchant-4': 1, 'merchant-5': 1, 'merchant-6': 1}
+      distinct merchants 12 max allThreads 2
+      ```
+
+      Same plan, same command, same console summary shape - twelve different merchants. Nothing in JMeter's summary
+      tells the two runs apart; only the labels do.
+
+      **Run 3 - the file only on server 1.** Server 2's folder had no `merchants.csv`. The controller's summary:
+
+      ```plaintext
+      summary =      6 in 00:00:01 =    4.3/s Avg:    45 Min:     4 Max:   125 Err:     0 (0.00%)
+      ```
+
+      Six samples, all from server 1, and 0% errors. The reason is only in server 2's own `server.log`:
+
+      ```plaintext
+      INFO o.a.j.s.FileServer: Stored: merchants.csv
+      ERROR o.a.j.t.JMeterThread: Test failed!
+      java.lang.IllegalArgumentException: Could not read file header line for file merchants.csv
+      ...
+      Caused by: java.lang.IllegalArgumentException: File merchants.csv must exist and be readable
+      ```
+
+      Its threads stopped before sending anything, so the run silently produced half the load. Check samples per
+      server on every run, and read the servers' logs, not only the controller's.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-jmdist-remote]
+    title: The controller command, option by option
+    body: |
+      ```bash
+      jmeter -Djava.rmi.server.hostname=127.0.0.1 -n -t jm_dist_login.jmx \
+        -R 127.0.0.1:21091,127.0.0.1:21092 \
+        -Jserver.rmi.ssl.keystore.file=../rmi_keystore.jks -Jserver.rmi.ssl.truststore.file=../rmi_keystore.jks \
+        -l results.jtl -X -Jjmeterengine.nongui.port=0 \
+        -Gport=<target port> -Gthreads=2 -Gloops=3
+      ```
+
+      - `-Djava.rmi.server.hostname=127.0.0.1` - a Java system property: the address RMI advertises and, with SSL,
+        the address JMeter binds its callback ports to. On a real network this is the controller's address the
+        servers can reach.
+      - `-n -t jm_dist_login.jmx` - CLI mode, this plan. "GUI mode should only be used for debugging".
+      - `-R host:port,host:port` - start the test on these servers. `:port` is needed because the registries are not
+        on 1099. `-r` would use `remote_hosts` instead.
+      - `-Jserver.rmi.ssl.keystore.file=...` and `truststore.file` - the controller needs the same key as the servers;
+        `-J` because these are the controller's own properties.
+      - `-l results.jtl` - the combined results file, written on the controller.
+      - `-X` - "Exit the remote servers at end of test". Without it they stay up for the next run (unless they were
+        started with `server.exitaftertest=true`).
+      - `-Jjmeterengine.nongui.port=0` - no UDP shutdown listener on the controller.
+      - `-Gport=... -Gthreads=2 -Gloops=3` - properties sent to every server; the plan reads them with `__P`. With
+        `-J` instead of `-G` the servers would never see them and would use the plan's defaults.
+
+      Two settings matter only when there are firewalls between the nodes: `server.rmi.localport` on each server and
+      `client.rmi.localport` on the controller fix the otherwise dynamic ports, so you can open exactly those.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: Running a distributed test, step by step
+    body: |
+      1. **Prove you need it.** Run the plan on one generator at increasing load while watching the generator's
+         CPU, memory, network and garbage collection. Note the load at which it stops being comfortable - that is your
+         per-generator limit.
+      2. **Size the fleet.** Servers = ceiling(target threads / per-generator limit); `-Gthreads` = target / servers.
+         Remember the plan's threads are per server.
+      3. **Prepare identical nodes.** Same JMeter, same Java, same plugins, near the target, not on it.
+      4. **Secure RMI.** Create one keystore with `create-rmi-keystore.sh`, copy it to every node, keep SSL on. Fix
+         `server.rmi.localport` and `client.rmi.localport` if firewalls are involved, and allow only the controller.
+      5. **Distribute the data.** Split each CSV file between servers, each slice at least that server's threads x
+         iterations rows, at the same relative path on every server.
+      6. **Parameterise for the servers.** Everything the servers need from the command line goes in `-G`; per-server
+         differences go in each server's `user.properties` or data.
+      7. **Start the servers**, then a short smoke run from the controller with `-R ... -X`: check samples per server,
+         labels, errors and that every server's data was used once.
+      8. **Run the test** with the default `StrippedBatch` sender and lean CSV results, watching the controller's own
+         CPU and network as well as the generators'.
+      9. **Analyse per server first**, then together, over the window in which every server was at full load.
+
+  - id: example
+    kind: example
+    concepts: [perf-jmdist-when, perf-jmdist-data]
+    title: "Example: the 4,000-user test that ran 16,000"
+    body: |
+      This is a hypothetical scenario to show the arithmetic; its numbers were not measured here.
+
+      A SandPay team must show the checkout API handles 4,000 concurrent merchants' sessions. A calibration run shows
+      one generator stays comfortable up to about 1,200 threads of this plan. The tester sets up four JMeter servers
+      and, copying the requirement into the command, runs `-Gthreads=4000`.
+
+      The target collapses at once. The results file shows four server prefixes with 4,000 threads each - 16,000
+      threads, four times the requirement, and each generator 3.3 times over its measured limit. The fix is the
+      arithmetic in step 2: four servers x 1,000 threads.
+
+      The second run passes - suspiciously well. Grouping the sign-in labels by merchant shows every merchant
+      signed in four times: the 4,000-row credentials file had been copied to all four servers. Merchants were
+      sharing sessions, and the cache was warmer than production. Split into four 1,000-row files, the third run's p95
+      is noticeably higher - and that is the number in the report.
+
+      What the tester now checks on every distributed smoke run:
+
+      - samples per server equal (or as planned), with no server missing;
+      - the sum of the servers' peak `allThreads` equals the planned total;
+      - every identifying value (merchant, card token, order reference) used once across all servers;
+      - the generators and the controller below their limits throughout.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: Tests for a distributed setup
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | - | ---- | ----- | -------- | -------- |
+      | 1 | Threads multiply | 2 servers, `-Gthreads=2 -Gloops=3` | 12 samples, 6 per server, `Started: 4` | console summary, samples per server |
+      | 2 | `-G` reaches the servers | same, then `-Jthreads=2` instead | `-G`: 2 threads per server; `-J`: the plan's default | controller log "Sending properties", thread names |
+      | 3 | Copied data repeats | one 12-row file copied to both servers | each of 6 merchants signed in twice | labels per merchant |
+      | 4 | Split data does not | the file split 6 + 6 | 12 merchants, each once | labels per merchant |
+      | 5 | Server down | stop one server, run | the run fails to start, or with `client.continue_on_fail=true` runs on the rest | controller console |
+      | 6 | RMI is not exposed | `ss -ltn` on a server | registry and engine ports bound to the intended interface only | `ss` output |
+      | 7 | Generator headroom | watch CPU, memory, network on every generator during the run | below the limits from the calibration run | monitoring |
+      | 8 | Results merge | merge two independent CLI runs | one header, rows sorted by time, a prefix per generator | `merge_jtls` |
+
+      The practice tests run cases 1 and 4 against real JMeter servers on 127.0.0.1, and case 8 on result files.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: Common mistakes and how to find them
+    body: |
+      | Mistake | Symptom | Fix |
+      | --- | --- | --- |
+      | Total load in the thread count | Target overloaded at once; `Started:` is servers x threads | Threads per server = total / servers. |
+      | Same data file on every server | Every identifier used once per server; results too good | Divide the file between servers. |
+      | Data file missing on a server | That server sends no samples (with a header-line CSV its threads stop with "Could not read file header line"); the summary still says 0% errors | Same relative path on every server; check samples per server and the servers' logs. |
+      | `-J` where `-G` was needed | Servers run the plan's defaults | `-G` for anything the servers read. |
+      | `server.rmi.ssl.disable=true` on a shared network | RMI ports listen on every interface | One keystore on all nodes, SSL on, ports firewalled to the controller. |
+      | Expired or different keystores | The controller cannot connect to the servers | Regenerate (the script's key is valid for seven days) and copy the same file everywhere. |
+      | Different JMeter or Java versions | Errors when the plan is sent, odd behaviour | Exactly the same JMeter, same Java on all nodes. |
+      | Generators on the application server | Server CPU includes JMeter; results "somewhat tainted" | Separate machines on the same network segment. |
+      | Controller overloaded | Live summary lags; controller CPU or network high; samples arrive late | Keep `StrippedBatch`, save fewer fields, fewer servers per controller, or independent runs. |
+      | Relying on `responseData` in listeners | Assertions or listeners that read response data stop working | Do it on the server with post-processors; stripped modes drop data of successful samples. |
+      | Reading `allThreads` as the total | "Peak 2 threads" for a 4-thread run | Sum each server's peak; group by the server prefix. |
+      | Measuring from the first sample | The early window has only some servers running | Analyse the window where every server was at full load. |
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-jmdist-when, perf-jmdist-remote]
+    title: Trade-offs
+    body: |
+      | | One generator | Remote mode | Independent CLI runs |
+      | --- | --- | --- | --- |
+      | Setup | None | Servers, keystore, RMI ports, same versions | Same versions; something to start them together |
+      | Start and stop | One command | One command, `-X` | Your CI or orchestration |
+      | Results | One file | One file, server in the thread name | One per generator, merged by you |
+      | Live view | Summariser | Combined summariser on the controller | Per generator |
+      | Bottleneck risk | The generator | The generators **and** the controller | The generators |
+      | Network | None between nodes | RMI both ways, same subnet | None between nodes |
+      | Security | Local | A remote execution agent per node - SSL, firewall | Nothing listening |
+      | Data | One file | One file per server | One file per generator |
+
+      Cloud load-testing services and containers change how generators are provisioned, not these trade-offs: each
+      generator still runs the full plan, needs its own data and must be watched.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-jmdist-remote, perf-jmdist-data, perf-jmdist-when]
+    title: Summary
+    body: |
+      - Remote mode: one controller (`-r` or `-R`) sends the plan and `-G` properties to JMeter servers
+        (`jmeter-server`) over RMI and collects their samples into one file; `-X` stops the servers.
+      - Every server runs the full plan: total threads = threads per server x servers.
+      - Data files are not sent. Each server reads its own copy, relative to where it was started - divide the data,
+        or every row is used once per server.
+      - Keep RMI over SSL with one shared keystore; with SSL disabled, JMeter 5.6.3's RMI ports listened on every
+        interface here. Fix ports with `server.rmi.localport` and `client.rmi.localport` when firewalls are involved.
+      - Samples come back in `StrippedBatch` mode by default; thread names carry the server, `allThreads` is per
+        server, and servers start one after another.
+      - Distribute only when a measured generator cannot produce the load; remote mode costs more than independent
+        CLI runs, and the controller can become the bottleneck.
+
+exercises:
+  - id: jm-dist-mcq-total
+    type: mcq
+    concept: perf-jmdist-remote
+    skill: application
+    title: How many threads reach the target?
+    prompt: |
+      A plan's thread group has `${__P(threads,10)}` threads. It is run with
+      `jmeter -n -t plan.jmx -R gen1,gen2,gen3,gen4 -Gthreads=500`. How many threads does the target get?
+    options:
+      - id: t2000
+        text: 2,000
+        feedback: Correct - every server runs the full plan with 500 threads; 4 x 500.
+      - id: t500
+        text: '500'
+        feedback: JMeter does not divide the load; 500 is per server.
+      - id: t125
+        text: '125'
+        feedback: That would be the per-server count if JMeter split 500 four ways - it does not.
+      - id: t40
+        text: '40'
+        feedback: -G sends threads=500 to every server, so the default of 10 is not used.
+    correct: [t2000]
+    hints:
+      - "\"JMeter does not distribute the load between servers, each runs the full test plan.\""
+    solution: |
+      4 servers x 500 threads = 2,000. For 2,000 in total you would send `-Gthreads=500`; for 500 in total,
+      `-Gthreads=125`.
+
+  - id: jm-dist-mcq-g-vs-j
+    type: mcq
+    concept: perf-jmdist-data
+    skill: analysis
+    title: The servers ignored the port
+    prompt: |
+      The plan's HTTP port is `${__P(port,8090)}`. The controller is run with `-R gen1,gen2 -Jport=9443`. The results
+      show every request went to port 8090. Why?
+    options:
+      - id: j-local
+        text: -J sets a property on the controller only; the servers need -G
+        feedback: Correct - "-G ... defines a JMeter property to be sent to all remote servers"; -J is local.
+      - id: p-cached
+        text: __P caches the first value it sees
+        feedback: __P reads the property each time; the servers simply never received port=9443.
+      - id: needs-r
+        text: -R ignores properties; only -r sends them
+        feedback: Both -r and -R start remote servers; neither sends -J properties.
+      - id: needs-udv
+        text: Properties do not work in remote mode; use User Defined Variables
+        feedback: Properties work - -G is the way to send them.
+    correct: [j-local]
+    hints:
+      - Which option defines a property "to be sent to all remote servers"?
+    solution: |
+      `-J` defines a local property on the controller. Send properties the servers need with `-G` (or put them in
+      each server's `user.properties`).
+
+  - id: jm-dist-mcq-data
+    type: mcq
+    concept: perf-jmdist-data
+    skill: application
+    title: Where does the server look for the file?
+    prompt: |
+      The plan's CSV Data Set Config reads `data/merchants.csv`. The file exists in the controller's working
+      directory. You run on two servers. What happens?
+    options:
+      - id: on-server
+        text: Each server looks for data/merchants.csv relative to the directory it was started in, on its own disk
+        feedback: Correct - data files "are not sent across by the client".
+      - id: sent
+        text: The controller sends the file with the plan
+        feedback: Only the plan and -G properties travel.
+      - id: split
+        text: The controller splits the file between the servers
+        feedback: JMeter splits neither load nor data; you divide the file yourself.
+      - id: rmi-read
+        text: The servers read the controller's file over RMI as they need rows
+        feedback: Each server opens its own local file.
+    correct: [on-server]
+    hints:
+      - The component reference - "the CSV file must be stored on the server host system ..."
+    solution: |
+      Each server opens the path on its own disk, relative to where `jmeter-server` was started. Put a slice of the
+      data there.
+
+  - id: jm-dist-mcq-copied
+    type: mcq
+    concept: perf-jmdist-data
+    skill: analysis
+    title: 0% errors, half the merchants
+    prompt: |
+      Two servers, each with a copy of the same 12-row merchants file, run 2 threads x 3 loops with a shared CSV Data
+      Set Config. The summary says 12 samples, 0% errors. How many different merchants signed in?
+    options:
+      - id: six
+        text: '6'
+        feedback: Correct - each server read rows 1-6 of its own copy, so each merchant signed in twice.
+      - id: twelve
+        text: '12'
+        feedback: That needs the file split between the servers.
+      - id: three
+        text: '3'
+        feedback: Rows are read per thread per iteration - 6 per server.
+      - id: one
+        text: '1'
+        feedback: The shared pointer gives each thread and iteration a new row on each server.
+    correct: [six]
+    hints:
+      - Each server reads threads x loops rows from its own copy, starting at row 1.
+    solution: |
+      6. Each server consumed rows 1-6 of its own copy; the 12 sign-ins were 6 merchants twice - with nothing in the
+      summary to show it.
+
+  - id: jm-dist-mcq-ssl
+    type: mcq
+    concept: perf-jmdist-remote
+    skill: recall
+    title: The first distributed run fails at once
+    prompt: |
+      A team installs JMeter 5.6.3 on a controller and two servers, starts `jmeter-server` and runs the controller.
+      Nothing else was configured. What does chapter 13 say they still need?
+    options:
+      - id: keystore
+        text: A keystore for RMI over SSL on every node (or SSL disabled deliberately)
+        feedback: Correct - "Since JMeter 4.0 the default transport mechanism for RMI will use SSL."
+      - id: rmiregistry
+        text: To start rmiregistry on each server first
+        feedback: '"The JMeter server application starts the RMI registry itself; there is no need to start RMI registry separately."'
+      - id: copy-plan
+        text: To copy the test plan to each server
+        feedback: '"No need to copy the test plan to each server - the client sends it to all the servers"'
+      - id: gui
+        text: To start the controller in GUI mode
+        feedback: CLI mode with -r or -R is the recommended way.
+    correct: [keystore]
+    hints:
+      - What changed in JMeter 4.0?
+    solution: |
+      RMI uses SSL by default, so every node needs the same `rmi_keystore.jks` (made by `create-rmi-keystore.sh`), or
+      SSL must be disabled on purpose.
+
+  - id: jm-dist-mcq-exposed
+    type: mcq
+    concept: perf-jmdist-remote
+    skill: analysis
+    title: What does the asterisk mean?
+    prompt: |
+      With `server.rmi.ssl.disable=true`, `ss -ltn` on a JMeter 5.6.3 server shows `LISTEN 0 50 *:1099 *:*`. What
+      is the risk?
+    options:
+      - id: everywhere
+        text: The RMI port accepts connections on every network interface, without SSL, and the server runs any plan it is sent
+        feedback: Correct - "JMeter is basically a remote execution agent on both the server and client side."
+      - id: loopback
+        text: None - an asterisk means loopback only
+        feedback: The asterisk is the wildcard address - every interface.
+      - id: slow
+        text: Results will be slower because SSL is off
+        feedback: SSL off is faster if anything; the risk is exposure, not speed.
+      - id: no-samples
+        text: Samples cannot come back to the controller
+        feedback: They can; that is not the problem.
+    correct: [everywhere]
+    hints:
+      - Compare with the SSL-on output, where the address is 127.0.0.1.
+    solution: |
+      Anyone who can reach port 1099 can drive the server. Keep SSL on with a shared keystore and firewall the ports
+      to the controller.
+
+  - id: jm-dist-mcq-sender
+    type: mcq
+    concept: perf-jmdist-when
+    skill: recall
+    title: The default sample sender
+    prompt: What does JMeter's default remote sample sender do?
+    options:
+      - id: stripped-batch
+        text: Removes response data from successful samples and sends them in batches (100 samples or 60 seconds)
+        feedback: Correct - StrippedBatch, the default "since 2.9".
+      - id: standard
+        text: Sends every sample synchronously as soon as it is generated
+        feedback: That is Standard mode.
+      - id: statistical
+        text: Sends summaries per thread group and label
+        feedback: That is Statistical mode, which loses per-sample detail.
+      - id: hold
+        text: Holds every sample until the end of the run
+        feedback: That is Hold mode, which "is discouraged".
+    correct: [stripped-batch]
+    hints:
+      - The controller's log said "Using batching" and "DataStrippingSampleSender".
+    solution: |
+      `StrippedBatch`: response data of successful samples removed, samples sent every `num_sample_threshold` (100) or
+      `time_threshold` (60,000 ms).
+
+  - id: jm-dist-mcq-allthreads
+    type: mcq
+    concept: perf-jmdist-when
+    skill: analysis
+    title: Peak allThreads is 250
+    prompt: |
+      A distributed run used 4 servers with `-Gthreads=250`. Its results file shows a maximum `allThreads` of 250. A
+      colleague concludes only one server worked. What do you say?
+    options:
+      - id: per-server
+        text: allThreads is counted by each server for itself; check samples per server from the thread-name prefix
+        feedback: Correct - in remote runs each row's allThreads is that server's count.
+      - id: agree
+        text: Agree - allThreads would be 1,000 if all four had worked
+        feedback: In the lesson's run, 2 servers x 2 threads showed allThreads 2 on every row.
+      - id: stripped
+        text: StrippedBatch removes the other servers' counts
+        feedback: Stripping removes response data, not counts.
+      - id: bug
+        text: It is a JMeter bug; ignore allThreads
+        feedback: It is how the counts are kept; read it per server.
+    correct: [per-server]
+    hints:
+      - What did the two-server run's rows say?
+    solution: |
+      `allThreads` is per server. Group the rows by the `host:port-` prefix of `threadName`: four prefixes with samples
+      means four servers worked; the sum of their peaks is up to 1,000.
+
+  - id: jm-dist-mcq-one-machine
+    type: mcq
+    concept: perf-jmdist-when
+    skill: application
+    title: Do you need more machines?
+    prompt: |
+      At the target load of 800 threads, a calibration run on one generator shows 35% CPU, 40% heap, 10% of network
+      capacity, and response times that match a lighter run. What do you do?
+    options:
+      - id: one
+        text: Run on this one generator in CLI mode
+        feedback: Correct - it has headroom on every resource, so distributing adds cost and risk for nothing.
+      - id: two
+        text: Use two servers with 400 threads each to be safe
+        feedback: Remote mode "does use more resources" and adds a controller; there is no measured need.
+      - id: thousand
+        text: Distribute because the manual says 1000-2000 threads per machine
+        feedback: That is a rough guide; your measurement says 800 is comfortable here.
+      - id: gui
+        text: Run it in the GUI to watch it live
+        feedback: GUI mode is for debugging, never for load.
+    correct: [one]
+    hints:
+      - Distribute when a measured generator cannot produce the load.
+    solution: |
+      One generator is enough - it is below its limits with room to spare. Keep watching it during the real run.
+
+  - id: jm-dist-mcq-independent
+    type: mcq
+    concept: perf-jmdist-when
+    skill: application
+    title: Twenty generators in three subnets
+    prompt: |
+      A test needs twenty generators spread across three subnets, and CI already starts jobs on all of them at once.
+      Which approach does the manual's advice point to?
+    options:
+      - id: independent
+        text: Independent CLI runs started together, with the result files merged afterwards
+        feedback: Correct - no RMI across subnets, no controller bottleneck; "the sample result files can be combined".
+      - id: one-controller
+        text: One controller with -R and all twenty servers
+        feedback: RMI "cannot communicate across subnets without a proxy", and "the client JMeter can become overloaded".
+      - id: statistical
+        text: Remote mode with the Statistical sender so the controller copes
+        feedback: That loses per-sample detail and still needs RMI across subnets.
+      - id: gui-remote
+        text: Remote Start All from the GUI
+        feedback: Still RMI across subnets, plus the GUI.
+    correct: [independent]
+    hints:
+      - Best Practices 16.2 - "distributed mode (or not)".
+    solution: |
+      Independent CLI runs per generator, started by CI, then merge the JTLs with a generator prefix per row.
+
+  - id: jm-dist-order
+    type: order
+    concept: perf-jmdist-remote
+    skill: application
+    title: Set up and run a distributed test
+    prompt: Put the steps in order.
+    items:
+      - id: calibrate
+        text: Measure one generator's limit with a calibration run
+      - id: size
+        text: Calculate servers and threads per server from the target and the limit
+      - id: nodes
+        text: Install the same JMeter, Java and plugins on every node and create one RMI keystore for all of them
+      - id: data
+        text: Split the data files and put each slice at the same relative path on its server
+      - id: servers
+        text: Start jmeter-server on every server
+      - id: smoke
+        text: Run a short smoke test with -R, -G and -X and check samples and data per server
+      - id: load
+        text: Run the load test, watching the generators and the controller
+    hints:
+      - Servers must be running before the controller can send them anything.
+    solution: |
+      Calibrate, size, prepare nodes and keystore, distribute data, start servers, smoke run, load run.
+
+  - id: jm-dist-debug
+    type: debug
+    concept: perf-jmdist-remote
+    skill: analysis
+    title: Ten times the load
+    prompt: |
+      The requirement is 600 concurrent users in total. This is the CI job's command for its three JMeter servers.
+      Which line is the defect?
+    language: bash
+    code: |
+      jmeter -n -t checkout.jmx \
+        -R gen1:1099,gen2:1099,gen3:1099 \
+        -Gport=443 \
+        -Gthreads=600 \
+        -Grampup=300 \
+        -l results.jtl \
+        -X
+    correctLines: [4]
+    lineNotes:
+      - line: 2
+        note: Three servers, each listed with its registry port - fine.
+      - line: 5
+        note: Ramp-up is per server too, but 300 s for each server's threads is a reasonable choice.
+      - line: 7
+        note: -X stops the servers at the end - fine for a CI job.
+    hints:
+      - Each server runs the full plan.
+    solution: |
+      `-Gthreads=600` gives every server 600 threads - 1,800 in total. Use `-Gthreads=200`.
+
+  - id: jm-dist-short
+    type: short
+    concept: perf-jmdist-data
+    skill: analysis
+    title: Why the distributed run was faster than the single one
+    prompt: |
+      A single-generator run with 200 merchants' credentials (200 threads, 1 loop) gave a p95 of 410 ms. The team then
+      ran the same plan on four servers with `-Gthreads=200` each, copying the same 200-row file to every server. The
+      p95 dropped to 290 ms although the load quadrupled. Give two likely causes, how you would confirm each from the
+      results, and the fix.
+    modelAnswer: |
+      Each server read rows 1-200 of its own copy, so every merchant signed in four times at nearly the same moment:
+      the target served 800 sessions for only 200 merchants, and per-merchant data (sessions, caches, hot rows) was
+      warm for three of every four requests. Confirm by counting sign-ins per merchant from the labels - four each -
+      and by comparing the first and later requests for the same merchant. A second possible cause is that the
+      servers did not all run at full load at the same time (they start one after another, and a short single-loop
+      test may barely overlap); confirm by plotting active threads per server prefix over time and analysing only
+      the window where all four were running. Fixes: an 800-row file divided into four 200-row slices, one per
+      server; a test long enough to have a steady state with every server at full load; and the thread count checked
+      against the requirement (here 800 threads in total - if 200 was meant, use `-Gthreads=50`).
+    rubric:
+      - Explains that each server used the whole copied file, so merchants repeated across servers.
+      - Links repeated data to warmer caches, shared sessions and faster responses.
+      - Confirms with sign-ins per merchant from labels, or timing per server.
+      - Proposes dividing the data between servers and checking the total thread count.
+    hints:
+      - How many times did merchant-1 sign in?
+    solution: |
+      The copied file made every merchant sign in four times (warm data), and the servers may not have overlapped.
+      Count sign-ins per merchant and active threads per server; split the file and size threads per server.
+
+  - id: jm-dist-testdesign
+    type: testdesign
+    concept: perf-jmdist-when
+    skill: application
+    title: Prove a distributed setup before the load test
+    prompt: |
+      Before a 3-server load test of the SandPay payments API, design the checks that prove the distributed setup is
+      right. Give preconditions, steps, expected results and evidence for each.
+    modelAnswer: |
+      Preconditions: three servers and a controller with the same JMeter and Java, one shared RMI keystore,
+      `server.rmi.localport` and `client.rmi.localport` fixed, the data split in three slices at the same relative
+      path, the target in a test environment we are allowed to load.
+
+      1. **Exposure** - `ss -ltn` on each server. Expected: registry and engine ports bound only to the interface the
+         controller uses; firewall allows only the controller. Evidence: `ss` output.
+      2. **Threads per server** - smoke run `-Gthreads=2 -Gloops=3`. Expected: 6 samples per server prefix,
+         `Started: 6`. Evidence: console summary, samples per server.
+      3. **Properties reach the servers** - smoke run with `-Gport`. Expected: every request to that port. Evidence:
+         URL column, controller log "Sending properties".
+      4. **Data split** - smoke run. Expected: every merchant signed in once across all servers. Evidence: labels per
+         merchant.
+      5. **Negative control** - copy one slice to all three servers. Expected: the check reports each merchant three
+         times. Evidence: the check's output.
+      6. **Server failure** - stop one server. Expected: the controller reports it (or continues if
+         `client.continue_on_fail=true` is set on purpose). Evidence: console.
+      7. **Headroom** - the load run itself. Expected: generators and controller below their calibrated limits.
+         Evidence: CPU, heap, network graphs per node.
+    rubric:
+      - Each case has preconditions, steps, expected result and evidence.
+      - Checks thread multiplication and -G properties.
+      - Checks data uniqueness across servers, with a negative control.
+      - Checks RMI exposure or security.
+      - Checks generator and controller headroom.
+    hints:
+      - Which mistakes would still give 0% errors?
+    solution: |
+      Check exposure, threads per server, -G properties, data uniqueness (with a negative control), failure handling
+      and headroom - from `ss`, the console, labels and node monitoring.
+
+  - id: jm-dist-interview
+    type: interview
+    concept: perf-jmdist-remote
+    skill: analysis
+    title: "Interview: how does JMeter distributed testing work?"
+    prompt: |
+      "We need 5,000 concurrent users and one JMeter box can't do it. How does JMeter's distributed testing work,
+      and what do you watch out for?"
+    modelAnswer: |
+      First I'd confirm the need: a calibration run on one generator, watching its CPU, heap, network and GC, tells
+      me how many threads of *this* plan one box handles - say 1,250. Then four generators.
+
+      In remote mode one JMeter is the controller and the others run `jmeter-server`. The controller, in CLI mode
+      with `-R host1,host2,...`, sends the test plan and any `-G` properties to every server over RMI; each server
+      runs the **whole** plan, so threads multiply - for 5,000 in total I send `-Gthreads=1250`, not 5000. Samples
+      come back to the controller in `StrippedBatch` mode by default and land in one results file, each thread name
+      prefixed with its server. `-X` stops the servers at the end.
+
+      The traps: data files are not sent, so I split the CSV data between servers or every row is used once per
+      server; everything the servers need goes in `-G`, not `-J`; all nodes run exactly the same JMeter and Java;
+      RMI uses SSL since JMeter 4.0, so one keystore goes on every node and I don't disable SSL on a shared network -
+      a JMeter server runs whatever plan it is sent; firewalls need `server.rmi.localport` and
+      `client.rmi.localport` fixed. Generators sit near the target but not on it, and I watch the controller too,
+      because it receives every sample.
+
+      If the fleet is large or spans networks, I'd rather run independent CLI instances started by CI and merge the
+      result files, which avoids RMI and the controller bottleneck. Either way I analyse per generator first, over
+      the window when all of them were at full load.
+    rubric:
+      - Starts from a measured per-generator limit.
+      - Explains controller, servers, RMI and that every server runs the full plan (threads per server).
+      - Covers data distribution and -G versus -J.
+      - Covers SSL keystore, same versions and ports or firewalls.
+      - Mentions the controller bottleneck and independent runs as an alternative.
+    followUps:
+      - How would you make sure no two generators use the same customer?
+      - What changes if the generators are in different networks?
+      - How do you know the generators were not the bottleneck?
+    hints:
+      - Answer in order - do we need it, how it works, the traps, the alternative.
+    solution: |
+      Measure first; controller plus servers over RMI, each running the full plan with per-server threads via -G;
+      split data, one keystore, same versions; watch the controller; independent runs for big or split fleets.
+
+  - id: jm-dist-code-sizing
+    type: coding
+    concept: perf-jmdist-remote
+    skill: application
+    title: Size a distributed run
+    prompt: |
+      In `exercises/jmeter/jm_dist_sizing.py`, implement `total_threads`, `threads_per_server` and `size_run`. The
+      tests start from the manual's example (1,000 threads on 6 servers is 6,000), refuse targets that do not divide
+      evenly, and check that `size_run` picks the fewest servers that keep each one within your measured limit while
+      reaching the target.
+    project: perf
+    files:
+      - exercises/jmeter/jm_dist_sizing.py
+    test: tests/jmeter/test_jm_dist_sizing.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dist_sizing.py
+    hints:
+      - A local run (0 servers) still runs the plan once.
+      - Ceiling division without floats is -(-a // b).
+      - Servers first (from the limit), then threads per server (from the target and the servers).
+    modelAnswer: |
+      ```python
+      def total_threads(threads_per_server, servers):
+          if threads_per_server < 0 or servers < 0:
+              raise ValueError("counts cannot be negative")
+          return threads_per_server * max(servers, 1)
+
+      def threads_per_server(target_threads, servers):
+          if target_threads < 1 or servers < 1:
+              raise ValueError("target_threads and servers must be at least 1")
+          if target_threads % servers:
+              raise ValueError("does not divide evenly - every server runs the same plan")
+          return target_threads // servers
+
+      def size_run(target_threads, max_threads_per_server):
+          if target_threads < 1 or max_threads_per_server < 1:
+              raise ValueError("counts must be at least 1")
+          servers = -(-target_threads // max_threads_per_server)
+          per_server = -(-target_threads // servers)
+          total = per_server * servers
+          return RunSize(servers, per_server, total, total - target_threads)
+      ```
+    rubric:
+      - Every test in tests/jmeter/test_jm_dist_sizing.py passes.
+      - Treats the plan's thread count as per server.
+      - Refuses an uneven split instead of rounding silently.
+      - Chooses the fewest servers within the measured limit and reports any overshoot.
+    solution: |
+      Total = per-server threads x servers; per-server = target / servers (exact); servers = ceiling(target / limit),
+      then per-server = ceiling(target / servers).
+
+  - id: jm-dist-code-split
+    type: coding
+    concept: perf-jmdist-data
+    skill: application
+    title: A slice of the data for every server
+    prompt: |
+      In `exercises/jmeter/jm_dist_split.py`, implement `split_rows`, `write_server_files` and
+      `rows_needed_per_server`. The last test is a real distributed run: two JMeter servers on 127.0.0.1, each started
+      in its own folder by `support/jm_dist_fixture.py`, receive your files and run the sign-in plan with
+      `-Gthreads=2 -Gloops=3`. It passes only if all 12 merchants sign in exactly once, 6 per server. The run takes
+      about 15-30 seconds (three JVMs start).
+    project: perf
+    files:
+      - exercises/jmeter/jm_dist_split.py
+    test: tests/jmeter/test_jm_dist_split.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dist_split.py
+    hints:
+      - divmod(len(rows), servers) gives the base size and how many slices get one extra row.
+      - Keep the header line out of the split and write it at the top of every file.
+      - Each server reads one row per thread per iteration from its own file.
+    modelAnswer: |
+      ```python
+      def split_rows(rows, servers):
+          if servers < 1:
+              raise ValueError("servers must be at least 1")
+          if len(rows) < servers:
+              raise ValueError("fewer rows than servers")
+          size, extra = divmod(len(rows), servers)
+          out, start = [], 0
+          for n in range(servers):
+              end = start + size + (1 if n < extra else 0)
+              out.append(rows[start:end])
+              start = end
+          return out
+
+      def write_server_files(source, server_dirs, name="merchants.csv"):
+          lines = [line for line in Path(source).read_text().splitlines() if line.strip()]
+          header, rows = lines[0], lines[1:]
+          paths = []
+          for folder, part in zip(server_dirs, split_rows(rows, len(server_dirs))):
+              path = Path(folder) / name
+              path.write_text("".join(line + "\n" for line in [header, *part]))
+              paths.append(path)
+          return paths
+
+      def rows_needed_per_server(threads_per_server, loops):
+          if threads_per_server < 1 or loops < 1:
+              raise ValueError("threads and loops must be at least 1")
+          return threads_per_server * loops
+      ```
+    rubric:
+      - Every test in tests/jmeter/test_jm_dist_split.py passes.
+      - Slices never overlap, lose rows or differ in size by more than one.
+      - Every server file keeps the header line.
+      - The real two-server run signs every merchant in exactly once.
+    solution: |
+      Contiguous slices with divmod, the header written to every file, and threads x loops rows per server.
+
+  - id: jm-dist-code-results
+    type: coding
+    concept: perf-jmdist-when
+    skill: analysis
+    title: Read and merge distributed results
+    prompt: |
+      In `exercises/jmeter/jm_dist_results.py`, implement `server_of`, `samples_per_server`, `peak_threads` and
+      `merge_jtls`. The rows in the tests have the shape of this lesson's two-server run (`127.0.0.1:21092-Merchants
+      1-2`, `allThreads` per server). `merge_jtls` combines result files from independent CLI runs: one header, a
+      generator prefix on every thread name, rows sorted by `timeStamp` as numbers.
+    project: perf
+    files:
+      - exercises/jmeter/jm_dist_results.py
+    test: tests/jmeter/test_jm_dist_results.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_dist_results.py
+    hints:
+      - A regular expression anchored at the start - host, a colon, digits, then a hyphen - finds the server.
+      - Keep the highest allThreads per server, then add the servers up.
+      - 'Sort with key=lambda r: int(r["timeStamp"]); Python''s sort is stable for ties.'
+    modelAnswer: |
+      ```python
+      _PREFIX = re.compile(r"^([A-Za-z0-9.\-]+:\d+)-")
+
+      def server_of(thread_name):
+          match = _PREFIX.match(thread_name)
+          return match.group(1) if match else None
+
+      def samples_per_server(rows):
+          return Counter(server_of(r["threadName"]) for r in rows)
+
+      def peak_threads(rows):
+          peaks = {}
+          for r in rows:
+              server = server_of(r["threadName"])
+              peaks[server] = max(peaks.get(server, 0), int(r["allThreads"]))
+          return sum(peaks.values())
+
+      def merge_jtls(sources, out):
+          header, merged = None, []
+          for name, path in sources.items():
+              with open(path, newline="") as f:
+                  reader = csv.DictReader(f)
+                  if header is None:
+                      header = list(reader.fieldnames or [])
+                  elif list(reader.fieldnames or []) != header:
+                      raise ValueError(f"{path} has a different header")
+                  for row in reader:
+                      row["threadName"] = f"{name}-{row['threadName']}"
+                      merged.append(row)
+          merged.sort(key=lambda r: int(r["timeStamp"]))
+          with open(out, "w", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=header, lineterminator="\n")
+              writer.writeheader()
+              writer.writerows(merged)
+          return len(merged)
+      ```
+    rubric:
+      - Every test in tests/jmeter/test_jm_dist_results.py passes.
+      - Finds the server prefix and returns None for local thread names.
+      - Adds up each server's own peak instead of taking the maximum allThreads.
+      - Merges with one header, a prefix per generator and numeric time order, and refuses mismatched headers.
+    solution: |
+      A `host:port-` regex for the server, per-server peaks summed, and a merge that checks headers, prefixes thread
+      names and sorts by integer timestamp.
+
+placement:
+  - id: jm-dist-place-total
+    type: mcq
+    concept: perf-jmdist-remote
+    skill: application
+    title: Threads per server
+    prompt: |
+      You need 900 threads in total on 3 JMeter servers. What do you send?
+    options:
+      - id: g300
+        text: -Gthreads=300
+        feedback: Correct - each server runs the full plan, 3 x 300 = 900.
+      - id: g900
+        text: -Gthreads=900
+        feedback: That gives 2,700 threads.
+      - id: j300
+        text: -Jthreads=300
+        feedback: -J stays on the controller; the servers use the plan's default.
+      - id: g100
+        text: -Gthreads=100
+        feedback: That gives 300 threads in total.
+    correct: [g300]
+    hints:
+      - Threads multiply by the number of servers.
+    solution: |
+      `-Gthreads=300`: per-server threads = 900 / 3, sent to every server with `-G`.
+
+  - id: jm-dist-place-data
+    type: mcq
+    concept: perf-jmdist-data
+    skill: analysis
+    title: Unique customers on four servers
+    prompt: |
+      Each of 4 servers runs 100 threads x 5 loops, and no customer may be used twice. How should the 2,000-row
+      customer file be handled?
+    options:
+      - id: split
+        text: Split it into four 500-row files, one per server, at the same relative path
+        feedback: Correct - each server needs 100 x 5 = 500 rows of its own.
+      - id: copy
+        text: Copy the 2,000-row file to every server
+        feedback: Each server would read rows 1-500 of its copy - every customer used four times.
+      - id: controller
+        text: Keep it on the controller; it sends rows to the servers
+        feedback: Data files are not sent.
+      - id: thread-mode
+        text: Copy it everywhere and use Current thread sharing mode
+        feedback: Then every thread starts at row 1 - even more repetition.
+    correct: [split]
+    hints:
+      - Data files are not sent, and each server reads its own copy from the top.
+    solution: |
+      Divide it: four 500-row slices, one per server, each exactly 100 threads x 5 loops.
+
+  - id: jm-dist-place-when
+    type: mcq
+    concept: perf-jmdist-when
+    skill: application
+    title: Is one generator enough?
+    prompt: |
+      At the target load, one generator's CPU sits at 97% and its response times are 40% higher than a lighter run
+      shows for the same requests. What does that tell you?
+    options:
+      - id: saturated
+        text: The generator is saturated - add generators (or lighten the plan) and re-measure
+        feedback: Correct - a saturated generator adds its own delay to every response time.
+      - id: target-slow
+        text: The target is slow at this load; report it
+        feedback: The generator is at 97% CPU - you cannot tell yet whether the target or JMeter is slow.
+      - id: fine
+        text: Nothing - 97% CPU means it is used efficiently
+        feedback: A load generator needs headroom; at 97% its threads queue for CPU.
+      - id: statistical
+        text: Switch to the Statistical sample sender
+        feedback: Sample senders matter only in remote mode, and this is one machine.
+    correct: [saturated]
+    hints:
+      - Who is adding the 40%?
+    solution: |
+      The generator is the bottleneck; its timings are not the target's. Scale out (or make the plan cheaper) and
+      re-measure until the generator has headroom.
+
+recall:
+  - id: jm-dist-recall-roles
+    concept: perf-jmdist-remote
+    prompt: What do the controller and the JMeter servers each do in remote mode?
+    answer: The controller sends the test plan and -G properties to every server over RMI, starts and stops them and collects all samples into one results file; each server (jmeter-server) runs the full plan against the target.
+  - id: jm-dist-recall-multiply
+    concept: perf-jmdist-remote
+    prompt: A plan with 1,000 threads runs on 6 JMeter servers. How many threads reach the target?
+    answer: 6,000 - JMeter does not distribute the load; each server runs the full plan.
+  - id: jm-dist-recall-options
+    concept: perf-jmdist-remote
+    prompt: What do -r, -R, -G and -X do?
+    answer: -r starts the servers in remote_hosts; -R host1,host2 starts these servers instead; -G sends a property to all servers; -X exits the servers at the end of the test.
+  - id: jm-dist-recall-ssl
+    concept: perf-jmdist-remote
+    prompt: What does RMI need since JMeter 4.0?
+    answer: SSL - one keystore (create-rmi-keystore.sh, rmi_keystore.jks) on every server and the controller, or SSL disabled deliberately, which exposes the RMI ports.
+  - id: jm-dist-recall-data
+    concept: perf-jmdist-data
+    prompt: What does the controller not send to the servers, and what follows?
+    answer: Data files. Each server reads its own copy relative to where it was started, so unique data must be divided between servers.
+  - id: jm-dist-recall-results
+    concept: perf-jmdist-when
+    prompt: How do you tell servers apart in a distributed run's results, and what is special about allThreads?
+    answer: Each threadName is prefixed with host:port of the server; allThreads is counted per server, so the total is up to the sum of the servers' peaks.
+  - id: jm-dist-recall-when
+    concept: perf-jmdist-when
+    prompt: When is one load generator enough?
+    answer: When a calibration run shows it stays below its CPU, memory and network limits at the target load - distributing then only adds cost, a controller bottleneck and setup risk.
+
+next:
+  - jmeter-html-dashboard-and-ci
+  - locust-distributed-and-ci
+  - performance-test-environments-and-data
+  - observability-for-web-apps

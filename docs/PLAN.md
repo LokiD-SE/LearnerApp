@@ -247,10 +247,12 @@ owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberate
       vulnerable SandPay portal bound to loopback only, with 17 flaws (OWASP Top 10:2021 and API Top 10:2023),
       each closable with `make_app(fixed=...)`; `tests/support` proves every flaw is present and fixable;
       `SEC_TARGET=solutions`.
-- [ ] Track K lessons, in batches of about 6 - 12 of 31 published (2026-11-20). Done: the fundamentals
-      module (6) and JMeter part 1 (architecture, thread groups and timers, HTTP samplers, correlation,
-      assertions and listeners, parameterisation). Next: JMeter part 2 (logic controllers, JSR223/Groovy, HTML
-      dashboard and CI, distributed testing), then the Locust module (6), then analysis, CI and the capstone (9).
+- [ ] Track K lessons, in batches of about 6 - 18 of 31 published (2026-11-20). Done: the fundamentals
+      module (6), JMeter part 1 (architecture, thread groups and timers, HTTP samplers, correlation,
+      assertions and listeners, parameterisation), JMeter part 2 (logic controllers, JSR223/Groovy, HTML
+      dashboard and CI, distributed testing) and Locust part 1 (fundamentals, HTTP validation and grouping).
+      Next: the rest of the Locust module (task sets, events and custom clients, load shapes, distributed and
+      CI), then analysis, CI and the capstone (9).
       Sources: the Apache JMeter user manual and component reference, the Locust documentation, Little's law
       (Lazowska et al.), Google SRE books, the USE and RED methods, web.dev.
 - [ ] Track L lessons, in batches of about 6 - 12 of 30 published (2026-11-20). Done: foundations (6) and

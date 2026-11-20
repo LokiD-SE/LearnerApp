@@ -1,0 +1,1339 @@
+id: jmeter-jsr223-and-groovy
+title: Scripting JMeter with JSR223 and Groovy
+subject: performance-testing
+module: jmeter
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Some requests need a value no built-in element can make - an HMAC signature, a body built per iteration, a check on a field's meaning. JMeter's JSR223 elements run a Groovy script at exactly those points. Learn when a script is worth it, how JMeter compiles and caches Groovy (and what an uncached or interpreted script costs the load generator), and why a ${variable} inside a cached script silently keeps its first value - with real JMeter 5.6.3 runs that sign SandPay payments.
+tags:
+  [
+    JMeter,
+    JSR223,
+    Groovy,
+    Groovy 3,
+    scripting,
+    JSR223 Sampler,
+    JSR223 PreProcessor,
+    JSR223 PostProcessor,
+    JSR223 Assertion,
+    Cache compiled script if available,
+    cacheKey,
+    Compilable,
+    compiled script cache,
+    jsr223.compiled_scripts_cache_size,
+    BeanShell,
+    __groovy,
+    vars.get,
+    vars.put,
+    ctx,
+    prev,
+    SampleResult,
+    AssertionResult,
+    Parameters,
+    variable interpolation,
+    HMAC,
+    request signing,
+    idempotency key,
+    load generator cost,
+  ]
+
+environment: |
+  - **Runtime:** Apache JMeter 5.6.3 (non-GUI mode) on OpenJDK 17.0.21, Python 3.12.3 in `practice/perf/.venv`,
+    Linux. JMeter 5.6.3 ships **Groovy 3.0.20** (`lib/groovy-3.0.20.jar`, `lib/groovy-jsr223-3.0.20.jar`) - check
+    `lib/` of your own JMeter before relying on a Groovy feature newer than that.
+  - **Runs:** every JMeter output in this lesson was printed by the plans shown, run on 20 November 2026 against
+    `practice/perf/support/jm_groovy_fixture.py` on the loopback interface. Response codes, failure messages and
+    the fixture's counts repeat on any machine. **Timings do not:** they come from one laptop that was also
+    running other jobs (load average 6-10 during the timing runs), and only their *shape* - cached Groovy far
+    cheaper than uncached, the first sample far slower than the rest - is the lesson.
+  - **Target:** a fictional SandPay endpoint that wants signed payment requests: `X-Signature` = lower-case hex
+    HMAC-SHA256 of `<X-Timestamp>.<Idempotency-Key>.<body>` with the merchant's secret. The scheme is made up for
+    practice (real providers each define their own; read theirs). Synthetic merchants `merchant-<n>` /
+    `secret-<n>`; every 4th new payment is declined by a counter, so counts are exact.
+  - **Sources, as documented on 20 November 2026:** the Apache JMeter user manual -
+    [Component Reference](https://jmeter.apache.org/usermanual/component_reference.html) (JSR223 Sampler,
+    JSR223 PreProcessor, JSR223 PostProcessor, JSR223 Assertion, BeanShell Sampler);
+    [Best Practices](https://jmeter.apache.org/usermanual/best-practices.html) 16.7, 16.9, 16.10 and 16.12;
+    [Functions](https://jmeter.apache.org/usermanual/functions.html) (`__groovy`);
+    [Elements of a Test Plan](https://jmeter.apache.org/usermanual/test_plan.html) 3.9 Execution order; and
+    `bin/jmeter.properties` of JMeter 5.6.3 (`jsr223.compiled_scripts_cache_size`). Quotations are from those
+    pages.
+  - **Observed, not documented:** that a cached script with `${n}` keeps **each thread's** first value (thread 2
+    kept its own first value, not thread 1's), and that in JMeter 5.6.3 only `cacheKey` = `false` turns caching
+    off - `true`, an empty value and a legacy unique string all cached in the runs here. The manual describes
+    the checkbox, not the stored values.
+  - **Not repeated here:** samplers, thread groups and scoping (earlier JMeter lessons), extractors
+    ([Correlation and extractors](#/lesson/jmeter-correlation-and-extractors)), Response and JSON Assertions
+    ([Assertions and listeners](#/lesson/jmeter-assertions-and-listeners)), and why payments carry an
+    idempotency key ([Idempotency keys](#/lesson/idempotency-keys)). The Once Only Controller in the plan is
+    covered in [Logic controllers](#/lesson/jmeter-logic-controllers).
+
+prerequisites:
+  - jmeter-correlation-and-extractors
+  - jmeter-assertions-and-listeners
+  - jmeter-parameterisation-and-data
+
+concepts:
+  - id: perf-groovy-when-to-script
+    name: When to script, and which JSR223 element
+    summary: Script only what no built-in element can do - compute a signature, build a body per iteration, check a rule across fields. The JSR223 PreProcessor runs before a sampler, the PostProcessor and Assertion after it, the Sampler is a step of its own. Each gets ready-made variables - vars (this thread's JMeter variables), props, ctx, log, prev or SampleResult, and AssertionResult in an assertion. Built-in extractors and assertions stay the first choice because they are cheaper and easier to read.
+  - id: perf-groovy-compile-cache
+    name: Compilation, caching and what a script costs
+    summary: Groovy implements JSR223's Compilable interface, so JMeter can compile a script once and reuse it - for a script file, or for inline text with "Cache compiled script if available" checked (cacheKey not false). Uncached Groovy is compiled on every run, which costs the load generator far more than the work itself; BeanShell and JavaScript cannot be compiled and are interpreted every time. The first run of any Groovy script pays for engine start-up and compilation, so keep it out of the steady-state numbers.
+  - id: perf-groovy-interpolation
+    name: Never ${...} inside a cached script
+    summary: JMeter replaces ${...} references in the script text before the engine sees it. With caching on, the compiled script keeps the values of the first replacement, so a key, timestamp or id baked in that way never changes again - the requests still succeed, which hides the bug. Read runtime values with vars.get("name"), ctx and props, or pass them through the Parameters field, which JMeter resolves on every run.
+
+objectives:
+  - Decide whether a requirement needs a script or a built-in element, and choose the JSR223 element (Sampler, PreProcessor, PostProcessor, Assertion) that runs at the right moment.
+  - Write Groovy for JMeter that reads and writes thread variables with vars, uses ctx and prev, and fails a sample with AssertionResult.
+  - Explain how JMeter compiles and caches JSR223 scripts, which languages can be cached and what the cacheKey setting stores.
+  - Estimate the load-generator CPU a script costs from a results file, separating the first-run cost from the steady state.
+  - Diagnose the stale-value bug of ${...} in a cached script from server-side evidence (replays, identical keys) and fix it with vars.get or Parameters.
+  - Audit a plan for BeanShell, uncached or non-compilable scripts and slow script functions.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-groovy-when-to-script, perf-groovy-interpolation]
+    title: The idea in plain language
+    body: |
+      JMeter's built-in elements are like a kitchen's fixed appliances: the HTTP sampler is the oven, extractors
+      are the sieve, assertions are the thermometer. Most load tests need nothing else. Then a recipe says
+      "sign every order with a secret". No appliance does that, so you write a small **script** - a few lines
+      of Groovy that JMeter runs at the right moment, here just before each payment request is sent.
+
+      Two things about those few lines matter more than the code itself.
+
+      **First, a script is work the load generator does for every request.** If JMeter has to translate
+      (compile) your script from text into runnable code every time, that translation can cost more than the
+      request you are testing. JMeter can compile a Groovy script **once** and keep it - a cached recipe card
+      instead of rewriting the recipe for each order. On the laptop used here, the same HMAC script took about
+      1 ms per run cached and about 20 ms uncached.
+
+      **Second, a cached script is frozen text.** If you wrote `${counter}` inside it, JMeter filled that hole
+      in **before** the script was compiled - and the compiled card is reused, hole already filled. Every
+      later request gets the first value. In the SandPay run below, all 12 payment requests got `201 Created`,
+      yet only 2 payments were created: the other 10 replayed the first idempotency key of their thread. The
+      fix is to ask for values while the script runs - `vars.get("counter")` - instead of pasting them in.
+
+  - id: what
+    kind: what
+    concepts: [perf-groovy-when-to-script, perf-groovy-compile-cache, perf-groovy-interpolation]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **JSR223** | the Java "Scripting for the Java Platform" API; JMeter's JSR223 elements run any language that has a JSR223 engine in `lib/` |
+      | **Groovy** | the scripting language JMeter recommends; 5.6.3 ships Groovy 3.0.20 |
+      | **JSR223 Sampler** | a script as a step of its own; its return value becomes the response data |
+      | **JSR223 PreProcessor** | "allows JSR223 script code to be applied before taking a sample" |
+      | **JSR223 PostProcessor** | "allows JSR223 script code to be applied after taking a sample" |
+      | **JSR223 Assertion** | "allows JSR223 script code to be used to check the status of the previous sample" |
+      | **`vars`** | this thread's JMeter variables: `vars.get(key)`, `vars.put(key, val)`, `vars.putObject(...)` |
+      | **`props`** | JMeter properties - global to the JMeter instance |
+      | **`ctx`** | the JMeterContext, e.g. `ctx.getThreadNum()` (0-based) |
+      | **`prev` / `SampleResult`** | the sample just taken (in post-processors and assertions), or the current one (in the Sampler) |
+      | **`AssertionResult`** | in an assertion: `setFailure(true)` and `setFailureMessage("...")` fail the sample |
+      | **`Parameters` / `args`** | the Parameters field as one string, and split on white-space |
+      | **Compilable** | the JSR223 interface that lets an engine compile a script once; "Groovy is one of these, java, beanshell and javascript are not" |
+      | **Cache compiled script if available** | the checkbox (stored as `cacheKey`) that makes JMeter compile inline script text and cache it "using its MD5 hash as unique cache key" |
+      | **Interpolation** | JMeter replacing `${name}` / `${__function()}` in a field with a value |
+      | **BeanShell** | an older scripting language and set of elements; the manual advises migrating to JSR223 + Groovy |
+
+      SandPay names in the examples: `POST /auth/token` returns `{"access_token": "tok-merchant-1", ...}`;
+      `POST /v1/payments` needs `Authorization`, `Idempotency-Key`, `X-Timestamp` and `X-Signature` and returns
+      `201` with `{"id": "pay_7004", "status": "captured" | "declined", ...}`.
+
+  - id: why
+    kind: why
+    concepts: [perf-groovy-when-to-script, perf-groovy-compile-cache]
+    title: Why scripting is both necessary and dangerous in a load test
+    body: |
+      **Necessary**, because real APIs ask for things the built-in elements cannot produce:
+
+      - **Request signatures** - an HMAC over the timestamp and body, as many payment and webhook APIs require.
+        JMeter has no element that computes one.
+      - **Bodies built per iteration** - a different amount, reference and currency mix for every request, with
+        rules ("refund at most the captured amount").
+      - **Checks on meaning** - "status is captured, and the amount equals what we sent" is two fields and a
+        rule; a JSON Assertion checks one path at a time.
+      - **Glue** - decode a token, pick the next item from a structure you extracted, stop a thread on a
+        condition.
+
+      **Dangerous**, because a script runs inside the load generator, in every virtual user, on every
+      iteration. Three things go wrong in practice:
+
+      1. **The generator becomes the bottleneck.** An expensive script limits how many requests a generator
+         can send, so the test reports the generator's ceiling as the system's. Best Practices 16.7 lists
+         "Use the most performing scripting language (see JSR223 section)" under *Reducing resource
+         requirements*.
+      2. **The script is silently wrong.** The cached-script `${...}` bug sends the same key or timestamp again
+         and again while every response is 2xx.
+      3. **The plan becomes unreadable.** Logic hidden in script text is invisible in the tree, hard to review
+         and easy to break when the API changes.
+
+      So the rule this lesson builds: **script only what nothing else can do, cache it, read runtime values at
+      run time, and measure what it costs.**
+
+  - id: internals-elements
+    kind: internals
+    concepts: [perf-groovy-when-to-script]
+    title: Where each JSR223 element runs and what it can see
+    body: |
+      The manual's execution order for each sampler (Elements of a Test Plan, 3.9):
+
+      ```plaintext
+      Configuration elements
+      Pre-Processors
+      Timers
+      Sampler
+      Post-Processors (unless SampleResult is null)
+      Assertions (unless SampleResult is null)
+      Listeners (unless SampleResult is null)
+      ```
+
+      So a **JSR223 PreProcessor** under `POST /v1/payments` runs just before that request is built, and the
+      variables it puts are what `${body}`, `${sig}` and `${idem_key}` in the sampler and its Header Manager
+      resolve to - the sampler's fields are resolved when it samples, after the pre-processors. A **JSR223
+      Assertion** under the same sampler sees the response as `prev`, after any post-processor has run.
+
+      **What each element gets** (Component Reference, the variables "set up for use by the script"):
+
+      | Variable | Sampler | Pre | Post | Assertion |
+      | --- | --- | --- | --- | --- |
+      | `log`, `Label`, `FileName`, `Parameters`, `args`, `ctx`, `vars`, `props`, `OUT` | yes | yes | yes | yes |
+      | `sampler` (the current sampler) | yes | yes | yes | yes |
+      | `SampleResult` (the current result) | yes | - | - | - |
+      | `prev` (the previous SampleResult) | - | - | yes | yes (also as `SampleResult`) |
+      | `AssertionResult` | - | - | - | yes |
+
+      Two consequences:
+
+      - **A JSR223 Sampler sets its own status.** "Unlike the BeanShell Sampler, the JSR223 Sampler does not set
+        the ResponseCode, ResponseMessage and sample status via script variables. Currently the only way to
+        changes these is via the SampleResult methods": `SampleResult.setSuccessful(...)`,
+        `setResponseCode(...)`, `setResponseMessage(...)`. Its response data is the script's return value. A
+        Sampler that only prepares data can call `SampleResult.setIgnore()` so the sample is not delivered to
+        listeners - but it still counts for `${JMeterThread.last_sample_ok}`.
+      - **An assertion fails by flag, not by exception.** "If an error is detected, the script should use
+        `AssertionResult.setFailureMessage("message")` and `AssertionResult.setFailure(true)`." The failure
+        message is what lands in the JTL's `failureMessage` column - make it say what was wrong.
+
+      **Variables are per thread.** `vars` is this thread's copy; `vars.put("sig", ...)` in thread 1 is invisible
+      to thread 2. `props` is global to the JMeter instance - Best Practices 16.13 lists properties as the way to
+      share a value between threads, which is exactly why a per-user value must never go there.
+
+  - id: internals-cache
+    kind: internals
+    concepts: [perf-groovy-compile-cache, perf-groovy-interpolation]
+    title: How JMeter compiles, caches - and freezes - a script
+    body: |
+      From the JSR223 Sampler's reference entry: "The JSR223 test elements have a feature (compilation) that can
+      significantly increase performance. To benefit from this feature:
+
+      - Use Script files instead of inlining them. This will make JMeter compile them if this feature is
+        available on ScriptEngine and cache them.
+      - Or Use Script Text and check *Cache compiled script if available* property."
+
+      And the condition: "the language engine used for scripting must implement JSR223 Compilable interface
+      (Groovy is one of these, java, beanshell and javascript are not)". When checked, "JMeter will compile the
+      Script and cache it using its MD5 hash as unique cache key". The cache holds
+      `jsr223.compiled_scripts_cache_size=100` scripts by default (`jmeter.properties`).
+
+      **In the `.jmx`**, the checkbox is the `cacheKey` property. Our runs with JMeter 5.6.3 showed `false` as
+      the only value that turns caching off; `true` (what the GUI saves), an empty value and an old-style unique
+      string such as `insert1` (JMeter's own MongoDB template still has one) all cached.
+
+      **Why `${...}` freezes.** The JSR223 Sampler's entry: "JMeter processes function and variable references
+      before passing the script field to the interpreter, so the references will only be resolved once."
+      Best Practices 16.12: "ensure the script does not use any variable using `${varName}` as caching would take
+      only first value of `${varName}`. Instead use: `vars.get("varName")`." We tested it with two threads,
+      three loops and four samplers - one sets `n`, the others print what they see:
+
+      ```plaintext
+      thread 1, loop 1:  cached "${n}" -> t0-i1   uncached "${n}" -> t0-i1   vars.get("n") -> t0-i1
+      thread 1, loop 2:  cached "${n}" -> t0-i1   uncached "${n}" -> t0-i2   vars.get("n") -> t0-i2
+      thread 1, loop 3:  cached "${n}" -> t0-i1   uncached "${n}" -> t0-i3   vars.get("n") -> t0-i3
+      thread 2, loop 3:  cached "${n}" -> t1-i1   uncached "${n}" -> t1-i3   vars.get("n") -> t1-i3
+      ```
+
+      (Our summary of the JTL's `responseMessage` column, where each script wrote what it saw; `t0` is
+      `ctx.getThreadNum()` 0 and `i1` is `vars.getIteration()` 1.) The cached `${n}` is stuck at each thread's
+      first value; uncached `${n}` and `vars.get("n")` are right. A Parameters field of `${n}` read through
+      `Parameters` / `args[0]` was right in every loop too - the field is resolved per run and passed in, the
+      script text does not change.
+
+      **Uncached is right but expensive.** Uncached Groovy is compiled on every execution. The manual adds a
+      memory warning for that case: "When using Groovy as scripting language and not checking *Cache compiled
+      script if available* (while caching is recommended), you should set this JVM Property
+      `-Dgroovy.use.classvalue=true` due to a Groovy Memory leak as of version 2.4.6".
+
+      **BeanShell is interpreted.** It has no working compile step ("Beanshell implements the Compilable
+      interface but it has not been coded - the method just throws an Exception"), so every run parses the
+      text again. Best Practices 16.9: "Since JMeter 3.1, we advise switching from BeanShell to JSR223 Test
+      Elements ... and switching from `__Beanshell` function to `__groovy` function."
+
+      **The `__groovy` function follows the same rule.** Its entry warns against `${__groovy("${myVar}".substring(0\,2))}`
+      - "the Groovy above cannot be cached as the script changes each time" - and recommends
+      `${__groovy(vars.get("myVar").substring(0\,2))}`.
+
+  - id: when
+    kind: when
+    concepts: [perf-groovy-when-to-script]
+    title: Script or built-in element?
+    body: |
+      | Need | First choice | Script only if |
+      | --- | --- | --- |
+      | read a value from JSON | JSON Extractor | the value needs computing from several fields |
+      | check a status code or a field | Response / JSON Assertion | the rule spans fields ("captured **and** amount matches") |
+      | a unique id per request | `${__UUID()}` in the field | it must be combined with other values the script also builds |
+      | test data per user | CSV Data Set Config | the data is generated by rules no file can hold |
+      | a signature, hash or HMAC | - (no element does it) | always - this is the classic case |
+      | a pause | a Timer | the pause depends on the previous response |
+      | loop / branch | Logic controllers (If, While, Loop) | the condition is too complex for `__jexl3` / `__groovy` in an If Controller |
+      | build the whole request flow in code | - | consider Locust instead: there the whole test **is** Python |
+
+      Prefer a built-in element because it is cheaper per sample, visible in the tree, and reviewed by more
+      people than your script. When a script is the answer, prefer a **PreProcessor or PostProcessor on the
+      sampler that needs it** over a separate JSR223 Sampler - a Sampler adds rows to the results (and a
+      response time that is your script's, not the server's), unless it calls `SampleResult.setIgnore()`.
+
+      Not a replacement: a script does not make JMeter a functional test framework. Keep load-test assertions
+      few and cheap (Best Practices 16.7: "Use as few Assertions as possible").
+
+  - id: visual
+    kind: visual
+    concepts: [perf-groovy-when-to-script, perf-groovy-interpolation]
+    title: One signed payment, inside one thread
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant V as vars of thread 1
+        participant Pre as JSR223 PreProcessor
+        participant S as HTTP sampler
+        participant API as SandPay practice API
+        participant A as JSR223 Assertion
+        Pre->>V: "vars.put idem_key, ts, body, sig"
+        S->>V: "resolve ${body} ${sig} ${idem_key} ${ts}"
+        S->>API: "POST /v1/payments with X-Signature"
+        API-->>S: "201 status captured or declined"
+        A->>S: "read prev response"
+        A-->>A: "setFailure if not captured"
+      ```
+
+      Notice where the `${...}` references live: in the **sampler and Header Manager fields**, which JMeter
+      resolves on every request. The **script** writes the variables with `vars.put` and contains no `${...}`
+      at all - that is what keeps the cached script correct.
+
+  - id: code
+    kind: code
+    concepts: [perf-groovy-when-to-script, perf-groovy-compile-cache]
+    title: The signing pre-processor and the Groovy assertion
+    body: |
+      From `solutions/jmeter/jm_groovy_sign.jmx`. The JSR223 PreProcessor `sign payment`, a child of
+      `POST /v1/payments` (language `groovy`, `cacheKey` `true`):
+
+      ```groovy
+      import groovy.json.JsonOutput
+      import javax.crypto.Mac
+      import javax.crypto.spec.SecretKeySpec
+
+      // Runs before every POST /v1/payments, once per sample, in this thread.
+      int merchant = ctx.getThreadNum() + 1            // ctx counts threads from 0; merchants from 1
+      int iteration = vars.getIteration()              // this thread's current loop, starting at 1
+      String key = "jm-" + merchant + "-" + iteration + "-" + UUID.randomUUID()
+      String ts = String.valueOf(System.currentTimeMillis().intdiv(1000))
+      String body = JsonOutput.toJson([amount_minor: 1000 + iteration, currency: "EUR",
+                                       reference: "order-" + merchant + "-" + iteration])
+
+      Mac mac = Mac.getInstance("HmacSHA256")
+      mac.init(new SecretKeySpec(("secret-" + merchant).getBytes("UTF-8"), "HmacSHA256"))
+      String sig = mac.doFinal((ts + "." + key + "." + body).getBytes("UTF-8")).encodeHex().toString()
+
+      vars.put("idem_key", key)
+      vars.put("ts", ts)
+      vars.put("body", body)
+      vars.put("sig", sig)
+      ```
+
+      The sampler's raw body is `${body}` and its Header Manager sends `Authorization: Bearer ${token}`,
+      `Idempotency-Key: ${idem_key}`, `X-Timestamp: ${ts}` and `X-Signature: ${sig}`.
+
+      The JSR223 Assertion `payment captured`, also a child of `POST /v1/payments`:
+
+      ```groovy
+      import groovy.json.JsonSlurper
+
+      // prev is the sample this assertion checks; AssertionResult is what JMeter records.
+      if (prev.getResponseCode() != "201") {
+          AssertionResult.setFailure(true)
+          AssertionResult.setFailureMessage("expected 201, got " + prev.getResponseCode())
+          return
+      }
+      def payment = new JsonSlurper().parseText(prev.getResponseDataAsString())
+      if (payment.status != "captured") {
+          AssertionResult.setFailure(true)
+          AssertionResult.setFailureMessage("payment " + payment.id + " is " + payment.status + ", expected captured")
+      }
+      ```
+
+      How a JSR223 element looks in the `.jmx` (the script text is XML-escaped inside `script`):
+
+      ```xml
+      <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="sign payment">
+        <stringProp name="scriptLanguage">groovy</stringProp>
+        <stringProp name="parameters"></stringProp>
+        <stringProp name="filename"></stringProp>
+        <stringProp name="cacheKey">true</stringProp>
+        <stringProp name="script">import groovy.json.JsonOutput ...</stringProp>
+      </JSR223PreProcessor>
+      <hashTree/>
+      ```
+
+      The driver that ran the plan and printed the results below (run from `practice/perf`; `run.py` is a
+      scratch helper, not part of the project):
+
+      ```python
+      import sys; sys.path.insert(0, "support")
+      from pathlib import Path
+      from load_tools import run_jmeter, read_jtl
+      from jm_groovy_fixture import serve
+
+      which = sys.argv[1]                      # "solutions" or "exercises"
+      with serve() as t:
+          jtl = run_jmeter(Path(which) / "jmeter/jm_groovy_sign.jmx",
+                           {"port": t.port, "threads": 2, "loops": 6,
+                            "jmeter.save.saveservice.timestamp_format": "HH:mm:ss.SSS"},
+                           Path("/tmp/out-" + which))
+          for r in read_jtl(jtl):
+              print(r["timeStamp"], r["threadName"], r["label"], r["responseCode"], r["success"], r["failureMessage"])
+          print(t.stats())
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-groovy-interpolation, perf-groovy-compile-cache, perf-groovy-when-to-script]
+    title: Why the important lines are written that way
+    body: |
+      - **`ctx.getThreadNum() + 1`** - the thread number at run time, read through the context. The sign-in
+        body uses `${__threadNum}` (1-based) in an HTTP field, where interpolation is fine; inside the script it
+        would be frozen per thread - harmless for a constant, but it trains the wrong habit.
+      - **`vars.getIteration()`** - this thread's loop counter, read at run time. Combined with the thread
+        number and `UUID.randomUUID()` it makes every key unique, so every request is a new payment.
+      - **`System.currentTimeMillis().intdiv(1000)`** - Unix seconds at run time. The broken exercise version,
+        `"${__time(/1000,)}"`, is evaluated once and stays at the first second for the rest of the test - the
+        signature stays valid only until the server's 300-second window closes.
+      - **`JsonOutput.toJson([...])`** - builds the body from a map, so it is valid JSON with no hand-written
+        quoting; the server signs the **exact bytes** it receives, so the script signs the exact string it
+        puts in `${body}`.
+      - **`"<ts>.<key>.<body>"` and `getBytes("UTF-8")`** - the message the (fictional) SandPay scheme
+        defines, in an explicit encoding; the sampler's `contentEncoding` is UTF-8 too, so both sides hash the
+        same bytes.
+      - **`encodeHex().toString()`** - Groovy's byte-array helper; lower-case hex, as the scheme says.
+      - **`vars.put(...)` for every output** - the hand-off to the sampler and Header Manager, which resolve
+        `${...}` per request.
+      - **`cacheKey` `true`** - compile once; legal **because** the script has no `${...}`.
+      - **`AssertionResult.setFailureMessage(... payment.id ... payment.status ...)`** - the JTL row then says
+        *which* payment and *why*: `payment pay_7004 is declined, expected captured`.
+      - **`return` after the code check** - a non-201 response may not be JSON; parsing it would throw, and an
+        exception in an assertion is a script error, not a clear failure message.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-groovy-when-to-script, perf-groovy-compile-cache, perf-groovy-interpolation]
+    title: Adding a script to a plan, step by step
+    body: |
+      1. **Rule out a built-in element** with the table in *Script or built-in element?*. Write down what the
+         script must produce (variable names) or check (the rule).
+      2. **Pick the element by timing**: before the request → PreProcessor; after it → PostProcessor (store
+         values) or Assertion (pass/fail); its own step → Sampler (with `setIgnore()` if it is not a real
+         sample). Add it **as a child of the one sampler** it serves.
+      3. **Language `groovy`, *Cache compiled script if available* checked** - or put the script in a file
+         (`Script file`), which JMeter compiles and caches too and which you can review and version like code.
+      4. **Write the script with no `${...}`.** Read values with `vars.get`, `ctx`, `props`, `prev`; pass
+         field values that must be resolved by JMeter through **Parameters**. Write results with `vars.put`.
+      5. **Make failures loud**: in assertions, `setFailure(true)` plus a message naming the value; in other
+         elements, `log.error(...)` and a variable default the next request will expose.
+      6. **Debug with one thread** - Best Practices 16.10: "Code the script in the sampler script pane, and test
+         it by running the test. If there are any errors, these will show up in the Tree View and jmeter.log
+         file."
+      7. **Prove it with server-side or result evidence** - several threads and loops; unique keys, no replays,
+         the expected failures and only those.
+      8. **Measure the cost** once: a script-only plan, or the sampler's response time with and without the
+         script, on the generator you will use.
+
+  - id: example
+    kind: example
+    concepts: [perf-groovy-interpolation, perf-groovy-when-to-script]
+    title: "All 201, two payments: the cached ${...} bug in a real run"
+    body: |
+      A colleague's first version of the pre-processor (the exercise's starting point) - cached, and with
+      JMeter references in the script text:
+
+      ```groovy
+      int merchant = ${__threadNum}
+      String key = "jm-${__threadNum}-${__counter(TRUE,)}"
+      String ts = "${__time(/1000,)}"
+      String body = '{"amount_minor": 1250, "currency": "EUR"}'
+      // ... the same HMAC lines as the solution ...
+      ```
+
+      Run with 2 threads × 6 loops (the driver from the code section, `exercises`):
+
+      ```plaintext
+      21:26:06.581 Merchants 1-1 POST /auth/token 200 true
+      21:26:06.581 Merchants 1-2 POST /auth/token 200 true
+      21:26:08.265 Merchants 1-1 POST /v1/payments 201 true
+      21:26:08.265 Merchants 1-2 POST /v1/payments 201 true
+      21:26:08.274 Merchants 1-1 POST /v1/payments 201 true
+      ... 8 more rows, every one 201 true ...
+      21:26:08.300 Merchants 1-2 POST /v1/payments 201 true
+      {'created': 2, 'replays': 10, 'bad_signature': 0, 'keys': ['jm-1-1', 'jm-2-1']}
+      ```
+
+      Every request "passed". The server tells the truth: **2 payments created, 10 replays**, and only two keys
+      ever seen - `jm-1-1` and `jm-2-1`, each thread's first. The signatures were valid (they were computed
+      over the frozen key and timestamp), so nothing failed. A load test like this measures the idempotency
+      cache, not payment creation - and no declines ever show up, because no new payment is ever made.
+
+      The same script with caching **off** created all 12 payments with keys `jm-1-1` .. `jm-2-6` - correct,
+      and compiled 12 times. The solution (cached, no `${...}`, plus the Groovy assertion):
+
+      ```plaintext
+      21:25:56.592 Merchants 1-2 POST /auth/token 200 true
+      21:25:56.592 Merchants 1-1 POST /auth/token 200 true
+      21:25:59.323 Merchants 1-1 POST /v1/payments 201 true
+      21:25:59.323 Merchants 1-2 POST /v1/payments 201 true
+      21:25:59.714 Merchants 1-2 POST /v1/payments 201 true
+      21:25:59.714 Merchants 1-1 POST /v1/payments 201 false payment pay_7004 is declined, expected captured
+      21:25:59.730 Merchants 1-2 POST /v1/payments 201 true
+      21:25:59.740 Merchants 1-2 POST /v1/payments 201 true
+      21:25:59.741 Merchants 1-1 POST /v1/payments 201 true
+      21:25:59.753 Merchants 1-2 POST /v1/payments 201 false payment pay_7008 is declined, expected captured
+      21:25:59.760 Merchants 1-1 POST /v1/payments 201 true
+      21:25:59.763 Merchants 1-2 POST /v1/payments 201 true
+      21:25:59.774 Merchants 1-1 POST /v1/payments 201 true
+      21:25:59.788 Merchants 1-1 POST /v1/payments 201 false payment pay_7012 is declined, expected captured
+      {'created': 12, 'replays': 0, 'bad_signature': 0, ...}
+      ```
+
+      (The key list is cut: 12 keys `jm-<merchant>-<loop>-<uuid>`.) Twelve new payments, three declines
+      flagged with their ids. Look at the timestamps: the first payment of each thread started about 2.7 s
+      after sign-in - the first JSR223 execution loads the Groovy engine and compiles the scripts. The other
+      ten took milliseconds. That first-run cost belongs to warm-up, not to the API.
+
+      **Cost on the generator.** A script-only plan (`tests/jmeter/fixtures/jm_groovy_cost.jmx`: one thread,
+      the same one-HMAC script three ways, no HTTP) run with 1000 loops printed:
+
+      ```plaintext
+      hmac groovy cached     n=1000 first=1183 median=1 p95=2 max=8 total=2171
+      hmac groovy uncached   n=1000 first=44 median=20 p95=38 max=176 total=21433
+      hmac beanshell         n=1000 first=36 median=2 p95=5 max=17 total=2771
+      ```
+
+      (ms; median, p95 and max over samples 2-1000; this machine, this day.) Cached Groovy: about 1 ms, after a
+      1.2 s first run that paid for the engine. Uncached Groovy: about 20 ms **every time** - slower than
+      interpreted BeanShell. At 200 signed requests per second, 20 ms of script per request is about 4 CPU
+      cores of the generator doing nothing but compiling. JMeter measures `elapsed` in whole milliseconds, so
+      "1" here means "under about 1.5 ms", not a precise figure.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-groovy-interpolation, perf-groovy-when-to-script, perf-groovy-compile-cache]
+    title: Testing a scripted plan
+    body: |
+      | # | Check | How | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | the script's output is accepted | 2 threads × 6 loops | every `POST /v1/payments` 201, no `bad signature` | JTL codes; server counter |
+      | 2 | values change per request | same run | 12 distinct keys, 0 replays | server stats or saved request headers |
+      | 3 | values differ per thread | same run | thread 1 and thread 2 keys never overlap | keys grouped by merchant |
+      | 4 | the assertion fails exactly the bad ones | same run | 3 failures, each naming a declined `pay_` id | JTL `success`, `failureMessage` |
+      | 5 | the assertion stays quiet on good ones | same run | 9 successes | JTL |
+      | 6 | the script is cached and stays correct | inspect the `.jmx` | language `groovy`, `cacheKey` not `false`, no `${` in `script` | XML / lint |
+      | 7 | the plan has no legacy scripting | lint | no BeanShell, no `__BeanShell` / `__javaScript` | lint findings empty |
+      | 8 | the script's cost is known | script-only plan, warm-up excluded | steady-state ms per run, cores at target rate | JTL summary |
+
+      Checks 1-6 are `tests/jmeter/test_jm_groovy_sign.py`; check 7 is the lint exercise; check 8 is the cost
+      exercise. None of them asserts a response time - check 2 is the one a response-time report can never
+      catch.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-groovy-interpolation, perf-groovy-compile-cache, perf-groovy-when-to-script]
+    title: Common mistakes and a debugging method
+    body: |
+      - **`${...}` in a cached script.** Values freeze at the first replacement (per thread, in our runs). Use
+        `vars.get`, `ctx`, `props` or Parameters.
+      - **Groovy string interpolation looks the same.** In Groovy, `"order-${ref}"` is a GString - but JMeter
+        sees `${ref}` first and replaces it if a JMeter variable `ref` exists ("If an undefined function or
+        variable is referenced ... the reference is returned unchanged", and only then does Groovy interpolate
+        it). Whether it works depends on which variables happen to exist - use concatenation
+        (`"order-" + ref`) in JMeter scripts so there is no doubt who resolves what.
+      - **Cache unchecked "to be safe".** It is correct, but compiles on every run (20 ms here vs 1 ms) and
+        needs `-Dgroovy.use.classvalue=true` against the Groovy memory leak the manual describes.
+      - **BeanShell or JavaScript for load scripts** - interpreted every time; the manual's advice since JMeter
+        3.1 is JSR223 + Groovy. `${__BeanShell(...)}` / `${__javaScript(...)}` in a field are the same problem
+        in disguise; use `${__groovy(...)}` with `vars.get`.
+      - **A JSR223 Sampler for preparation work** without `SampleResult.setIgnore()` - its rows go into the
+        results and its "response time" is your script's.
+      - **Throwing instead of failing** in an assertion - an exception is reported as a script error; use
+        `AssertionResult.setFailure(true)` with a message.
+      - **Putting a per-user value in `props`** - properties are shared by all threads.
+      - **Heavy work per sample** - reading a file, building a big object, parsing a large response with a slow
+        method. Do it once (a setUp Thread Group, a CSV file, `vars.putObject`) and reuse it.
+      - **Counting the first sample** - it includes engine start and compilation (about 1 s here). Warm up or
+        exclude it from steady-state numbers.
+
+      **Method.** When a scripted plan "passes" but looks wrong: (1) look at what the **server** saw - created
+      vs replayed, distinct keys, rejected signatures; (2) run one thread with the script logging its outputs
+      (`log.info("key=" + key)`) and read `jmeter.log`; (3) search the script for `${` and the element for
+      `cacheKey`; (4) check the element's scope - a pre-processor one level too high runs before **every**
+      sampler; (5) when it is correct, measure its cost.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-groovy-compile-cache, perf-groovy-when-to-script]
+    title: Trade-offs and alternatives
+    body: |
+      - **Inline script vs script file.** Inline is visible in the GUI and travels with the `.jmx`; a file
+        (`Script file`) is compiled and cached automatically, can be shared between elements, linted and
+        reviewed as code - but it is one more file to ship to every load generator (a later lesson on
+        distributed testing).
+      - **JSR223 element vs `__groovy` function.** A function in a field is short and handy for a one-liner;
+        anything longer belongs in an element, where you can read and debug it.
+      - **Groovy vs a Java plugin.** For a computation so heavy that even compiled Groovy limits the generator,
+        a custom Java sampler or function plugin is faster - and far more work to build and maintain. Measure
+        first.
+      - **Script vs move the work.** Pre-computing data into a CSV removes run-time work entirely (Best
+        Practices 16.7: create large randomised data "in a file that can be read with CSV Dataset"); a script
+        is for values that depend on run time - timestamps, previous responses, signatures.
+      - **JMeter + scripts vs Locust.** When most of a test is code, Locust's plain-Python user classes may be
+        simpler than a JMeter plan full of scripts; JMeter's strength is the tree of built-in elements.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-groovy-when-to-script, perf-groovy-compile-cache, perf-groovy-interpolation]
+    title: Quick reference
+    body: |
+      - **Script only what no element can do**: signatures, rule-based bodies, multi-field checks.
+      - **Element by timing**: PreProcessor before the request, PostProcessor/Assertion after it, Sampler as a
+        step (`setIgnore()` if it is not a real sample); a child of the sampler it serves.
+      - **Variables**: `vars` (this thread), `props` (global), `ctx`, `log`, `prev`, `SampleResult`,
+        `AssertionResult`, `Parameters`/`args`.
+      - **Fail an assertion** with `AssertionResult.setFailure(true)` + `setFailureMessage("...")`.
+      - **Groovy + cache**: language `groovy`, *Cache compiled script if available* (`cacheKey` not `false`) or a
+        script file; cache size `jsr223.compiled_scripts_cache_size=100`.
+      - **Never `${...}` inside a cached script** - it keeps the first value. `vars.get("name")` or Parameters.
+      - **BeanShell / JavaScript** are not compilable - migrate to JSR223 + Groovy.
+      - **Cost**: the first run pays engine start and compile; uncached Groovy compiles every time. Measure ms
+        per run and multiply by the target rate to get generator cores.
+      - **Prove correctness from the server's side**: unique keys, no replays, the expected failures.
+
+exercises:
+  - id: which-element
+    type: mcq
+    concept: perf-groovy-when-to-script
+    skill: application
+    title: Where does the signature go?
+    prompt: |
+      Every `POST /v1/payments` must carry an `X-Signature` computed over that request's body and timestamp.
+      Which element do you add, and where?
+    options:
+      - id: pre-child
+        text: A JSR223 PreProcessor as a child of POST /v1/payments that puts the signature in a variable used by the Header Manager
+        feedback: Correct - it runs just before that request, and the header field resolves the variable when the request is sent.
+      - id: post-child
+        text: A JSR223 PostProcessor under POST /v1/payments
+        feedback: A post-processor runs after the request has already been sent unsigned.
+      - id: sampler
+        text: A JSR223 Sampler at the start of the thread that signs all payments at once
+        feedback: Each request has its own body and timestamp; one signature up front cannot match them.
+      - id: plan-level
+        text: A JSR223 PreProcessor at Test Plan level
+        feedback: Then it runs before every sampler in scope, including the sign-in - wasted work and overwritten variables.
+    correct: [pre-child]
+    hints:
+      - Look at the execution order - which elements run before the sampler?
+    solution: |
+      A PreProcessor scoped to the payment sampler: it computes and stores the signature right before each
+      request; `${sig}` in the header resolves per request.
+
+  - id: built-in-first
+    type: mcq
+    concept: perf-groovy-when-to-script
+    skill: analysis
+    title: Does this need a script?
+    prompt: |
+      Which of these requirements is the best case for a JSR223 script rather than a built-in element?
+    options:
+      - id: hmac
+        text: Send an HMAC-SHA256 of the timestamp and body in a header
+        feedback: Correct - no JMeter element computes an HMAC.
+      - id: extract
+        text: Store the access_token from a JSON sign-in response
+        feedback: A JSON Extractor does that, cheaper and visibly.
+      - id: status
+        text: Fail the sample when the response code is not 201
+        feedback: A Response Assertion on the response code does that.
+      - id: uuid
+        text: Send a new UUID as the Idempotency-Key of each request
+        feedback: "`${__UUID()}` in the header field does that."
+    correct: [hmac]
+    hints:
+      - Three of these have a built-in element or function.
+    solution: |
+      Only the signature has no built-in equivalent; the others are JSON Extractor, Response Assertion and
+      `__UUID`.
+
+  - id: cache-languages
+    type: mcq
+    concept: perf-groovy-compile-cache
+    skill: recall
+    title: Which languages can JMeter cache?
+    prompt: |
+      According to the JMeter Component Reference, which scripting language used in a JSR223 element can be
+      compiled and cached?
+    options:
+      - id: groovy
+        text: Groovy
+        feedback: Correct - its engine implements the Compilable interface.
+      - id: beanshell
+        text: BeanShell
+        feedback: The manual lists beanshell among those that are not; its compile method "just throws an Exception".
+      - id: javascript
+        text: JavaScript
+        feedback: Not compilable in JMeter's JSR223 sense, per the manual.
+      - id: java
+        text: java
+        feedback: Listed as not compilable too.
+    correct: [groovy]
+    hints:
+      - '"Groovy is one of these, java, beanshell and javascript are not."'
+    solution: |
+      Groovy. That is why JMeter recommends JSR223 + Groovy for load testing.
+
+  - id: what-cachekey-false
+    type: mcq
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: An uncached script in a 200 req/s test
+    prompt: |
+      An inline Groovy PreProcessor has `cacheKey` set to `false`. Script-only measurements on your generator
+      show about 20 ms per run uncached and about 1 ms cached. The test targets 200 requests per second. What is
+      the main problem?
+    options:
+      - id: cpu
+        text: The generator spends about 4 CPU cores just compiling the script, which can cap the load it can create
+        feedback: Correct - 20 ms × 200/s = 4 core-seconds per second.
+      - id: wrong
+        text: The script will return stale values
+        feedback: Uncached scripts re-resolve ${...} each time; the problem here is cost, not correctness.
+      - id: none
+        text: None - 20 ms is far below the API's response time
+        feedback: Script time is CPU on the generator, added to every request, in every thread.
+      - id: server
+        text: The server will see higher latency
+        feedback: The script runs on the generator; the server never sees it - but the generator may fail to reach 200/s.
+    correct: [cpu]
+    hints:
+      - Multiply the per-run cost by the rate.
+    solution: |
+      20 ms × 200 per second ≈ 4 cores of pure compilation. Check the cache box (no `${...}` in the script) and
+      it drops to about 0.2 cores.
+
+  - id: first-sample
+    type: mcq
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: The slow first payment
+    prompt: |
+      In a signed-payment run, each thread's first `POST /v1/payments` starts about 2.7 s after sign-in; later
+      ones follow within milliseconds. The server's own logs show 2 ms per payment throughout. Most likely cause?
+    options:
+      - id: groovy-start
+        text: The first JSR223 execution loads the Groovy engine and compiles the scripts on the generator
+        feedback: Correct - a one-off warm-up cost; keep it out of steady-state numbers.
+      - id: db-warm
+        text: The server's database cache was cold
+        feedback: The server says 2 ms for the first payment too.
+      - id: timer
+        text: A timer fired before the first payment only
+        feedback: There is no timer in the plan; a timer would also delay later iterations.
+      - id: tls
+        text: TLS handshakes
+        feedback: The practice API is plain HTTP on loopback.
+    correct: [groovy-start]
+    hints:
+      - Which side of the connection did the extra time happen on?
+    solution: |
+      Engine start and compilation happen once per script on the generator. Warm up, or exclude the first
+      samples from the analysis.
+
+  - id: stale-symptom
+    type: mcq
+    concept: perf-groovy-interpolation
+    skill: analysis
+    title: Twelve 201s, two payments
+    prompt: |
+      A cached Groovy PreProcessor builds the key as `"jm-${__threadNum}-${__counter(TRUE,)}"`. Two threads × six
+      loops all return 201, but the server created only 2 payments and counted 10 replays. Why?
+    options:
+      - id: frozen
+        text: JMeter replaced the ${...} once and the cached compiled script keeps that first key
+        feedback: Correct - "caching would take only first value of ${varName}".
+      - id: counter
+        text: __counter(TRUE,) does not count per thread
+        feedback: It does count per thread - the problem is that the script never sees the new value.
+      - id: server
+        text: The server's idempotency store is broken
+        feedback: Replaying a known key is exactly what an idempotency store should do.
+      - id: threads
+        text: The two threads share variables
+        feedback: Variables are per thread; each thread replayed its own first key.
+    correct: [frozen]
+    hints:
+      - What does JMeter do with ${...} before the script reaches the Groovy engine?
+    solution: |
+      The references are resolved before compilation and the compiled script is cached, so the key is fixed
+      at its first value per thread. Build it with `ctx`, `vars.getIteration()` and `UUID.randomUUID()`.
+
+  - id: fix-stale
+    type: mcq
+    concept: perf-groovy-interpolation
+    skill: application
+    title: The right fix
+    prompt: |
+      A cached script contains `String ref = "${order_ref}"`, where `order_ref` comes from a CSV Data Set and
+      changes every iteration. Which change keeps caching and makes the value correct?
+    options:
+      - id: vars-get
+        text: String ref = vars.get("order_ref")
+        feedback: Correct - the value is read at run time; the script text never changes.
+      - id: uncheck
+        text: Uncheck Cache compiled script if available
+        feedback: That makes it correct but compiles every run - the expensive fix.
+      - id: gstring
+        text: Write "$order_ref" without braces
+        feedback: Then Groovy looks for a Groovy variable order_ref, which does not exist in the script.
+      - id: props
+        text: Put order_ref in a property and read ${__P(order_ref)}
+        feedback: Still ${...} in a cached script - and properties are global, not per user.
+    correct: [vars-get]
+    hints:
+      - The manual's advice in Best Practices 16.12.
+    solution: |
+      `vars.get("order_ref")` (or pass `${order_ref}` in the Parameters field and read `Parameters`).
+
+  - id: params-field
+    type: mcq
+    concept: perf-groovy-interpolation
+    skill: analysis
+    title: The Parameters field
+    prompt: |
+      A cached Groovy Sampler has Parameters `${n}` and the script `SampleResult.setResponseMessage(Parameters)`.
+      `n` changes every iteration. What does the response message show in iteration 3?
+    options:
+      - id: current
+        text: The value of n in iteration 3
+        feedback: Correct - the field is resolved per run and passed in; the script text is unchanged. Our run showed t0-i3 in loop 3.
+      - id: first
+        text: The value of n in iteration 1
+        feedback: That is what ${n} inside the script would show.
+      - id: literal
+        text: The literal text ${n}
+        feedback: JMeter resolves the Parameters field before passing it.
+      - id: error
+        text: A script error - Parameters is not defined in a Sampler
+        feedback: Parameters is one of the variables set up for every JSR223 element.
+    correct: [current]
+    hints:
+      - Which text does JMeter compile - the script or the parameters?
+    solution: |
+      The current value. Parameters is the documented way to pass field values into a cached script.
+
+  - id: assertion-api
+    type: mcq
+    concept: perf-groovy-when-to-script
+    skill: recall
+    title: Failing a sample from a JSR223 Assertion
+    prompt: How should a JSR223 Assertion report that the response is wrong?
+    options:
+      - id: setfailure
+        text: AssertionResult.setFailure(true) and AssertionResult.setFailureMessage("...")
+        feedback: Correct - the manual's documented way; the message lands in the JTL.
+      - id: throw
+        text: Throw an exception
+        feedback: That is reported as a script error, without your message.
+      - id: return-false
+        text: Return false from the script
+        feedback: The assertion's return value is not its result.
+      - id: prev-code
+        text: prev.setResponseCode("500")
+        feedback: That rewrites the response, it does not fail the assertion with a reason.
+    correct: [setfailure]
+    hints:
+      - The Component Reference names two methods on one object.
+    solution: |
+      `AssertionResult.setFailure(true)` plus a message that names the value and the rule.
+
+  - id: beanshell-migrate
+    type: mcq
+    concept: perf-groovy-compile-cache
+    skill: application
+    title: The legacy BeanShell PreProcessor
+    prompt: |
+      An old plan signs requests with a BeanShell PreProcessor. Following the JMeter manual, what do you change?
+    options:
+      - id: jsr223
+        text: Replace it with a JSR223 PreProcessor in Groovy with the compiled script cached
+        feedback: Correct - "Migration to JSR223 PreProcessor+Groovy is highly recommended for performance".
+      - id: keep
+        text: Keep it - BeanShell is Java syntax, so it runs at Java speed
+        feedback: It is interpreted on every run; it is not compiled to Java bytecode.
+      - id: jsr223-bsh
+        text: Move the same code into a JSR223 element with language beanshell
+        feedback: Still not compilable - the language, not the element, is the problem.
+      - id: function
+        text: Use ${__BeanShell(...)} in the header instead
+        feedback: The same interpreter, now hidden in a field.
+    correct: [jsr223]
+    hints:
+      - Best Practices 16.9.
+    solution: |
+      JSR223 + Groovy + cache. Most Java-style BeanShell code runs in Groovy with few changes; test it with one
+      thread first.
+
+  - id: script-order
+    type: order
+    concept: perf-groovy-when-to-script
+    skill: application
+    title: Adding a signature script
+    prompt: Put the steps of adding a request-signing script to a plan in order.
+    items:
+      - id: rule-out
+        text: Confirm no built-in element or function can produce the value
+      - id: element
+        text: Add a JSR223 PreProcessor (Groovy, cache checked) as a child of the sampler
+      - id: script
+        text: Write the script with vars.get / ctx and vars.put - no ${...} in the text
+      - id: reference
+        text: Reference the variables (${sig}, ${ts}) in the sampler and Header Manager
+      - id: one-thread
+        text: Run one thread and check the variables and jmeter.log
+      - id: prove
+        text: Run several threads and loops and check unique values and the server's acceptance
+      - id: cost
+        text: Measure the script's cost per run on the generator
+    hints:
+      - You cannot measure the cost of a script that is not yet correct.
+    solution: |
+      Rule out, place, write, wire, debug with one thread, prove with many, measure.
+
+  - id: debug-script
+    type: debug
+    concept: perf-groovy-interpolation
+    skill: analysis
+    title: Four problems in one pre-processor
+    prompt: |
+      A JSR223 PreProcessor, language groovy, Cache compiled script if available **checked**, a child of
+      `POST /v1/payments`. Click **every** line that is a defect.
+    language: groovy
+    code: |
+      int merchant = ctx.getThreadNum() + 1
+      String key = "jm-" + merchant + "-${__counter(TRUE,)}"
+      String ts = String.valueOf(System.currentTimeMillis().intdiv(1000))
+      String body = JsonOutput.toJson([amount_minor: 1000 + vars.getIteration(), currency: "EUR"])
+      String sig = hmacHex("secret-" + merchant, ts + "." + key + "." + body)
+      props.put("sig", sig)
+      vars.put("idem_key", key)
+      vars.put("ref", "${order_ref}")        // order_ref: CSV Data Set, a new row every loop
+      vars.put("ts", ts)
+    correctLines: [2, 6, 8]
+    lineNotes:
+      - line: 1
+        note: Reading the thread number from ctx at run time is right.
+      - line: 3
+        note: Unix seconds computed at run time - right.
+      - line: 4
+        note: A body built per iteration from vars - right (assuming JsonOutput is imported).
+      - line: 5
+        note: Fine if hmacHex is defined in the script - the message matches the scheme.
+      - line: 7
+        note: Storing the key per thread is right.
+    hints:
+      - Which lines contain ${...}?
+      - Which object is shared by all threads?
+    solution: |
+      Line 2: `${__counter(TRUE,)}` freezes at the first value - use `vars.getIteration()` or a UUID. Line 6:
+      `props` is global, so threads overwrite each other's signature - use `vars.put`. Line 8: `${order_ref}` is
+      resolved once, so every loop stores the first CSV row's reference - use `vars.get("order_ref")`. (The
+      script also never puts `body`, but that is a missing line, not a defective one.)
+
+  - id: short-why-wrong
+    type: short
+    concept: perf-groovy-interpolation
+    skill: analysis
+    title: Why "every request passed" proves nothing here
+    prompt: |
+      A teammate says the signing script must be fine: 1,000 requests, 100% 201, p95 4 ms. You know the script
+      is cached and contains `${__time(/1000,)}` and `${__UUID()}`. Explain what probably happened and what
+      evidence would settle it.
+    modelAnswer: |
+      Both functions were resolved once per thread before the cached script was compiled, so every request of
+      a thread reused the same UUID key and timestamp. The signatures were computed over those same values, so
+      they are valid, and the server answers each repeated key as an idempotent replay - a 201 served from its
+      idempotency store, which is also why p95 is so low. The run measured the replay path, not payment
+      creation (and once 300 s pass, the frozen timestamp would start failing). Evidence: the server's
+      created-vs-replayed counts or the number of distinct `Idempotency-Key` values it saw (one per thread
+      instead of 1,000), or saved request headers per thread. Fix: `UUID.randomUUID()` and
+      `System.currentTimeMillis()` in the script, cache kept on.
+    rubric:
+      - Explains that ${...} is resolved once before the cached script compiles.
+      - Explains why requests still succeed (valid signatures over frozen values, idempotent replays).
+      - Notes the run measured the wrong code path (and the timestamp window).
+      - Names server-side or header evidence - distinct keys or created vs replayed counts.
+    hints:
+      - What does an idempotent API do with a key it has already seen?
+    solution: |
+      Frozen key and timestamp → valid signatures, replayed payments, fast 201s. Count distinct keys or created
+      payments on the server.
+
+  - id: testdesign-script
+    type: testdesign
+    concept: perf-groovy-when-to-script
+    skill: application
+    title: Test plan for a scripted signing step
+    prompt: |
+      Design the checks that prove a JMeter plan's Groovy signing pre-processor and Groovy assertion are right
+      before the plan is used for a 30-minute load test. Give preconditions, steps, the expected result and the
+      evidence for each.
+    modelAnswer: |
+      Preconditions: practice API (or a test environment) that verifies signatures and reports created vs
+      replayed payments; 2+ threads, 6+ loops; JTL with `success` and `failureMessage`.
+
+      1. **Signature accepted** - run. Expected: every payment 201, zero `bad signature`. Evidence: codes,
+         server counter.
+      2. **Fresh values** - same run. Expected: distinct keys = requests, zero replays; timestamps advance.
+         Evidence: server stats or saved headers per thread.
+      3. **Per-thread values** - expected: each thread's keys and merchants are its own. Evidence: keys grouped
+         by thread.
+      4. **Assertion catches declines** - with a known decline pattern (every 4th). Expected: exactly those
+         samples fail, the message names the payment and its status. Evidence: JTL.
+      5. **No false failures** - the other samples pass. Evidence: JTL counts.
+      6. **Wrong secret** - change the secret on purpose. Expected: 401s, assertion message "expected 201, got
+         401". Evidence: JTL. Proves the test can fail.
+      7. **Static check** - Groovy, cached, no `${` in scripts, no BeanShell. Evidence: lint output.
+      8. **Long-run validity** - run longer than the timestamp window (5 min). Expected: still accepted.
+         Evidence: no 401s late in the run.
+      9. **Cost** - script-only timing, warm-up excluded. Expected: ms per run × target rate fits the
+         generator's CPU budget. Evidence: summary of the JTL.
+    rubric:
+      - Each case has preconditions, steps, an expected result and concrete evidence.
+      - Includes a server-side uniqueness check (keys or created vs replayed).
+      - Includes a deliberate negative case proving the assertion and signature can fail.
+      - Includes a check that outlives frozen values (time window) or a static ${...} check.
+      - Includes measuring the script's cost on the generator.
+    hints:
+      - Which bug would make every response 201 and still be wrong?
+    solution: |
+      Accepted, fresh, per-thread, failing exactly the bad ones, able to fail on purpose, statically clean,
+      valid over time, and affordable on the generator.
+
+  - id: interview-groovy
+    type: interview
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: "Interview: JSR223 and Groovy in JMeter"
+    prompt: |
+      "When do you use JSR223 elements in JMeter, and what do you watch out for so they don't distort a load
+      test?"
+    modelAnswer: |
+      I script only what no element can do - request signatures, bodies built by rules, checks that span fields
+      - and I keep extraction and simple assertions on the built-in elements, which are cheaper and visible in
+      the tree. I place a PreProcessor or PostProcessor as a child of the one sampler it serves, or an
+      Assertion that fails with `AssertionResult.setFailure` and a clear message.
+
+      Three things I watch. First, language and caching: Groovy, because its engine is Compilable, with "Cache
+      compiled script if available" checked or a script file - uncached Groovy compiles every run, which on my
+      last project cost about 20 ms versus 1 ms cached, and BeanShell or JavaScript are interpreted every
+      time. Second, no `${...}` inside a cached script: JMeter resolves it once before compiling, so the value
+      freezes - I read values with `vars.get`, `ctx` and `props`, or pass them through Parameters. That bug is
+      nasty because requests keep succeeding; I verify fresh values from the server's side, such as distinct
+      idempotency keys. Third, cost: the first execution pays engine start and compilation, so I exclude it,
+      and I multiply the steady-state ms per run by the target rate to check the generator has the CPU.
+    rubric:
+      - Script only when built-in elements cannot do it; names a concrete case.
+      - Correct element choice and scope (Pre/Post/Assertion as child of the sampler).
+      - Groovy + compile cache, and why BeanShell/JavaScript are slower.
+      - The ${...}-in-cached-script pitfall and the vars.get / Parameters fix.
+      - Measures generator cost and excludes the warm-up.
+    followUps:
+      - How would you share a parsed configuration object between all threads without re-parsing it?
+      - What does SampleResult.setIgnore() change, and what does it not change?
+      - When would you move a scripted JMeter test to Locust?
+    hints:
+      - Correctness first (frozen values), then cost (compile, interpret, warm-up).
+    solution: |
+      Script only what is needed; Groovy, cached, no ${...} inside; prove fresh values from the server side;
+      measure the cost and exclude warm-up.
+
+  - id: sign-code
+    type: coding
+    concept: perf-groovy-interpolation
+    skill: application
+    title: Fix the signing script and add a Groovy assertion
+    prompt: |
+      `exercises/jmeter/jm_groovy_sign.jmx` signs SandPay payments with a cached Groovy PreProcessor - and every
+      request returns 201, yet most of them are replays, because the script uses `${...}`. Rewrite the
+      `sign payment` script without any `${...}` (keep `groovy` and the cache on), and replace the TODO comment
+      with a JSR223 Assertion (Groovy, cached) that fails a sample unless the code is 201 and the JSON `status`
+      is `captured`, with a message naming the payment id and status. The test runs the plan with real JMeter
+      (2 threads × 6 loops) against `support/jm_groovy_fixture.py` and checks signatures, replays, the 3 declines
+      and the script settings.
+    project: perf
+    files:
+      - exercises/jmeter/jm_groovy_sign.jmx
+    test: tests/jmeter/test_jm_groovy_sign.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_groovy_sign.py
+    hints:
+      - "Thread: `ctx.getThreadNum() + 1`; loop: `vars.getIteration()`; uniqueness: `UUID.randomUUID()`."
+      - "Seconds: `String.valueOf(System.currentTimeMillis().intdiv(1000))`."
+      - Edit in the GUI, or edit the XML - remember `<` and `"` are escaped inside the script property (`&lt;`, `&quot;`).
+      - "In the assertion: `prev.getResponseCode()`, `new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())`."
+    modelAnswer: |
+      The pre-processor and assertion scripts shown in this lesson's code section, as in
+      `solutions/jmeter/jm_groovy_sign.jmx`: the key from `ctx.getThreadNum() + 1`, `vars.getIteration()` and a
+      UUID; the timestamp from `System.currentTimeMillis()`; the body from `JsonOutput.toJson`; the HMAC over
+      `ts + "." + key + "." + body`; results via `vars.put`. The assertion checks `prev.getResponseCode()` and
+      the parsed `status`, and calls `AssertionResult.setFailure(true)` with
+      `"payment " + payment.id + " is " + payment.status + ", expected captured"`. Both elements:
+      `scriptLanguage` `groovy`, `cacheKey` `true`, no `${` in `script`.
+    rubric:
+      - Every test in tests/jmeter/test_jm_groovy_sign.py passes.
+      - The scripts contain no ${...} and stay cached.
+      - The assertion's message names the payment and its status.
+      - You can explain why the original plan returned 201 for every request.
+    solution: |
+      Read runtime values with ctx, vars and Java/Groovy APIs inside a cached Groovy script; fail with
+      AssertionResult and a precise message.
+
+  - id: lint-code
+    type: coding
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: Lint a plan's scripting
+    prompt: |
+      Implement `lint` in `exercises/jmeter/jm_groovy_lint.py`. For a `.jmx`, report `(rule, testname)` pairs
+      for the rules in the module docstring - `beanshell`, `not-compilable`, `uncached`, `interpolation` (`${`
+      in a cached inline script) and `script-function` (`${__BeanShell(` or `${__javaScript(`) - skipping
+      disabled elements and treating only `cacheKey` `false` as uncached. The tests use a legacy plan with one
+      of each problem, small generated plans, and finally your fixed signing plan.
+    project: perf
+    files:
+      - exercises/jmeter/jm_groovy_lint.py
+    test: tests/jmeter/test_jm_groovy_lint.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_groovy_lint.py
+    hints:
+      - "`root.iter()` visits every element; elements with a `testname` attribute are the test elements."
+      - "`el.findtext(\"stringProp[@name='cacheKey']\")` reads one property; `or \"\"` handles a missing one."
+      - A script file (non-empty `filename`) is compiled and cached by JMeter whatever cacheKey says.
+    modelAnswer: |
+      ```python
+      SLOW_FUNCTIONS = re.compile(r"\$\{__(BeanShell|javaScript)\(")
+
+      def lint(plan):
+          root = ET.parse(plan).getroot()
+          findings = set()
+          for el in root.iter():
+              name = el.get("testname")
+              if name is None or el.get("enabled") == "false":
+                  continue
+              if el.tag.startswith("BeanShell"):
+                  findings.add(("beanshell", name))
+              if el.tag.startswith("JSR223"):
+                  language = _prop(el, "scriptLanguage").lower()
+                  inline = not _prop(el, "filename")
+                  cached = _prop(el, "cacheKey") != "false"
+                  if language not in ("", "groovy"):
+                      findings.add(("not-compilable", name))
+                  if inline and not cached:
+                      findings.add(("uncached", name))
+                  if inline and cached and "${" in _prop(el, "script"):
+                      findings.add(("interpolation", name))
+              if any(SLOW_FUNCTIONS.search(p.text or "") for p in el.iter("stringProp")):
+                  findings.add(("script-function", name))
+          return sorted(findings)
+      ```
+    rubric:
+      - Every test in tests/jmeter/test_jm_groovy_lint.py passes.
+      - Disabled elements and script files are handled as the docstring says.
+      - You can explain why interpolation is only reported for cached scripts.
+    solution: |
+      A static check of language, cache setting and ${...} catches both the slow and the silently-wrong
+      scripts before a run.
+
+  - id: cost-code
+    type: coding
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: What does the script cost the generator?
+    prompt: |
+      Implement `nearest_rank`, `summarise`, `compile_overhead_ms` and `generator_cores` in
+      `exercises/jmeter/jm_groovy_cost.py`. The tests feed a JTL recorded with real JMeter
+      (`tests/jmeter/fixtures/jm_groovy_cost.jtl`: one thread, 200 loops of the same HMAC script as cached
+      Groovy, uncached Groovy and BeanShell). `summarise` keeps the first sample apart (warm-up) and gives the
+      median and nearest-rank p95 of the rest; `generator_cores` converts ms per run and a rate into CPU cores.
+    project: perf
+    files:
+      - exercises/jmeter/jm_groovy_cost.py
+    test: tests/jmeter/test_jm_groovy_cost.py
+    command: .venv/bin/python -m pytest tests/jmeter/test_jm_groovy_cost.py
+    hints:
+      - Group by label in file order - the first row of a label is its first sample.
+      - "Nearest rank: `sorted(values)[ceil(p/100 * n) - 1]`, at least index 0."
+      - "Cores: ms per run × runs per second / 1000."
+    modelAnswer: |
+      ```python
+      def nearest_rank(values, pct):
+          ordered = sorted(values)
+          return ordered[max(1, math.ceil(pct / 100 * len(ordered))) - 1]
+
+      def summarise(rows):
+          elapsed = {}
+          for row in rows:
+              elapsed.setdefault(row["label"], []).append(int(row["elapsed"]))
+          out = {}
+          for label, values in elapsed.items():
+              rest = values[1:] or values
+              out[label] = {"n": len(values), "first_ms": values[0], "median_ms": statistics.median(rest),
+                            "p95_ms": nearest_rank(rest, 95), "total_ms": sum(values)}
+          return out
+
+      def compile_overhead_ms(summary, cached, uncached):
+          return summary[uncached]["median_ms"] - summary[cached]["median_ms"]
+
+      def generator_cores(script_ms, samples_per_second):
+          return round(script_ms * samples_per_second / 1000, 2)
+      ```
+
+      On the fixture: cached Groovy first 951 ms then median 1 ms; uncached median 21 ms (overhead 20 ms);
+      BeanShell median 3 ms. 21 ms at 200/s is 4.2 cores.
+    rubric:
+      - Every test in tests/jmeter/test_jm_groovy_cost.py passes.
+      - The warm-up sample is excluded from the steady-state statistics.
+      - You can explain why the first cached sample is the slowest of all.
+    solution: |
+      Separate warm-up from steady state, compare medians, and convert ms per run into generator cores at the
+      target rate.
+
+placement:
+  - id: place-element
+    type: mcq
+    concept: perf-groovy-when-to-script
+    skill: application
+    title: Checking two fields at once
+    prompt: |
+      A payment response must be `status: captured` **and** have `amount_minor` equal to the amount the request
+      sent (stored in `${amount}`). Which element fits best?
+    options:
+      - id: jsr223-assert
+        text: A JSR223 Assertion (Groovy) under the sampler that compares both fields using vars.get("amount")
+        feedback: Correct - a rule across fields, with the expected value read at run time.
+      - id: two-extractors
+        text: Two JSON Extractors and nothing else
+        feedback: Extractors store values; they never fail a sample.
+      - id: pre
+        text: A JSR223 PreProcessor
+        feedback: It runs before the response exists.
+      - id: response-assert
+        text: A Response Assertion on the response code
+        feedback: That checks the code, not the fields.
+    correct: [jsr223-assert]
+    solution: |
+      A Groovy assertion after the sample, reading the expected amount with `vars.get`.
+
+  - id: place-cache
+    type: mcq
+    concept: perf-groovy-compile-cache
+    skill: analysis
+    title: Which script is compiled once?
+    prompt: Which of these JSR223 scripts does JMeter 5.6.3 compile once and reuse?
+    options:
+      - id: groovy-cached
+        text: Inline Groovy with Cache compiled script if available checked
+        feedback: Correct.
+      - id: groovy-uncached
+        text: Inline Groovy with the cache unchecked
+        feedback: Compiled on every execution.
+      - id: bsh-cached
+        text: Inline BeanShell (JSR223, language beanshell) with the cache checked
+        feedback: BeanShell is not compilable; the checkbox cannot help.
+      - id: js
+        text: Inline JavaScript with the cache checked
+        feedback: Not compilable either, per the manual.
+    correct: [groovy-cached]
+    solution: |
+      Only a Compilable engine (Groovy) with caching on, or a script file.
+
+  - id: place-interp
+    type: debug
+    concept: perf-groovy-interpolation
+    skill: analysis
+    title: The frozen value
+    prompt: |
+      A cached Groovy PostProcessor. Click the line that will keep its first value for the whole test.
+    language: groovy
+    code: |
+      def payment = new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())
+      vars.put("last_id", payment.id)
+      vars.put("audit", "merchant ${merchant_id} paid " + payment.id)   // merchant_id: CSV Data Set
+      vars.put("count", String.valueOf((vars.get("count") ?: "0").toInteger() + 1))
+    correctLines: [3]
+    lineNotes:
+      - line: 1
+        note: Reads the current response at run time.
+      - line: 2
+        note: Stores the current id.
+      - line: 4
+        note: Reads and updates a variable at run time.
+    solution: |
+      Line 3: `${merchant_id}` is resolved by JMeter once, before compilation, so every audit line names the
+      first CSV row's merchant. Use `vars.get("merchant_id")`.
+
+recall:
+  - id: recall-elements
+    concept: perf-groovy-when-to-script
+    prompt: When does each JSR223 element run?
+    answer: PreProcessor before its sampler; PostProcessor after it, then Assertion; Sampler as a step of its own (its return value is the response data).
+  - id: recall-vars
+    concept: perf-groovy-when-to-script
+    prompt: Name the main variables a JSR223 script gets, and which are per thread.
+    answer: vars (this thread's variables), props (global properties), ctx, log, Parameters/args, prev or SampleResult, sampler, and AssertionResult in assertions. vars is per thread; props is global.
+  - id: recall-fail
+    concept: perf-groovy-when-to-script
+    prompt: How does a JSR223 Assertion fail a sample?
+    answer: AssertionResult.setFailure(true) and AssertionResult.setFailureMessage("...") - the message appears in the JTL's failureMessage.
+  - id: recall-compilable
+    concept: perf-groovy-compile-cache
+    prompt: Which JSR223 languages can JMeter compile and cache, and how do you turn caching on?
+    answer: Groovy (Compilable); not java, BeanShell or JavaScript. Check Cache compiled script if available (cacheKey true) or use a script file.
+  - id: recall-cost
+    concept: perf-groovy-compile-cache
+    prompt: Why is the first execution of a Groovy script slow, and what does uncached Groovy cost?
+    answer: The first run loads the Groovy engine and compiles (about 1 s here). Uncached, the script compiles every run - about 20 ms vs 1 ms cached on the laptop used here.
+  - id: recall-interp
+    concept: perf-groovy-interpolation
+    prompt: What happens to ${var} inside a cached script, and what do you use instead?
+    answer: JMeter resolves it once before compilation, so the cached script keeps the first value. Use vars.get("var"), ctx, props, or the Parameters field.
+  - id: recall-evidence
+    concept: perf-groovy-interpolation
+    prompt: Why can a frozen-value bug pass every assertion, and how do you catch it?
+    answer: The requests stay valid (e.g. idempotent replays return 201), so codes look fine. Check from the server side - distinct keys, created vs replayed counts - or saved request headers.
+
+next:
+  - jmeter-html-dashboard-and-ci
+  - jmeter-logic-controllers
+  - locust-events-and-custom-clients
+  - idempotency-keys
