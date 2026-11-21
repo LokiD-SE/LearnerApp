@@ -247,21 +247,21 @@ owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberate
       vulnerable SandPay portal bound to loopback only, with 17 flaws (OWASP Top 10:2021 and API Top 10:2023),
       each closable with `make_app(fixed=...)`; `tests/support` proves every flaw is present and fixable;
       `SEC_TARGET=solutions`.
-- [ ] Track K lessons, in batches of about 6 - 25 of 31 published (2026-11-21). Done: the fundamentals
+- [ ] Track K lessons, in batches of about 6 - 28 of 31 published (2026-11-21). Done: the fundamentals
       module (6), JMeter part 1 (architecture, thread groups and timers, HTTP samplers, correlation,
       assertions and listeners, parameterisation), JMeter part 2 (logic controllers, JSR223/Groovy, HTML
       dashboard and CI, distributed testing) and the Locust module (fundamentals, HTTP validation and grouping,
       task sets, events and custom clients, load shapes, distributed and CI) and analysis part 1 (reading results, bottleneck analysis, backend and database
-      performance). Next: frontend, CI/CD, payment systems, tools compared, capstone and mock interview (6).
+      performance, frontend, CI/CD, payment systems). Next: tools compared, capstone and mock interview (3).
       Sources: the Apache JMeter user manual and component reference, the Locust documentation, Little's law
       (Lazowska et al.), Google SRE books, the USE and RED methods, web.dev.
-- [ ] Track L lessons, in batches of about 6 - 23 of 30 published (2026-11-21). Done: foundations (6), web
+- [ ] Track L lessons, in batches of about 6 - 26 of 30 published (2026-11-21). Done: foundations (6), web
       vulnerabilities (authentication, sessions, access control/IDOR, SQL injection, XSS, CSRF and clickjacking,
       SSRF and open redirects, file handling and path traversal, misconfiguration, cryptography and data
       exposure) and API security (OWASP API Top 10, JWT and OAuth, mass assignment and data exposure, business logic and
-      rate limits) and DevSecOps part 1 (DAST with ZAP, SAST and secret scanning, dependency and supply chain).
-      Next: security in CI/CD and regression automation (2), and mobile, payments, reporting, capstone and
-      mock interview (5). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10, API Security Top 10:2023,
+      rate limits) and DevSecOps (DAST with ZAP, SAST and secret scanning, dependency and supply chain, security in CI/CD,
+      regression automation) and vulnerability reporting and CVSS. Next: mobile, payments, capstone and mock
+      interview (4). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10, API Security Top 10:2023,
       MASVS/MASTG, cheat sheets and ZAP docs; RFCs (JWT, OAuth); FIRST CVSS v4.0; PCI DSS v4.0.1. ZAP, Burp,
       Semgrep and similar tools are quoted from their docs, not installed.
 - Lesson forks follow a shared brief (kept outside the repo); the hard-won rules are: quote YAML values with

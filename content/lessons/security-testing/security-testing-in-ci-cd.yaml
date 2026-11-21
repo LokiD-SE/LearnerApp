@@ -1,0 +1,1422 @@
+id: security-testing-in-ci-cd
+title: Security testing in CI/CD
+subject: security-testing
+module: devsecops
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Put the scans from the last three lessons into a pipeline without making the pipeline the weakest part of the system. Decide which check runs at which moment (a hook, the pull request, the merge, the night) from three facts - how long it takes, whether it needs a running app, whether it may hold credentials - then audit the workflow file itself for the flaws that turn CI into an attack path (unpinned actions, a broad token, script injection, a privileged trigger that checks out untrusted code, secrets written in the file), and finally write one gate that reads several scanners, keeps a baseline that expires, and fails closed when a scan did not finish. Practised on synthetic workflows and the repository's own workflow file, with GitHub Actions explained from its documentation.
+tags:
+  [
+    CI/CD,
+    pipeline security,
+    shift left,
+    DevSecOps,
+    security gate,
+    quality gate,
+    baseline,
+    pre-commit hook,
+    pull request,
+    GitHub Actions,
+    workflow,
+    GITHUB_TOKEN,
+    permissions,
+    least privilege,
+    pin to commit SHA,
+    script injection,
+    pull_request_target,
+    poisoned pipeline execution,
+    pwn request,
+    secrets,
+    fork,
+    SAST,
+    DAST,
+    SCA,
+    fail closed,
+    OWASP CI/CD Security,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest, on Linux. The three exercises use only the standard
+    library (`re`, `datetime`, `dataclasses`) - there is no YAML library, on purpose: the audit reads a workflow file the way a quick
+    linter does, line by line. Every output marked as run here was printed by the code shown, on 21 November 2026, from
+    `practice/security`, with `PYTHONPATH=solutions:support .venv/bin/python <script>`. Nothing depends on timing or on the network.
+  - **Practice material:** synthetic. `support/cicd_fixture.py` holds a fictional SandPay pipeline, two small workflow files
+    (`BAD_WORKFLOW` and `GOOD_WORKFLOW`) and alerts from three scanners. The 40-character values in `GOOD_WORKFLOW` are
+    **invented**, not commits of any real repository, the `sandpay-example` actions do not exist and the token in
+    `BAD_WORKFLOW` was never issued. The run times in the pipeline table are illustrative values chosen for the exercise, **not
+    measurements** of any tool. The one real file audited is this repository's own `.github/workflows/pages.yml`, read as text.
+  - **Ethics:** audit and change only pipelines you own or are **authorised in writing** to change. A CI system holds the keys to
+    production, so a test that "just tries" a malicious pull request against a shared pipeline is an attack on that system. Test a
+    pipeline's defences in a throwaway repository you control, and never run anything that sends a credential off the machine.
+  - **Sources (read in full on 21 November 2026):**
+    GitHub Docs [Secure use reference](https://docs.github.com/en/actions/reference/security/secure-use) (least privilege, script
+    injection, untrusted code checkout, pinning to a full-length commit SHA, quoted below);
+    [Events that trigger workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)
+    (forks, `pull_request_target`, `workflow_run`);
+    [Workflow syntax for GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) (the
+    `permissions` key);
+    [Use GITHUB_TOKEN for authentication in workflows](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication);
+    the OWASP [CI/CD Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/CI_CD_Security_Cheat_Sheet.html);
+    the [OWASP Top 10 CI/CD Security Risks](https://owasp.org/www-project-top-10-ci-cd-security-risks/) (the list of risk names only).
+    Their wording is quoted where it is quoted. GitHub's pages change; check the current page before you copy a setting.
+  - **Not run here:** GitHub Actions itself, every CI service, ZAP, Semgrep, Gitleaks, a code-scanning product and OpenSSF Scorecards
+    are **not installed and not run**. Workflow files and settings are quoted from the documentation and labelled "from the docs, not
+    run here". The audit you build is a small teaching scanner (it misses YAML anchors, flow-style mappings and reusable-workflow
+    inputs); it is not a replacement for the tools the documentation names.
+  - **Not repeated here:** how each scanner works - [SAST and secret scanning](#/lesson/sast-and-secret-scanning),
+    [DAST with OWASP ZAP](#/lesson/dast-with-owasp-zap) and
+    [Dependency and supply chain security](#/lesson/dependency-and-supply-chain-security); how a delivery pipeline is built -
+    [CI/CD for web apps](#/lesson/ci-cd-for-web-apps); the testing side of the same pipeline - security regression tests in
+    [Automating security regression tests](#/lesson/security-regression-automation).
+
+prerequisites:
+  - security-testing-fundamentals
+  - ci-cd-for-web-apps
+  - sast-and-secret-scanning
+  - dast-with-owasp-zap
+  - dependency-and-supply-chain-security
+
+concepts:
+  - id: sec-cicd-placement
+    name: Where each check runs - stages, budgets and trust
+    summary: A pipeline has a few moments at which code can be checked - the developer's hook, the pull request, the merge and a scheduled run - and each has a time budget, may or may not have a deployed test environment, and may or may not be trusted with credentials. Put each check at the earliest moment where it fits all three. Code from a pull request is untrusted, so the pull-request stage gets no credentials; a check that needs a running app or a long scan waits for the merge or the night; and a check that runs in the hook runs again in CI, because the hook can be skipped and the CI stage cannot.
+  - id: sec-cicd-workflow
+    name: The pipeline is code that holds your keys
+    summary: A workflow file runs with a token and with secrets, so a flaw in it is a flaw in everything it can reach. The checkable ones are an action referenced by a movable tag instead of a full commit SHA, a token with more permissions than the job needs, an expression such as the pull request title expanded into a shell script, a privileged trigger (pull_request_target, workflow_run) that checks out the pull request's code, and a credential written into the file. Each has a known fix, and each can be found by reading the file.
+  - id: sec-cicd-gate
+    name: One gate over several scanners
+    summary: Scanners speak different severity vocabularies, crash, time out and find old things. A gate puts every tool's severity on one scale, blocks only on new alerts at or above an agreed level, keeps a baseline whose entries expire so an accepted risk comes back for review, runs in report mode where it cannot block (the nightly scan) and fails closed when an expected scan is missing or did not finish. An unknown word in any input is an error, never a pass.
+
+objectives:
+  - Place each security check at a pipeline stage from its run time, its need for a running app and its need for credentials, and say why code from a pull request gets no secrets.
+  - Explain why a hook is a convenience and CI is the control, and why the same check can run in both.
+  - Audit a GitHub Actions workflow for unpinned actions, an over-broad token, script injection, an untrusted checkout on a privileged trigger and plaintext secrets, and give the fix for each from the documentation.
+  - Write one gate that normalises several scanners' severities, honours a baseline with expiry dates, supports a report-only mode and fails closed.
+  - Decide what blocks a merge, what files a ticket and what only reports, and how to keep the number of findings from burying the team.
+  - Design a test plan for the security stages of a pipeline, including tests of the pipeline's own defences.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: The idea in plain language
+    body: |
+      Think of the security checks as the guards of a building, and the pipeline as the corridor every parcel travels along on
+      its way from the sender to the customer.
+
+      You do not put every guard at the front door. The **doorman** has ten seconds per visitor, so he does only the quick look:
+      is this person carrying a key-shaped object. The **reception desk** has a few minutes and does more: an x-ray of the bag,
+      a check of the paperwork. The **loading bay** at the back can take an hour, but only for parcels that were already accepted,
+      and it has the real warehouse behind it, so it can do the checks that need the real goods. And the **night shift** has
+      all night, so that is when the slowest inspections run. A check goes to the earliest place where it can actually be done.
+
+      Two rules make the corridor honest. First, the doorman is **not** the only guard: a visitor can walk around the door, so
+      the same quick look happens again at reception, where nobody can skip it. Second, **visitors from outside never get the
+      keys** to the warehouse. A stranger can use the reception desk but not the safe.
+
+      Now the part people forget. The corridor itself is a building too. The rules for the guards are written on a piece of paper,
+      and anyone who can change the paper can change the guards. If the paper says "ask the next visitor to read out a name and
+      then do what the name says", a visitor with a clever name takes over the building. So the paper must be checked as carefully as
+      the parcels: **who may change it, which keys it can touch, and what it does with words that come from outside**.
+
+      Last, the guards must agree on a language. One says "high", another "error", another "severity 8". The manager needs a single rule -
+      *stop the parcel if anything new is at least this serious* - and one more habit: **if a guard did not turn up, the parcel does
+      not pass**. That is the whole lesson. Put each check in the right place, keep the pipeline's own paper safe, and let one
+      gate decide, failing closed.
+
+  - id: what
+    kind: what
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: What the terms mean
+    body: |
+      **CI/CD pipeline.** The automated path that takes a change from a developer's machine to production: build, test, check,
+      release, deploy. It runs on **triggers** - a commit, a pull request, a merge, a schedule. The OWASP CI/CD Security Cheat Sheet
+      says why it matters: CI/CD environments "allow for code to be pushed to a repository and then deployed to a production
+      environment with little to no manual intervention. However, this benefit can quickly become an attack vector".
+
+      **Shift left.** Running checks earlier, where a problem is cheaper to fix. It does not mean "everything runs in the hook".
+      A scan that needs a deployed application cannot run before there is one.
+
+      **Stage / trigger.** A moment at which checks run. This lesson uses four: the **pre-commit** hook on the developer's machine,
+      the **pull-request** stage on code that is not merged yet, the **merge** stage on code that was reviewed and accepted, and a
+      **nightly** scheduled run.
+
+      **Gate.** A rule that turns scan output into pass or fail for a stage. A gate is **enforcing** when it can stop a merge
+      and **report-only** when it can only tell people.
+
+      **Baseline.** The list of findings that already existed when the gate was switched on, so that old findings do not block new
+      work. In this lesson a baseline entry can carry an **expiry date**: an accepted risk that must be looked at again.
+
+      **Fail closed.** When the gate cannot tell (a scan crashed, an expected report is missing, a severity word is unknown), it
+      reports failure. The opposite, *fail open*, quietly lets the change through.
+
+      **GITHUB_TOKEN and `permissions`.** In GitHub Actions each run gets a token. The documentation says: "As a good security
+      practice, you should always make sure that actions only have the minimum access they require by limiting the permissions
+      granted to the GITHUB_TOKEN", and adds that an action can reach the token "even if the workflow does not explicitly pass the
+      GITHUB_TOKEN to the action".
+
+      **Pinning.** Referring to an action by an immutable identifier. GitHub's wording: "Pin references to actions to a commit SHA in your
+      workflow files." A tag such as `v4` can move. GitHub says so directly: "a tag can be moved or deleted if a bad actor gains
+      access to the repository storing the action."
+
+      **Script injection.** Untrusted text becomes part of a shell script. In GitHub Actions the `${{ ... }}` expression is replaced by its
+      value *before* the script runs, so a pull request title that contains shell syntax becomes shell syntax.
+
+      **Poisoned pipeline execution (PPE).** CICD-SEC-4 in the OWASP Top 10 CI/CD Security Risks (this lesson's summary - the OWASP list page gives only the name): an attacker changes what the
+      pipeline runs by changing something the pipeline trusts - the workflow file, a script it calls, a pull request it checks out.
+      The common GitHub form is called a *pwn request*: a privileged workflow that checks out and runs code from a pull request.
+
+  - id: why
+    kind: why
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Why this matters
+    body: |
+      **A scan that nobody runs is not a control.** The three earlier lessons built scanners that find secrets, risky code, vulnerable
+      dependencies and live-application flaws. Run by hand once a quarter, they find last quarter's problem. A change is checked
+      when it is cheapest to fix only if the checks run **on every change, by themselves, in the right place**. That is the work
+      of this lesson.
+
+      **A scan in the wrong place is worse than none.** A twenty-minute scan in the pre-commit hook is switched off by lunch time.
+      A scan that needs a deployed application, put in a stage that has none, fails every time and is ignored. A scan that
+      needs credentials, put on code from strangers, either cannot run or hands the strangers the credentials. Placement is a
+      design decision with reasons, not a matter of taste.
+
+      **The pipeline is the best target in the company.** It holds deploy keys, signing keys and a token that can write to the
+      repository, and it runs code that people it has never met can influence. The OWASP Top 10 CI/CD Security Risks lists the
+      problems: insufficient flow control (CICD-SEC-1), inadequate identity and access management (CICD-SEC-2), dependency chain
+      abuse (CICD-SEC-3), poisoned pipeline execution (CICD-SEC-4), insufficient pipeline-based access controls (CICD-SEC-5),
+      insufficient credential hygiene (CICD-SEC-6), insecure system configuration (CICD-SEC-7), ungoverned usage of third-party
+      services (CICD-SEC-8), improper artifact integrity validation (CICD-SEC-9) and insufficient logging and visibility
+      (CICD-SEC-10). A security tester who audits only the application and never the pipeline that ships it has left the way in open.
+
+      **A gate that cries wolf gets bypassed.** If every run fails on forty old findings, people learn to merge with the failure
+      showing. If it passes when a scanner crashed, it reports "secure" on an unscanned build. The gate is where trust in the whole
+      programme is won or lost, and both mistakes are about the same few lines of code.
+
+      **Security in the pipeline is also a testing job.** Whoever owns test automation usually owns the pipeline's stages, so the
+      tester is often the person who decides what runs where, reads the failures and notices that a check has quietly stopped running.
+
+  - id: placement-internals
+    kind: internals
+    concepts: [sec-cicd-placement]
+    title: How to place a check - budgets, a running app and trust
+    body: |
+      Each check has three properties that decide where it can go. Each trigger offers three matching properties.
+
+      | Check property | Trigger property | Meaning |
+      | --- | --- | --- |
+      | `seconds` - how long it takes | `budget_s` - how long people will wait | A check that is slower than the budget gets ignored or switched off |
+      | `needs_app` - it talks to a running copy of the application | `has_app` - a deployed test environment exists now | A DAST scan cannot run before something is deployed |
+      | `needs_secrets` - it needs a credential | `secrets_ok` - the code is trusted enough to hold one | Untrusted code must not be given secrets |
+
+      The four triggers in the exercise, with the values chosen for the lesson (a team sets its own budgets):
+
+      | Trigger | Budget | Running app | Secrets | Why |
+      | --- | --- | --- | --- | --- |
+      | `pre-commit` | 15 s | no | no | A laptop: seconds, nothing deployed, no deploy credentials |
+      | `pull-request` | 600 s | no | no | The code is not merged and may come from a fork: untrusted |
+      | `merge` | 3600 s | yes | yes | Reviewed code, and a test environment exists |
+      | `nightly` | 28800 s | yes | yes | Nobody is waiting: the slow, thorough scans |
+
+      **The rule is one sentence.** A check goes to the *earliest* trigger whose budget is at least its run time, which has an app if
+      the check needs one and which allows secrets if the check needs them. If there is none, the check cannot be placed - it must be
+      split (a scan of only the changed files in the pull request, the full scan at the merge), sped up, or given a slower trigger.
+      Raising an error is better than guessing: a check that is silently never run is the worst outcome.
+
+      **Why untrusted code gets no secrets.** The GitHub documentation is explicit about forks: "With the exception of GITHUB_TOKEN,
+      secrets are not passed to the runner when a workflow is triggered from a forked repository. The GITHUB_TOKEN has read-only
+      permissions in pull requests from forked repositories." It adds that "Workflows triggered by Dependabot pull requests are treated
+      as though they are from a forked repository, and are also subject to these restrictions." So a check that needs a credential cannot
+      run in the pull-request stage for outside contributions, whatever you wish - and the escape hatch (a privileged trigger, below)
+      is exactly the dangerous one.
+
+      **The hook is not the control.** A hook is a script on the developer's machine; anyone can skip it with a flag, and a new clone
+      does not have it. So anything the
+      hook checks is checked *again* in CI, where nobody can bypass it. The exercise encodes this: a check placed at the first trigger
+      is also listed at the second.
+
+      **Report-only is a stage property, not a failure.** The nightly scan runs on code that is already merged. Failing "the pipeline"
+      at 03:00 stops nobody. It should file a ticket, with an owner and a date. A gate has an `enforce` mode and a `report` mode for
+      exactly this reason.
+
+  - id: workflow-internals
+    kind: internals
+    concepts: [sec-cicd-workflow]
+    title: The workflow file - five ways it becomes an attack path
+    body: |
+      A workflow file is a program that runs with a token and with secrets, in a repository that many people can send pull requests
+      to. These are the flaws the audit exercise looks for. Each quotes the GitHub documentation read on 21 November 2026.
+
+      **1. Actions that are not pinned to a full commit SHA.** An action is code from another repository that runs inside your job.
+      The documentation: "a compromise of a single action within a workflow can be very significant, as that compromised action would
+      have access to all secrets configured on your repository, and may be able to use the GITHUB_TOKEN to write to the repository."
+      Pinning to a full-length commit SHA "helps mitigate the risk of a bad actor adding a backdoor to the action's repository, as they
+      would need to generate a SHA-1 collision for a valid Git object payload", and you "should verify it is from the action's
+      repository and not a repository fork". A short SHA is not a full one. A tag is acceptable "only if you trust the creator", and even
+      then "there is risk to this approach even if you trust the author". The same page says the strongest protection is a **workflow
+      dependency lockfile**, which "supersedes SHA pinning for repositories that adopt it" - check whether your platform offers it.
+
+      **2. A token with more permissions than the job needs.** "It's good security practice to set the default permission for the
+      GITHUB_TOKEN to read access only for repository contents. The permissions can then be increased, as required, for individual jobs."
+      The `permissions` key does this. Details from the workflow syntax page: "If you specify the access for any of these permissions, all of
+      those that are not specified are set to none"; `permissions: read-all` and `permissions: write-all` are shorthands; and
+      `permissions: {}` disables all of them. The starting point is the default for the enterprise, organisation or repository, so a file with no
+      `permissions:` key gets whatever that default is. The audit reports a file that never sets it, and `write-all` wherever it appears.
+
+      **3. Script injection.** The documentation's mechanism: with an inline script, the `${{ }}` expression is expanded *into* the script.
+      Its safe pattern puts the value into an **intermediate environment variable**: "the value of the `${{ github.event.pull_request.title }}`
+      expression is stored in memory and used as a variable, and doesn't interact with the script generation process." Its example title,
+      `a"; ls $GITHUB_WORKSPACE"`, shows what an attacker writes. Text that outsiders can write includes the titles and bodies of issues and pull requests,
+      comments, review bodies, commit messages and branch names. The page says it directly: "The recommended approach is to create a
+      JavaScript action that processes the context value as an argument" - a `with:` input is not a script. The list the audit uses is
+      this lesson's own selection of such contexts; it is not an official list.
+
+      **4. A privileged trigger that checks out untrusted code - the pwn request.** `pull_request_target` "runs in the context of the
+      default branch of the base repository, rather than in the context of the merge commit", which is what lets it label or comment on
+      a pull request from a fork - and what makes it dangerous: "Running untrusted code on the pull_request_target trigger may lead to
+      security vulnerabilities. These vulnerabilities include cache poisoning and granting unintended access to write privileges or
+      secrets." `workflow_run` is similar: it "is able to access secrets and write tokens, even if the previous workflow was not."
+      The Secure use reference: "Workflows that use these triggers must not explicitly check out untrusted code, including from pull
+      request forks". The tell-tale line is `ref:` pointing at the pull request's head. The audit looks for that pair.
+
+      **5. A secret written into the file.** "Sensitive data should never be stored as plaintext in workflow files." The OWASP cheat sheet:
+      "Secrets should never be hardcoded in code repositories or CI/CD configuration files. Employ tools such as git-leaks or git-secrets to
+      detect such secrets." The audit's rule is a simple name-and-literal heuristic; the secret scanner from the SAST lesson is the proper
+      tool, and it should read the workflow files too.
+
+      **What the audit cannot see.** It reads lines, so it misses YAML anchors, flow-style mappings, values built in other files, and what an
+      action does internally. It also cannot tell whether the repository's settings (required reviews, protected branches, who may approve
+      a fork's workflow run) are safe. The OWASP cheat sheet lists those: protected branches, reviewed pull requests, no auto-merge, manual
+      approval before a production deploy, and "if the file is stored alongside the code, it is imperative that the file is reviewed before
+      any merge request is approved".
+
+  - id: when
+    kind: when
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: When to use which, and when not to
+    body: |
+      | Situation | Do this | Because |
+      | --- | --- | --- |
+      | A fast check on what a developer is about to commit (secrets in staged files) | Pre-commit hook **and** the same check in CI | The hook is quick feedback; CI cannot be skipped |
+      | Static analysis of a change | Pull request, on the changed files; the full scan at merge or nightly | The review needs an answer in minutes; the full scan can wait |
+      | A dependency audit on the lockfile | Pull request, plus a scheduled run | A new advisory can appear without any code change |
+      | A DAST baseline scan | Merge stage, against a deployed test environment | It needs a running app |
+      | A full active scan, or a long authenticated scan | Nightly (or merge, if it fits) | Long, and it changes data in the target |
+      | A check that needs a credential | After merge, never on a fork's code | Untrusted code must not hold secrets |
+      | A privileged trigger (`pull_request_target`, `workflow_run`) seems necessary | Only when the job truly needs the privileged context, and then never check out the pull request's code | That pair is the pwn request |
+      | The first time you switch a gate on in an old repository | Report-only first, then baseline, then enforce on new findings | Otherwise the first run fails for reasons unrelated to the change |
+
+      **Do not** put a slow scan in the hook to feel thorough. **Do not** make a scan blocking before you have run it in report mode and
+      read the results. **Do not** run the full DAST scan on every pull request against a shared environment: it is slow, it writes data,
+      and a fork's pull request is untrusted code asking you to attack your own staging system. **Do not** treat a green pipeline as a
+      security sign-off - it means the configured checks found nothing new.
+
+  - id: visual-stages
+    kind: visual
+    concepts: [sec-cicd-placement, sec-cicd-gate]
+    title: One change travelling through the stages
+    body: |
+      ```mermaid
+      flowchart LR
+        A["Developer commits"] --> B["Pre-commit hook: secrets in staged files"]
+        B -- "secret found" --> X["Commit refused"]
+        B -- "clean or hook skipped" --> C["Pull-request stage: secret scan again, SAST on changed files, dependency audit. No credentials."]
+        C -- "new finding at or above the gate, or a scan did not finish" --> F["Merge blocked: triage"]
+        C -- "only baselined or lower findings" --> D["Review and merge"]
+        D --> E["Merge stage: deployed test environment, DAST baseline, full SAST, SBOM and signing. Credentials allowed."]
+        E --> G["Release"]
+        E --> H["Nightly: full active scan, report-only"]
+        H -- "new finding" --> I["Ticket with owner and date"]
+      ```
+
+      Read it left to right: each box does what only it can do. The hook is fast and local. The pull-request stage is the one that cannot be
+      skipped and holds no credentials. The merge stage has a deployed test environment, so it can run the application-level scans. The
+      nightly run has the longest budget but cannot block anything, so its output is a ticket, not a red build.
+
+  - id: visual-trust
+    kind: visual
+    concepts: [sec-cicd-workflow]
+    title: Which trigger gets secrets, and why checkout is the dangerous step
+    body: |
+      ```mermaid
+      flowchart TD
+        PR["Pull request from a fork"] --> T1["pull_request trigger"]
+        PR --> T2["pull_request_target trigger"]
+        T1 --> R1["Runs the merge commit. No secrets except GITHUB_TOKEN, which is read-only."]
+        T2 --> R2["Runs in the context of the base repository's default branch. May have write access and secrets."]
+        R2 --> Q{"Does the job check out the pull request's code?"}
+        Q -- "no: it only labels or comments" --> OK["Acceptable: nothing untrusted runs with the secrets"]
+        Q -- "yes: ref is the head SHA or branch" --> BAD["Pwn request: attacker code runs with write access and secrets"]
+        R1 --> OK2["Safe default for building and testing a fork's code"]
+      ```
+
+      The two triggers differ in **whose code runs** and **what it may touch**. `pull_request` runs the proposed change with almost no power.
+      `pull_request_target` runs *your* workflow with power - and the moment it also runs *their* code, the two meet. The GitHub documentation's
+      advice is to "avoid using the pull_request_target workflow trigger if it's not necessary" and, for splitting privilege between workflows, that
+      `workflow_run` "is a better trigger" - used with care, because artifacts from the first workflow are untrusted input too.
+
+  - id: code-run
+    kind: code
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: The three tools run on the practice material
+    body: |
+      The solutions are in `practice/security/solutions/devsecops/`. Each script below imports one of them and prints a table. Save each
+      script under any name in `practice/security`, and run it with `PYTHONPATH=solutions:support .venv/bin/python <script>`. Outputs were printed on 21 November
+      2026 by exactly this code.
+
+      **1. Where each check runs.** The run times are the illustrative values in the fixture, not measurements.
+
+      ```python
+      from devsecops.cicd_plan import place, plan
+      from cicd_fixture import CHECKS, TRIGGERS
+
+      print(f"{'check':22} {'sec':>5}  app  secrets  runs at")
+      for c in CHECKS:
+          print(f"{c.name:22} {c.seconds:>5}  {'yes' if c.needs_app else '-':3}  {'yes' if c.needs_secrets else '-':7}  {place(c).name}")
+      print()
+      for trigger, names in plan(CHECKS).items():
+          budget = next(t.budget_s for t in TRIGGERS if t.name == trigger)
+          print(f"{trigger:13} budget {budget:>5}s  {', '.join(names)}")
+      ```
+
+      ```text
+      check                    sec  app  secrets  runs at
+      secret-scan-staged         5  -    -        pre-commit
+      secret-scan-history      400  -    -        pull-request
+      sast-changed-files        90  -    -        pull-request
+      sast-full               1500  -    -        merge
+      sca-lockfile-audit        60  -    -        pull-request
+      sbom-and-sign            240  -    yes      merge
+      zap-baseline             900  yes  -        merge
+      zap-authenticated       1200  yes  yes      merge
+      zap-full-active         7200  yes  -        nightly
+
+      pre-commit    budget    15s  secret-scan-staged
+      pull-request  budget   600s  sast-changed-files, sca-lockfile-audit, secret-scan-history, secret-scan-staged
+      merge         budget  3600s  sast-full, sbom-and-sign, zap-authenticated, zap-baseline
+      nightly       budget 28800s  zap-full-active
+      ```
+
+      Check the reasons against the table in the internals section. `sbom-and-sign` takes only 240 seconds, but it needs a signing key, so
+      the pull-request stage (untrusted, no secrets) is not allowed to run it and it lands at the merge. `zap-baseline` needs a running
+      app, so it cannot go earlier than the merge even though 900 s would nearly fit. And `secret-scan-staged` appears twice in the plan - at the hook and
+      again at the pull-request stage - while `place` returned only the hook.
+
+      **2. Auditing a workflow file.** The audit runs on the two synthetic workflows and on this repository's own workflow, read as text from `practice/security`.
+
+      ```python
+      import sys
+      from devsecops.cicd_audit import audit_workflow
+      from cicd_fixture import BAD_WORKFLOW, GOOD_WORKFLOW
+
+      def show(title, text):
+          print(f"== {title}")
+          found = audit_workflow(text)
+          for f in found:
+              print(f"  line {f.line:>2}  {f.severity:6} {f.rule_id:17} {f.message}")
+          if not found:
+              print("  no findings")
+
+      show("BAD_WORKFLOW", BAD_WORKFLOW)
+      show("GOOD_WORKFLOW", GOOD_WORKFLOW)
+      for path in sys.argv[1:]:
+          show(path, open(path).read())
+      ```
+
+      Run as `... audit.py ../../.github/workflows/pages.yml`:
+
+      ```text
+      == BAD_WORKFLOW
+        line  7  high   plaintext-secret  SANDPAY_API_TOKEN holds a literal value; use a secret
+        line 10  medium no-permissions    no permissions: key, so the token keeps its default
+        line 13  medium unpinned-action   actions/checkout@v4 is not a full commit SHA
+        line 15  high   pwn-request       a privileged trigger checks out the pull request's head
+        line 16  high   unpinned-action   sandpay-example/scan-action follows a moving ref (main)
+        line 19  high   script-injection  github.event.pull_request.title is expanded into the script text
+      == GOOD_WORKFLOW
+        no findings
+      == ../../.github/workflows/pages.yml
+        line 25  medium unpinned-action   actions/checkout@v4 is not a full commit SHA
+        line 26  medium unpinned-action   actions/setup-node@v4 is not a full commit SHA
+        line 35  medium unpinned-action   actions/upload-artifact@v4 is not a full commit SHA
+        line 43  medium unpinned-action   actions/upload-pages-artifact@v3 is not a full commit SHA
+        line 53  medium unpinned-action   actions/checkout@v4 is not a full commit SHA
+        line 54  medium unpinned-action   actions/setup-java@v4 is not a full commit SHA
+        line 65  medium unpinned-action   actions/setup-node@v4 is not a full commit SHA
+        line 78  medium unpinned-action   actions/setup-python@v5 is not a full commit SHA
+        line 94  medium unpinned-action   actions/upload-artifact@v4 is not a full commit SHA
+        line 115  medium unpinned-action   actions/deploy-pages@v4 is not a full commit SHA
+      ```
+
+      Three things to notice. The bad workflow has all six rules' worth of trouble and the fixed one has none - the usual positive and negative
+      controls. The repository's own workflow is **not** clean: it sets a top-level `permissions: contents: read` (so there is no `no-permissions`
+      finding, and the `deploy` job sets its own permissions), but every action is referenced by a version tag, which the audit calls medium. The tags
+      are the first-party `actions/` organisation's; whether to pin them to SHAs, adopt a lockfile or accept the tag risk is a decision for the
+      repository's owner, and a real one: it trades update effort against exposure (see the trade-offs). The line numbers are from 21 November 2026
+      and will move when the file changes.
+
+      **3. One gate over several scanners.** Three scanners, each in its own vocabulary, with a baseline whose entries have expiry dates.
+
+      ```python
+      import datetime
+      from devsecops.cicd_gate import decide
+      from cicd_fixture import Alert, Report
+
+      today = datetime.date(2026, 11, 21)
+      zap = Report("zap", [Alert("zap", "z-cookie", "Medium"), Alert("zap", "z-csp", "Low")])
+      sca = Report("sca", [Alert("sca", "c-http-old", "High"), Alert("sca", "c-crypto", "Critical")])
+      sast = Report("sast", [Alert("sast", "s-md5", "error"), Alert("sast", "s-note", "note")])
+      baseline = {"c-http-old": "2026-11-30", "s-md5": "2026-11-01"}
+
+      def show(title, reports, policy):
+          d = decide(reports, ["zap", "sca", "sast"], policy, baseline, today)
+          ids = lambda xs: [a.id for a in xs]
+          print(f"{title}\n  exit {d.exit_code}  blocking {ids(d.blocking)}  expired {ids(d.expired)}  "
+                f"baselined {ids(d.baselined)}  reported {ids(d.reported)}  incomplete {d.incomplete}")
+
+      enforce = {"mode": "enforce", "block_at": "high"}
+      show("pull request, enforce at high", [zap, sca, sast], enforce)
+      show("same, baseline entries still valid and critical fixed",
+           [zap, Report("sca", [Alert("sca", "c-http-old", "High")]), Report("sast", [Alert("sast", "s-note", "note")])], enforce)
+      show("a scanner crashed (no sast report)", [zap, Report("sca", [])], enforce)
+      show("nightly, report mode", [zap, sca, sast], {"mode": "report", "block_at": "high"})
+      ```
+
+      ```text
+      pull request, enforce at high
+        exit 1  blocking ['c-crypto', 's-md5']  expired ['s-md5']  baselined ['c-http-old']  reported ['s-note', 'z-cookie', 'z-csp']  incomplete []
+      same, baseline entries still valid and critical fixed
+        exit 0  blocking []  expired []  baselined ['c-http-old']  reported ['s-note', 'z-cookie', 'z-csp']  incomplete []
+      a scanner crashed (no sast report)
+        exit 2  blocking []  expired []  baselined []  reported ['z-cookie', 'z-csp']  incomplete ['sast']
+      nightly, report mode
+        exit 0  blocking ['c-crypto', 's-md5']  expired ['s-md5']  baselined ['c-http-old']  reported ['s-note', 'z-cookie', 'z-csp']  incomplete []
+      ```
+
+      The first run blocks twice: `c-crypto` is a new critical, and `s-md5` is an old finding whose baseline entry **expired on 1 November** - so it
+      counts as new again and is listed under `expired`, which is how an accepted risk comes back to be reviewed. `c-http-old` is still accepted until 30
+      November, so it does not block. In the second run the critical is fixed and the SAST report no longer has the MD5 alert, so the gate passes
+      although a high-severity alert is still baselined. The third run is the one that matters for trust: no scanner reported a finding, yet the run fails
+      with **exit 2**, because the SAST report never arrived. The last run shows the same alerts in `report` mode - listed, but exit 0.
+
+  - id: code-docs
+    kind: code
+    concepts: [sec-cicd-workflow, sec-cicd-placement]
+    title: The documented fixes - from the docs, not run here
+    body: |
+      **The intermediate environment variable (quoted from the GitHub "Secure use reference"; not run here).** The expression goes into `env:`, never
+      into the script text:
+
+      ```yaml
+      - name: Check PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ "$TITLE" =~ ^octocat ]]; then
+          echo "PR title starts with 'octocat'"
+          exit 0
+          else
+          echo "PR title did not start with 'octocat'"
+          exit 1
+          fi
+      ```
+
+      The same page gives the logged result of the attempted injection, `TITLE: a"; ls $GITHUB_WORKSPACE"` then `PR title did not start with 'octocat'`: the value is data in
+      a variable and "doesn't interact with the script generation process". The even safer form passes the value as an input to a JavaScript action
+      (`with: title: ${{ github.event.pull_request.title }}`), because nothing builds a shell script from it.
+
+      **Limiting the token (adapted from the workflow-syntax and token pages; not run here).** The documentation's first example sets `read-all` for the
+      whole workflow. The tighter pattern is an empty or minimal top-level block, raised per job only where a job needs more:
+
+      ```yaml
+      permissions:
+        contents: read
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            pull-requests: write
+          steps:
+            - run: echo "this job may also comment on pull requests"
+      ```
+
+      "If you specify the access for any of these permissions, all of those that are not specified are set to none", so the job above has exactly those two.
+      `permissions: {}` turns everything off. Whether a given action works with that much, you find out by running it - not by guessing.
+
+      **Pinning (adapted from the same page; not run here).** Replace the tag by a full-length commit SHA of the action's own repository and keep the
+      tag as a comment, so the next person knows what version it is:
+
+      ```yaml
+      - uses: owner/some-action@0123456789abcdef0123456789abcdef01234567 # v1.2.3
+      ```
+
+      That value is invented for the example. Take the real one from the action's repository (not a fork) and let a dependency-update tool propose the
+      change, so that pinning does not freeze you on an old version. GitHub documents Dependabot version updates for actions and reusable workflows.
+
+      **A pre-merge gate step.** Nothing here is specific to one CI product. Every system has a step that runs a command and fails the job on a non-zero
+      exit code, so the gate in this lesson is a script whose exit code is the verdict:
+
+      ```text
+      python gate.py --reports reports/ --mode enforce --block-at high --baseline baseline.json
+      echo $?        # 0 pass, 1 new finding at or above the gate, 2 a scan did not finish
+      ```
+
+      The `gate.py` command line is this lesson's own invention to show the shape; the exercise gives you the function (`decide`), not the command.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: The lines that carry the weight
+    body: |
+      **`place` - the earliest trigger that fits all three conditions.**
+
+      ```python
+      def place(check, triggers=TRIGGERS):
+          for trigger in triggers:
+              if check.seconds > trigger.budget_s:
+                  continue
+              if check.needs_app and not trigger.has_app:
+                  continue
+              if check.needs_secrets and not trigger.secrets_ok:
+                  continue
+              return trigger
+          raise ValueError(f"no trigger fits check {check.name!r}: ...")
+      ```
+
+      - The loop walks the triggers **in order**, so the first match is the earliest. The order of `TRIGGERS` is part of the design.
+      - Each `continue` is one reason to refuse the trigger. Reading them top to bottom gives the explanation a reviewer asks for: too slow, no app, no secrets.
+      - `>` makes the budget inclusive: a check that takes exactly 15 seconds fits the hook. A test pins that edge.
+      - The final `raise` is the fail-closed line. A check that fits nowhere is an error that names the check, not a check that is quietly never run.
+
+      **`_script_lines` - which lines are shell script.**
+
+      ```python
+      match = re.match(r"^(\s*)(-\s+)?run:\s*(.*)$", lines[i])
+      key_col = len(match.group(1)) + (len(match.group(2)) if match.group(2) else 0)
+      if value[:1] in ("|", ">"):
+          ... collect following lines while indent > key_col ...
+      else:
+          scripts[i + 1] = value
+      ```
+
+      - A `run:` value is either on the same line, or a block scalar (`|` or `>`) whose body is every following line indented **more than the `run` key**. The `- ` of a list item counts toward the key's column - the
+        `(-\s+)?` group - which is the easy thing to get wrong.
+      - Only these lines are searched for `${{ ... }}` with an untrusted context. The same expression under `env:` or `with:` is never reported: that is the fix, not the flaw.
+
+      **`decide` - four lines that make the gate trustworthy.**
+
+      ```python
+      normalised = [(alert, normalise_severity(alert.tool, alert.severity)) for r in reports for alert in r.alerts]
+      finished = {r.tool for r in reports if r.complete}
+      decision.incomplete = sorted(t for t in expected_tools if t not in finished)
+      if expiry is None or datetime.date.fromisoformat(expiry) >= today:
+      ```
+
+      - The first line normalises **every** alert before any decision is made, so an unknown severity raises an error even in report mode. One typo cannot weaken
+        the gate.
+      - `finished` is built from the reports that exist and are complete; `incomplete` is computed from the **expected** tools, so a tool that produced no report at all is incomplete. Computing
+        it from the reports you happened to receive is the bug in the debug exercise.
+      - `>= today` makes the expiry day inclusive, and a malformed date raises `ValueError` from `fromisoformat` instead of silently counting as valid.
+      - The exit code is chosen last: report mode 0; enforce mode 1 for any blocking alert, then 2 for any incomplete scan, then 0. A finding is certain, an unfinished scan is only unknown,
+        so the finding wins - but both fail the run.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Step by step - adding security to a pipeline
+    body: |
+      1. **Agree scope and ownership in writing.** Which repositories and pipelines, who may change them, and the rule that nobody tests a pipeline's defences on a shared system.
+      2. **List the checks you have.** For each: how long it takes, whether it needs a running app, whether it needs a credential. Measure the time on your own runners; do not copy numbers.
+      3. **Place each check** with the three questions. Split the ones that do not fit (changed files at the pull request, the full scan at the merge or at night). Repeat any hook check in CI.
+      4. **Audit the pipeline itself first.** Run the workflow audit and read the repository settings: pin or lock the actions, set the token to the minimum, remove interpolation of untrusted text from scripts, remove any privileged trigger
+         that checks out pull request code, and move secrets out of files. This is a pipeline change reviewed like any other.
+      5. **Prove each check on known-bad and known-good input** before you trust it, the way you did for each scanner: a seeded flaw is found, the fixed code is quiet.
+      6. **Run everything in report mode** for a while and read the whole output. Triage, as in the SAST lesson: true positives become tickets, false positives get a recorded suppression.
+      7. **Baseline what remains**, with an owner and an **expiry date** for each accepted item.
+      8. **Turn the pull-request gate on** for new findings at or above the agreed severity, and make it fail closed on a missing or unfinished scan.
+      9. **Keep the slow scans in report mode** at the merge or nightly stage, and make them file a ticket with an owner and a date.
+      10. **Watch the pipeline itself.** Track how often each check runs, how long it takes, how many findings are new, how many suppressions and baseline entries exist and when they expire. A check that silently stopped running is the
+          failure you cannot see in a green build.
+
+  - id: example
+    kind: example
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: A worked example - hypothetical
+    body: |
+      *This example is hypothetical: the team, the repository and the story are made up, and no figures are claimed.*
+
+      Ravi owns test automation for the SandPay checkout service. The team wants "security in the pipeline" by the end of the quarter. He starts with the pipeline, not with the scanners.
+
+      **He audits the workflow file.** The audit reports one pull-request workflow that is triggered by `pull_request_target`, checks out the pull request's head so it can build the change, and has no
+      `permissions:` key. That is the pair the GitHub documentation warns about, with a token that has whatever the repository default is. He does not run an attack to prove it. He explains it with
+      the documentation's own sentences, and the fix is small: switch to `pull_request`, drop the privileged trigger, and set `permissions: contents: read`. A second job needed to comment on the pull request, so it
+      gets `pull-requests: write` for that job only and never checks out the pull request's code.
+
+      **He places the checks.** Secret scanning on staged files becomes a hook and also a pull-request step. SAST on the changed files and a lockfile audit run in the pull request, within the budget the team agreed. The ZAP baseline scan needs
+      a deployed environment, so it waits for the merge stage; the authenticated scan needs a test account's password, and since fork pull requests do not receive secrets it also runs only after the merge. The long active scan runs at night
+      in report mode and files a ticket.
+
+      **He sets the gate up in stages.** Week one: everything in report mode. Week two: triage - one SQL string built in a function with a hard-coded allow-list becomes a recorded suppression, a handful of old dependency advisories go
+      into the baseline with owners and an expiry date a month out. Week three: the pull-request gate blocks new findings at high and above, and fails the run if a scan is missing. The first time a runner runs out of disk and the SAST
+      job dies, the pipeline goes red with "scan did not finish" rather than green - and the team learns that the red build is the system working.
+
+      **A month later** two baseline entries expire, appear in the report as "expired" and are either fixed or renewed with a reason by their owners. Nobody had to remember.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Test cases for the security stages of a pipeline
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Placement is explained | for each check, write its time, app need and secret need and its stage | each check is at the earliest stage that fits, with a reason | the placement table |
+      | 2 | Nothing fits | add a check slower than every budget | an error that names the check, not a silent skip | the message |
+      | 3 | Hook skipped | commit with the hook bypassed | CI catches the same thing and fails the pull request | the CI result |
+      | 4 | Fork gets no secrets | open a pull request from a fork of a throwaway repository | a step that reads a secret sees it empty; the token is read-only | the job log |
+      | 5 | Known-bad finds | scan a workflow with each flaw (tag, branch ref, no permissions, write-all, injected title, privileged checkout, literal token) | one finding per flaw, on its line | the findings table |
+      | 6 | Known-good is quiet | scan the fixed workflow | no findings | the empty report |
+      | 7 | Look-alikes are quiet | a pinned action with a trailing comment, a local `./` action, a `contains()` expression, the title passed through `env:` | no findings | the empty report |
+      | 8 | Secret never printed | read the audit output and the CI log | the variable name, never its value | the log |
+      | 9 | Pinned action still works | pin to a SHA and run the workflow | the job runs; an update tool proposes the next SHA | the run and the update PR |
+      | 10 | Least privilege works | set the token to read-only and run each job | each job passes, or fails with a permissions error that tells you what to add | the run |
+      | 11 | New finding blocks | add one new high finding | exit 1, the finding named | the gate result |
+      | 12 | Old finding does not | run the same scan with the old finding in the baseline | exit 0, finding listed as baselined | the gate result |
+      | 13 | Baseline expires | set a baseline entry's date to yesterday | the finding blocks again and is listed as expired | the gate result |
+      | 14 | Unfinished scan | make one scanner crash or not produce a report | exit 2, the tool named - not a pass | the gate result |
+      | 15 | Unknown word | give a scanner an unknown severity or the gate an unknown threshold | an error, not a pass | the message |
+      | 16 | Report mode | run the nightly scan with a new high finding | exit 0, the finding listed, a ticket created | the report and the ticket |
+      | 17 | Same alerts, three tools | feed the gate ZAP, SCA and SAST alerts of equal seriousness | the same decision for each | the normalised table |
+
+      Cases 5 to 7 are the positive and negative controls you used for every scanner in the earlier lessons, now applied to the pipeline's own configuration.
+      Cases 3 and 4 are tested in a **throwaway repository you control**: never against a shared or company repository, and never with a real secret.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Putting a slow scan in the hook.** It gets disabled. Use the hook for what takes seconds and let CI do the rest.
+      - **Treating the hook as the control.** It can be skipped. Run the same check in CI.
+      - **Giving untrusted code secrets.** A check that "needs" a credential on a fork's pull request has been placed wrongly, or someone is reaching for a privileged
+        trigger to make it work. Move the check after the merge.
+      - **Using `pull_request_target` because `pull_request` "does not work".** It usually means the job wants secrets or write access. Ask what exactly it needs and give that to a separate
+        job that does not run the pull request's code.
+      - **Believing a tag is a pin.** `v4` can move. A full commit SHA cannot. (And a short SHA is not a full one.)
+      - **Leaving the token at its default.** The documentation's advice is to set the default to read-only and raise it per job. A workflow that never mentions `permissions:` inherits whatever the repository default is.
+      - **Interpolating untrusted text into a script.** Put the value in `env:` and use the variable. This applies to titles, bodies, comments, commit messages and branch names.
+      - **Reading `${{ }}` as "a variable".** It is replaced before the shell runs. That is why quoting inside the script does not save you.
+      - **Failing open.** A missing report, an unknown severity or an unknown threshold that counts as a pass turns the gate into decoration. Raise an error.
+      - **Computing "did every scan run?" from the reports you received.** Compare against the list of scans you **expect**.
+      - **A baseline that never expires.** An accepted risk with no date is a forgotten risk. Give each entry an owner and an expiry.
+      - **Failing the nightly build.** It cannot stop code that is already merged. Use report mode and file a ticket.
+      - **Auditing the application and never the pipeline.** The pipeline holds the keys. Include the workflow files, the repository settings and the CI service's permissions in scope.
+
+      **A debugging method for "the gate did something strange".** (1) Print the normalised alerts, not the raw ones. (2) Print which tools the gate **expected** and which it **received** - complete or not.
+      (3) Print each baseline entry's expiry beside today's date. (4) Check the mode and the threshold. (5) Look at the exit code you got against the table: 0 pass, 1 finding, 2 unfinished scan.
+      (6) Only then look at the scanner.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Trade-offs and honest limits
+    body: |
+      | Choice | Gain | Cost |
+      | --- | --- | --- |
+      | Pin actions to a full SHA | A moved tag cannot change what you run | Updates become a deliberate step; use an update tool so you do not stay on an old version |
+      | Keep tags for first-party actions | Less work | The tag can move; GitHub says to do this "only if you trust the creator" and that risk remains |
+      | A workflow dependency lockfile, where offered | The strongest protection GitHub describes, covering transitive actions | A platform feature to adopt and maintain; check availability and limits |
+      | Block on any new medium | Catches more | More false positives, more bypasses; block on high first and lower the line with evidence |
+      | Run the full scan on every pull request | Fewer surprises at the merge | Slow reviews and a shared environment under attack from untrusted code |
+      | Report-only for slow scans | Nobody waits | Findings can sit; a ticket with an owner and a date is what makes them move |
+      | A baseline | Adoption on an old codebase | It hides real problems if it never expires |
+      | A line-based audit | Small, readable, no dependencies | Misses anchors, flow-style YAML, reusable workflow inputs and settings outside the file |
+
+      **Honest limits.** A clean audit of the workflow file says the file has none of six patterns; it says nothing about the repository's settings, the actions' internals or the runners. A green gate says no **new** finding
+      at or above the threshold, from the scans that finished. Neither is a sign-off. The OWASP cheat sheet's list of SCM and pipeline settings (protected branches, reviewed pull requests, manual approval for production, isolated
+      build nodes, MFA, logging) is the part of the job this lesson cannot test for you.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-cicd-placement, sec-cicd-workflow, sec-cicd-gate]
+    title: Summary
+    body: |
+      - **Place checks at the earliest stage where they fit:** within the time budget, with a running app if they need one, and with credentials only where the code is trusted.
+      - **Code from a pull request gets no secrets** (GitHub passes none to a fork's workflow except a read-only token), so credentialled checks run after the merge.
+      - **A hook is a convenience; CI is the control.** The same check runs in both.
+      - **The workflow file is code that holds your keys.** Pin actions to a full commit SHA, set the token to the least permissions each job needs, put untrusted text in `env:` and never in a script,
+        never check out a pull request's code on `pull_request_target` or `workflow_run`, and keep secrets out of files.
+      - **One gate over all scanners:** normalise severities, block on new alerts at or above the agreed level, keep a baseline whose entries expire, run slow scans in report mode and **fail closed** on a missing or unfinished scan or an unknown word.
+      - **Nightly findings become tickets** with an owner and a date, not red builds.
+      - **Test the pipeline's defences** in a throwaway repository, with positive and negative controls, and watch that every check keeps running.
+      - **Next:** turn each confirmed finding into a test that stays - [Automating security regression tests](#/lesson/security-regression-automation).
+
+exercises:
+  - id: cicd-hook-vs-ci
+    type: mcq
+    concept: sec-cicd-placement
+    skill: analysis
+    title: Why does the secret scan run twice?
+    prompt: |
+      The SandPay pipeline runs a secret scan on staged files in a pre-commit hook **and** the same scan in the pull-request stage. A developer asks to drop the CI copy because
+      "the hook already does it". What is the right answer?
+    options:
+      - id: skipped
+        text: "Keep both. A hook runs on the developer's machine and can be skipped or never installed; the CI stage cannot be skipped, so it is the control."
+        feedback: "Correct. The hook gives quick feedback; CI is what guarantees the check happened."
+      - id: slow
+        text: "Drop the CI copy - running the same scan twice wastes time."
+        feedback: "The time saved is a few seconds; the risk is a skipped hook and a leaked secret."
+      - id: drop-hook
+        text: "Drop the hook instead - CI is enough, so developers never see an early warning."
+        feedback: "That removes the quick feedback. A secret found before the commit never enters history at all, which is the cheapest case."
+      - id: both-block
+        text: "Keep both, but only one of them may fail the run."
+        feedback: "Both can fail. The CI failure is the one that stops the merge."
+    correct: [skipped]
+    hints:
+      - Can a developer skip a hook?
+      - Which of the two cannot be bypassed?
+    solution: A hook is on the developer's machine and can be bypassed; CI cannot be skipped. Keep the hook for fast feedback and the CI scan as the control.
+
+  - id: cicd-fork-secrets
+    type: mcq
+    concept: sec-cicd-placement
+    skill: application
+    title: The authenticated scan on pull requests from forks
+    prompt: |
+      A teammate wants the authenticated ZAP scan, which needs a test account's password stored as a repository secret, to run on every pull request, including those from forks.
+      What does the GitHub documentation say happens, and what should you do?
+    options:
+      - id: no-secrets
+        text: "Secrets other than the GITHUB_TOKEN are not passed to a workflow triggered from a fork, so the scan cannot authenticate. Run it after the merge instead of reaching for a privileged trigger."
+        feedback: "Correct. The documentation: secrets are not passed to the runner for fork-triggered workflows except GITHUB_TOKEN, which is read-only there."
+      - id: works
+        text: "The secret is passed as usual; the scan works."
+        feedback: "Not for forks. The documentation says secrets are not passed to the runner in that case."
+      - id: target
+        text: "Switch the workflow to pull_request_target so the secret is available."
+        feedback: "That would give the secret to a workflow that may also run the fork's code - the pwn-request pattern. Move the check after the merge instead."
+      - id: copy
+        text: "Put the password in the workflow file so every run has it."
+        feedback: "A plaintext secret in a file is a finding of its own, and it would be visible to everyone who can read the repository."
+    correct: [no-secrets]
+    hints:
+      - What does the documentation say about secrets in workflows triggered from a forked repository?
+      - What does the privileged trigger run, and whose code?
+    solution: Secrets are not passed to fork-triggered workflows (except a read-only GITHUB_TOKEN). Move the authenticated scan to the merge stage rather than using pull_request_target.
+
+  - id: cicd-where-zap
+    type: mcq
+    concept: sec-cicd-placement
+    skill: application
+    title: Where does the ZAP baseline scan run?
+    prompt: |
+      The ZAP baseline scan takes about fifteen minutes (an illustrative figure) and needs a deployed copy of the checkout service. The pull-request budget is ten minutes and the pull-request stage has no
+      deployed environment. Where does the scan go?
+    options:
+      - id: merge
+        text: "The merge stage, where a test environment exists and the budget is longer."
+        feedback: "Correct. It fails two of the pull-request conditions (time and a running app) and fits at the merge."
+      - id: hook
+        text: "The pre-commit hook, so developers see problems as early as possible."
+        feedback: "A hook has seconds and nothing deployed."
+      - id: pr
+        text: "The pull-request stage, with the budget raised to twenty minutes."
+        feedback: "Raising the budget does not create a deployed application, and it makes every review wait."
+      - id: never
+        text: "Nowhere - it does not fit any early stage, so skip it."
+        feedback: "A check that fits nowhere early belongs later, not nowhere."
+    correct: [merge]
+    hints:
+      - List the three conditions and check each trigger against them.
+    solution: It needs a running app and more time than the pull-request budget, so it runs at the merge stage against the deployed test environment.
+
+  - id: cicd-pin-sha
+    type: mcq
+    concept: sec-cicd-workflow
+    skill: recognition
+    title: Which action reference is pinned?
+    prompt: |
+      Which `uses:` line follows GitHub's advice to pin an action to a full-length commit SHA? (The values are invented.)
+    options:
+      - id: full
+        text: "uses: owner/action@0123456789abcdef0123456789abcdef01234567 # v1.2.3"
+        feedback: "Correct. Forty hexadecimal characters; the comment is only a note."
+      - id: tag
+        text: "uses: owner/action@v1.2.3"
+        feedback: "A tag can be moved or deleted if the action's repository is compromised."
+      - id: short
+        text: "uses: owner/action@0123456"
+        feedback: "A short SHA is not a full-length SHA."
+      - id: branch
+        text: "uses: owner/action@main"
+        feedback: "A branch moves with every commit - the weakest reference."
+    correct: [full]
+    hints:
+      - How many characters does a full SHA-1 commit id have?
+    solution: Only the 40-character commit SHA is pinned. A tag, a short SHA and a branch can all point to different code later.
+
+  - id: cicd-permissions
+    type: mcq
+    concept: sec-cicd-workflow
+    skill: analysis
+    title: What does this permissions block grant?
+    prompt: |
+      A job in a workflow has this block, and the workflow has no other `permissions:` key. What does the GITHUB_TOKEN of that job get, according to the workflow syntax documentation?
+
+      ```yaml
+      permissions:
+        contents: read
+        pull-requests: write
+      ```
+    options:
+      - id: two
+        text: "Read on contents and write on pull requests; every permission that is not listed is set to none."
+        feedback: "Correct. The documentation: if you specify the access for any of these permissions, all of those that are not specified are set to none."
+      - id: rest-default
+        text: "Those two, and everything else stays at the repository default."
+        feedback: "Listing any permission sets the unlisted ones to none."
+      - id: all
+        text: "Full access, because a write permission was listed."
+        feedback: "Write on one scope does not widen the others."
+      - id: nothing
+        text: "Nothing - the block is ignored unless it is at the top of the file."
+        feedback: "A job can have its own permissions block; it adjusts what the workflow level set."
+    correct: [two]
+    hints:
+      - What happens to the permissions you do not list?
+    solution: The job gets contents read and pull-requests write and nothing else, because unspecified permissions become none once any is specified.
+
+  - id: cicd-injection
+    type: mcq
+    concept: sec-cicd-workflow
+    skill: analysis
+    title: Which step is vulnerable to script injection?
+    prompt: |
+      Four steps handle the pull request title. Which one lets an attacker who controls the title run commands in the job?
+    options:
+      - id: inline
+        text: 'run: echo "Title is ${{ github.event.pull_request.title }}"'
+        feedback: "Correct. The expression is replaced by the title before the shell starts, so a title containing quote and shell syntax becomes part of the script."
+      - id: env
+        text: 'env: TITLE: ${{ github.event.pull_request.title }}  with  run: echo "Title is $TITLE"'
+        feedback: "This is the documented fix - the value is stored in an environment variable and does not take part in building the script."
+      - id: with
+        text: 'uses: ./check-title  with: title: ${{ github.event.pull_request.title }}'
+        feedback: "Passed to an action as an input, not interpolated into a shell script."
+      - id: contains
+        text: "if: ${{ contains(github.event.pull_request.title, 'fix') }}"
+        feedback: "contains() returns a boolean, and it is evaluated by the workflow engine, not pasted into a shell."
+    correct: [inline]
+    hints:
+      - Which step pastes the title into text that a shell will read?
+      - Which steps use the title as data?
+    solution: Only the inline run step builds a shell script out of the title. The env, with and boolean forms keep it as data.
+
+  - id: cicd-pwn
+    type: mcq
+    concept: sec-cicd-workflow
+    skill: analysis
+    title: What makes pull_request_target plus checkout dangerous?
+    prompt: |
+      A workflow triggers on `pull_request_target` and its first step checks out `ref: ${{ github.event.pull_request.head.sha }}` and then runs `npm test`. Why is that a serious flaw?
+    options:
+      - id: privileged
+        text: "The workflow runs in the base repository's context, possibly with write access and secrets, and it now runs the pull request author's code - which may be an attacker's."
+        feedback: "Correct. The two things the documentation says must not meet: a privileged trigger and a checkout of untrusted code."
+      - id: slow
+        text: "It builds the same commit twice and slows the pipeline."
+        feedback: "Speed is not the issue."
+      - id: sha
+        text: "A head SHA is not a valid ref."
+        feedback: "It is valid; that is exactly why it works - and why it is dangerous."
+      - id: fine
+        text: "It is fine because the workflow file itself comes from the default branch."
+        feedback: "The workflow file is trusted, but `npm test` runs the checked-out package scripts, which the author controls."
+    correct: [privileged]
+    hints:
+      - Whose code does `npm test` run after the checkout?
+      - What does the pull_request_target context have access to?
+    solution: A privileged trigger runs with the base repository's power; checking out the pull request head runs the author's code inside that power - the pwn request.
+
+  - id: cicd-baseline-expiry
+    type: mcq
+    concept: sec-cicd-gate
+    skill: application
+    title: The baseline entry expired yesterday
+    prompt: |
+      The gate blocks at high in enforce mode. A high-severity finding is in the baseline with the expiry date of yesterday. Nothing else changed. What does the gate do?
+    options:
+      - id: block
+        text: "It treats the finding as new again, lists it as expired and exits 1."
+        feedback: "Correct. An accepted risk comes back for review when its date passes."
+      - id: pass
+        text: "It still passes - a baselined finding is always ignored."
+        feedback: "Then the baseline would hide the finding forever, which is the mistake an expiry date prevents."
+      - id: error
+        text: "It exits 2 because the baseline is out of date."
+        feedback: "Exit 2 means a scan did not finish. An expired entry is an ordinary blocking finding."
+      - id: warn
+        text: "It passes with a warning and nobody has to act."
+        feedback: "That is fail-open with extra steps."
+    correct: [block]
+    hints:
+      - What is the point of giving a baseline entry a date?
+    solution: The expired entry no longer suppresses the finding, so it counts as a new high and the gate exits 1, listing it as expired.
+
+  - id: cicd-incomplete
+    type: mcq
+    concept: sec-cicd-gate
+    skill: analysis
+    title: The scanner crashed after ten seconds
+    prompt: |
+      The gate expects reports from ZAP, the dependency audit and the SAST tool. The SAST job crashed and uploaded nothing; the other two reported no findings. What should the gate return in enforce mode?
+    options:
+      - id: two
+        text: "A failure (exit 2) that names the SAST tool - the scan did not finish, so nothing is known about its results."
+        feedback: "Correct. A missing expected report is incomplete, and incomplete fails closed."
+      - id: zero
+        text: "Pass - no findings were reported."
+        feedback: "No findings from a scan that did not run is not the same as no findings."
+      - id: one
+        text: "Exit 1 as if a finding had been found."
+        feedback: "There is no finding. Exit 2 keeps 'unfinished' separate from 'found something', so people know what to do."
+      - id: retry
+        text: "Retry quietly until it passes and say nothing."
+        feedback: "A retry is reasonable; hiding the failure is not."
+    correct: [two]
+    hints:
+      - Which tools did the gate expect?
+      - What does an absent report prove?
+    solution: "Exit 2, naming the unfinished tool: an absent report proves nothing, so the gate fails closed."
+
+  - id: cicd-nightly-report
+    type: mcq
+    concept: sec-cicd-gate
+    skill: application
+    title: The nightly scan finds a new high
+    prompt: |
+      The nightly full active scan, which runs on code already merged to the main branch, finds a new high-severity alert at 03:00. What should the pipeline do?
+    options:
+      - id: ticket
+        text: "Run in report mode: exit 0 for the job, list the finding and file a ticket with an owner and a date."
+        feedback: "Correct. A red nightly build blocks no change; a ticket with an owner moves the work."
+      - id: red
+        text: "Fail the nightly pipeline and block all merges until it is fixed."
+        feedback: "That could freeze unrelated work, and the vulnerable code is already merged. Triage first; decide on a block with evidence."
+      - id: ignore
+        text: "Ignore it - nightly scans are advisory."
+        feedback: "Advisory does not mean ignored; it means findings go to tickets."
+      - id: roll
+        text: "Roll back the last release automatically."
+        feedback: "An automatic rollback on an unverified scan result is a policy decision for the team, not a default."
+    correct: [ticket]
+    hints:
+      - Can a failing scheduled job stop a change that is already merged?
+    solution: "The nightly scan runs in report mode: it lists the finding and files a ticket with an owner and a date, because failing the job would stop nothing."
+
+  - id: cicd-order
+    type: order
+    concept: sec-cicd-gate
+    skill: application
+    title: Add security to an existing pipeline in order
+    prompt: Put these steps for adding security checks to a pipeline that already builds and deploys in a sensible order.
+    items:
+      - id: scope
+        text: Agree scope and ownership in writing, and that pipeline defences are tested only in a throwaway repository
+      - id: audit
+        text: Audit the workflow files and settings - pins, token permissions, injection, privileged triggers, secrets
+      - id: place
+        text: Place each check by its run time, its need for a running app and its need for credentials
+      - id: prove
+        text: Prove each check on known-bad and known-good input
+      - id: report
+        text: Run everything in report mode and triage the output
+      - id: baseline
+        text: Baseline the remaining findings with an owner and an expiry date
+      - id: gate
+        text: Enforce on new findings at the pull request and fail closed on a missing scan
+    hints:
+      - The pipeline that runs the scans should be safe before it is trusted with them.
+      - You cannot baseline before you have triaged.
+    solution: |
+      Scope and ownership, audit the pipeline itself, place the checks, prove each one, run in report mode and triage, baseline with expiry dates, then enforce on new findings and fail
+      closed.
+
+  - id: cicd-debug
+    type: debug
+    concept: sec-cicd-gate
+    skill: analysis
+    title: Which line lets a crashed scanner pass?
+    prompt: |
+      This function should list the scanners whose results cannot be trusted. The gate fails the run when the list is not empty. Pick the line that lets a scanner that produced **no report at all**
+      slip through.
+    language: python
+    code: |
+      def incomplete(reports, expected_tools):
+          finished = {r.tool for r in reports if r.complete}
+          unfinished = sorted(r.tool for r in reports if not r.complete)
+          return unfinished
+    correctLines: [3]
+    hints:
+      - Which scanners does line 3 look at - the ones you expected, or the ones that sent a report?
+      - What happens to a tool with no report object?
+    lineNotes:
+      - line: 2
+        note: This set is only the reports that finished. It is the right ingredient, but the function never compares it with the expected tools.
+      - line: 3
+        note: It lists only reports that arrived and say they are unfinished. A tool that crashed before writing anything has no report, so it is never listed.
+      - line: 4
+        note: The return value is fine once line 3 is fixed - sort for a stable, readable message.
+    solution: |
+      Line 3 only looks at reports that exist. Compute the list from the expected tools instead: `sorted(t for t in expected_tools if t not in finished)`.
+
+  - id: cicd-short
+    type: short
+    concept: sec-cicd-placement
+    skill: analysis
+    title: Explain why the authenticated scan waits for the merge
+    prompt: |
+      A teammate says: "The authenticated scan only needs a test account. Let us run it on every pull request so we find problems before merge." In a few sentences, explain what is wrong with
+      that plan and what you propose.
+    modelAnswer: |
+      Two things. First, a pull request can come from a fork, and the code in it is untrusted. GitHub does not pass secrets, other than a read-only GITHUB_TOKEN, to a workflow triggered from a
+      fork, so the scan could not log in - and the usual way around that, a privileged trigger such as `pull_request_target`, runs with the base repository's power and becomes dangerous the moment it
+      also runs the pull request's code. Second, the authenticated scan needs a deployed environment and a long run, which the pull-request stage does not have.
+
+      I would run the quick, credential-free checks in the pull request (secret scan, SAST on changed files, dependency audit) and run the authenticated scan in the merge stage against the
+      deployed test environment, where the code was reviewed, credentials are allowed and the budget is longer. Findings from it go to the gate and to tickets.
+    rubric:
+      - Says that pull requests may come from forks, which are untrusted, and that GitHub does not pass secrets to them.
+      - Names the privileged-trigger workaround as the dangerous option.
+      - Notes the need for a deployed environment and a longer budget.
+      - Proposes a split - quick checks at the pull request, the authenticated scan after the merge.
+    hints:
+      - Who can open a pull request, and whose code runs?
+      - What does the scan need that the pull-request stage does not have?
+    solution: Forks are untrusted and get no secrets; a privileged trigger would be dangerous; the scan also needs a deployed app and time. Run the quick checks at the pull request and the authenticated scan after the merge.
+
+  - id: cicd-testdesign
+    type: testdesign
+    concept: sec-cicd-workflow
+    skill: application
+    title: Test plan for the security stages and the gate
+    prompt: |
+      SandPay is adding secret scanning, SAST, a dependency audit and a ZAP baseline scan to its GitHub Actions pipeline, with one gate. Design the test plan that proves the placement, the workflow's own
+      defences and the gate work - preconditions, steps, expected result and evidence for each case.
+    modelAnswer: |
+      Preconditions: written scope for the repositories; a throwaway repository and a fork of it that you control; synthetic credentials that were never issued; the workflow files and the gate configuration under review; a baseline file with owners and expiry dates.
+
+      1. **Placement** - for each check write its time, app need and secret need, and its stage. Expected: each at the earliest stage that fits, hook checks repeated in CI. Evidence: the table.
+      2. **Hook skipped** - commit a synthetic key with the hook bypassed. Expected: the CI secret scan fails the pull request. Evidence: the CI result.
+      3. **Fork gets no secrets** - from the fork, open a pull request whose workflow prints whether a secret is empty (never the value). Expected: empty, and the token read-only. Evidence: the log.
+      4. **Workflow audit controls** - audit a workflow seeded with each flaw and the fixed one. Expected: one finding per flaw on its line, none on the fixed file, none on the look-alikes. Evidence: both reports.
+      5. **No secret in output** - read the audit output and the job logs. Expected: names only. Evidence: the logs.
+      6. **Pinned and least-privilege run** - pin the actions and set the token to read-only. Expected: every job passes or fails with a clear permissions message. Evidence: the runs.
+      7. **Gate decisions** - feed a new high, an old baselined high, an expired entry and a new low. Expected: block, pass, block listed as expired, pass listed as reported. Evidence: the four results.
+      8. **Unfinished scan** - make one scanner fail to upload. Expected: exit 2 naming it. Evidence: the result.
+      9. **Unknown word** - give an unknown severity and an unknown threshold. Expected: an error, not a pass.
+      10. **Report mode** - run the nightly scan with a new high. Expected: exit 0, the finding listed, a ticket created.
+    rubric:
+      - Uses a throwaway repository and a controlled fork with synthetic credentials and written scope.
+      - Tests placement, the hook-versus-CI point and the fork-gets-no-secrets behaviour.
+      - Audits the workflow with positive and negative controls and checks that no secret value is printed.
+      - Tests the gate for a new finding, a baselined one, an expired one, a below-threshold one, an unfinished scan, an unknown word and report mode.
+      - Every case has preconditions, steps, an expected result and evidence.
+    hints:
+      - What would prove a fork gets no secrets, without printing one?
+      - How do you test that the gate fails closed?
+    solution: |
+      Placement table, hook bypass caught in CI, fork without secrets, workflow audit with positive and negative controls and no secret output, pinning and least privilege, the gate's
+      decisions (new, baselined, expired, below threshold), an unfinished scan, an unknown word and report mode.
+
+  - id: cicd-interview
+    type: interview
+    concept: sec-cicd-gate
+    skill: analysis
+    title: 'Interview: how do you put security checks into CI/CD?'
+    prompt: '"We want security scanning in our pipeline. How do you design it so that it works, and so that the pipeline does not become the weak point?"'
+    modelAnswer: |
+      I treat it as two jobs: placing the checks, and securing the pipeline that runs them.
+
+      For placement I ask three questions of each check: how long it takes, whether it needs a running application and whether it needs a credential. Each check goes to the earliest stage that fits - quick
+      credential-free ones in a hook and again in the pull request, because a hook can be skipped; changed-file static analysis and a dependency audit in the pull request; application scans after the merge against a
+      deployed test environment; the long scans at night in report mode with a ticket. Code from a pull request is untrusted, and GitHub does not give secrets to fork-triggered workflows, so nothing that needs a
+      credential runs there.
+
+      For the pipeline I audit the workflow files first: pin actions to a full commit SHA, give the token the least permissions per job, pass untrusted text through environment variables instead of
+      shell scripts, never check out pull request code on a privileged trigger, and keep secrets out of files. I also check repository settings - protected branches, reviews, approval before production.
+
+      One gate reads every scanner: normalised severities, block on new findings at or above an agreed level, a baseline whose entries expire, and fail closed on an unfinished scan or an unknown word. I roll it
+      out in report mode first, triage, baseline, then enforce, and I monitor that every check keeps running.
+    rubric:
+      - Places checks by time, running-app need and credential need, and explains that a hook is not the control.
+      - Says that pull-request code is untrusted and gets no secrets, and where credentialled and slow scans run.
+      - Covers pinning, least-privilege tokens, injection, privileged triggers and secrets in the pipeline itself.
+      - Describes one gate with normalisation, a baseline with expiry, fail-closed behaviour and a staged rollout.
+    followUps:
+      - A team insists on `pull_request_target` to comment on pull requests from forks. What do you do?
+      - How do you decide the threshold at which the gate blocks?
+      - What would you monitor to know a check has silently stopped?
+    hints:
+      - Structure it as placement, the pipeline's own security, the gate, rollout and monitoring.
+    solution: Place by time, app and secrets; hook plus CI; untrusted code gets no secrets; harden the workflows (pin, least privilege, no injection, no untrusted checkout, no secrets in files); one gate that fails closed with an expiring baseline; staged rollout and monitoring.
+
+  - id: cicd-plan-code
+    type: coding
+    concept: sec-cicd-placement
+    skill: application
+    title: Place the checks in the pipeline
+    prompt: |
+      In `practice/security/exercises/devsecops/cicd_plan.py`, implement `place` and `plan`. A check goes to the earliest trigger where it fits the time budget, a running app exists if it needs one and credentials are allowed
+      if it needs them; a check that fits nowhere raises an error that names it; and anything placed at the first trigger is also listed at the second. The tests place the fixture's nine checks, test the edges of the budgets,
+      the credential and app rules, an empty plan and custom triggers.
+    project: security
+    files: [exercises/devsecops/cicd_plan.py]
+    test: tests/devsecops/test_cicd_plan.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_cicd_plan.py
+    modelAnswer: |
+      ```python
+      def place(check, triggers=TRIGGERS):
+          for trigger in triggers:
+              if check.seconds > trigger.budget_s:
+                  continue
+              if check.needs_app and not trigger.has_app:
+                  continue
+              if check.needs_secrets and not trigger.secrets_ok:
+                  continue
+              return trigger
+          raise ValueError(f"no trigger fits check {check.name!r}: split it, speed it up or add a slower trigger")
+
+      def plan(checks, triggers=TRIGGERS):
+          result = {t.name: [] for t in triggers}
+          for check in checks:
+              placed = place(check, triggers)
+              result[placed.name].append(check.name)
+              if placed is triggers[0] and len(triggers) > 1:
+                  result[triggers[1].name].append(check.name)
+          return {name: sorted(names) for name, names in result.items()}
+      ```
+
+      The loop order is the design: the first trigger that passes all three tests is the earliest. `plan` starts from every trigger so empty ones still appear, repeats hook checks at the next trigger and
+      sorts at the end so the input order does not matter.
+    rubric:
+      - Every test in tests/devsecops/test_cicd_plan.py passes.
+      - place returns the earliest trigger whose budget is at least the check's seconds, which has an app if needed and allows secrets if needed.
+      - place raises ValueError containing the check's name when nothing fits.
+      - plan has every trigger as a key in trigger order, with sorted names, and repeats first-trigger checks at the second.
+    hints:
+      - Walk the triggers in order and `continue` for each reason to refuse one.
+      - Build the result dictionary from every trigger first so empty ones stay.
+      - Use `placed is triggers[0]` to spot a hook check.
+    solution: Loop over the triggers in order refusing on time, missing app or missing secrets; raise with the check's name if none fits; plan() starts from every trigger, repeats first-trigger checks at the second and sorts.
+
+  - id: cicd-audit-code
+    type: coding
+    concept: sec-cicd-workflow
+    skill: application
+    title: Audit a workflow file
+    prompt: |
+      In `practice/security/exercises/devsecops/cicd_audit.py`, implement `audit_workflow`. Read the text line by line and report `unpinned-action`, `no-permissions`, `write-all`, `script-injection`, `pwn-request` and
+      `plaintext-secret` exactly as the docstring defines them, sorted by line and rule id, without ever putting a secret's value in a message. The tests run the audit on a bad and a fixed workflow, on look-alikes that must stay
+      quiet (a pinned action with a comment, a local action, `contains()`, the environment-variable form) and on every trigger form.
+    project: security
+    files: [exercises/devsecops/cicd_audit.py]
+    test: tests/devsecops/test_cicd_audit.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_cicd_audit.py
+    modelAnswer: |
+      ```python
+      def _script_lines(lines):
+          scripts = {}
+          i = 0
+          while i < len(lines):
+              m = re.match(r"^(\s*)(-\s+)?run:\s*(.*)$", lines[i])
+              if m and not _is_comment(lines[i]):
+                  key_col = len(m.group(1)) + (len(m.group(2)) if m.group(2) else 0)
+                  value = m.group(3).strip()
+                  if value[:1] in ("|", ">"):
+                      j = i + 1
+                      while j < len(lines):
+                          body = lines[j]
+                          if body.strip() and len(body) - len(body.lstrip()) <= key_col:
+                              break
+                          if body.strip():
+                              scripts[j + 1] = body
+                          j += 1
+                      i = j
+                      continue
+                  scripts[i + 1] = value
+              i += 1
+          return scripts
+
+      # pinning: a full 40-hex ref is fine; no ref or main/master/HEAD is high; anything else medium
+      action, _, ref = value.partition("@")
+      if re.fullmatch(r"[0-9a-f]{40}", ref):
+          continue
+      ```
+
+      The rest is a short function per rule over the same `lines` list: pinning from `uses:` lines, permissions from the column-0 key and the four-space job keys, injection from `${{ }}` expressions
+      in script lines (skipping boolean functions), the pwn request from a privileged trigger plus a `ref:` of the head, and plaintext secrets from UPPER_CASE names with a literal value.
+    rubric:
+      - Every test in tests/devsecops/test_cicd_audit.py passes.
+      - Findings are sorted by line then rule id and carry a severity and a message.
+      - Only run scripts are searched for untrusted expressions; env and with values and boolean functions are quiet.
+      - Pinned (40 hex) and local actions are quiet; branches and missing refs are high, tags and short SHAs medium; docker images need a sha256 digest.
+      - No message contains the value of a secret, and comment lines are ignored.
+    hints:
+      - Find the script lines first, as a dictionary from line number to text, then search those for expressions.
+      - A `- run:` item puts the key two columns to the right of the dash - count that in the indent.
+      - Strip a trailing comment with `re.split(r"\s+#", value)[0]` before comparing a ref.
+    solution: Walk the lines; find script text (run values and run blocks), check each uses line for a 40-hex pin, the permissions keys, untrusted expressions in scripts, a privileged trigger with a head checkout, and UPPER_CASE credential names with literal values; sort the findings.
+
+  - id: cicd-gate-code
+    type: coding
+    concept: sec-cicd-gate
+    skill: application
+    title: Write the gate
+    prompt: |
+      In `practice/security/exercises/devsecops/cicd_gate.py`, implement `normalise_severity` and `decide`. Map three tools' vocabularies onto one scale, split alerts into new, baselined and expired using a baseline with expiry dates,
+      fail closed on a missing or unfinished scan and on any unknown word, support a report-only mode, and return exit code 1 for a new blocking alert, 2 for an unfinished scan and 0 otherwise. The tests cover every vocabulary,
+      the thresholds, the expiry day, a missing report, report mode and unknown policies and severities.
+    project: security
+    files: [exercises/devsecops/cicd_gate.py]
+    test: tests/devsecops/test_cicd_gate.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_cicd_gate.py
+    modelAnswer: |
+      ```python
+      def normalise_severity(tool, raw):
+          if tool not in VOCABULARY:
+              raise ValueError(f"unknown tool {tool!r}")
+          table = VOCABULARY[tool]
+          key = raw.strip().lower()
+          if key not in table:
+              raise ValueError(f"unknown {tool} severity {raw!r}")
+          return table[key]
+
+      def decide(reports, expected_tools, policy, baseline, today):
+          if policy.get("mode") not in MODES or policy.get("block_at") not in SEVERITIES:
+              raise ValueError("unknown policy")
+          normalised = [(a, normalise_severity(a.tool, a.severity)) for r in reports for a in r.alerts]
+          finished = {r.tool for r in reports if r.complete}
+          incomplete = sorted(t for t in expected_tools if t not in finished)
+          ...  # split new / baselined / expired, then blocking at or above block_at
+          if policy["mode"] == "report": code = 0
+          elif blocking: code = 1
+          elif incomplete: code = 2
+          else: code = 0
+      ```
+
+      Validation comes first, so an unknown word raises even in report mode. `incomplete` is computed from the expected tools, so a tool with no report is listed. An expiry of `None` never runs out, an expiry on or after today still
+      counts, and an earlier one makes the alert new again and also lists it as expired.
+    rubric:
+      - Every test in tests/devsecops/test_cicd_gate.py passes.
+      - normalise_severity ignores case and spaces and raises ValueError for an unknown tool or word.
+      - decide validates the policy and every severity before deciding anything, including in report mode.
+      - Baseline entries suppress an alert when the expiry is None or on or after today; older entries make it new and list it as expired.
+      - incomplete is computed from the expected tools; the exit code is 0 in report mode, otherwise 1 for blocking alerts, 2 for incomplete scans and 0 otherwise.
+    hints:
+      - Normalise every alert first, in one list comprehension.
+      - Compare the expected tools with the set of finished tools, not with the reports you received.
+      - datetime.date.fromisoformat raises ValueError for a malformed date - let it.
+    solution: Validate the policy and normalise every alert up front; compute incomplete from the expected tools; split by baseline and expiry; block at or above the threshold sorted by severity then id; choose the exit code last (report 0, else 1, 2, 0).
+
+placement:
+  - id: cicd-place-stage
+    type: mcq
+    concept: sec-cicd-placement
+    skill: application
+    title: Where does the dependency audit that needs an internal registry token run?
+    prompt: |
+      The dependency audit takes a minute but needs a token to read an internal package registry. The pull-request stage allows outside contributions from forks. Where should the audit run for those changes?
+    options:
+      - id: merge
+        text: "After the merge (or in a trusted workflow), because the pull-request stage must not hold credentials for code from forks."
+        feedback: "Correct. A check that needs a credential belongs where the code is trusted."
+      - id: pr
+        text: "In the pull-request stage with the token stored as a repository secret."
+        feedback: "Secrets are not passed to workflows triggered from forks, and putting them there on a privileged trigger would be dangerous."
+      - id: hook
+        text: "In the pre-commit hook, so developers use their own token."
+        feedback: "A hook is on each developer's laptop and can be skipped; it cannot be the only run."
+    correct: [merge]
+    solution: A check that needs a credential must not run on untrusted fork code, so it runs after the merge or in a trusted workflow.
+
+  - id: cicd-place-workflow
+    type: mcq
+    concept: sec-cicd-workflow
+    skill: analysis
+    title: Which change fixes the injection?
+    prompt: |
+      A workflow step is `run: ./notify.sh "${{ github.event.issue.title }}"`. Which change removes the script injection?
+    options:
+      - id: env
+        text: "Put the title in an `env:` variable and use `./notify.sh \"$TITLE\"`."
+        feedback: "Correct. The value no longer takes part in generating the script."
+      - id: quote
+        text: "Add more quotation marks around the expression."
+        feedback: "Quotes inside the script do not help; the text is replaced before the shell parses it, and a quote in the title closes yours."
+      - id: pin
+        text: "Pin the checkout action to a commit SHA."
+        feedback: "Pinning is a different control; it does not change how the title is used."
+    correct: [env]
+    solution: Pass the title through an environment variable, as GitHub documents, so the value is data and not script text.
+
+  - id: cicd-place-gate
+    type: mcq
+    concept: sec-cicd-gate
+    skill: analysis
+    title: What does this gate result mean?
+    prompt: |
+      The gate returns exit code 2 with `incomplete: ['sast']` and no blocking findings. What is the right reading?
+    options:
+      - id: unknown
+        text: "The SAST scan did not finish or did not report, so its results are unknown - rerun it; the run must not count as a pass."
+        feedback: "Correct. Unknown is not clean."
+      - id: clean
+        text: "No findings, so it is safe to merge."
+        feedback: "The SAST results are missing, not empty."
+      - id: high
+        text: "A high-severity finding was found in the SAST results."
+        feedback: "That would be exit 1 with the finding listed."
+    correct: [unknown]
+    solution: Exit 2 means a scan did not finish; the SAST result is unknown, so the run fails and the scan is rerun.
+
+recall:
+  - id: cicd-recall-place
+    concept: sec-cicd-placement
+    prompt: What three questions place a security check in a pipeline?
+    answer: How long does it take (does it fit the stage's budget), does it need a running app (does the stage have one), and does it need credentials (is the code at this stage trusted). It goes to the earliest stage where all three are satisfied; if none, split it or speed it up.
+  - id: cicd-recall-hook
+    concept: sec-cicd-placement
+    prompt: Why does a check that runs in the pre-commit hook also run in CI?
+    answer: A hook runs on the developer's machine and can be skipped or never installed. CI cannot be bypassed by the committer, so it is the control; the hook is quick feedback.
+  - id: cicd-recall-fork
+    concept: sec-cicd-placement
+    prompt: What does GitHub say about secrets in workflows triggered from a fork?
+    answer: With the exception of GITHUB_TOKEN, secrets are not passed to the runner, and the GITHUB_TOKEN has read-only permissions in pull requests from forks. Dependabot pull requests are treated as though they are from a fork. So checks that need credentials run after the merge.
+  - id: cicd-recall-flaws
+    concept: sec-cicd-workflow
+    prompt: Name the five workflow flaws the audit looks for and the fix for each.
+    answer: Unpinned actions (pin to a full commit SHA); a broad token (set permissions to the least each job needs); script injection (put untrusted text in env, not in the script); a privileged trigger that checks out pull request code (do not, or use pull_request); secrets in the file (use secrets and a secret scanner).
+  - id: cicd-recall-pin
+    concept: sec-cicd-workflow
+    prompt: Why is a tag not a pin, and what counts as one?
+    answer: A tag can be moved or deleted if the action's repository is compromised. A full-length commit SHA identifies one commit; a short SHA is not enough. Keep the tag as a comment and let an update tool propose changes. A workflow dependency lockfile, where available, is documented as the strongest protection.
+  - id: cicd-recall-gate
+    concept: sec-cicd-gate
+    prompt: What makes a multi-scanner gate trustworthy?
+    answer: One severity scale; blocking only on new alerts at or above an agreed level; a baseline whose entries expire; report mode for scans that cannot block; failing closed on a missing or unfinished scan and on any unknown word; and a staged rollout from report mode.
+  - id: cicd-recall-exit
+    concept: sec-cicd-gate
+    prompt: What do exit codes 0, 1 and 2 mean in this lesson's gate, and which wins when both 1 and 2 apply?
+    answer: 0 pass, 1 a new finding at or above the threshold, 2 an expected scan did not finish. A finding wins over an unfinished scan, because it is certain; both fail the run. In report mode the exit code is always 0 and the findings are only listed.
+
+next:
+  - security-regression-automation
+  - mobile-app-security-testing
+  - payments-security-testing
+  - vulnerability-reporting-and-cvss

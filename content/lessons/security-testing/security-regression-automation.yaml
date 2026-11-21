@@ -1,0 +1,1526 @@
+id: security-regression-automation
+title: Automating security regression tests
+subject: security-testing
+module: devsecops
+level: intermediate
+status: published
+estimatedMinutes: 150
+summary: Turn every confirmed finding into an automated test that stays. Write each regression test as a probe with a positive control and prove it with the red/green pair - it must report the flaw on the build that has it and stay quiet once only that flaw is fixed. Keep a finding-to-test registry that catches closed findings with no test, tests that no longer exist, orphan tests and accepted risks that quietly expired. Guard the tests themselves against being flaky, blind or noisy, and decide in CI what each verdict means - because a security test that sometimes passes is not a control. Built against the deliberately vulnerable SandPay portal and run with real pytest.
+tags:
+  [
+    security regression testing,
+    regression test,
+    finding to test,
+    retest,
+    red green,
+    positive control,
+    negative control,
+    probe,
+    false positive,
+    false negative,
+    flaky test,
+    quarantine,
+    xfail,
+    strict xfail,
+    pytest,
+    collect-only,
+    traceability,
+    registry,
+    accepted risk,
+    risk acceptance,
+    expiry,
+    orphan test,
+    dangling test,
+    coverage,
+    CI gate,
+    DevSecOps,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests, on Linux. Every output marked as run
+    here was printed by the code shown, on 21 November 2026, from `practice/security` (or from a scratch folder with
+    `PYTHONPATH=solutions:support`). The pytest summary times (about 2 seconds) and the collection time are from one machine and
+    vary; nothing in the lesson or the tests depends on timing.
+  - **Practice target:** the **deliberately vulnerable** SandPay merchant portal, `support/sandpay_vuln.py`. It binds to
+    loopback only. `make_app()` is "the build that still has the flaw"; `make_app({"idor"})` is "the build where only that flaw is
+    fixed". In a real project those two builds are the commit before the fix and the commit after it. SandPay is fictional, and
+    the findings `SP-101` to `SP-107`, their build names, owners and dates are invented for this lesson.
+  - **Ethics:** write regression tests for findings in systems you own or are **authorised in writing** to test, and send their
+    requests only to a build you are allowed to hit - a local or test build, never production unless the rules of engagement say
+    so. A probe proves that a flaw exists and then stops: it never keeps or prints what it read (the path-traversal probe looks for
+    a key *name*, not the key), and it never uses a destructive payload.
+  - **Sources (read in full on 21 November 2026):**
+    the OWASP [Web Security Testing Guide v4.2](https://owasp.org/www-project-web-security-testing-guide/v42/), Introduction (its
+    sections on testing in the SDLC and on Test Automation) and Reporting (re-tests); the pytest documentation,
+    [How to use skip and xfail](https://docs.pytest.org/en/stable/how-to/skipping.html) (the `strict` parameter),
+    [Flaky tests](https://docs.pytest.org/en/stable/explanation/flaky.html) and
+    [How to invoke pytest](https://docs.pytest.org/en/stable/how-to/usage.html) (`--collect-only -q`); and the Google Testing Blog post
+    [Flaky Tests at Google and How We Mitigate Them](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html)
+    (John Micco, 2016) for the definition of a flaky result, its quarantine mitigation and the risk it names. Their wording is
+    quoted where it is quoted.
+  - **Not run here:** no CI service, scheduler or issue tracker is used; the pipeline sketches describe what you would configure.
+    The registry is a JSON file in this lesson - real teams keep the same fields in an issue tracker or a spreadsheet, and the
+    checks work the same way.
+  - **Not repeated here:** how each flaw is found - [Testing access control and IDOR](#/lesson/testing-access-control-idor),
+    [Testing SSRF and open redirects](#/lesson/testing-ssrf-and-open-redirects) and
+    [Testing file handling and path traversal](#/lesson/testing-file-handling-and-path-traversal); the other automated scans -
+    [SAST and secret scanning](#/lesson/sast-and-secret-scanning) and [DAST with OWASP ZAP](#/lesson/dast-with-owasp-zap); how
+    pipelines are built - [CI/CD for web apps](#/lesson/ci-cd-for-web-apps).
+
+prerequisites:
+  - security-testing-fundamentals
+  - testing-access-control-idor
+  - testing-ssrf-and-open-redirects
+  - sast-and-secret-scanning
+
+concepts:
+  - id: sec-reg-pair
+    name: A finding as a test - the probe, the control and the red/green pair
+    summary: A regression test for a security finding is a probe that reports whether the flaw is present, preceded by a positive control that proves the request itself works. It is only proven when it has been seen to report the flaw on the build that has it (red) and to stay quiet on the build where just that flaw is fixed (green). A test that was only ever seen green is blind until shown otherwise, and one that cannot go green is noise.
+  - id: sec-reg-registry
+    name: The finding-to-test registry - traceability that does not rot
+    summary: A registry lists each finding with its status and the pytest node id of the test that guards it. Four checks keep it true - a fixed finding without a test, an entry whose test no longer exists (dangling), a test that no finding points at (orphan), and an accepted risk with no reason, no date or a date that has passed. Fed from pytest's own list of collected tests, it fails the pipeline when a test is renamed or deleted instead of letting the coverage disappear quietly.
+  - id: sec-reg-trust
+    name: Trusting the test - flaky, blind and noisy
+    summary: A flaky test result is one that both passes and fails on the same code, and it teaches a team to ignore red. A security test has two more ways to be wrong - blind (never reports the flaw) and noisy (reports it on the fixed build). A guard runs the probe several times on both builds and classifies it; CI then gates a trustworthy test, quarantines a flaky one for a limited time with an owner, and sends a blind, noisy or broken one back to be fixed. A quarantined security test is a reopened finding, not a tidy-up.
+
+objectives:
+  - Turn a confirmed finding into a probe with a positive control that returns a bool and never keeps what it read.
+  - Prove a regression test with the red/green pair, and say what a test that was only ever green does and does not show.
+  - Keep a finding-to-test registry and report fixed-without-test, dangling, orphan and expired findings from pytest's collected test ids.
+  - Mark an open finding's test as a strict expected failure so the fix has to remove the marker.
+  - Classify a probe as trustworthy, flaky, blind, noisy or broken, and decide what CI does with each - including a time limit on quarantine.
+  - Design a regression plan for a set of findings, with expected results and evidence, and explain what it still does not cover.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: The idea in plain language
+    body: |
+      A building inspector finds that a fire door does not close properly. The owner repairs it. The inspector signs the sheet
+      and leaves. Six months later a builder replaces the door frame, and the new frame holds the door open by one centimetre.
+      Nobody notices until the next fire.
+
+      The fix was real. What was missing was a **standing check**: a person who tries that door every month, with a written
+      procedure ("push the door from two metres away; it must latch"), and a log that says *this check exists because of that
+      finding*. A security **regression test** is that standing check for software. The assessment found that Alice could read
+      Bob's payment; the developers fixed it; the regression test asks the same question on every build for ever, and fails the
+      day a refactor reopens the hole.
+
+      Three habits make the check worth having, and they are the three halves of this lesson:
+
+      1. **Prove the check can fail.** A smoke alarm that has never been tested might be dead. The test must be seen to go red on
+         a build that has the flaw and green on a build where only that flaw is fixed. Before the real question it asks an easy
+         one it must get right (can Alice read her *own* payment?), so a broken login is never mistaken for "secure".
+      2. **Keep the log.** Every closed finding names its test, and a nightly job checks that the test still exists. Otherwise
+         somebody renames a file, the door check quietly stops running, and the log still says "covered".
+      3. **Trust the alarm.** If the door check sometimes fails for no reason, people learn to ignore it - and then they ignore
+         the day it fails for a real one. A flaky test is worse than no test, because it spends the team's trust.
+
+      None of this finds a new vulnerability. It makes sure a vulnerability that was already found, fixed and paid for **stays
+      fixed**.
+
+  - id: what
+    kind: what
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: What the terms mean
+    body: |
+      **Regression test (for a finding).** An automated test whose only job is to fail if one specific, already-fixed security
+      flaw comes back. The WSTG describes the idea inside its section on the SDLC: "Source code analysis and unit tests can
+      validate that the code change mitigates the vulnerability exposed by the previously identified coding defect." This lesson
+      does the same for flaws found by a black-box tester, at the HTTP level.
+
+      **Probe.** The small function inside the test that sends the requests and answers one question: *is the flaw present?* It
+      returns `True` (present) or `False` (absent). It never returns the data it read, so a test log can never leak it.
+
+      **Positive control.** A request that has to succeed, run before the attack. Alice reading her *own* payment must give a 200
+      with her merchant id; a public file must be served. If the control fails, the probe raises an error instead of answering -
+      "I could not ask" is a different statement from "the flaw is gone".
+
+      **The red/green pair.** Run the probe on two builds: the one with the flaw (it must say `True` - *red*) and the one where
+      only that flaw is fixed (it must say `False` - *green*). The verdicts:
+
+      | Probe on the vulnerable build | Probe on the fixed build | Verdict | Meaning |
+      | --- | --- | --- | --- |
+      | reports the flaw | stays quiet | **red-green** | proven |
+      | never reports the flaw | stays quiet | **blind** | always green - protects nothing |
+      | anything | reports the flaw | **noisy** | can never go green - a false positive |
+
+      **Registry.** A list of findings, each with an id, the flaw, a severity, a status (`open`, `fixed` or `accepted`) and the
+      **pytest node id** of its test (`path/to/test_file.py::test_name`). Its checks are:
+
+      - **fixed-without-test** - the finding is closed and nothing guards it;
+      - **dangling-test** - the entry names a test that pytest no longer collects (renamed, deleted, never written);
+      - **orphan-test** - a collected test that no finding points at (nobody knows why it exists, so nobody dares delete it - or
+        everybody does);
+      - **accepted-incomplete / accepted-expired** - an *accepted risk* with no reason, no end date, or a date that has passed.
+
+      **Strict expected failure.** pytest's `xfail` marker marks a test that is expected to fail. By default, "both XFAIL and XPASS
+      don't fail the test suite"; with `strict=True`, "this will make XPASS ('unexpectedly passing') results from this test to fail
+      the test suite". For an **open** finding that is exactly right: write the test first, mark it as an expected failure, and the
+      pipeline goes red the day somebody fixes the flaw - with the message to remove the marker.
+
+      **Flaky.** The Google Testing Blog defines it: 'We define a "flaky" test result as a test that exhibits both a passing and a
+      failing result with the same code.' pytest's guide says the same in other words: "Sometimes it passes, sometimes it fails,
+      and it's not clear why." For a security test we add two more states: **blind** and **noisy**, from the table above, and
+      **broken** when the positive control itself fails.
+
+      **Quarantine.** Take a test off the critical path so it stops blocking people, while it still runs and still reports. The
+      Google post describes it as "removes the test from the critical path and files a bug", and warns that it "could easily mask a
+      real race condition or some other bug in the code being tested". pytest's guide says the non-strict `xfail` "could be
+      considered like a manual quarantine, and is rather dangerous to use permanently".
+
+  - id: why
+    kind: why
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Why fixed findings come back, and why the test must be trusted
+    body: |
+      **Fixes are fragile.** A vulnerability is fixed by a line of code in one place: an ownership check, an allow-list, an output
+      encoder. The next refactor moves the handler, a merge conflict drops the line, a new route copies the old unprotected
+      pattern, a framework upgrade changes a default. Nothing about the *business* tests notices: the feature still works, which is
+      exactly what a vulnerable build also does. Only a test that asks the **attacker's question** can tell the two builds apart.
+
+      **The assessment is a snapshot; the test is a recording of what the assessment learned.** A pentest report gives a point in time.
+      The WSTG's own advice on reporting is that once issues are reported, "it is also important to provide guidance to the software
+      developer on how to re-test and find the vulnerability", and that for a re-test the report can summarise "the updated status of
+      previously identified vulnerabilities". A regression test is that guidance turned into code that runs by itself.
+
+      **Automation is part of the process.** The WSTG says that in agile and DevSecOps methods "consideration should be put into
+      integrating security tests in to continuous integration/continuous deployment (CI/CD) workflows in order to maintain baseline
+      security information/analysis". Scanners (SAST, DAST, dependency checks) catch classes of problems. A regression suite catches
+      *your* problems, the ones your own application has already had once.
+
+      **Trust is the whole value.** The Google post reports that in their corpus a flaky result appears in "about 1.5% of all test runs"
+      and that "about 84% of the transitions we observe from pass to fail involve a flaky test". The effect they name is the one to
+      avoid: "It is quite common to ignore legitimate failures in flaky tests due to the high number of false-positives." (Those figures
+      are Google's, from 2016; they are quoted for the effect, not as a rate for your project.) pytest's guide states the cost
+      generally: developers "can become mistrustful of the test results, which can lead to overlooking genuine failures". A security
+      suite that cries wolf is switched off - and then the real regression ships.
+
+      **Traceability keeps coverage honest.** "We have regression tests for our findings" is only true if a list says which test
+      belongs to which finding and something checks the list. Without it, deleting a "weird old test" is a silent loss of protection.
+
+  - id: pair-internals
+    kind: internals
+    concepts: [sec-reg-pair]
+    title: Inside a good probe - control, attack, bool
+    body: |
+      The three probes in `practice/security/solutions/devsecops/reg_probe.py` share one shape.
+
+      **1. Log in or set up, and fail loudly.** `_login` raises `RuntimeError("control failed: login answered 401")` when the login does
+      not return 200. A probe that swallowed that error and returned `False` would report "not vulnerable" for a build whose login is
+      simply broken - the most dangerous kind of green.
+
+      **2. Run the positive control.** For IDOR: Alice reads `pay_1001`, her own payment, and the answer must be a 200 whose
+      `merchant_id` is `m_100`. For the open redirect: `next=/settings` must redirect to `/settings`. For path traversal: the public
+      file `terms.txt` must come back. Only now do we know the request shape, the token and the URL are right, so a later "denied"
+      means *denied*.
+
+      **3. Ask the attacker's question - once.** Alice asks for `pay_2001`, which belongs to merchant `m_200`. The flaw is present
+      only if the answer is a 200 **and** the body shows that other merchant's data. (A 200 with an empty or an error body would
+      be a false alarm; the owner field is the evidence.)
+
+      **4. Return a bool.** `True` = flaw present. No data leaves the function. The path-traversal probe looks for the text
+      `SETTLEMENT_SIGNING_KEY=` in the body - the key *name* proves the internal file was served - and discards the body.
+
+      **Test the property, not the payload.** The probe for XSS in the test file below sends one payload, which is fine for a
+      one-line flaw in this portal. For real applications, a finding such as "the search page does not encode its output" should
+      be guarded by a test that sends *several* shapes (HTML tag, attribute break-out, JavaScript URL) or, better, by a unit test of
+      the encoder itself. A regression test that checks only the exact string from the report is passed by a fix that blocks that
+      string and nothing else.
+
+      **Where the two builds come from.** In this practice project the "vulnerable" and "fixed" builds are two configurations of the
+      same program (`make_app()` and `make_app({flaw})`), which is what makes a proof possible without git. On a real project you
+      check out the commit **before** the fix (or revert the fix in a scratch branch), run the test and watch it fail; then run it on
+      the fixed commit and watch it pass. That one red run, kept in the pull request, is the evidence that the test can fail.
+
+      **How the proof is automated.** `prove_pair(flaw)` serves both builds, runs the probe on each, and applies the table from the
+      *what* section. It is a teaching tool, not part of the pipeline: you run it once, when you write the test.
+
+  - id: registry-internals
+    kind: internals
+    concepts: [sec-reg-registry]
+    title: Inside the registry - five checks and one number
+    body: |
+      The registry is a JSON list. One entry:
+
+      ```json
+      {"id": "SP-101", "flaw": "idor", "severity": "High", "status": "fixed", "fixed_in": "build-412",
+       "test": "tests/regression/test_sp101_idor.py::test_alice_cannot_read_bobs_payment"}
+      ```
+
+      **Parse it strictly.** `parse_registry` raises `ValueError` for invalid JSON, for something that is not a list, for an entry
+      without `id`, `flaw`, `severity` or `status`, for a status outside `open`, `fixed`, `accepted`, for a severity outside
+      `Critical`, `High`, `Medium`, `Low`, and for a duplicate id. A registry that silently drops a bad entry would lose the finding
+      it was written to track. Parsing *fails closed*, the same rule as the gate in the SAST lesson.
+
+      **Take the test list from pytest.** `pytest --collect-only -q` prints one node id per line and then a summary line such as
+      `4 tests collected in 0.19s`. The pytest documentation notes that this list "can be generated using `pytest --collect-only -q`".
+      `parse_collected` keeps the lines that have no spaces and contain `::` and ignores everything else. The registry never lists a
+      test by file name only: a node id includes the function, so renaming the function breaks the link and the check notices.
+
+      **The checks, in the order the code reports them for each entry:**
+
+      | Check | When it fires | Why it matters |
+      | --- | --- | --- |
+      | `fixed-without-test` | status `fixed` and no `test` | closed, but nothing stops it coming back |
+      | `dangling-test` | the named test is not among the collected ones | the guard was renamed or deleted - coverage is gone while the log still says "covered" |
+      | `accepted-incomplete` | status `accepted` with no `accepted_until` or no `reason` | a risk nobody owns and nobody will revisit |
+      | `accepted-expired` | `accepted_until` is before today (the day itself still counts) | the acceptance ran out and nobody noticed |
+      | `orphan-test` | a collected test no entry names (reported with no finding id) | a test with no known purpose is the first to be deleted |
+
+      An **open** finding may have no test yet, and may have one (written first, marked as a strict expected failure); but if it names
+      a test, the test must exist.
+
+      **One number, with a warning.** `coverage` returns how many *fixed* findings have a collected test: `{"fixed": 4, "covered": 2,
+      "ratio": 0.5}`. It is a **traceability** figure. It does not say that the application is half secure - it says that half of the
+      closed findings are guarded. A ratio of 1.0 means every closed finding has a test that exists; it does not say the tests are good,
+      which is the next section's job. With nothing fixed yet the ratio is 1.0, because there is nothing to cover.
+
+      **Accepted risks need an end.** An accepted risk is a decision, not a closure. It needs a reason, an owner (in a real registry) and
+      a date. When the date passes, the check turns red and somebody has to decide again: fix it, or accept it again in writing.
+
+  - id: trust-internals
+    kind: internals
+    concepts: [sec-reg-trust]
+    title: Inside the guard - runs, verdicts and what CI does
+    body: |
+      **Run each build several times.** `run_guard(probe, flaw, runs=5)` serves ONE vulnerable portal and ONE portal with only `flaw`
+      fixed, and calls the probe `runs` times on each. Five runs will not find a one-in-a-hundred flake, so say what the guard
+      proves: that the probe is *consistent over a few runs on a quiet machine*. Rare flakes show up only in the real pipeline's
+      history, which is why teams also track results over time (Google's post describes "a tool that monitors the flakiness of tests").
+
+      **Classify the answers.** `classify` receives the two lists of answers (True = flaw reported) and checks in this order:
+
+      1. Both answers on the same build -> **flaky**. Nothing else can be said about the probe.
+      2. The flaw is reported on the fixed build -> **noisy**. It can never go green; every merge will fail.
+      3. The flaw is never reported on the vulnerable build -> **blind**. It is always green and protects nothing.
+      4. Otherwise -> **trustworthy**.
+
+      A probe whose positive control raises `RuntimeError` is **broken**: there is no answer to classify. The guard returns that verdict
+      with whatever it collected.
+
+      **What CI does with each verdict** (`ci_action`):
+
+      | Verdict | Action | Meaning |
+      | --- | --- | --- |
+      | trustworthy | **gate** | a failure blocks the merge |
+      | flaky | **quarantine**, then **escalate** | runs and reports but does not block - for at most `max_days` days (14 here), then it blocks again until it is fixed or a named owner accepts the risk in writing |
+      | blind, noisy, broken | **fix-test** | the test is wrong; deleting it removes the finding's only guard |
+      | anything else | error | an unknown verdict must never become a pass |
+
+      The 14 days are this lesson's example policy, not a rule from a source. Choose your own number and write it down.
+
+      **Quarantine is different for a security test.** For an ordinary feature test, quarantining a flaky test is housekeeping. For the
+      guard of a *High* finding it is a **reopened finding**: for as long as the test is out of the gate, a regression can ship. So a
+      quarantine needs an owner, an end date, a visible entry in the registry (flip the finding back to `open` or add a note), and an
+      escalation path. The Google post says the same thing in general terms: quarantine "could easily mask a real race condition or some
+      other bug in the code being tested".
+
+      **Fix flakiness at its cause.** pytest's guide names the usual roots: tests that depend on state that is not controlled, on
+      ordering, on threads that are not waited for. For the portal tests the cure is the one already in the exercises - a fresh server per
+      build, positive controls, counters instead of random numbers, and no sleeps.
+
+  - id: when
+    kind: when
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: When to automate a finding, and when not to
+    body: |
+      **Automate** when the finding has a **cheap, deterministic, safe check**: an access-control gap (two accounts, one request), a
+      missing encoding, a redirect that leaves the site, a path that escapes a folder, a missing or wrong header, a mass-assignment
+      property, an injection that a single harmless payload shows. These are cheap to run on every pull request.
+
+      **Automate at a lower level** when the cause is a function: if the bug was an unescaped output, a unit test of the encoder
+      is faster, less flaky and closer to the cause than an HTTP test through the whole stack. Keep one HTTP test for the finding as the
+      attacker saw it, and unit tests for the cause.
+
+      **Run it somewhere else** (nightly or before release, not on every commit) when it is slow: a race-condition probe that needs
+      hundreds of attempts, a rate-limit probe that must wait for a window, a probe that needs a large data set.
+
+      **Do not automate** (and say why in the registry) when the check would be **unsafe or meaningless**: a denial-of-service finding
+      (the test would be the attack), a finding that needs a human to judge ("the error message is too friendly"), or a finding in
+      infrastructure you cannot reproduce in the test environment. Guard those another way - a configuration scanner, a checklist item in
+      the release review - and record that decision as the "test" of the finding.
+
+      **Do not turn a scanner alert into a regression test blindly.** A ZAP or SAST alert is a *claim*; replay it by hand (the DAST lesson's
+      replay exercise does this), and only a confirmed finding earns a test.
+
+      **A regression suite is not a security assessment.** It guards what was found. It says nothing about what has not been found yet
+      - new endpoints, new flaw classes, new business logic. The WSTG warns that "just relying on successful test results from automated
+      tools will give security practitioners a false sense of security." The suite is the floor under the assessments, not a replacement.
+
+  - id: visual-lifecycle
+    kind: visual
+    concepts: [sec-reg-pair, sec-reg-registry]
+    title: The life of one finding, from report to regression
+    body: |
+      ```mermaid
+      flowchart TD
+        F["Finding confirmed: SP-101, Alice reads Bob's payment"] --> W["Write the probe: control, attack, return a bool"]
+        W --> R{"Run on the vulnerable build"}
+        R -- "green: it did not see the flaw" --> B["Blind: fix the probe, never merge it"]
+        R -- "red: flaw reported" --> X["Mark it as a strict expected failure while the finding is open"]
+        X --> D["Developers fix it in a pull request"]
+        D --> G{"Run on the fixed build"}
+        G -- "still red" --> N["Noisy or not fixed: look at the evidence"]
+        G -- "green" --> M["Remove the xfail marker, register the node id, status fixed"]
+        M --> C["CI gates every change on the test"]
+        C -- "a later change reopens the flaw" --> RG["Red: the regression is caught before release"]
+        M --> K["Nightly: registry check against pytest --collect-only"]
+        K -- "test renamed or deleted" --> DT["Dangling: the pipeline fails, coverage restored"]
+      ```
+
+      Read it as two loops. The **proof loop** (top) happens once, when the test is written: it must be red on the flawed build before
+      anyone is allowed to call it a guard. The **upkeep loop** (bottom) happens for ever: the gate catches the regression, and the
+      registry check catches the test that disappeared, which is the only way a guard can fail without any red result at all.
+
+  - id: visual-trust
+    kind: visual
+    concepts: [sec-reg-trust]
+    title: Classifying a probe and choosing the CI action
+    body: |
+      ```mermaid
+      flowchart TD
+        S["Run the probe N times on each build"] --> Q0{"Did the positive control fail?"}
+        Q0 -- "yes" --> BR["broken: fix-test"]
+        Q0 -- "no" --> Q1{"Same answer every time on each build?"}
+        Q1 -- "no" --> FL["flaky: quarantine, owner and end date"]
+        FL --> Q4{"Quarantined longer than the limit?"}
+        Q4 -- "yes" --> ES["escalate: block until fixed or accepted in writing"]
+        Q4 -- "no" --> QU["keep running and reporting, not blocking"]
+        Q1 -- "yes" --> Q2{"Reports the flaw on the fixed build?"}
+        Q2 -- "yes" --> NO["noisy: fix-test"]
+        Q2 -- "no" --> Q3{"Reports the flaw on the vulnerable build?"}
+        Q3 -- "no" --> BL["blind: fix-test"]
+        Q3 -- "yes" --> TR["trustworthy: gate"]
+      ```
+
+      The order matters. A flaky probe cannot be called blind or noisy, because its answers cannot be trusted either way; a probe
+      that is consistently wrong on the fixed build is noisy whatever it says on the vulnerable one. Three of the five verdicts end
+      in "fix the test", and none of them ends in "delete the test": removing the guard of a closed finding is a decision about the
+      finding, so it goes through the registry.
+
+  - id: code-run
+    kind: code
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: The pair, a regression suite and its lifecycle, run on the portal
+    body: |
+      The solutions are in `practice/security/solutions/devsecops/`. Outputs were printed on 21 November 2026 by exactly this code, from
+      a scratch folder with `PYTHONPATH=solutions:support` (the two folders under `practice/security`).
+
+      **1. Prove each probe with the red/green pair.**
+
+      ```python
+      from devsecops.reg_probe import prove_pair, PROBES
+
+      for flaw in PROBES:
+          r = prove_pair(flaw)
+          print(f"{r.flaw:<15} vulnerable build: {str(r.found_on_vulnerable):<5}  fixed build: {str(r.found_on_fixed):<5}  -> {r.verdict}")
+      ```
+
+      Output:
+
+      ```text
+      idor            vulnerable build: True   fixed build: False  -> red-green
+      open-redirect   vulnerable build: True   fixed build: False  -> red-green
+      path-traversal  vulnerable build: True   fixed build: False  -> red-green
+      ```
+
+      **2. A probe that was only ever seen green.** A tester forgets the bearer token and writes no control:
+
+      ```python
+      import requests
+      from devsecops.reg_probe import prove_pair
+
+      def naive_idor(base_url):
+          # forgot the bearer token, and has no control request
+          r = requests.get(base_url + "/api/payments/pay_2001", timeout=5)
+          return r.status_code == 200
+
+      r = prove_pair("idor", naive_idor)
+      print(r.flaw, r.found_on_vulnerable, r.found_on_fixed, "->", r.verdict)
+      ```
+
+      Output:
+
+      ```text
+      idor False False -> blind
+      ```
+
+      Run only on the fixed build, this test would have been green - and it would have stayed green on the vulnerable one. The unauthenticated
+      request is answered with a 401, which the probe reads as "not vulnerable". That is the case the pair exists to catch.
+
+      **3. A regression suite, and the build under test.** Four tests in a folder called `regression/`. The `conftest.py` serves "the build
+      under test": the environment variable `BUILD_FIXED` lists the portal flaws that build has fixed, which stands in for "the commit being
+      tested".
+
+      ```python
+      # regression/conftest.py
+      import os
+
+      import pytest
+      from sandpay_vuln import make_app, serve
+
+
+      @pytest.fixture
+      def build():
+          fixed = {flaw for flaw in os.environ.get("BUILD_FIXED", "").split(",") if flaw}
+          with serve(make_app(fixed)) as base_url:
+              yield base_url
+      ```
+
+      ```python
+      # regression/test_sp101_idor.py
+      from devsecops.reg_probe import probe_idor
+
+
+      def test_alice_cannot_read_bobs_payment(build):
+          assert probe_idor(build) is False, "SP-101: Alice read a payment of merchant m_200"
+      ```
+
+      `test_sp102_redirect.py` and `test_sp103_traversal.py` are the same shape with `probe_open_redirect` and `probe_path_traversal`. The
+      fourth test guards an **open** finding, `SP-105` (reflected XSS), and is written first, with its own small probe and a strict expected
+      failure:
+
+      ```python
+      # regression/test_sp105_xss.py
+      import pytest
+      import requests
+
+      PAYLOAD = "<script>alert(1)</script>"
+
+
+      def reflects_unescaped(base_url):
+          control = requests.get(base_url + "/search", params={"q": "hello"}, timeout=5)
+          if control.status_code != 200 or "hello" not in control.text:
+              raise RuntimeError("control failed: /search does not echo a plain word")
+          attack = requests.get(base_url + "/search", params={"q": PAYLOAD}, timeout=5)
+          return PAYLOAD in attack.text
+
+
+      @pytest.mark.xfail(strict=True, reason="SP-105 is open: remove this marker in the change that fixes it")
+      def test_search_encodes_output(build):
+          assert reflects_unescaped(build) is False
+      ```
+
+      Run it on three builds with `BUILD_FIXED=<flaws> python -m pytest -q --tb=no -rfxX regression`. First, the build that has none of the
+      findings fixed:
+
+      ```text
+      FFFx                                                                     [100%]
+      =========================== short test summary info ============================
+      FAILED regression/test_sp101_idor.py::test_alice_cannot_read_bobs_payment - A...
+      FAILED regression/test_sp102_redirect.py::test_login_next_stays_on_site - Ass...
+      FAILED regression/test_sp103_traversal.py::test_files_never_serves_the_internal_directory
+      XFAIL regression/test_sp105_xss.py::test_search_encodes_output - SP-105 is open: remove this marker in the change that fixes it
+      3 failed, 1 xfailed in 2.22s
+      ```
+
+      Three red (the findings are not fixed), and the open finding as an *expected* failure. Now the build with the three findings fixed
+      (`BUILD_FIXED=idor,open-redirect,path-traversal`):
+
+      ```text
+      ...x                                                                     [100%]
+      =========================== short test summary info ============================
+      XFAIL regression/test_sp105_xss.py::test_search_encodes_output - SP-105 is open: remove this marker in the change that fixes it
+      3 passed, 1 xfailed in 2.21s
+      ```
+
+      And the build where somebody also fixed `SP-105` but did not touch the test (`BUILD_FIXED=idor,open-redirect,path-traversal,xss-reflected`):
+
+      ```text
+      ...F                                                                     [100%]
+      =========================== short test summary info ============================
+      FAILED regression/test_sp105_xss.py::test_search_encodes_output - [XPASS(stri...
+      1 failed, 3 passed in 2.19s
+      ```
+
+      The strict marker turns "the flaw is fixed" into a red result with the instruction to remove the marker, so an open finding's test
+      cannot be forgotten. (If you drop `strict=True`, that run reports `XPASS` and the suite stays green - the test silently stops being a
+      guard.) The pytest documentation says the same: "both XFAIL and XPASS don't fail the test suite by default".
+
+      **4. The same suite, listed by pytest.** This is what the registry check reads (the time on the last line changes from run to run):
+
+      ```text
+      regression/test_sp101_idor.py::test_alice_cannot_read_bobs_payment
+      regression/test_sp102_redirect.py::test_login_next_stays_on_site
+      regression/test_sp103_traversal.py::test_files_never_serves_the_internal_directory
+      regression/test_sp105_xss.py::test_search_encodes_output
+
+      4 tests collected in 0.19s
+      ```
+
+  - id: code-registry
+    kind: code
+    concepts: [sec-reg-registry, sec-reg-trust]
+    title: The registry check and the guard, run on synthetic data
+    body: |
+      **5. The registry check.** `support/reg_fixture.py` holds a synthetic registry (`SAMPLE_REGISTRY`, seven findings `SP-101` to
+      `SP-107`) and a hand-written `COLLECT_OUTPUT` in the shape of the listing above - it is *not* the output of the folder you just ran,
+      so that it can contain the problems a real registry grows over a year. The check is run "on 21 November 2026":
+
+      ```python
+      from devsecops.reg_registry import parse_registry, parse_collected, registry_problems, coverage
+      from reg_fixture import SAMPLE_REGISTRY, COLLECT_OUTPUT
+
+      entries = parse_registry(SAMPLE_REGISTRY)
+      tests = parse_collected(COLLECT_OUTPUT)
+      for p in registry_problems(entries, tests, "2026-11-21"):
+          print(f"{p.kind:<20} {p.finding_id or '-':<7} {p.detail}")
+      print(coverage(entries, tests))
+      ```
+
+      Output:
+
+      ```text
+      fixed-without-test   SP-103  path-traversal is fixed but no test guards it
+      dangling-test        SP-104  tests/regression/test_sp104_sqli.py::test_status_filter_is_not_injectable was not collected
+      accepted-expired     SP-106  acceptance ended on 2026-10-31
+      accepted-incomplete  SP-107  an accepted risk needs a date and a reason
+      orphan-test          -       tests/regression/test_old_cors.py::test_cors_wildcard guards no registered finding
+      {'fixed': 4, 'covered': 2, 'ratio': 0.5}
+      ```
+
+      Five problems, five different follow-ups. `SP-103` is closed with nothing behind it: write the test (the probe exists - `probe_path_traversal`).
+      `SP-104` is the dangerous one: the registry says "covered", but pytest no longer collects the test, so the guard may have been renamed or
+      deleted - and no test is red, because a test that does not exist cannot fail. `SP-106` and `SP-107` are accepted risks without a live
+      decision. And `test_cors_wildcard` guards nothing anybody can name - find its finding or delete it with a note. `SP-105` (open, test
+      present) and `SP-101`, `SP-102` (fixed, test present) are healthy and are not reported.
+
+      **6. The guard.** Five probes, five runs on each build, the CI action for each verdict:
+
+      ```python
+      from devsecops.reg_guard import run_guard, ci_action
+      from reg_fixture import redirect_probe, make_flaky, always_false, always_true, broken_control
+
+      cases = [("real redirect probe", redirect_probe), ("always False", always_false), ("always True", always_true),
+               ("flaky TTF", make_flaky("TTF")), ("failed control", broken_control)]
+      for name, probe in cases:
+          g = run_guard(probe, "open-redirect", runs=5)
+          flags = lambda runs: "".join("T" if x else "F" for x in runs) or "-"
+          print(f"{name:<20} vulnerable {flags(g.vulnerable_runs):<6} fixed {flags(g.fixed_runs):<6} {g.verdict:<12} {ci_action(g.verdict)}")
+      print([ci_action("flaky", d) for d in (0, 14, 15)])
+      ```
+
+      Output:
+
+      ```text
+      real redirect probe  vulnerable TTTTT  fixed FFFFF  trustworthy  gate
+      always False         vulnerable FFFFF  fixed FFFFF  blind        fix-test
+      always True          vulnerable TTTTT  fixed TTTTT  noisy        fix-test
+      flaky TTF            vulnerable TTFTT  fixed FTTFT  flaky        quarantine
+      failed control       vulnerable -      fixed -      broken       fix-test
+      ['quarantine', 'quarantine', 'escalate']
+      ```
+
+      `make_flaky("TTF")` is a counter, not a random number: it answers True, True, False, True, True, False, ... one answer per call, so
+      the "flaky" probe flakes the same way on every machine and the lesson's output is reproducible. A real flake is not so polite - which
+      is why the real defence is a long history of results, not five runs. (The first line, "real redirect probe", is a real probe against
+      the real portal; the other four are the synthetic probes from `reg_fixture.py`.)
+
+      What matters is the *shape*: the same two columns of `T` and `F` decide everything, and the verdict never depends on how fast the
+      probe ran.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Reading the key lines of the solutions
+    body: |
+      **`probe_idor` - the control is the first real request.**
+
+      ```python
+      token = _login(base_url, *ALICE)
+      headers = {"Authorization": f"Bearer {token}"}
+      own = requests.get(base_url + "/api/payments/pay_1001", headers=headers, timeout=5)
+      if own.status_code != 200 or own.json().get("merchant_id") != "m_100":
+          raise RuntimeError("control failed: Alice cannot read her own payment")
+      other = requests.get(base_url + "/api/payments/pay_2001", headers=headers, timeout=5)
+      return other.status_code == 200 and other.json().get("merchant_id") == "m_200"
+      ```
+
+      - `_login` raises on anything but a 200, so a broken account never turns into "secure".
+      - The control reads the owner field as well as the status: a 200 for somebody else's data would not be a pass of the control.
+      - `raise RuntimeError` - not `return False` - because "I could not ask the question" must never look like "the flaw is absent".
+      - The last line needs **both** a 200 and the other merchant's id. A 200 with the wrong body, or a redirect, is not evidence.
+
+      **`probe_open_redirect` - the redirect is observed, never followed.**
+
+      ```python
+      ok = requests.get(base_url + "/login", params={"next": "/settings"}, allow_redirects=False, timeout=5)
+      ...
+      bad = requests.get(base_url + "/login", params={"next": EVIL}, allow_redirects=False, timeout=5)
+      location = bad.headers.get("Location", "")
+      return bad.status_code == 302 and urllib.parse.urlsplit(location).netloc == "evil.example"
+      ```
+
+      - `allow_redirects=False` means the probe never contacts the other site - it only reads the `Location` header.
+      - `urlsplit(...).netloc` compares the **host**, not a string prefix, so `https://evil.example.attacker.test/` and
+        `https://evil.example/` are told apart by the real parser instead of a guess.
+
+      **`prove_pair` - two builds, three verdicts.**
+
+      ```python
+      with serve(make_app()) as base:
+          found_vulnerable = bool(probe(base))
+      with serve(make_app({flaw})) as base:
+          found_fixed = bool(probe(base))
+      if found_fixed:
+          verdict = "noisy"
+      elif not found_vulnerable:
+          verdict = "blind"
+      else:
+          verdict = "red-green"
+      ```
+
+      - `{flaw}` fixes only the flaw under test. Every other flaw stays in the build, which also shows the probe is not confused by them (the
+        tests run the probe with *all other* flaws fixed as well).
+      - The checks run `noisy` first: a probe that reports the flaw on the fixed build is wrong whatever it said before.
+
+      **`registry_problems` - dates and sets.**
+
+      ```python
+      if e.test and e.test not in test_ids:
+          problems.append(Problem("dangling-test", e.id, f"{e.test} was not collected"))
+      ...
+      named = {e.test for e in entries if e.test}
+      for test_id in sorted(test_ids - named):
+          problems.append(Problem("orphan-test", None, f"{test_id} guards no registered finding"))
+      ```
+
+      - A set difference finds the orphans; sorting them makes the report stable, so a diff of two reports shows only real changes.
+      - The date check uses `date.fromisoformat`, so `2026-11-21` against `2026-11-21` is **not** expired: the accepted day still counts.
+
+      **`classify` - order is the logic.**
+
+      ```python
+      if len(set(vulnerable_runs)) > 1 or len(set(fixed_runs)) > 1:
+          return "flaky"
+      if fixed_runs[0]:
+          return "noisy"
+      if not vulnerable_runs[0]:
+          return "blind"
+      return "trustworthy"
+      ```
+
+      - `len(set(...)) > 1` is "both answers appeared" - Google's definition of flaky, written as code.
+      - After the flaky check every list is constant, so looking at `[0]` is enough.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Turning a confirmed finding into a regression test, step by step
+    body: |
+      1. **Confirm the finding first.** Reproduce it by hand (or replay the scanner alert). Only a confirmed finding earns a test, and the
+         reproduction is the first draft of the probe. Write down the request, the account and the evidence.
+      2. **Give it an id and an entry.** `SP-xxx`, the flaw, the severity, status `open`. The id goes into the test's docstring and failure message.
+      3. **Write the positive control.** The request that must succeed - own object, public file, local redirect. Make the probe raise
+         `RuntimeError` when it fails.
+      4. **Write the attack and return a bool.** One harmless request that shows the flaw. Return `True` for "present". Never return or log
+         what was read.
+      5. **Write the test so a failure is a finding.** `assert probe(build) is False, "SP-xxx: what was read"`. The message says which finding
+         came back.
+      6. **See it red.** Run it on a build that still has the flaw - the commit before the fix, or a scratch revert. If it is green, the probe
+         is blind: fix the probe, not the application. Keep the red run's output in the pull request.
+      7. **Mark it while the finding is open.** `@pytest.mark.xfail(strict=True, reason="SP-xxx is open: remove this marker in the fix")`.
+         The fix's pull request then fails until the marker is removed - the reminder is built in.
+      8. **See it green after the fix.** Run it on the fixed build. If it stays red (and you checked the fix), the probe is noisy.
+      9. **Run the guard.** `run_guard(probe, flaw)` on both builds. Anything but *trustworthy* goes back to step 3.
+      10. **Register the test.** Set the status to `fixed`, add `fixed_in` and the **node id** of the test. Commit the test, the registry change and
+          the fix together.
+      11. **Put it in the pipeline.** Fast tests on every pull request (the gate); slow tests nightly. Add the registry check: collect with
+          `pytest --collect-only -q`, run `registry_problems`, fail on any problem.
+      12. **Review the registry on a schedule.** Expired acceptances, orphans, quarantined tests past their end date. A quarantine nobody owns
+          becomes a deletion nobody decided.
+
+  - id: example
+    kind: example
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: A scenario - six months after the assessment (hypothetical)
+    body: |
+      *Hypothetical, with invented names and dates; the registry and the numbers are the lesson's own.*
+
+      SandPay's merchant portal passed an assessment in the spring. Mei, the QA engineer, wrote a regression test for each of the four High
+      and Critical findings that were fixed. Six months later she runs the registry check before the release review.
+
+      The report shows `SP-104` as **dangling**. The registry says the SQL injection finding is covered by
+      `test_status_filter_is_not_injectable`, but pytest no longer collects it. She looks at the history: a developer reorganised the test
+      folders and renamed the file, and the old test was deleted in the same commit. Nothing had gone red - a test that no longer exists
+      cannot fail. She restores the test under its new path, updates the node id in the registry, and adds the registry check to the
+      nightly job so the next rename fails the pipeline.
+
+      The same report shows `SP-106` as **expired**: "password rehash planned for the next release", accepted until 31 October. Nobody
+      revisited it. Mei raises it in the review: either the rehash is done (change the status, add a test that a fresh login stores a
+      salted hash) or the acceptance is renewed in writing by the owner with a new date. It is not allowed to stay open-ended.
+
+      The week before, the open-redirect test `SP-102` had failed twice on the pipeline for no reason anybody found and had been re-run
+      until it passed. Mei runs the guard on it with ten runs on each build and finds it answers `T` on the vulnerable build every time, but on
+      the fixed build it answers `T` in two of ten runs: **flaky**, and in the worse direction (a false red that people will learn to ignore).
+      She finds the cause - the test used a shared server that another test was restarting - gives it its own server per build, and runs the
+      guard again: *trustworthy*. She had considered quarantining it, but the finding is High and a quarantined guard is a reopened finding;
+      fixing the test took less time than explaining the quarantine.
+
+      The release review gets one page: four closed findings, four guarded, one expired acceptance resolved, one dangling test restored, one
+      flaky test fixed at its cause. What the page does **not** say is "the application is secure" - it says that what was found has stayed
+      fixed.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Test cases for a security regression suite
+    body: |
+      | # | Case | Steps | Expected | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Red on the vulnerable build | run the new test on the build before the fix | fails with the finding id in the message | the failing run |
+      | 2 | Green on the fixed build | run it on the fixed build | passes | the passing run |
+      | 3 | Positive control | break the login (wrong password) and run the probe | an error that says the control failed, not a pass | the error text |
+      | 4 | Not confused by other flaws | run the probe with every other flaw fixed | still reports its own flaw | the result |
+      | 5 | Nothing sensitive in the log | read the test output and the report | a key name at most, never a value, a token or a password | the log |
+      | 6 | Strict expected failure | open finding, then fix it without touching the test | the suite fails with XPASS(strict) | the run |
+      | 7 | Fixed without test | add a `fixed` entry with no test | the registry check reports it | the report |
+      | 8 | Dangling test | rename a test function | the registry check reports the old node id | the report |
+      | 9 | Orphan test | add a test that no finding names | reported with no finding id | the report |
+      | 10 | Accepted risk | accept a finding without a date; with a date in the past | incomplete; expired | the report |
+      | 11 | Expiry day | accepted until today | not expired | the report |
+      | 12 | Bad registry | duplicate id, unknown status, invalid JSON | an error, not a shorter list | the message |
+      | 13 | Guard: flaky | probe that gives both answers | verdict flaky, action quarantine | the table |
+      | 14 | Guard: blind and noisy | a probe that never reports; one that always reports | blind; noisy; both fix-test | the table |
+      | 15 | Quarantine limit | a flaky test quarantined for more than the limit | escalate | the action |
+      | 16 | Unknown verdict | pass a typo to the CI decision | an error, not a pass | the message |
+      | 17 | Same coverage, still guarded | rename a *file* but keep the function name | the node id changes - the registry check still fails until the entry is updated | the report |
+
+      Cases 1 to 4 are the positive and negative controls you used on the portal in the earlier lessons: a test that has never been red proves
+      nothing, and a control that cannot fail proves nothing either. Cases 7 to 12 test the *registry*, which is software too and gets its own tests.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Common mistakes and a debugging method
+    body: |
+      | Mistake | What happens | Fix |
+      | --- | --- | --- |
+      | The test was only ever run on the fixed build | It may be blind - for example a request that gets a 401 for the wrong reason | Run it on the vulnerable build first and keep the red result |
+      | No positive control | A broken login, a changed URL or a renamed field looks like "not vulnerable" | Control request first; raise an error when it fails |
+      | The probe returns the data it read | A secret or a token ends up in a test log or a failure message | Return a bool; check for a key name; discard the body |
+      | `except Exception: return False` in a probe | Every error becomes a pass | Let errors escape, or raise a clear `RuntimeError` |
+      | Testing the exact payload from the report | A fix that blocks that string passes; the flaw is still there | Test the property with several shapes, or test the cause with a unit test |
+      | Closing a finding with no test | It silently regresses | Registry check: fixed-without-test |
+      | Listing a test by file name only | Renaming a function does not break the link, so the registry lies | Use the full node id |
+      | Deleting a "strange old test" | The only guard of a closed finding is gone | Check the registry first; orphans are traced, not guessed |
+      | `xfail` without `strict=True` for an open finding | The fix makes it XPASS and the suite stays green - the test stops guarding | `strict=True` and a reason that says to remove it |
+      | Leaving `xfail` on a fixed finding | It can never fail again | The fix's pull request must remove it |
+      | Re-running a failed test until it passes | A real regression is hidden behind a flake | Run the guard; find the cause; quarantine only with an owner and an end date |
+      | Permanent quarantine | The finding is open in everything but name | An expiry date, escalation, and a registry note |
+      | Treating coverage as security | "100% of findings are guarded" becomes "we are secure" | Report it as traceability; say what was not tested |
+      | Writing the registry as prose | Nothing can check it | A structured list with node ids, checked by code in CI |
+
+      **A debugging method.** When a regression test is red: (1) read the finding id in the message - which flaw says it is back? (2) run the
+      positive control by hand - if it fails, the problem is the test or the environment, not the flaw; (3) run the probe against the
+      commit before the last merge - when did it turn red? (4) only then open the application code. When a test is *green but you doubt it*:
+      run it against the revert of the fix. If it is still green, it is blind.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Trade-offs and alternatives
+    body: |
+      | Choice | Benefit | Cost |
+      | --- | --- | --- |
+      | HTTP-level test of the finding as the attacker saw it | Proves the whole stack, including routing and configuration | Slower, more state, more ways to flake |
+      | Unit test of the cause (an encoder, an ownership check) | Fast and stable, close to the bug | Does not prove the route still calls it |
+      | Both | The finding is guarded at two levels | Two things to maintain - keep the HTTP test small |
+      | Run every regression test on each pull request | A regression is caught before merge | Long pipelines; people start skipping the gate |
+      | Fast tests on PRs, slow ones nightly | Quick feedback | A slow-test regression can ship for a day |
+      | Strict expected failure for open findings | The fix cannot forget the test | A little ceremony; a marker to remove |
+      | Quarantine a flaky test | The team keeps moving | The finding is effectively open - needs an owner and a deadline |
+      | Reruns (a plugin that retries failures) | Hides infrastructure noise | Can hide a real intermittent flaw too - pytest's guide lists reruns as a mitigation, not a cure |
+      | A registry in code (JSON checked in CI) | Checked by machines, reviewed in pull requests | Duplicates the tracker; keep one source |
+      | A registry in the issue tracker | One place for findings | Needs an export to be checked against the test list |
+      | Scanners (SAST, DAST) instead | No tests to write | They catch classes, not *your* past findings, and they do not know the finding history |
+      | Property-based or fuzz testing | Finds new variants of a flaw | Different tool, different cost; it complements, not replaces, the regression suite |
+
+      **The honest limit:** a regression suite guards the past. A new endpoint, a new account type or a new business rule has no test until
+      somebody finds a flaw in it. The suite is a floor, and the assessment, the scanners and the code review stay on top of it.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-reg-pair, sec-reg-registry, sec-reg-trust]
+    title: Summary
+    body: |
+      - A security regression test is a **probe** (control, attack, return a bool) that fails if one already-fixed flaw comes back. It never
+        returns or logs what it read.
+      - Prove it with the **red/green pair**: it must report the flaw on the build that has it and stay quiet where only that flaw is fixed.
+        Only-ever-green means blind until shown otherwise; red on the fixed build means noisy.
+      - Raise an error when the **positive control** fails - "could not ask" is not "not vulnerable".
+      - For an **open** finding write the test first and mark it `xfail(strict=True)`; the fix then fails until the marker is removed.
+      - Keep a **registry** of findings with pytest node ids and check it against `pytest --collect-only -q`: fixed-without-test, dangling,
+        orphan, and accepted risks that are incomplete or expired. Parse it strictly.
+      - Coverage of closed findings is a **traceability** number, not a security score.
+      - **Guard the test**: run it several times on both builds. Flaky (both answers on one build), noisy, blind or broken - each has a different
+        action. A quarantined security test is a reopened finding, so it needs an owner, an end date and an escalation.
+      - The suite guards what was found. It is the floor under the assessments, the scanners and the reviews, not their replacement.
+
+exercises:
+  - id: rg-red-first
+    type: mcq
+    concept: sec-reg-pair
+    skill: analysis
+    title: Why run the new test on the vulnerable build?
+    prompt: |
+      A developer fixes SP-101 (Alice can read Bob's payment) and writes a regression test. The test passes on the fixed branch, and they
+      want to merge. What is the missing step, and why?
+    options:
+      - id: red
+        text: "Run it on a build that still has the flaw and see it fail. A test that was only ever green might be blind - for example a request that is rejected for the wrong reason."
+        feedback: "Correct. The red run is the evidence that the test can tell the two builds apart."
+      - id: more
+        text: "Run it ten more times on the fixed branch to be sure it is stable."
+        feedback: "Stability matters (the guard checks it), but ten green runs on the fixed build still cannot show that the test would fail on a vulnerable one."
+      - id: review
+        text: "Nothing - a passing test on the fixed build is exactly what a regression test is."
+        feedback: "A passing test is only half of it. If the probe forgot the token, it passes on both builds and protects nothing."
+      - id: scan
+        text: "Run the DAST scanner instead, because scanners find regressions."
+        feedback: "A scanner finds classes of problems; it does not know that SP-101 happened before."
+    correct: [red]
+    hints:
+      - What would the test have said if the fix had never been written?
+      - Which build shows that the test can fail?
+    solution: |
+      Run it on the vulnerable build (the commit before the fix, or a scratch revert) and keep the red result. Without it, the test may be
+      green for the wrong reason and protect nothing.
+
+  - id: rg-control
+    type: mcq
+    concept: sec-reg-pair
+    skill: analysis
+    title: What does the missing control hide?
+    prompt: |
+      A probe logs in with `try ... except Exception: return False`, then requests Bob's payment as Alice. After a release, the login endpoint
+      starts answering 500 because of a configuration error. What does the regression suite report?
+    options:
+      - id: green
+        text: "All green. The failed login becomes False - 'flaw not present' - so the suite reports a pass while testing nothing."
+        feedback: "Correct. Swallowing the error turns 'could not ask' into 'not vulnerable'."
+      - id: red
+        text: "Red - the exception makes the test fail."
+        feedback: "Not here: the exception is caught, and the probe returns False."
+      - id: skipped
+        text: "The test is skipped automatically because the login failed."
+        feedback: "pytest only skips what is marked or raised as skipped; a caught exception is not a skip."
+      - id: flaky
+        text: "Flaky - it passes sometimes and fails sometimes."
+        feedback: "It is consistently green; that is the problem."
+    correct: [green]
+    hints:
+      - What does the probe return when the login raises?
+      - What does a True or False mean to the caller?
+    solution: |
+      A caught login error becomes False ("flaw absent"), so the test passes while testing nothing. Raise an error for a failed control.
+
+  - id: rg-property
+    type: mcq
+    concept: sec-reg-pair
+    skill: application
+    title: The exact payload or the property?
+    prompt: |
+      The report for a reflected XSS finding used the payload `<script>alert(1)</script>`. The developer fixes it by removing the string
+      `<script>` from the query. Which regression test would still catch the original flaw class?
+    options:
+      - id: property
+        text: "A test that sends several shapes (a tag, an attribute break-out, a script URL) and checks that none comes back unencoded - plus a unit test of the output encoder."
+        feedback: "Correct. It tests the property 'output is encoded', so a fix that blocks one string does not satisfy it."
+      - id: exact
+        text: "The test that sends exactly `<script>alert(1)</script>` and checks it is not reflected."
+        feedback: "That fix passes this test, and `<img src=x onerror=...>` still works."
+      - id: status
+        text: "A test that checks the page answers 200."
+        feedback: "A vulnerable page also answers 200."
+      - id: header
+        text: "A test that checks the server header."
+        feedback: "Unrelated to the flaw."
+    correct: [property]
+    hints:
+      - What does the fix block, and what does it leave?
+    solution: |
+      Test the property (output is encoded) with several shapes, and test the encoder itself; a test of the exact reported string is passed by a
+      fix that only blocks that string.
+
+  - id: rg-xfail
+    type: mcq
+    concept: sec-reg-pair
+    skill: application
+    title: What does strict do?
+    prompt: |
+      SP-105 is open. Its test is marked `@pytest.mark.xfail(strict=True, reason="...")`. A developer fixes the flaw and forgets the marker. What does
+      pytest do?
+    options:
+      - id: fail
+        text: "The test XPASSes and, because strict is on, the suite FAILS - the developer is told to remove the marker."
+        feedback: "Correct. The pytest documentation: strict makes XPASS ('unexpectedly passing') results fail the test suite."
+      - id: pass
+        text: "The suite stays green and shows an XPASS."
+        feedback: "That is the non-strict default: 'both XFAIL and XPASS don't fail the test suite by default'."
+      - id: skip
+        text: "The test is skipped from now on."
+        feedback: "xfail does not skip: the test runs and its result is compared with the expectation."
+      - id: error
+        text: "pytest reports a collection error."
+        feedback: "The test collects normally."
+    correct: [fail]
+    hints:
+      - What does 'unexpectedly passing' mean for an expected failure?
+    solution: |
+      With strict=True an XPASS fails the suite, so the pull request that fixes the finding cannot forget to remove the marker.
+
+  - id: rg-orphan
+    type: mcq
+    concept: sec-reg-registry
+    skill: analysis
+    title: What is an orphan test?
+    prompt: |
+      The registry check reports `orphan-test tests/regression/test_old_cors.py::test_cors_wildcard guards no registered finding`. What should you do?
+    options:
+      - id: trace
+        text: "Find out which finding it was written for. If there is one, add the node id to its entry; if there is none, delete the test with a note."
+        feedback: "Correct. A test with no known purpose is a risk either way: it may be the only guard of something, or dead weight."
+      - id: delete
+        text: "Delete it immediately - an orphan is dead code."
+        feedback: "It may be the only guard of a closed finding whose registry entry was never written."
+      - id: ignore
+        text: "Ignore it - only findings matter, not tests."
+        feedback: "Then the registry cannot be trusted: you do not know what the test is for."
+      - id: gate
+        text: "Move it to quarantine."
+        feedback: "Quarantine is for flaky tests, not for unlabelled ones."
+    correct: [trace]
+    hints:
+      - Could it be the only guard of something?
+    solution: |
+      Trace it to a finding and register it, or delete it with a note saying why - never guess.
+
+  - id: rg-dangling
+    type: mcq
+    concept: sec-reg-registry
+    skill: analysis
+    title: Why is a dangling test the dangerous one?
+    prompt: |
+      Of the five registry problems, a colleague says the dangling test is the one that worries them most. Why?
+    options:
+      - id: silent
+        text: "Nothing is red: a test that no longer exists cannot fail, so coverage disappears while the registry still says 'covered'."
+        feedback: "Correct. Only a check of the registry against the collected tests can see it."
+      - id: slow
+        text: "It makes the pipeline slower."
+        feedback: "A missing test costs nothing to run - that is the point."
+      - id: noisy
+        text: "It fails the build every night."
+        feedback: "It fails nothing; the registry check is what raises it."
+      - id: dup
+        text: "It means two findings share a test."
+        feedback: "That is a different situation; a dangling entry names a test that is not collected."
+    correct: [silent]
+    hints:
+      - What does a deleted test report?
+    solution: |
+      A deleted or renamed test produces no result at all, so the loss is silent; the registry check against pytest's collected ids is the only
+      thing that notices.
+
+  - id: rg-coverage
+    type: mcq
+    concept: sec-reg-registry
+    skill: application
+    title: What does a coverage ratio of 1.0 say?
+    prompt: |
+      The registry report shows `{'fixed': 12, 'covered': 12, 'ratio': 1.0}`. A manager writes "100% secure" on a slide. What is the accurate statement?
+    options:
+      - id: trace
+        text: "Every closed finding has a test that exists. It says nothing about untested flaws, nor about whether the tests are good."
+        feedback: "Correct. It is a traceability figure about past findings."
+      - id: secure
+        text: "The application has no vulnerabilities."
+        feedback: "It only covers findings that were already found."
+      - id: good
+        text: "All twelve tests are trustworthy."
+        feedback: "Existence is not quality - the guard checks that separately."
+      - id: gate
+        text: "The pipeline will block every regression."
+        feedback: "Only if the tests run in the gate and are trustworthy."
+    correct: [trace]
+    hints:
+      - What was counted?
+    solution: |
+      It counts closed findings that have a collected test. It says nothing about unfound flaws or the quality of the tests.
+
+  - id: rg-accepted
+    type: mcq
+    concept: sec-reg-registry
+    skill: application
+    title: What does an accepted risk need?
+    prompt: |
+      A Low finding will not be fixed this quarter. Which registry entry is acceptable?
+    options:
+      - id: full
+        text: "status accepted, a reason, an owner and an accepted_until date - after which the check turns red."
+        feedback: "Correct. An acceptance is a decision with an end, not a closure."
+      - id: closed
+        text: "status fixed, with no test, because it is Low."
+        feedback: "That records a fix that did not happen."
+      - id: forever
+        text: "status accepted with no date, so nobody has to revisit it."
+        feedback: "Reported as incomplete: a risk nobody will revisit."
+      - id: delete
+        text: "Remove the entry."
+        feedback: "The finding still exists; deleting the entry loses the decision."
+    correct: [full]
+    hints:
+      - When will somebody look at it again?
+    solution: |
+      Accepted with a reason, an owner and an end date, so the registry check forces a new decision when the date passes.
+
+  - id: rg-flaky
+    type: mcq
+    concept: sec-reg-trust
+    skill: analysis
+    title: Which verdict is this?
+    prompt: |
+      Five runs of a probe give `TTFTT` on the vulnerable build and `FFFFF` on the fixed build. What is the verdict, and what does CI do?
+    options:
+      - id: flaky
+        text: "Flaky - both answers appeared on the same build. CI quarantines it with an owner and an end date, then escalates."
+        feedback: "Correct. The Google definition: both a passing and a failing result with the same code."
+      - id: trust
+        text: "Trustworthy - four of five runs found the flaw."
+        feedback: "A test that sometimes misses the flaw cannot be trusted to catch a regression."
+      - id: blind
+        text: "Blind - it missed the flaw once."
+        feedback: "Blind means it never reports the flaw; here the answers are mixed."
+      - id: noisy
+        text: "Noisy - the vulnerable build gave a false negative."
+        feedback: "Noisy means it reports the flaw on the fixed build."
+    correct: [flaky]
+    hints:
+      - Do the answers on one build agree with each other?
+    solution: |
+      Mixed answers on the vulnerable build make it flaky, whatever the other build says; CI quarantines it with an owner and an end date, then escalates.
+
+  - id: rg-quarantine
+    type: mcq
+    concept: sec-reg-trust
+    skill: application
+    title: Quarantining the guard of a High finding
+    prompt: |
+      The regression test for a High finding is flaky and blocks merges. A colleague proposes moving it out of the gate "until someone has time". What is
+      the best response?
+    options:
+      - id: owner
+        text: "Quarantine only with an owner, an end date and a note on the finding - for that time the finding is effectively open - and escalate when the date passes. Better, fix the flake first."
+        feedback: "Correct. A quarantined security test is a reopened finding."
+      - id: yes
+        text: "Agree - flaky tests are noise and should be hidden."
+        feedback: "Hiding it hides the only guard; the Google post warns it can 'easily mask a real race condition or some other bug'."
+      - id: rerun
+        text: "Re-run it until it passes."
+        feedback: "A real regression can hide behind a re-run."
+      - id: delete
+        text: "Delete the test and mark the finding closed."
+        feedback: "That removes the guard and keeps the claim."
+    correct: [owner]
+    hints:
+      - What is protecting the finding while the test is out of the gate?
+    solution: |
+      Quarantine only with an owner, an end date and a visible note; the finding is effectively open meanwhile, and the limit must escalate. Fixing the flake is better.
+
+  - id: rg-order
+    type: order
+    concept: sec-reg-pair
+    skill: application
+    title: Add a regression test for a new finding in order
+    prompt: Put the steps for adding a regression test for a confirmed finding in a sensible order.
+    items:
+      - id: confirm
+        text: Confirm the finding by hand and write down the request and the evidence
+      - id: control
+        text: Write the positive control and the probe that returns a bool
+      - id: red
+        text: Run the test on the vulnerable build and see it fail
+      - id: mark
+        text: Mark it as a strict expected failure while the finding is open
+      - id: fix
+        text: Fix the flaw and run the test on the fixed build to see it pass
+      - id: guard
+        text: Run the guard on both builds and fix the test if it is not trustworthy
+      - id: register
+        text: Remove the marker, register the node id and set the status to fixed
+    hints:
+      - You cannot register a test that you have not seen go red and green.
+      - The marker goes on while the finding is open and comes off in the fix.
+    solution: |
+      Confirm, write the control and the probe, see it red, mark it as a strict expected failure, fix and see it green, run the guard, then remove the marker and
+      register the node id.
+
+  - id: rg-debug
+    type: debug
+    concept: sec-reg-pair
+    skill: analysis
+    title: Which line turns a broken login into a pass?
+    prompt: |
+      This probe is meant to report whether Alice can read Bob's payment. Pick the line that makes the suite pass when the login endpoint is broken.
+    language: python
+    code: |
+      def probe_idor(base_url):
+          try:
+              token = login(base_url)
+          except Exception:
+              return False
+          headers = {"Authorization": f"Bearer {token}"}
+          other = requests.get(base_url + "/api/payments/pay_2001", headers=headers, timeout=5)
+          return other.status_code == 200
+    correctLines: [5]
+    hints:
+      - What does the caller understand when a probe returns False?
+      - What should a failed login be instead of an answer?
+    lineNotes:
+      - line: 5
+        note: A failed login becomes False, which means "flaw not present". It must raise an error so the test fails loudly.
+      - line: 7
+        note: There is no control request that proves Alice can read her own payment with this token, so a wrong token or URL cannot be told from "denied".
+      - line: 8
+        note: The result is only the status. A 200 that does not carry the other merchant's data is not evidence of the flaw - check the owner field.
+    solution: |
+      Line 5 returns False when the login fails, so a broken login looks like "not vulnerable". Raise an error for a failed control (and add the own-payment
+      control and the owner check on lines 7 and 8).
+
+  - id: rg-short
+    type: short
+    concept: sec-reg-trust
+    skill: analysis
+    title: Explain why re-running is not a fix
+    prompt: |
+      A developer says the regression test for the open-redirect finding "just needs a re-run" because it fails about one run in ten. In a few sentences, explain
+      what is wrong with re-running, what you would do instead and what you would not do.
+    modelAnswer: |
+      A test that gives both a passing and a failing result on the same code is flaky, and re-running until it passes hides it - a real regression
+      would be hidden behind the same re-run. Worse, the team learns to ignore red.
+
+      I would run the guard on both builds with more runs to see whether it is noisy (fails on the fixed build) or flaky both ways, then find the cause (shared state,
+      ordering, a server another test restarts) and fix it. If it must leave the gate meanwhile, I would quarantine it with an owner and an end date, note it on the
+      finding - because the finding is effectively open - and escalate if the date passes.
+
+      I would not delete it, I would not leave it quarantined without a date, and I would not mark the finding closed.
+    rubric:
+      - Says re-running hides the flake and can hide a real regression.
+      - Proposes running the guard to classify it and fixing the cause (state, ordering, shared server).
+      - Quarantine only with an owner, an end date and a note on the finding, with escalation.
+      - Does not delete the test or close the finding.
+    hints:
+      - What would a real regression look like behind a re-run?
+      - What does a quarantine cost the finding?
+    solution: Re-running hides a flake and can hide a regression; run the guard, fix the cause, quarantine only with an owner and an end date, never delete the guard.
+
+  - id: rg-testdesign
+    type: testdesign
+    concept: sec-reg-registry
+    skill: application
+    title: Test plan for the registry check
+    prompt: |
+      SandPay wants a nightly job that checks the finding-to-test registry against pytest's collected tests. Design the test plan for the job itself - preconditions,
+      steps, expected result and evidence for each case.
+    modelAnswer: |
+      Preconditions: a throwaway copy of the registry and a small test folder, the job configuration, and a fixed "today" date.
+
+      1. **Healthy registry** - every fixed finding has an existing test. Expected: no problems, exit 0. Evidence: the report.
+      2. **Fixed without test** - add a fixed entry with no test. Expected: reported by finding id.
+      3. **Dangling** - rename a test function. Expected: the old node id is reported, and the new one is reported as an orphan.
+      4. **Orphan** - add a test no entry names. Expected: reported with no finding id.
+      5. **Accepted incomplete** - an accepted entry without a date, and one without a reason. Expected: both reported.
+      6. **Accepted expired and the boundary** - a date yesterday, and a date today. Expected: expired; not expired.
+      7. **Bad registry** - invalid JSON, a duplicate id, an unknown status or severity. Expected: an error that stops the job, not a shorter list.
+      8. **Open finding** - an open entry with no test, and one naming a missing test. Expected: no problem; a dangling report.
+      9. **Collection output** - include the summary line and warnings. Expected: only node ids are read.
+      10. **Fail closed** - pytest collection fails. Expected: the job fails, not a pass.
+    rubric:
+      - Covers fixed-without-test, dangling, orphan, accepted-incomplete and accepted-expired.
+      - Tests the date boundary and the bad-registry errors.
+      - Includes open findings and the parsing of pytest output.
+      - Fails closed when collection or parsing fails.
+      - Every case has preconditions, steps, an expected result and evidence.
+    hints:
+      - Which inputs could make the job report nothing while something is wrong?
+      - What happens on the expiry day itself?
+    solution: |
+      Cover each problem kind, the date boundary, bad registries, open findings, the pytest output format, and make the job fail closed.
+
+  - id: rg-interview
+    type: interview
+    concept: sec-reg-trust
+    skill: analysis
+    title: 'Interview: how do you stop fixed vulnerabilities coming back?'
+    prompt: '"Your last penetration test found twelve issues and they were all fixed. How do you make sure they stay fixed?"'
+    modelAnswer: |
+      For each confirmed finding I write an automated test: a probe with a positive control that returns a bool and never keeps what it read. I prove it
+      with the red/green pair - it must fail on the build that has the flaw and pass where only that flaw is fixed - otherwise it may be blind. While a finding is
+      open I mark its test as a strict expected failure, so the fix has to remove the marker.
+
+      I keep a registry of findings with the pytest node id of each test and check it in CI against `pytest --collect-only -q`: closed findings with no test, tests
+      that were renamed or deleted, orphan tests, and accepted risks without a reason or with an expired date. I report coverage as traceability, not as security.
+
+      I guard the tests themselves: run them several times on both builds, and treat flaky, blind, noisy and broken differently. A flaky test of a High finding
+      may be quarantined only with an owner and an end date, because that finding is effectively open. And I say what the suite does not do: it guards what was found,
+      not what has not been found yet.
+    rubric:
+      - Describes a probe with a positive control, proven red on the vulnerable build and green on the fixed one.
+      - Describes a registry with node ids checked against the collected tests (fixed-without-test, dangling, orphan, expired).
+      - Handles flaky, blind and noisy tests and the risk of quarantine.
+      - States the limit - it guards past findings only - and treats coverage as traceability.
+    followUps:
+      - How would you test the registry check itself?
+      - What would make you test a finding at the unit level instead of through HTTP?
+      - A finding is about denial of service. What do you do?
+    hints:
+      - Structure it as test, proof, registry, trust, limit.
+    solution: A test per finding proven red then green, a registry checked against collected tests, a guard for flaky/blind/noisy, quarantine with an owner and date, and the limit that it guards the past only.
+
+  - id: rg-probe-code
+    type: coding
+    concept: sec-reg-pair
+    skill: application
+    title: Write the three probes and the red/green proof
+    prompt: |
+      In `practice/security/exercises/devsecops/reg_probe.py`, implement `probe_idor`, `probe_open_redirect`, `probe_path_traversal` and `prove_pair`. Each probe runs a
+      positive control, raises `RuntimeError` when the control fails, returns a bool, and never keeps what it read. `prove_pair` serves the vulnerable build and the build with
+      only the flaw fixed and gives `red-green`, `blind` or `noisy`. The tests run each probe against the vulnerable portal, against the fixed one, against a portal with every
+      other flaw fixed, and against a server that answers 404 to everything.
+    project: security
+    files: [exercises/devsecops/reg_probe.py]
+    test: tests/devsecops/test_reg_probe.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_reg_probe.py
+    modelAnswer: |
+      ```python
+      def probe_idor(base_url):
+          token = _login(base_url, *ALICE)
+          headers = {"Authorization": f"Bearer {token}"}
+          own = requests.get(base_url + "/api/payments/pay_1001", headers=headers, timeout=5)
+          if own.status_code != 200 or own.json().get("merchant_id") != "m_100":
+              raise RuntimeError("control failed: Alice cannot read her own payment")
+          other = requests.get(base_url + "/api/payments/pay_2001", headers=headers, timeout=5)
+          return other.status_code == 200 and other.json().get("merchant_id") == "m_200"
+
+      def prove_pair(flaw, probe=None):
+          if probe is None:
+              if flaw not in PROBES:
+                  raise ValueError(f"no probe for flaw {flaw!r}")
+              probe = PROBES[flaw]
+          with serve(make_app()) as base:
+              found_vulnerable = bool(probe(base))
+          with serve(make_app({flaw})) as base:
+              found_fixed = bool(probe(base))
+          verdict = "noisy" if found_fixed else ("blind" if not found_vulnerable else "red-green")
+          return PairResult(flaw, found_vulnerable, found_fixed, verdict)
+      ```
+
+      The redirect probe passes `allow_redirects=False` and compares `urlsplit(location).netloc`; the traversal probe looks for the key name `SETTLEMENT_SIGNING_KEY=` and keeps nothing.
+    rubric:
+      - Every test in tests/devsecops/test_reg_probe.py passes.
+      - Each probe runs a positive control first and raises RuntimeError when it fails.
+      - Each probe returns a bool, never the data it read, and still finds its flaw when all other flaws are fixed.
+      - prove_pair uses one portal per build and returns red-green, blind or noisy, with noisy checked first.
+      - A flaw with no probe raises ValueError unless a probe is passed.
+    hints:
+      - 'The control comes before the attack, and a failed control is `raise RuntimeError(...)`, not `return False`.'
+      - Use `allow_redirects=False` and read the Location header with `urllib.parse.urlsplit`.
+      - Check `found_fixed` first in `prove_pair`.
+    solution: Log in, run a control, ask once, return a bool and raise on a failed control; prove_pair serves both builds and checks noisy, then blind, then red-green.
+
+  - id: rg-registry-code
+    type: coding
+    concept: sec-reg-registry
+    skill: application
+    title: Write the registry checks
+    prompt: |
+      In `practice/security/exercises/devsecops/reg_registry.py`, implement `parse_registry`, `parse_collected`, `registry_problems` and `coverage`. Parsing must fail closed with `ValueError`.
+      The problems are `fixed-without-test`, `dangling-test`, `accepted-incomplete`, `accepted-expired` per entry in that order, then a sorted `orphan-test` for each collected test no entry names.
+      The tests run the checks on the lesson's synthetic registry, on its boundaries and on malformed input.
+    project: security
+    files: [exercises/devsecops/reg_registry.py]
+    test: tests/devsecops/test_reg_registry.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_reg_registry.py
+    modelAnswer: |
+      ```python
+      def registry_problems(entries, test_ids, today):
+          now = date.fromisoformat(today)
+          problems = []
+          for e in entries:
+              if e.status == "fixed" and not e.test:
+                  problems.append(Problem("fixed-without-test", e.id, f"{e.flaw} is fixed but no test guards it"))
+              if e.test and e.test not in test_ids:
+                  problems.append(Problem("dangling-test", e.id, f"{e.test} was not collected"))
+              if e.status == "accepted":
+                  if not e.accepted_until or not e.reason:
+                      problems.append(Problem("accepted-incomplete", e.id, "an accepted risk needs a date and a reason"))
+                  elif date.fromisoformat(e.accepted_until) < now:
+                      problems.append(Problem("accepted-expired", e.id, f"acceptance ended on {e.accepted_until}"))
+          named = {e.test for e in entries if e.test}
+          for test_id in sorted(test_ids - named):
+              problems.append(Problem("orphan-test", None, f"{test_id} guards no registered finding"))
+          return problems
+      ```
+
+      `parse_collected` keeps the stripped lines that contain `::` and no space. `parse_registry` validates every field and raises `ValueError`; `coverage` counts the fixed entries and those whose test was collected.
+    rubric:
+      - Every test in tests/devsecops/test_reg_registry.py passes.
+      - parse_registry raises ValueError for bad JSON, a non-list, a missing field, an unknown status or severity and a duplicate id.
+      - parse_collected keeps only node ids and ignores summaries, warnings and blank lines.
+      - Problems are reported in the specified order, the expiry day itself is still valid, and orphans are sorted with no finding id.
+      - coverage returns fixed, covered and a ratio that is 1.0 when nothing is fixed.
+    hints:
+      - '`date.fromisoformat` gives you dates you can compare with `<`.'
+      - A set difference finds the orphans; sort them for a stable report.
+      - An open finding with no test is fine; an open finding naming a missing test is dangling.
+    solution: Validate strictly in parse_registry, keep the node-id lines in parse_collected, report the four per-entry problems then the sorted orphans, and count covered fixed entries.
+
+  - id: rg-guard-code
+    type: coding
+    concept: sec-reg-trust
+    skill: application
+    title: Write the guard and the CI decision
+    prompt: |
+      In `practice/security/exercises/devsecops/reg_guard.py`, implement `classify`, `run_guard` and `ci_action`. `classify` checks flaky, then noisy, then blind, then trustworthy. `run_guard` serves one portal per
+      build, runs the probe `runs` times on each and returns `broken` when the probe raises `RuntimeError`. `ci_action` gates, quarantines, escalates or asks for a test fix, and raises for an unknown verdict.
+      The tests use real and counter-driven probes.
+    project: security
+    files: [exercises/devsecops/reg_guard.py]
+    test: tests/devsecops/test_reg_guard.py
+    command: .venv/bin/python -m pytest tests/devsecops/test_reg_guard.py
+    modelAnswer: |
+      ```python
+      def classify(vulnerable_runs, fixed_runs):
+          if not vulnerable_runs or not fixed_runs:
+              raise ValueError("need at least one run on each build")
+          if len(set(vulnerable_runs)) > 1 or len(set(fixed_runs)) > 1:
+              return "flaky"
+          if fixed_runs[0]:
+              return "noisy"
+          if not vulnerable_runs[0]:
+              return "blind"
+          return "trustworthy"
+
+      def ci_action(verdict, quarantined_days=0, max_days=14):
+          if verdict == "trustworthy":
+              return "gate"
+          if verdict == "flaky":
+              return "quarantine" if quarantined_days <= max_days else "escalate"
+          if verdict in ("blind", "noisy", "broken"):
+              return "fix-test"
+          raise ValueError(f"unknown verdict {verdict!r}")
+      ```
+
+      `run_guard` collects the answers inside `try`/`except RuntimeError`, serving each build once and looping inside the `with` block.
+    rubric:
+      - Every test in tests/devsecops/test_reg_guard.py passes.
+      - classify checks flaky, noisy, blind, trustworthy in that order and rejects empty lists.
+      - run_guard serves one portal per build, runs the probe the same number of times on each, and returns broken (keeping the collected answers) when the control fails.
+      - ci_action follows the table, honours max_days and raises ValueError for an unknown verdict.
+    hints:
+      - '`len(set(runs)) > 1` means both answers appeared.'
+      - Serve each build once and loop inside the with block - not one server per run.
+      - An unknown verdict must raise, never fall through to a pass.
+    solution: Check flaky, noisy, blind then trustworthy; serve each build once and catch RuntimeError for broken; map verdicts to actions and raise for an unknown one.
+
+placement:
+  - id: rg-place-pair
+    type: mcq
+    concept: sec-reg-pair
+    skill: analysis
+    title: Is the test proven?
+    prompt: |
+      A regression test for a path-traversal finding passes on the fixed build. Nobody has run it on the vulnerable build. What is the accurate reading?
+    options:
+      - id: unproven
+        text: "Not proven - it may be blind. Run it on the vulnerable build and see it fail."
+        feedback: "Correct. A test that was only ever green might be green for the wrong reason."
+      - id: proven
+        text: "Proven - it passes."
+        feedback: "A pass on the fixed build is only half of the proof."
+      - id: noisy
+        text: "Noisy - it should have failed."
+        feedback: "Noisy means it reports the flaw on the fixed build."
+    correct: [unproven]
+    solution: A test seen only green is unproven; run it on the vulnerable build and see it fail.
+
+  - id: rg-place-registry
+    type: mcq
+    concept: sec-reg-registry
+    skill: analysis
+    title: Which problem is this?
+    prompt: |
+      The registry says SP-104 is fixed and guarded by `test_status_filter_is_not_injectable`, but `pytest --collect-only -q` does not list that test. What is the problem and why is it quiet?
+    options:
+      - id: dangling
+        text: "A dangling test - the guard was renamed or deleted. It is quiet because a test that does not exist cannot fail."
+        feedback: "Correct. Only the registry check against the collected ids sees it."
+      - id: orphan
+        text: "An orphan test - a test with no finding."
+        feedback: "An orphan is the reverse: a collected test no finding names."
+      - id: flaky
+        text: "A flaky test."
+        feedback: "A flaky test runs and gives mixed results; this one does not run at all."
+    correct: [dangling]
+    solution: It is a dangling test; a missing test reports nothing, so only the registry check against the collected ids notices.
+
+  - id: rg-place-trust
+    type: mcq
+    concept: sec-reg-trust
+    skill: application
+    title: What does CI do?
+    prompt: |
+      The guard says a probe is blind - it never reports the flaw on the vulnerable build. What does CI do with it?
+    options:
+      - id: fix
+        text: "Send the test back to be fixed - it protects nothing - and do not delete the finding's guard."
+        feedback: "Correct. Blind, noisy and broken all mean the test is wrong."
+      - id: gate
+        text: "Gate on it - it has never failed."
+        feedback: "Never failing is the symptom."
+      - id: quarantine
+        text: "Quarantine it like a flaky test."
+        feedback: "Quarantine is for tests whose answers are mixed; a blind test is consistently wrong."
+    correct: [fix]
+    solution: A blind test protects nothing; send it back to be fixed, and do not remove the finding's guard.
+
+recall:
+  - id: rg-recall-pair
+    concept: sec-reg-pair
+    prompt: What is the red/green pair and what are its three verdicts?
+    answer: Run the probe on the build that has the flaw (it must report it) and on the build where only that flaw is fixed (it must stay quiet). Red-green is proven; blind never reports the flaw; noisy reports it on the fixed build.
+  - id: rg-recall-control
+    concept: sec-reg-pair
+    prompt: Why must a probe raise an error when its positive control fails?
+    answer: Not being able to ask is not the same as "not vulnerable". A broken login or a changed URL would otherwise look like a secure build and keep the suite green.
+  - id: rg-recall-xfail
+    concept: sec-reg-pair
+    prompt: How do you write the test for a finding that is still open?
+    answer: Write it first and mark it @pytest.mark.xfail(strict=True, reason=...). It is an expected failure now, and when the fix lands the XPASS fails the suite until the marker is removed.
+  - id: rg-recall-registry
+    concept: sec-reg-registry
+    prompt: What five problems does the registry check report?
+    answer: Fixed without a test, dangling test (named but not collected), accepted risk incomplete (no date or reason), accepted risk expired, and orphan test (collected but no finding names it).
+  - id: rg-recall-nodeid
+    concept: sec-reg-registry
+    prompt: Why list tests by pytest node id and get them from --collect-only -q?
+    answer: A node id (path::function) breaks when a test is renamed or deleted, which is exactly what must be noticed. The collected list is what pytest really runs, so the registry is checked against reality.
+  - id: rg-recall-flaky
+    concept: sec-reg-trust
+    prompt: What is a flaky result, and what two extra states does a security test have?
+    answer: Google's definition - both a passing and a failing result with the same code. A security test can also be blind (never reports the flaw) and noisy (reports it on the fixed build), and broken when its control fails.
+  - id: rg-recall-quarantine
+    concept: sec-reg-trust
+    prompt: Why is quarantining the test of a High finding different from quarantining an ordinary flaky test?
+    answer: While the guard is out of the gate a regression can ship, so the finding is effectively open. It needs an owner, an end date, a note on the finding and an escalation when the date passes.
+
+next:
+  - security-testing-in-ci-cd
+  - vulnerability-reporting-and-cvss
+  - security-testing-capstone
+  - dast-with-owasp-zap

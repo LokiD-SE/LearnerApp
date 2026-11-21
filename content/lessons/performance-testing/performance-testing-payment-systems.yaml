@@ -1,0 +1,1385 @@
+id: performance-testing-payment-systems
+title: Performance testing payment systems
+subject: performance-testing
+module: perf-analysis
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: A payment API is the one place where a load test can lie to you in a flattering way and a retry can move money twice. This lesson builds a load test that is safe to believe - one fresh Idempotency-Key per logical payment and the same key on every retry, status codes read as signals (429 and 503 are not the same finding), a per-client limit met by spreading the load over identities instead of hammering one, a provider sandbox replaced by a stub, and the client's ledger reconciled against the API's own counters so duplicates, unknown outcomes and replays show up. You write the retry rules, the reconciliation and the status triage in Python, and run them with real Locust runs against the local SandPay practice API.
+tags:
+  [
+    payments,
+    idempotency key,
+    idempotent replay,
+    duplicate payment,
+    retry,
+    retry-after,
+    "429",
+    "503",
+    rate limit,
+    overload,
+    provider sandbox,
+    stubbing a provider,
+    settlement report,
+    workload mix,
+    reconciliation,
+    ledger,
+    unknown outcome,
+    Locust,
+    JMeter,
+    capacity,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12 in `practice/perf/.venv` with Locust 2.47.0 and pytest, on one Linux machine. Every run
+    shown was made on 21 November 2026 by `practice/perf/support/ppay_demo.py` against the loopback practice API
+    `support/sandpay_target.py`; the tables below are printed by the solution code. **Timings, counts and request
+    rates change with the machine and the run** (two runs of the same script differ by a few payments); the way of
+    reading them does not. Locust's request count and the API's counter can differ by the few requests that were
+    still in flight when the test stopped, and the lesson shows that difference on purpose.
+  - **Synthetic data:** SandPay is a fictional payments company (`https://api.sandpay.example`). The practice API
+    serves `POST /v1/payments` with a required `Idempotency-Key`, a per-client limit on `POST /auth/token`,
+    `GET /v1/reports/settlement` (ten times the service time of a read), `503` with `Retry-After: 1` when its queue
+    is full, injected `500` answers, and `GET /metrics` with `payments_created` and `idempotent_replays`. The
+    behaviours the lesson relies on were read from its source: a replay is answered before any service time is spent,
+    a `500` is returned before anything is stored, and **the key is stored only after the payment has been
+    created**. That last choice is a simplification of the practice API; the lesson shows what it does under a client
+    timeout and does not claim any real provider behaves the same way. No card data appears anywhere; the amounts are
+    in minor units.
+  - **Stripe documentation, read on 21 November 2026** (used as a documented example of a payment provider, with no
+    connection to the practice API): [Rate limits](https://docs.stripe.com/rate-limits) (live mode 100 and sandbox
+    25 requests per second for the global API rate limit; the "Load testing" paragraph, quoted below);
+    [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) ("Retries with the same key return the
+    saved response, including 500 errors" for API v1; results are saved "only after the execution of an endpoint
+    begins"; keys up to 255 characters, V4 UUIDs suggested); [Testing](https://docs.stripe.com/testing) ("Don't use
+    testing environments to load test your integration").
+  - **Standards, read on 21 November 2026:** [RFC 6585 section 4](https://www.rfc-editor.org/rfc/rfc6585) (429 Too
+    Many Requests, "MAY include a Retry-After header", and that the specification "does not define how the origin
+    server identifies the user, nor how it counts requests"); [RFC 9110 section
+    10.2.3](https://www.rfc-editor.org/rfc/rfc9110) (`Retry-After = HTTP-date / delay-seconds`);
+    [draft-ietf-httpapi-idempotency-key-header-08](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+    of 22 October 2026 - an **Internet-Draft, not a standard** ("The idempotency key MUST be unique and MUST NOT be
+    reused with another request with a different request payload"; a UUID is "RECOMMENDED").
+  - **Locust 2.47.0:** [Writing a locustfile](https://docs.locust.io/en/stable/writing-a-locustfile.html)
+    (`catch_response` and `response.failure()`; the `tasks` attribute as a `{task: int}` dict gives the ratio).
+    **JMeter:** [Functions reference](https://jmeter.apache.org/usermanual/functions.html) (`__UUID` "returns a
+    pseudo random type 4 Universally Unique IDentifier"). The JMeter arrangement described in the lesson is **from the
+    manual, not run here**.
+  - **Not run here:** any real payment provider or sandbox (nothing leaves the machine), JMeter plans for this
+    lesson, k6 and Gatling. Statements about them come from the documents above or are left out.
+
+prerequisites:
+  - reading-load-test-results
+  - locust-task-sets-and-user-flows
+  - idempotency-keys
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-ppay-keys
+    name: Idempotency keys under load
+    summary: A payment load test needs a fresh Idempotency-Key for every logical payment and the same key for every retry of it; one fixed key turns the run into a stream of cheap replays that creates almost no payments, and a new key per retry can create the payment twice.
+  - id: perf-ppay-limits
+    name: Limits, overload and what to retry
+    summary: A 429 is a per-client policy that a test design should avoid by spreading the load, a 503 is the capacity limit and a result, a 5xx or a timeout is retried with the same key, and a 4xx other than 429 is a script mistake; a provider sandbox has lower limits than production and is replaced by a stub that sleeps like the real thing.
+  - id: perf-ppay-reconcile
+    name: Reconciling the client with the API
+    summary: The load tool's report counts requests, not payments; comparing the client's ledger with the API's own counters, with bounds for unknown outcomes and requests still in flight at the stop, finds duplicate payments, replays and lost responses that no latency percentile shows.
+
+objectives:
+  - Explain why one fixed Idempotency-Key makes a payment load test report huge throughput and almost no payments, and read the replay share from the API's counters.
+  - Generate one key per logical payment, reuse it on every retry, and say where a JMeter or Locust script has to create it.
+  - Tell 429, 503, other 5xx, timeouts and other 4xx apart, decide which are retried, honour Retry-After within a cap, and say which findings invalidate a run and which are results.
+  - Spread a load over identities to avoid a per-client limit instead of tuning around it, and explain why a provider sandbox is the wrong target for a load test (limits, latency) and what to use instead.
+  - Predict the throughput ceiling of a mixed workload from the capacity and the service time of each request type and check it against a run.
+  - Reconcile a ledger against the API's counters with bounds for timeouts and in-flight requests, and recognise a duplicate payment created by a retry that raced the original request.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: The idea in plain language
+    body: |
+      A SandPay engineer writes a Locust script for `POST /v1/payments`, runs 20 users for four seconds and reads
+      the report: **3,269 requests, 0 failures, mean 9.8 ms, about 965 requests per second**. The API was told to
+      take 20 ms per request, so this looks too good - and it is. The API's own counters say **20 payments
+      created and 3,254 idempotent replays**. The script sent the same `Idempotency-Key` every time, so after
+      the first request each user did nothing but ask for a saved answer. The report is perfect and describes
+      nothing a customer will ever do.
+
+      Run the same script with a fresh key per payment and the report says **700 requests, mean 90 ms, about 196
+      per second**. Those numbers are a fifth as flattering and they are the real ones.
+
+      Payment APIs add three traps to every load test:
+
+      1. **Retries move money.** A load script that retries after a timeout has to retry in a way that cannot
+         create the payment twice - and the test has to check that it did not.
+      2. **Limits are part of the system.** A `429` means the *test design* hit a per-client policy; a `503`
+         means the *system* hit its capacity. They are different findings and a script that treats both as "an
+         error" cannot tell them apart.
+      3. **The report counts requests; the business counts payments.** Latency percentiles say nothing about
+         whether the number of payments the API holds equals the number the script meant to create.
+
+      This lesson builds a payment load test that is safe to believe: right keys, right retries, status codes read
+      as signals, and a ledger reconciled against the API at the end.
+
+  - id: what
+    kind: what
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: What is different about a payment load test
+    body: |
+      Most of a load test is the same for a payment API as for any other - a workload model, a ramp, percentiles,
+      a steady state (see the lessons on [reading results](#/lesson/reading-load-test-results) and
+      [bottlenecks](#/lesson/bottleneck-analysis)). Four things are specific.
+
+      - **State that matters.** `POST /v1/payments` creates a payment. A run that creates 3,000 payments leaves 3,000
+        payments behind, and a run that creates 20 while reporting 3,000 has measured something else. The number
+        the API holds is as much a result as the p95.
+      - **The idempotency key.** The API recognises a repeated request by the key. The key is the client's promise
+        that *this is the same payment as before*. A load script has to make that promise truthfully: the same key
+        for a retry of one payment, a different key for a different payment.
+      - **Limits at every layer.** A per-client rate limit (here on `POST /auth/token`), a capacity limit that
+        answers `503` with `Retry-After`, and - in production - the limits of the payment provider behind the
+        API. Each one is a separate thing to find, with a separate fix.
+      - **Mixed work.** Payments are not the only traffic. A settlement report takes ten times the service time
+        of a read in the practice API; a few of them in the mix change how many payments per second fit.
+
+      Two rules frame the rest. First, **a load test of a payment system is judged by the payments it created,
+      not only by the requests it sent.** Second, **a test never loads a system it does not own**: a real payment
+      provider's sandbox is not a load-test target (the next sections quote the provider's own words), and the
+      practice API on loopback is.
+
+  - id: why
+    kind: why
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Why these mistakes cost so much
+    body: |
+      - **A flattering report is the expensive kind.** "965 requests per second with no failures" goes into a
+        capacity plan. At the real rate of 196 per second the plan is five times too optimistic, and nobody
+        notices until a sale. A fixed key is the commonest way to get there: it is the easiest script to write.
+      - **A duplicate payment is not a performance bug.** If a retry can create the payment twice under load, a
+        customer is charged twice when the network is slow. The load test is the cheapest place to find that,
+        because it makes timeouts and retries frequent. It only finds it if the test counts payments.
+      - **A limit that the test hit is not a limit the system has.** A script that logs in on every iteration from
+        one client meets a per-client rate limit within a second and then reports a wall of `429`s as if the
+        payment service had failed. The finding is about the script.
+      - **A provider's sandbox is not production.** Stripe's documentation gives different limits for live mode (100
+        requests per second) and sandbox (25 requests per second) for the global API rate limit, and on load testing
+        it says: "We generally discourage this practice because API limits are lower in a sandbox, so the load test
+        is likely to hit limits that it wouldn't hit in production. A sandbox is also not a perfect stand-in for
+        live API calls, and that can be somewhat misleading." Its recommendation is to mock the provider in your
+        own integration for load tests and to "simulate latency by sleeping for a time that you determine by
+        sampling the durations of real live mode Stripe API calls". Its testing page says it directly: "Don't use
+        testing environments to load test your integration because you might hit rate limits."
+      - **Money systems have an audit trail.** A load test against a shared environment creates real records that
+        finance or support may have to explain. Use synthetic merchants, a dedicated environment and a clean-up
+        plan.
+
+  - id: keys-internals
+    kind: internals
+    concepts: [perf-ppay-keys]
+    title: How the practice API treats a key
+    body: |
+      The behaviour below was read from `support/sandpay_target.py` and confirmed by the runs in this lesson.
+
+      1. A payment request needs an `Idempotency-Key` header; without one the API answers `400`.
+      2. The API looks up the pair **(client, key)**. If it has seen it, it answers with the saved status and body
+         and adds `Idempotent-Replayed: true`. **No service time is spent**, so a replay is almost free.
+      3. If it has not seen the pair, it spends the service time (twice the configured latency for a payment),
+         validates the body, and - on success - creates the payment and **then** stores the pair.
+      4. A failure (`422` for a bad body, or an injected `500`) is returned **before** anything is stored. Nothing
+         was created and nothing was saved, so a retry with the same key is a fresh attempt.
+
+      Three load-script designs follow from this:
+
+      | Design | What the API sees | What the report says | What is true |
+      | --- | --- | --- | --- |
+      | One fixed key for every request of a user | One payment, then replays | Very high rate, no failures, tiny mean | The run measured replays; almost no payments were created |
+      | A new key for every **request**, retries included | A new payment for every attempt | Honest rate | A retry after a timeout can create the payment twice |
+      | A new key per **logical payment**, the same key on every retry | One payment per logical payment | Honest rate | The only design that is safe to retry |
+
+      The standards and a provider agree on the shape. The Internet-Draft for the header says the key "MUST be
+      unique and MUST NOT be reused with another request with a different request payload" and recommends a UUID;
+      Stripe's documentation suggests V4 UUIDs, allows keys up to 255 characters, and says to avoid sensitive data
+      such as email addresses in a key. The draft was at version 08 on 22 October 2026 and is still a draft.
+      Provider semantics differ in the details that matter for retries. For Stripe's API v1 the documentation says
+      "Retries with the same key return the saved response, including 500 errors" and that results are saved "only
+      after the execution of an endpoint begins" - so a retry of a `500` there returns the saved `500`, whereas the
+      practice API forgets a failed attempt. **A load script that retries 5xx answers with the same key has to be
+      checked against the semantics of the API it targets.**
+
+      In Locust a fresh key is `str(uuid.uuid4())`, called once per logical payment. In JMeter the manual describes
+      `${__UUID()}` as returning "a pseudo random type 4 Universally Unique IDentifier". It is evaluated wherever
+      it is written, so a header that contains `${__UUID()}` gets a new key on every sampler execution; a plan that
+      retries by running a second sampler would send the retry under a different key. The usual remedy is to store
+      the value in a variable once per iteration and put the variable in both samplers. This JMeter arrangement is
+      from the manual, not run here.
+
+  - id: limits-internals
+    kind: internals
+    concepts: [perf-ppay-limits]
+    title: Limits, status codes and what to retry
+    body: |
+      **Reading the status codes.** The same load can produce several kinds of "not 2xx" and each means something
+      different:
+
+      | Answer | What it usually means | A finding about | Retry? |
+      | --- | --- | --- | --- |
+      | `429` | A per-client rate limit was exceeded. RFC 6585: "the user has sent too many requests in a given amount of time" | **The test design** (too much from one identity) | After `Retry-After`, with the same key |
+      | `503` + `Retry-After` | The service is full (in the practice API: capacity plus queue) | **The system** - this is a capacity result | After `Retry-After`, with the same key |
+      | other 5xx, or no answer | A fault, or a request whose outcome the client does not know | The system, and an **unknown outcome** | Yes, with the **same** key |
+      | `401`, `403` | The script is not authorised (a token expired or is missing) | The script | No |
+      | `400`, `404`, `422` ... | The request itself is wrong | The script or the data | No - retrying repeats the mistake |
+
+      RFC 6585 says a `429` response "MAY include a Retry-After header", and adds that the specification "does not
+      define how the origin server identifies the user, nor how it counts requests" - so what a "client" is, and
+      how the count works, belongs to the API under test and has to be learned from its documentation. RFC 9110
+      defines the header: `Retry-After = HTTP-date / delay-seconds`, where a delay is "a non-negative decimal
+      integer, representing time in seconds". A script that honours the header has to handle both forms; the
+      retry rule in this lesson uses the number of seconds and falls back to a back-off when the value is a date.
+
+      **The per-client limit.** The practice API limits `POST /auth/token` per `client_id` (the setting
+      `rate_limit_rps`). The measurement with a limit of 5 per second:
+
+      ```text
+      20 logins as merchant-1          : {'ok': 5, 'rate-limited': 15}  retry-after: 1
+      1 login each, 20 other merchants : {'ok': 20}
+      verdict, one client              : {'valid': False, 'findings': ['rate-limited: 15 requests were answered 429']}
+      ```
+
+      Twenty logins from one merchant in a fraction of a second: five pass and fifteen are limited. Twenty
+      merchants, one login each: no limit is met. The fix for a *test* is to behave like the real population -
+      many merchants, each logging in once and reusing its token - and not to raise the limit, unless the point of
+      the test is the limiter (then run it as a rate-limit test and tell the verdict so: `expect_limit=True`).
+
+      **Overload.** When the practice API's capacity and queue are full it answers `503` with `Retry-After: 1`. A
+      `503` is the system saying "I am at my limit", which is the thing a capacity test looks for: report the load
+      at which it began, and do not count it as a script error. A script that retries it with the same key,
+      after a pause, behaves like a well-written client; one that retries at once makes the overload worse.
+
+      **The provider behind the API.** In production the payment API calls an acquirer or a payment provider. Its
+      limits and latency are not yours to load. The documentation example quoted above says what a load test should
+      do instead: stub the provider in your own system, and make the stub **sleep for a time sampled from real
+      provider calls**. A stub with no latency makes the payment service look faster than it is; a stub with
+      the sampled latency keeps the service's queues and pools realistic.
+
+      **Mixed work.** The throughput a service can carry is about `capacity / mean service time` when it is
+      saturated (Little's law: see [bottleneck analysis](#/lesson/bottleneck-analysis)). In the practice API with
+      capacity 4 and a 20 ms base time, a payment takes 40 ms and a settlement report 200 ms. All payments: 4 /
+      0.040 = **100 per second**. One request in twenty a report: the mean is (19 x 40 + 200) / 20 = 48 ms, so the
+      ceiling falls to 4 / 0.048 = **83.3 per second**. The measured steady rates were 100 and 84 requests per
+      second (80 payments and 4 reports) in the run shown later.
+
+  - id: reconcile-internals
+    kind: internals
+    concepts: [perf-ppay-reconcile]
+    title: Reconciling the ledger with the API
+    body: |
+      The load tool's report is a list of requests. To judge payments, the script also keeps a **ledger**: one
+      record per *logical* payment with every attempt it made - the key, the status (or `None` when no answer
+      arrived) and whether the answer was a replay. At the end of the run the ledger is compared with the API's own
+      counters (`payments_created` and `idempotent_replays` from `GET /metrics`).
+
+      The ledger cannot always say exactly how many payments exist, so the comparison uses **bounds**:
+
+      - **low** = attempts the API answered `2xx` that were not replays (each one is proof of a creation);
+      - **high** = low + attempts that timed out (a request the client gave up on may still have been carried out)
+        + requests that were still running when the test was stopped (`in_flight`, at most one per user in a
+        closed loop - the ledger is written when a payment finishes, and a user stopped mid-request never wrote its
+        record).
+
+      The verdict, in order: `unexplained` if the API's count is outside `[low, high]`; `duplicates` if it is inside
+      the bounds but larger than the number of logical payments plus the in-flight allowance, because then some
+      payment exists twice; otherwise `ok`.
+
+      **The experiment.** The first request of a payment times out on the client after 40 ms while the API needs 200
+      ms to carry it out; the script retries at once or after the API has finished, with the same key or a new
+      one. The API counters and the reconciliation, from `support/ppay_demo.py`:
+
+      ```text
+      retry after 0.0 s, same key: attempts [(None, False), (201, False)]  created 2 replays 0  bounds (1, 2)  verdict duplicates
+      retry after 0.3 s, same key: attempts [(None, False), (201, True)]   created 1 replays 1  bounds (0, 1)  verdict ok
+      retry after 0.0 s, new key : attempts [(None, False), (201, False)]  created 2 replays 0  bounds (1, 2)  verdict duplicates
+      retry after 0.3 s, new key : attempts [(None, False), (201, False)]  created 2 replays 0  bounds (1, 2)  verdict duplicates
+      ```
+
+      Read the rows. A new key always creates a second payment: that is what a new key means. The same key is safe
+      **only if the retry arrives after the API has stored the first answer** - the second row, a replay. Retried
+      at once, while the first request is still running, the practice API has not stored the key yet and creates the
+      payment again: a **duplicate-payment race** in the practice API's idempotency layer. It is a deliberate
+      simplification of the practice API and it is exactly what the reconciliation exists to find. Nothing in the
+      latency report would show it: every request answered `201`.
+
+      Stripe's documentation describes a different design - results are saved once execution begins, and a request
+      that "conflicts with another request that's executing concurrently" is not saved and can be retried - so the
+      behaviour of a real provider has to be tested, not assumed from this one. The reconciliation is how you
+      test it.
+
+  - id: when
+    kind: when
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: When to use each check
+    body: |
+      - **Fresh key per logical payment, same key on retries:** in every payment load test that creates payments.
+        Use a fixed key only on purpose, as a *replay* test: it measures how cheap the replay path is and should be
+        reported as that, never as payment throughput.
+      - **Triage the status codes before the latency:** on every run, first. A run with more than a small share of
+        `400`/`401`/`422` answers is a broken script and no percentile from it means anything.
+      - **Spread over identities:** whenever the system has per-client limits. Use many merchants with one login each
+        (the practice API has `merchant-1` to `merchant-50`). Test the limiter itself in a separate, labelled
+        rate-limit run.
+      - **Stub the provider:** whenever the payment service calls an external provider. Sleep for a sampled
+        latency. Do not run load against a third party's sandbox - its documentation may forbid or discourage it,
+        and its limits are not yours.
+      - **Reconcile at the end:** every run that creates payments. Read the counters after the load has stopped and
+        the in-flight requests have finished or been allowed for.
+      - **Include the slow endpoints in the mix:** when settlement reports, exports or searches share the capacity
+        with payments. The ceiling depends on the mean service time of the mix, not on the payment alone.
+      - **Not for correctness:** this is not a functional test of idempotency (that is the job of
+        [idempotency keys](#/lesson/idempotency-keys) and the payment negative matrix). It checks that idempotency
+        survives concurrency and retries at volume.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: The retry rule and the race
+    body: |
+      ```mermaid
+      flowchart TD
+        A["Attempt: POST with key K"] --> B{"What came back?"}
+        B -- "2xx" --> OK["Done - ledger: ok"]
+        B -- "4xx except 429" --> REJ["Stop - ledger: rejected - fix the script"]
+        B -- "429, 503, 5xx or no answer" --> W["Wait: Retry-After seconds or back-off, capped"]
+        W --> M{"Attempts left?"}
+        M -- "yes" --> A
+        M -- "no" --> G["Stop - ledger: gave-up"]
+      ```
+
+      ```mermaid
+      sequenceDiagram
+        participant C as Client
+        participant A as Payment API
+        C->>A: POST key K (attempt 1)
+        Note over A: working for 200 ms, key K not stored yet
+        Note over C: gives up at 40 ms - no answer
+        C->>A: POST key K (retry at once)
+        Note over A: key K still unknown - works again
+        A-->>C: 201 (second payment)
+        Note over A: first request finishes - stores key K
+        Note over C,A: API holds two payments, the client expected one
+      ```
+
+      The flowchart is the whole retry rule: every retry carries the same key, and only some answers are retried.
+      The sequence is the race the reconciliation finds when the retry arrives before the first request has stored
+      its key.
+
+  - id: code-retry
+    kind: code
+    concepts: [perf-ppay-keys, perf-ppay-limits]
+    title: The retry rules in Python
+    body: |
+      The reference solution of `analysis/ppay_retry.py`, trimmed to the code (the exercise has the full
+      docstring):
+
+      ```python
+      import time
+      import uuid
+
+      MAX_WAIT_S = 0.1
+
+
+      def new_key():
+          return str(uuid.uuid4())
+
+
+      def _header(headers, name):
+          for k, v in (headers or {}).items():
+              if k.lower() == name:
+                  return v
+          return None
+
+
+      def retry_wait(status, headers, attempt):
+          if status is not None and 200 <= status < 300:
+              return None
+          if status is not None and 400 <= status < 500 and status != 429:
+              return None
+          wait = 0.05 * 2 ** (attempt - 1)
+          after = _header(headers, "retry-after")
+          if after is not None and str(after).strip().isdigit():
+              wait = float(after)
+          return min(wait, MAX_WAIT_S)
+
+
+      def submit_payment(send, logical, sleep=time.sleep, max_attempts=4):
+          key = new_key()
+          attempts = []
+          outcome = "gave-up"
+          for n in range(1, max_attempts + 1):
+              try:
+                  status, headers = send(key)
+              except TimeoutError:
+                  status, headers = None, {}
+              replayed = str(_header(headers, "idempotent-replayed")).lower() == "true"
+              attempts.append({"key": key, "status": status, "replayed": replayed})
+              wait = retry_wait(status, headers, n)
+              if wait is None:
+                  outcome = "ok" if status is not None and 200 <= status < 300 else "rejected"
+                  break
+              if n < max_attempts:
+                  sleep(wait)
+          return {"logical": logical, "attempts": attempts, "outcome": outcome}
+      ```
+
+      `support/ppay_user_locustfile.py` calls `submit_payment` from a Locust user, passes a `send` function that
+      makes the POST with `catch_response=True` (so a `503`, a `500` or no answer is a failure row in Locust's
+      table), and appends each ledger record to a JSON-lines file.
+
+  - id: code-reconcile
+    kind: code
+    concepts: [perf-ppay-reconcile]
+    title: Reconciliation in Python
+    body: |
+      The reference solution of `analysis/ppay_reconcile.py`:
+
+      ```python
+      def _attempts(ledger):
+          return [a for record in ledger for a in record["attempts"]]
+
+
+      def summarise(ledger):
+          attempts = _attempts(ledger)
+          ok = [a for a in attempts if a["status"] is not None and 200 <= a["status"] < 300]
+          unconfirmed = [
+              r for r in ledger
+              if not any(a["status"] is not None and 200 <= a["status"] < 300 for a in r["attempts"])
+          ]
+          return {
+              "logical": len(ledger),
+              "attempts": len(attempts),
+              "created": sum(1 for a in ok if not a["replayed"]),
+              "replays": sum(1 for a in ok if a["replayed"]),
+              "failed": sum(1 for a in attempts if a["status"] is not None and not 200 <= a["status"] < 300),
+              "timeouts": sum(1 for a in attempts if a["status"] is None),
+              "unconfirmed": len(unconfirmed),
+          }
+
+
+      def created_bounds(ledger, in_flight=0):
+          s = summarise(ledger)
+          return s["created"], s["created"] + s["timeouts"] + in_flight
+
+
+      def replay_share(metrics):
+          created, replays = metrics["payments_created"], metrics["idempotent_replays"]
+          total = created + replays
+          return replays / total if total else 0.0
+
+
+      def reconcile(ledger, metrics, in_flight=0):
+          low, high = created_bounds(ledger, in_flight)
+          server = metrics["payments_created"]
+          if server < low or server > high:
+              verdict = "unexplained"
+          elif server > len(ledger) + in_flight:
+              verdict = "duplicates"
+          else:
+              verdict = "ok"
+          return {"bounds": (low, high), "server_created": server, "logical": len(ledger), "verdict": verdict}
+      ```
+
+  - id: code-triage
+    kind: code
+    concepts: [perf-ppay-limits, perf-ppay-keys]
+    title: Reading the status codes first
+    body: |
+      The core of `analysis/ppay_triage.py`:
+
+      ```python
+      CLASSES = ("ok", "replay", "rate-limited", "overloaded", "server-error", "auth", "bad-request",
+                 "no-response", "other")
+
+
+      def classify(status, headers=None):
+          if status is None:
+              return "no-response"
+          if 200 <= status < 300:
+              replayed = any(k.lower() == "idempotent-replayed" and str(v).lower() == "true"
+                             for k, v in (headers or {}).items())
+              return "replay" if replayed else "ok"
+          if status == 429:
+              return "rate-limited"
+          if status == 503:
+              return "overloaded"
+          if 500 <= status < 600:
+              return "server-error"
+          if status in (401, 403):
+              return "auth"
+          if 400 <= status < 500:
+              return "bad-request"
+          return "other"
+      ```
+
+      `verdict(summary, expect_limit=False, script_error_share=0.01, replay_share=0.2)` then applies the rules in a
+      fixed order: an empty run is invalid; more than 1 % `auth` plus `bad-request` is a script error (invalid);
+      more than 20 % replays among the successes is invalid; any `429` is invalid unless a limit was expected; any
+      `503` is reported but is a result; more than 1 % `server-error` plus `no-response` is reported, also as a
+      result. The live probe of 40 payments with one fixed key:
+
+      ```text
+      fixed  {'ok': 1, 'replay': 39}  ->  {'valid': False, 'findings': ['replays: 39 of 40 successful requests were idempotent replays']}
+      fresh  {'ok': 40}  ->  {'valid': True, 'findings': []}
+      ```
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Line by line - the lines that carry the lesson
+    body: |
+      **`submit_payment`**
+
+      - `key = new_key()` is outside the loop. This one line is the difference between a safe retry and a duplicate
+        payment: the key belongs to the *logical* payment, so every attempt below reuses it.
+      - `except TimeoutError: status, headers = None, {}` turns "no answer" into an attempt with no status. The
+        outcome of such an attempt is unknown - the API may have carried it out - so it is recorded, not
+        discarded; the reconciliation counts timeouts when it works out the upper bound.
+      - `replayed = ... "idempotent-replayed" ...` keeps the API's own statement that this answer was a replay,
+        which is how the ledger can tell "created now" from "created earlier".
+      - `wait = retry_wait(status, headers, n)`: `None` means stop, and the stop reason is read from the status -
+        a `2xx` is `ok`, anything else that is not retryable is `rejected`.
+      - `if n < max_attempts: sleep(wait)` never sleeps after the last attempt; a script that does burns time
+        for nothing and distorts the pacing of a closed-loop run.
+
+      **`retry_wait`**
+
+      - The two early returns encode the rule "retry transient trouble, never a mistake": a `4xx` other than `429`
+        will fail the same way next time.
+      - `0.05 * 2 ** (attempt - 1)` is a back-off, used when the server gave no instruction.
+      - `str(after).strip().isdigit()` accepts only the `delay-seconds` form of `Retry-After`; an `HTTP-date` value
+        falls through to the back-off. A production client would parse the date as well.
+      - `min(wait, MAX_WAIT_S)` keeps a test run short. State this cap in the report: a real client would honour
+        `Retry-After: 1` in full, and the cap changes how long the test keeps the load on.
+
+      **`reconcile`**
+
+      - `server < low or server > high` is checked first: if the API's count is not even explainable by the ledger,
+        nothing else about the run can be trusted, and the cause is the test or the API, not a duplicate.
+      - `server > len(ledger) + in_flight` is the duplicate test: more payments exist than logical payments the
+        script started. The in-flight allowance is added because a payment created just as the test stopped has no
+        ledger record.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Steps - a payment load test you can believe
+    body: |
+      1. **Own the target.** A dedicated environment or the practice API; synthetic merchants; a clean-up plan. The
+         provider behind it is a stub that sleeps for a latency sampled from real calls. Nothing goes to a third
+         party's sandbox.
+      2. **Read the API's rules.** Idempotency semantics (when the key is stored, what a retry of a `5xx` returns),
+         the rate limits and how a "client" is identified, what `Retry-After` looks like.
+      3. **Write the workload.** The mix of payment, read and report requests; many merchants, each logging in once
+         and reusing its token; a fresh key per logical payment.
+      4. **Write the retry rule.** Same key on every retry; retry `429`, `503`, `5xx` and no answer after a pause;
+         never retry other `4xx`; a cap on attempts and on the wait. Keep a ledger of every logical payment.
+      5. **Run a small smoke test** and triage the status codes: any `400`/`401`/`422`, any `429`, a high replay
+         share? Fix the script before measuring.
+      6. **Run the test.** Read windows and steady state as in [reading results](#/lesson/reading-load-test-results);
+         note the first `503` and the load at which it began.
+      7. **Stop, let in-flight requests finish if you can, and read `GET /metrics`.** Note how many users were
+         running at the stop.
+      8. **Reconcile.** Bounds, verdict, replay share. A `duplicates` or `unexplained` verdict is a finding even
+         when every latency number is green.
+      9. **Report** the payments created next to the requests sent, the status mix, the retry rule and its cap,
+         the in-flight allowance and the verdict.
+
+  - id: example
+    kind: example
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Worked example - from a green report to three findings
+    body: |
+      The first part is a real run; the story around it is hypothetical, and its framing is invented to show the
+      order of reasoning.
+
+      A SandPay tester writes the Locust script the quick way and runs it:
+
+      ```text
+      fixed key   requests  3269  failures   0  mean    9.8 ms  steady   965 req/s
+         API counters: payments_created 20  idempotent_replays 3254  replay share 99.4%
+      fresh key   requests   700  failures   0  mean   90.1 ms  steady   196 req/s
+         API counters: payments_created 708  idempotent_replays 0  replay share 0.0%
+      ```
+
+      1. **Finding 1 - the fixed key.** The first report is "green" and describes 20 payments. The second, with a
+         fresh key per payment, is the measurement; Locust counted 700 requests and the API 708 payments because
+         the difference is requests still in flight when Locust stopped (at most one per user).
+      2. **Add retries and an overload.** Six users, capacity 2 and a queue of 2, and 20 % injected `500`s, with the
+         retry rule of this lesson:
+
+         ```text
+         Locust: POST /v1/payments  requests 286  failures 116  mean 53.2 ms  steady 64 req/s
+         ledger: {'logical': 175, 'attempts': 282, 'created': 170, 'replays': 0, 'failed': 112, 'timeouts': 0, 'unconfirmed': 5}
+         attempts per logical payment: {1: 106, 2: 40, 3: 20, 4: 9}
+         outcomes: {'ok': 170, 'gave-up': 5}
+         API   : {'payments_created': 170, 'idempotent_replays': 0} statuses {'200': 6, '201': 170, '500': 51, '503': 71}
+         reconcile: {'bounds': (170, 176), 'server_created': 170, 'logical': 175, 'verdict': 'ok'}
+         ```
+
+         The API answered `503` 71 times and `500` 51 times; 106 payments went through on the first try and 69 needed
+         two to four attempts. **Finding 2 - the capacity limit:** `503`s are a result of this overload, reported with
+         the load that caused them. Five payments gave up after four attempts - they are in the ledger as `gave-up`,
+         not lost. The API holds 170 payments, exactly the 170 the ledger proved: no duplicate, no replay. Three
+         different request counts describe the same traffic (Locust 286, the ledger 282, the API 292 payment requests)
+         because requests are in flight at the stop, and the lesson never expects them to be equal. In an earlier run
+         of the same script the API held three more payments than the ledger proved - payments created in the second
+         the test stopped - which is why `reconcile` takes `in_flight`.
+      3. **Finding 3 - the race.** With the first request cut by a 40 ms client timeout and a retry at once, the API
+         holds two payments under one key (the table in the reconciliation section) and the verdict is `duplicates`,
+         although every request in the Locust table was a `201`.
+      4. **The mix.** With one request in twenty a settlement report, the practice API's ceiling falls from 100 to
+         83 requests per second (the model) and the run measured 80 payments plus 4 reports - about 84:
+
+         ```text
+         report weight 0: model ceiling 100.0 req/s (mean service 40 ms)
+           POST /v1/payments          requests   444  failures   0  mean  160.1 ms  steady   100 req/s
+         report weight 1: model ceiling  83.3 req/s (mean service 48 ms)
+           POST /v1/payments          requests   364  failures   0  mean  180.6 ms  steady    80 req/s
+           GET /v1/reports/settlement requests    16  failures   0  mean  338.7 ms  steady     4 req/s
+         ```
+
+         The payment response time rose from 160 to 181 ms with the same 16 users: the reports hold capacity for 200
+         ms each. A test that omits the reports overstates the payments per second the service can take.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: How the exercises are tested
+    body: |
+      Three files under `practice/perf/tests/analysis/` check your three modules:
+
+      - '`test_ppay_retry.py` - `new_key` is a version 4 UUID; `retry_wait` for every status class, the doubling
+        back-off and its cap, `Retry-After` in seconds winning over the back-off but not over the cap, case-insensitive
+        headers, a date value ignored; `submit_payment` with scripted sends (one key for all attempts, the sleeps between
+        attempts and none after the last, a timeout recorded as `None`, a `422` rejected at once, a payment that gives up);
+        then the same code against the practice API with 50 % injected `500`s (exactly one payment per success) and
+        **one real Locust run** (about five seconds) whose users use your code.'
+      - '`test_ppay_reconcile.py` - `summarise` and `created_bounds` on a hand-made ledger, `replay_share` with zeros,
+        every verdict and both edges of the bounds, the in-flight allowance; then **the timeout experiment** against the
+        practice API in all four variants (about a second each).'
+      - '`test_ppay_triage.py` - `classify` for every status class and header capitalisation, `summarise` with zeros, each
+        `verdict` rule at its exact threshold (exactly 1 % and exactly 20 % are not above), the order of the findings;
+        then three short live probes: one fixed key, fresh keys, and a login per iteration from one client against a limit.'
+
+      The tests check **behaviour and counts, never absolute response times**. The Locust test asserts that every
+      retry kept its key, that nothing was retried after a success, and that the API's payment count stays within
+      the number of successes plus the in-flight allowance - not any rate.
+
+      Run them as the CI does: `PERF_TARGET=solutions .venv/bin/python -m pytest tests/analysis/test_ppay_*.py -q`
+      passes (68 tests); against the unsolved exercises each file fails.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Common mistakes
+    body: |
+      - **A fixed or per-user key.** The run becomes a replay test. Check `idempotent_replays` against
+        `payments_created`; a replay share above a few percent in a payment test is a script error.
+      - **Generating the key inside the retry loop** (or with `${__UUID()}` written in the sampler that a retry
+        re-runs). Every attempt becomes a new payment, and a slow API is rewarded with duplicates.
+      - **Counting `429` and `503` as the same error.** One is the test hitting a per-client policy, the other is the
+        service at capacity; they need different fixes and only one is a capacity result.
+      - **Hammering one identity.** One merchant logging in on every iteration meets the per-client limit and the
+        report is about the limiter. Spread the load.
+      - **Retrying `4xx`.** A `422` or `401` will fail again; the retries multiply the noise and hide the script
+        error. Triage the statuses first.
+      - **Retrying immediately.** Without a pause, retries of a `503` add load to an overloaded service. Honour
+        `Retry-After`, or back off, and say if you capped the wait.
+      - **Assuming a retry of a `5xx` is safe.** It depends on whether the API stored the failed attempt (the practice
+        API did not; Stripe's API v1 returns the saved `500`). Read the provider's rule and test it.
+      - **Trusting the load tool's request count as the payment count.** Reconcile with the API's counters and allow
+        for requests in flight at the stop.
+      - **Load testing a provider's sandbox.** Its limits are lower than live mode and its latency is not production's
+        (Stripe's documentation says so). Stub the provider with a sampled sleep.
+      - **Leaving the reports out of the mix.** The ceiling for payments depends on what shares the capacity.
+      - **Reading latency before status codes.** A script that is rejected answers fast; its percentiles look
+        wonderful.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Trade-offs
+    body: |
+      - **Honouring `Retry-After` in full or capping it:** full is realistic and keeps load shapes honest, but a
+        4-second header on a 60-second test eats much of it. A cap shortens the test and changes the load; state the
+        cap.
+      - **Retry count:** more attempts reduce `gave-up` and raise the work per logical payment; four attempts is a
+        choice, not a rule. Report attempts per payment, as the example does.
+      - **Reconcile by counters or by records:** the counters are cheap and universal and give bounds; a query of the
+        created payments by key gives exact answers (which payment is duplicated) but needs access to the data. Use
+        counters first, records when the verdict is not `ok`.
+      - **A stub or the real provider:** a stub is safe, repeatable and cheap, but it is only as realistic as its
+        latency sample and it cannot find provider-specific behaviour. Test the provider's behaviour in its own
+        documented test environment at *functional* volume, not load.
+      - **Closed loop or open arrivals:** the closed loop here is simple and maps to a fixed number of merchants'
+        sessions, but it hides the arrival rate of a sale. See [reading results](#/lesson/reading-load-test-results)
+        for coordinated omission.
+      - **One key per payment or a pool of reusable keys:** a pool tests the replay path under load (useful, labelled as
+        such); fresh keys test the creation path. Run them as separate scenarios with separate reports.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-ppay-keys, perf-ppay-limits, perf-ppay-reconcile]
+    title: Summary
+    body: |
+      - A fixed Idempotency-Key makes the run a stream of replays: 3,269 requests, 0 failures and 965 requests per
+        second created 20 payments, while fresh keys gave 196 requests per second and 708 payments. Judge a payment
+        run by payments created, with `idempotent_replays` as the check.
+      - One key per **logical payment**, the same key on every retry. A new key on a retry is a new payment.
+      - Read status codes before latency. `429` is a per-client limit that the test design hit (spread the load
+        over merchants, each logging in once); `503` is the capacity limit and a result; other `5xx` and timeouts
+        are retried with the same key; other `4xx` are script errors and are not retried.
+      - Retry after `Retry-After` (seconds, or an HTTP-date) or a back-off, within a cap you state; never retry at
+        once into an overloaded service.
+      - A provider's sandbox has lower limits and a different latency profile than production; its documentation
+        discourages load tests. Stub the provider with a latency sampled from real calls.
+      - The throughput ceiling of a mix is about `capacity / mean service time`: 100 per second for payments only and
+        83 with one request in twenty a settlement report, against 100 and about 84 measured.
+      - Reconcile the ledger with the API's counters using bounds - proven creations up to proven plus timeouts plus
+        requests in flight at the stop. A retry that raced the original request created two payments under one key
+        although every response was `201`; only the reconciliation says `duplicates`.
+      - The idempotency semantics of the API under test (when the key is stored, what a retried `5xx` returns) decide
+        what a safe retry is. Read them and test them.
+
+exercises:
+  - id: ppay-fixed-key-report
+    type: mcq
+    concept: perf-ppay-keys
+    skill: analysis
+    title: The report that is too good
+    prompt: |
+      A payment load test of 20 users for 4 seconds reports 3,269 requests, 0 failures, a mean of 9.8 ms and about 965
+      requests per second. The API was configured with a 20 ms service time per request. Its `/metrics` shows
+      `payments_created` 20 and `idempotent_replays` 3254. What is the best reading?
+    options:
+      - id: replays
+        text: Almost every request was an idempotent replay of one of 20 payments, so the run measured the replay path, not payment creation; the script's key must change per payment.
+        feedback: Correct - 99.4 % of the successful requests were replays, which are answered without service time.
+      - id: fast
+        text: The API is faster than its configuration; use 965 per second in the capacity plan.
+        feedback: The service time per creation is 40 ms here; 965 per second is possible only because replays cost almost nothing.
+      - id: cache
+        text: A cache is serving the answers, which is the right thing to measure for a payment API.
+        feedback: It is the idempotency layer returning the saved response, and a payment test is about creating payments.
+      - id: ok
+        text: There is nothing to fix; 0 failures means the run is valid.
+        feedback: Zero failures says every request was answered, not that the requests were the ones you meant to send.
+    correct: [replays]
+    hints:
+      - Compare payments_created with the number of requests.
+    solution: |
+      Replay share 99.4 %: the run measured replays. Use a fresh key per logical payment.
+
+  - id: ppay-key-per-what
+    type: mcq
+    concept: perf-ppay-keys
+    skill: application
+    title: One key per what?
+    prompt: |
+      Your script retries a payment after a timeout. Which key rule is right?
+    options:
+      - id: logical
+        text: Create the key once for the logical payment and send the same key on every attempt.
+        feedback: Correct - the key is the promise that the retry is the same payment.
+      - id: request
+        text: Create a new key for every request so no two requests look alike.
+        feedback: A retry under a new key is a new payment; if the first attempt was carried out, the customer is charged twice.
+      - id: user
+        text: One key per virtual user, reused for all of that user's payments.
+        feedback: After the first payment every request of that user is a replay.
+      - id: constant
+        text: A constant key from the test plan, because the draft says keys should be predictable.
+        feedback: The draft recommends a unique key, such as a UUID, and says it must not be reused with a different payload.
+    correct: [logical]
+    hints:
+      - What does the API think a second request with a known key is?
+    solution: |
+      One key per logical payment, reused by every retry.
+
+  - id: ppay-429-or-503
+    type: mcq
+    concept: perf-ppay-limits
+    skill: application
+    title: Two kinds of "too many"
+    prompt: |
+      A run shows 15 `429` answers from `POST /auth/token` (every iteration logs in as `merchant-1`) and, in another
+      run with 40 users, 70 `503` answers with `Retry-After: 1` from `POST /v1/payments`. How should each be reported?
+    options:
+      - id: split
+        text: The 429s are a finding about the test design - spread the logins over merchants and log in once each; the 503s are the service reaching its capacity and are a result to report with the load at which they began.
+        feedback: Correct - one invalidates the run, the other is what a capacity test is looking for.
+      - id: same
+        text: Both mean the API is too slow; report one error rate.
+        feedback: Merging them hides which one is a script problem and which one is a capacity result.
+      - id: both-bad
+        text: Both invalidate the run; delete those requests and rerun.
+        feedback: A 503 is a result, not a script error; deleting it removes the finding.
+      - id: raise
+        text: Raise the rate limit and ignore the 503s.
+        feedback: The limit is not yours to tune away, and the 503s are the capacity result.
+    correct: [split]
+    hints:
+      - Which one did the test design cause?
+    solution: |
+      429 is the test hitting a per-client policy; 503 is capacity.
+
+  - id: ppay-ceiling
+    type: mcq
+    concept: perf-ppay-limits
+    skill: application
+    title: The ceiling of a mixed workload
+    prompt: |
+      The API serves 4 requests at once. A payment takes 40 ms and a settlement report 200 ms. One request in ten is a
+      report. About how many requests per second can it carry when saturated?
+    options:
+      - id: r71
+        text: About 71 (mean service time 56 ms, 4 / 0.056).
+        feedback: Correct - 0.9 x 40 + 0.1 x 200 = 56 ms.
+      - id: r100
+        text: 100 (4 / 0.040) - the reports do not matter.
+        feedback: That is the ceiling with no reports in the mix.
+      - id: r20
+        text: 20 (4 / 0.200) - the slowest request sets the rate.
+        feedback: The ceiling follows the mean service time of the mix, not the slowest request.
+      - id: r30
+        text: About 30 (the average of 100 and 20 divided by two).
+        feedback: Averaging rates is wrong; average the service times and divide the capacity by that.
+    correct: [r71]
+    hints:
+      - Compute the mean service time first.
+    solution: |
+      Mean 56 ms; capacity / mean = 4 / 0.056, about 71 requests per second.
+
+  - id: ppay-sandbox
+    type: mcq
+    concept: perf-ppay-limits
+    skill: analysis
+    title: Load testing the provider's sandbox
+    prompt: |
+      A colleague wants to run the load test against the payment provider's sandbox "because it is free and safe".
+      Which objection is best supported by the provider documentation quoted in the lesson?
+    options:
+      - id: lower
+        text: The sandbox's limits are lower than live mode (25 against 100 requests per second for the global limit in the quoted example), its latency profile differs, and the documentation discourages load tests there; stub the provider and sleep for a latency sampled from real calls.
+        feedback: Correct - the load test would hit limits it would not hit in production, and the numbers would mislead.
+      - id: free
+        text: There is no objection; a sandbox exists for testing, and load is testing.
+        feedback: The quoted documentation says "Don't use testing environments to load test your integration".
+      - id: auth
+        text: The objection is only that a sandbox needs a separate API key.
+        feedback: The documented concerns are limits and latency, not keys.
+      - id: cards
+        text: The sandbox charges real cards.
+        feedback: The documentation says test transactions do not move funds; the objection is about limits and realism.
+    correct: [lower]
+    hints:
+      - What would a result from a 25 requests per second limit tell you about production?
+    solution: |
+      Lower limits, a different latency profile and an explicit discouragement; use a stub with sampled latency.
+
+  - id: ppay-retry-after
+    type: mcq
+    concept: perf-ppay-limits
+    skill: application
+    title: A 503 with Retry-After
+    prompt: |
+      A payment attempt gets `503` with `Retry-After: 1`. What should the script do?
+    options:
+      - id: wait-same
+        text: Wait about that long (within the cap you have stated for the test) and retry with the same key.
+        feedback: Correct - it behaves like a good client and does not add load to an overloaded service.
+      - id: now
+        text: Retry at once with a new key so the request is not recognised as a retry.
+        feedback: At once adds load, and a new key can create a second payment.
+      - id: stop
+        text: Treat it as a script error and stop the test.
+        feedback: A 503 is the system's capacity answer and a result, not a script mistake.
+      - id: ignore
+        text: Drop the payment from the ledger; the API did not accept it.
+        feedback: Every logical payment stays in the ledger with its attempts and outcome, or the reconciliation breaks.
+    correct: [wait-same]
+    hints:
+      - What does the header ask for, and what must stay constant?
+    solution: |
+      Wait (capped) and retry with the same key.
+
+  - id: ppay-retry-500
+    type: mcq
+    concept: perf-ppay-keys
+    skill: analysis
+    title: Is retrying a 500 with the same key safe?
+    prompt: |
+      Your script retries a `500` with the same key. In the practice API a failed attempt is not stored. The provider's
+      documentation for API v1 says "Retries with the same key return the saved response, including 500 errors". What
+      follows?
+    options:
+      - id: depends
+        text: Safety depends on the API's own rule; against the practice API the retry is a fresh attempt, against a provider that saves 500s it would return the saved 500, so the retry rule must be checked against the semantics of the API under test.
+        feedback: Correct - same key is necessary for safety, but what a retry of a failed attempt does is the API's choice.
+      - id: always
+        text: A retry with the same key always creates the payment exactly once, whatever the API.
+        feedback: The two documents describe different behaviour for a failed attempt.
+      - id: never
+        text: Never retry a 500.
+        feedback: The practice API's 500 is transient by design, and a retry with the same key is the documented way to recover.
+      - id: new
+        text: Use a new key for retries of 5xx answers.
+        feedback: A new key can create the payment twice if the first attempt was carried out.
+    correct: [depends]
+    hints:
+      - Which behaviour is documented for which API?
+    solution: |
+      Read and test the API's semantics; same key is required but the effect of retrying a failed attempt differs.
+
+  - id: ppay-race
+    type: mcq
+    concept: perf-ppay-reconcile
+    skill: analysis
+    title: The retry that arrived too early
+    prompt: |
+      The first request of a payment times out on the client after 40 ms; the API needs 200 ms. The script retries at once
+      with the same key. Every Locust row is a `201` and `/metrics` says `payments_created` 2 for that one logical payment.
+      What is the finding?
+    options:
+      - id: race
+        text: The idempotency layer stored the key only after finishing the first request, so a retry that arrived earlier created a second payment - a duplicate-payment race found by reconciliation, not by latency.
+        feedback: 'Correct - the verdict is duplicates: more payments exist than logical payments.'
+      - id: fine
+        text: Nothing; two 201 answers is what idempotency means.
+        feedback: Idempotency means the retry returns the first payment's answer, not that it creates another payment.
+      - id: replay
+        text: The second payment is an idempotent replay.
+        feedback: 'A replay creates nothing and carries `Idempotent-Replayed: true`; the counter shows created, not replayed.'
+      - id: tool
+        text: Locust double-counted the request.
+        feedback: The count that disagrees is the API's own payments_created, which Locust does not touch.
+    correct: [race]
+    hints:
+      - Compare payments with logical payments.
+    solution: |
+      A duplicate-payment race: the key was not stored yet when the retry arrived.
+
+  - id: ppay-bounds
+    type: mcq
+    concept: perf-ppay-reconcile
+    skill: application
+    title: Bounds for the created count
+    prompt: |
+      A ledger shows 3 attempts answered `201` (none replays), 2 attempts that timed out and 4 attempts answered `503`. The
+      test was stopped with 1 request in flight. The API's `payments_created` is 7. Which verdict does the lesson's
+      reconciliation give?
+    options:
+      - id: unexplained
+        text: unexplained - the bounds are 3 to 6 (3 proven, plus 2 timeouts, plus 1 in flight) and 7 is outside them.
+        feedback: Correct - the 503s created nothing, so they add nothing to the upper bound.
+      - id: ok
+        text: ok - 7 is the number of attempts that did not fail.
+        feedback: The attempts that did not fail were 3 answered, plus 2 whose outcome is unknown; 7 cannot be reached.
+      - id: duplicates
+        text: duplicates - more payments exist than logical payments.
+        feedback: The unexplained check comes first, and 7 is not even explainable by the ledger.
+      - id: seven
+        text: ok - bounds are 3 to 10 because the 503s may have created payments.
+        feedback: A 503 in the practice API is returned before anything is created or stored.
+    correct: [unexplained]
+    hints:
+      - Low is proven creations; high adds timeouts and in-flight requests.
+    solution: |
+      Bounds (3, 6); 7 is outside, so unexplained.
+
+  - id: ppay-first
+    type: mcq
+    concept: perf-ppay-limits
+    skill: application
+    title: What to read first
+    prompt: |
+      A payment run finishes with a p95 of 31 ms, which is excellent. What do you check before believing it?
+    options:
+      - id: status
+        text: The status mix - rejected (400/401/422), rate-limited or replay answers return quickly and make percentiles look good; triage the statuses and then reconcile with the API's counters.
+        feedback: Correct - a fast failure is still a fast response.
+      - id: more
+        text: Nothing; a p95 under the target is the result.
+        feedback: The p95 of what? A script that is rejected answers fast.
+      - id: users
+        text: Only the number of users, to compute a rate.
+        feedback: Rate and percentile are meaningless if the requests were not the ones intended.
+      - id: gc
+        text: The garbage collector of the load generator.
+        feedback: Worth checking in general, but not before the status mix.
+    correct: [status]
+    hints:
+      - Which answers are cheap for the API?
+    solution: |
+      Status mix first, then the reconciliation.
+
+  - id: ppay-jmeter-uuid
+    type: mcq
+    concept: perf-ppay-keys
+    skill: application
+    title: The key in a JMeter plan
+    prompt: |
+      A JMeter plan sends `Idempotency-Key: ${__UUID()}` in the header of a payment sampler, and a second sampler (a retry)
+      reuses the same header text. The JMeter manual says `__UUID` returns a pseudo random type 4 UUID. What is the problem?
+    options:
+      - id: new
+        text: The function is evaluated each time the text is used, so the retry sampler sends a different key; store the UUID in a variable once per iteration and use the variable in both samplers (from the manual, not run here).
+        feedback: Correct - the retry must carry the original key.
+      - id: none
+        text: There is no problem; JMeter remembers the UUID for the iteration.
+        feedback: An expression written in two places is evaluated twice, and the manual describes a fresh pseudo random UUID.
+      - id: format
+        text: The only problem is the format of the UUID.
+        feedback: A type 4 UUID is the recommended form of key.
+      - id: fixed
+        text: Replace it with a constant to make the test repeatable.
+        feedback: A constant makes the run a stream of replays.
+    correct: [new]
+    hints:
+      - How many times is the expression evaluated?
+    solution: |
+      Each use is a new UUID; keep it in a variable per iteration.
+
+  - id: ppay-order-run
+    type: order
+    concept: perf-ppay-reconcile
+    skill: application
+    title: Running a payment load test
+    prompt: Put the steps of a payment load test in a sensible order.
+    items:
+      - id: own
+        text: Choose an owned target and stub the provider with a sampled latency
+      - id: rules
+        text: Read the API's idempotency, rate-limit and Retry-After rules
+      - id: script
+        text: Write the workload with a fresh key per payment, many merchants and a retry rule
+      - id: smoke
+        text: Smoke-test and triage the status codes
+      - id: run
+        text: Run the test and read the windows and the first 503
+      - id: stop
+        text: Stop, note the users in flight and read the API's counters
+      - id: reconcile
+        text: Reconcile the ledger with the counters and report payments created next to requests sent
+    hints:
+      - Own it, learn it, script it, check it, run it, count it.
+    solution: |
+      Target and stub, API rules, script, smoke and triage, run, counters at the stop, reconcile and report.
+
+  - id: ppay-debug-key
+    type: debug
+    concept: perf-ppay-keys
+    skill: analysis
+    title: The retry that creates the payment twice
+    prompt: |
+      This function retries a payment after a failure. Under a slow API a customer is charged twice. Which line is the
+      defect?
+    language: python
+    code: |
+      def submit_payment(send, logical, max_attempts=4):
+          attempts = []
+          for n in range(1, max_attempts + 1):
+              key = str(uuid.uuid4())
+              status, headers = send(key)
+              attempts.append({"key": key, "status": status})
+              if status is not None and 200 <= status < 300:
+                  break
+              time.sleep(0.05 * 2 ** (n - 1))
+          return {"logical": logical, "attempts": attempts}
+    correctLines: [4]
+    lineNotes:
+      - line: 3
+        note: The loop over attempts is fine; the attempt count is capped.
+      - line: 6
+        note: Recording each attempt with its key and status is what makes a ledger possible.
+      - line: 8
+        note: The pause between attempts is right; it does not add load to an overloaded service.
+    hints:
+      - Where should the key be created for a retry to carry the original one?
+    solution: |
+      Line 4 creates a new key on every attempt, so every retry is a new payment. Create the key once before the loop.
+
+  - id: ppay-short-sandbox
+    type: short
+    concept: perf-ppay-limits
+    skill: analysis
+    title: What do you use instead of the provider's sandbox?
+    prompt: |
+      The product owner says "we must load test with the real provider sandbox, otherwise the test is not realistic".
+      Give two reasons to push back and say what you would do instead.
+    modelAnswer: |
+      First, the provider's own documentation says its sandbox has lower limits than live mode (for the example quoted, 25
+      against 100 requests per second for the global limit) and a different latency profile, so the test would hit limits
+      production would not and would mislead; the documentation discourages load tests there. Second, it is not our
+      system to load, and the limits and quotas belong to someone else. Instead I would stub the provider inside our own
+      environment and make the stub sleep for a latency sampled from real provider calls, so the service's queues and
+      pools behave realistically, and I would test the provider-specific behaviour (error codes, idempotency semantics)
+      at functional volume in its documented test environment.
+    rubric:
+      - Names the lower limits and different latency of a sandbox from the documentation.
+      - Says the provider's systems are not ours to load.
+      - Proposes a stub with latency sampled from real calls.
+      - Keeps provider-specific behaviour in functional tests.
+    hints:
+      - What would a result from the sandbox say about production?
+    solution: |
+      Lower limits and different latency, not ours to load; use a stub that sleeps for a sampled latency.
+
+  - id: ppay-testdesign-reconcile
+    type: testdesign
+    concept: perf-ppay-reconcile
+    skill: application
+    title: Test the reconciliation before a gate uses it
+    prompt: |
+      A CI step will fail the build when the API holds more payments than the load script can explain. Design test cases for
+      the reconciliation code before it goes live.
+    modelAnswer: |
+      Preconditions: hand-made ledgers and the practice API with a client timeout shorter than its service time.
+
+      1. **Clean run** - every logical payment answered `201` once, counters equal. Expected: verdict ok, bounds equal the
+         count. Evidence: the returned dict.
+      2. **Timeout then replay** - first attempt timed out, retry (after the API finished) was a replay. Expected: low 0,
+         high 1, API count 1, ok. Evidence: counters and verdict.
+      3. **Timeout then immediate retry, same key** - Expected on the practice API: two payments, verdict duplicates.
+         Evidence: payments_created 2 against 1 logical payment.
+      4. **Retry under a new key** - Expected: duplicates, and a message that the retry used a different key.
+      5. **503 and 500 only** - attempts that created nothing. Expected: they do not raise the upper bound. Evidence: bounds.
+      6. **In flight at the stop** - an API count above the ledger by at most the users running. Expected: ok with the
+         allowance, unexplained without it. Evidence: both calls.
+      7. **Count outside the bounds** - below low or above high. Expected: unexplained, checked before duplicates.
+      8. **Empty ledger and zero counters** - Expected: ok, no division by zero in the replay share.
+    rubric:
+      - Each case has preconditions, input, expected result and evidence.
+      - Covers a clean run and a timeout followed by a replay.
+      - Covers the duplicate race and a retry under a new key.
+      - Covers failures that create nothing, the in-flight allowance and counts outside the bounds.
+      - Covers the empty case.
+    hints:
+      - Which cases could make a broken gate pass silently?
+    solution: |
+      Clean, timeout then replay, immediate retry, new key, failures that create nothing, in-flight allowance, out of
+      bounds and empty input.
+
+  - id: ppay-interview-duplicates
+    type: interview
+    concept: perf-ppay-reconcile
+    skill: analysis
+    title: 'Interview: how do you load test a payment API?'
+    prompt: |
+      "How would you load test a payment API, and how would you know a retry under load does not charge a customer twice?"
+    modelAnswer: |
+      I would treat payments created as a result next to latency. The script would make one idempotency key per logical
+      payment, a random UUID, and reuse it on every retry, with many synthetic merchants each logging in once so no
+      per-client limit is hit. Retries would cover timeouts, 429, 503 and 5xx after the Retry-After pause or a back-off,
+      with a cap, and never other 4xx. The provider behind the API would be a stub that sleeps for a latency sampled from
+      real calls, because the provider's sandbox has lower limits and is not ours to load. Before reading any latency I
+      would triage the status codes: rejected requests, 429s or a high replay share make the run invalid, while a 503 is a
+      capacity result. During the run the script keeps a ledger of every logical payment and attempt. After the run I
+      would read the API's counters and reconcile: proven creations as the lower bound, plus timeouts and the requests in
+      flight at the stop as the upper bound; more payments than logical payments is a duplicate, found even when every
+      response was a 201. To provoke the race on purpose I would set the client timeout below the service time and retry at
+      once. And I would read the provider's idempotency rules, because whether a retried 5xx returns a saved error differs.
+    rubric:
+      - Key per logical payment, reused on retries.
+      - Handles limits, 503 and the retry rules, and stubs the provider.
+      - Triage of statuses before latency.
+      - Reconciliation with bounds and the in-flight allowance.
+      - Provokes the race and reads the provider's semantics.
+    hints:
+      - Start with what the test counts besides requests.
+    solution: |
+      Keys, retries and limits, a stubbed provider, status triage, a ledger reconciled with the API's counters.
+
+  - id: ppay-retry-code
+    type: coding
+    concept: perf-ppay-keys
+    skill: application
+    title: One key, safe retries
+    prompt: |
+      Implement `new_key`, `retry_wait` and `submit_payment` in `exercises/analysis/ppay_retry.py`. The tests use scripted
+      sends, then the practice API with injected 500s, then one real Locust run whose users call your code.
+    project: perf
+    files: [exercises/analysis/ppay_retry.py]
+    test: tests/analysis/test_ppay_retry.py
+    command: .venv/bin/python -m pytest tests/analysis/test_ppay_retry.py
+    modelAnswer: |
+      See "The retry rules in Python". The key is created once before the loop; `retry_wait` returns None for 2xx and for 4xx
+      other than 429, else the Retry-After seconds or the back-off, capped; a timeout is an attempt with no status and is
+      retried with the same key.
+    rubric:
+      - Every test in tests/analysis/test_ppay_retry.py passes.
+      - Creates the key once per logical payment and reuses it on every attempt.
+      - Retries only 429, 5xx and no answer and never other 4xx.
+      - Sleeps between attempts but not after the last, within the cap.
+    hints:
+      - '`new_key` is one line with the uuid module.'
+      - Put the key above the loop, not inside it.
+      - Catch `TimeoutError` around `send(key)` and record the status as None.
+    solution: |
+      Three small functions; the care goes into where the key is created and which statuses are retried.
+
+  - id: ppay-reconcile-code
+    type: coding
+    concept: perf-ppay-reconcile
+    skill: application
+    title: Reconcile the ledger with the API
+    prompt: |
+      Implement `summarise`, `created_bounds`, `replay_share` and `reconcile` in `exercises/analysis/ppay_reconcile.py`. The
+      tests use hand-made ledgers and the timeout experiment against the practice API.
+    project: perf
+    files: [exercises/analysis/ppay_reconcile.py]
+    test: tests/analysis/test_ppay_reconcile.py
+    command: .venv/bin/python -m pytest tests/analysis/test_ppay_reconcile.py
+    modelAnswer: |
+      See "Reconciliation in Python". Low is the number of non-replay 2xx attempts; high adds timeouts and in-flight requests;
+      outside the bounds is unexplained (checked first); above the logical count plus in-flight is duplicates.
+    rubric:
+      - Every test in tests/analysis/test_ppay_reconcile.py passes.
+      - Failures that create nothing do not raise the upper bound.
+      - Checks unexplained before duplicates and allows for in-flight requests.
+      - Handles an empty ledger and zero counters without dividing by zero.
+    hints:
+      - Write `summarise` first; the other functions are built on it.
+      - A replay is a 2xx whose `replayed` flag is true.
+      - '`reconcile` is two comparisons in a fixed order.'
+    solution: |
+      Count, bound, compare; the order of the verdict checks matters.
+
+  - id: ppay-triage-code
+    type: coding
+    concept: perf-ppay-limits
+    skill: application
+    title: Read the status codes first
+    prompt: |
+      Implement `classify`, `summarise` and `verdict` in `exercises/analysis/ppay_triage.py`. The tests use hand-made rows,
+      each rule at its exact threshold, and three live probes of the practice API.
+    project: perf
+    files: [exercises/analysis/ppay_triage.py]
+    test: tests/analysis/test_ppay_triage.py
+    command: .venv/bin/python -m pytest tests/analysis/test_ppay_triage.py
+    modelAnswer: |
+      See "Reading the status codes first". `classify` maps a status and its headers to one class; `summarise` counts every
+      class including zeros; `verdict` applies the rules in a fixed order and marks a run invalid for a script error, a
+      replay share above the limit or an unexpected 429, while a 503 and a few 5xx are reported but are results.
+    rubric:
+      - Every test in tests/analysis/test_ppay_triage.py passes.
+      - Header names are matched case-insensitively.
+      - Exactly 1 % and exactly 20 % are not above the thresholds.
+      - A 503 is reported and does not invalidate the run.
+    hints:
+      - '`any(k.lower() == "idempotent-replayed" ...)` for the replay header.'
+      - Start the counts from a dict with every class at zero.
+      - Compute the shares with the total of all requests, and guard the empty run first.
+    solution: |
+      One mapping, one count, and an ordered list of rules over the counts.
+
+placement:
+  - id: ppay-place-key
+    type: mcq
+    concept: perf-ppay-keys
+    skill: application
+    title: A script with one key per user
+    prompt: A payment script gives each virtual user one Idempotency-Key at login and sends it with every payment. The report shows very high throughput and no errors. What is wrong?
+    options:
+      - id: replays
+        text: After each user's first payment every request is an idempotent replay, so the run measures replays; use a fresh key per logical payment.
+        feedback: Correct - the counters would show few payments and many replays.
+      - id: nothing
+        text: Nothing; the API is just fast.
+        feedback: Replays are answered without service time.
+      - id: users
+        text: Too few users; add more.
+        feedback: More users with the same design give more replays.
+    correct: [replays]
+    hints:
+      - What does the API do with a key it has seen?
+    solution: |
+      The run measured replays; use a key per logical payment.
+
+  - id: ppay-place-limits
+    type: mcq
+    concept: perf-ppay-limits
+    skill: application
+    title: A wall of 429s
+    prompt: A load script logs in as the same merchant on every iteration and gets many 429 answers. What is the right response?
+    options:
+      - id: spread
+        text: Fix the test design - many merchants, each logging in once and reusing its token - and run a separate, labelled rate-limit test if the limiter is the subject.
+        feedback: Correct - the finding is about the script's identity use.
+      - id: report
+        text: Report that the payment service is failing.
+        feedback: The 429 is a per-client policy that the script triggered.
+      - id: retry
+        text: Retry at once until it works.
+        feedback: That adds load and measures the limiter.
+    correct: [spread]
+    hints:
+      - Who is the client in the API's limit?
+    solution: |
+      Spread the identities; test the limiter separately.
+
+  - id: ppay-place-reconcile
+    type: mcq
+    concept: perf-ppay-reconcile
+    skill: analysis
+    title: Requests are not payments
+    prompt: A run sent 1,000 payment requests, all answered 2xx, and the API's counter shows 1,040 payments for 1,000 logical payments. What does it mean?
+    options:
+      - id: duplicates
+        text: Some payments were created twice, for example by retries that raced the original request or used a new key; the reconciliation reports duplicates even though every response was successful.
+        feedback: Correct - more payments exist than logical payments, beyond any in-flight allowance.
+      - id: fine
+        text: Nothing; counters are approximate.
+        feedback: The counter is exact, and 40 extra payments need an explanation.
+      - id: tool
+        text: The load tool lost 40 requests.
+        feedback: Lost requests would lower the API count, not raise it.
+    correct: [duplicates]
+    hints:
+      - Compare payments with logical payments.
+    solution: |
+      Duplicates beyond the in-flight allowance.
+
+recall:
+  - id: ppay-recall-fixed
+    concept: perf-ppay-keys
+    prompt: What does a fixed Idempotency-Key do to a payment load test?
+    answer: After the first request every request is an idempotent replay, answered without service time, so the run reports huge throughput and creates almost no payments (20 payments and 3,254 replays in the lesson's run). Check idempotent_replays against payments_created.
+  - id: ppay-recall-key
+    concept: perf-ppay-keys
+    prompt: Where is the key created and what do retries do with it?
+    answer: Once per logical payment (a random UUID); every retry of that payment sends the same key. A new key on a retry is a new payment.
+  - id: ppay-recall-codes
+    concept: perf-ppay-limits
+    prompt: How do 429, 503, other 5xx and other 4xx differ in a load test?
+    answer: 429 is a per-client limit that the test design hit (spread the load); 503 is the capacity limit and a result; other 5xx and timeouts are retried with the same key; other 4xx are script errors and are not retried.
+  - id: ppay-recall-sandbox
+    concept: perf-ppay-limits
+    prompt: Why not load test a provider's sandbox?
+    answer: Its limits are lower than live mode (25 against 100 requests per second in the quoted example), its latency differs, and its documentation discourages it. Stub the provider and sleep for a latency sampled from real calls.
+  - id: ppay-recall-ceiling
+    concept: perf-ppay-limits
+    prompt: How do you estimate the ceiling of a mixed workload?
+    answer: Capacity divided by the mean service time of the mix. Capacity 4 with 40 ms payments gives 100 per second; one request in twenty a 200 ms report gives a 48 ms mean and 83 per second.
+  - id: ppay-recall-bounds
+    concept: perf-ppay-reconcile
+    prompt: What are the bounds on payments created?
+    answer: Low is the number of non-replay 2xx attempts. High adds the attempts that timed out and the requests in flight at the stop. Outside the bounds is unexplained; above the logical payments plus in-flight is duplicates.
+  - id: ppay-recall-race
+    concept: perf-ppay-reconcile
+    prompt: How can a retry with the same key still create a second payment?
+    answer: If the API stores the key only after finishing the first request, a retry that arrives earlier creates the payment again. Every response is a 201, so only reconciling payments against logical payments finds it.
+
+next:
+  - performance-testing-in-ci-cd
+  - load-testing-tools-compared
+  - performance-testing-capstone
+  - idempotency-keys
