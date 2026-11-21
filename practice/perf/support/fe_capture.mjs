@@ -99,7 +99,9 @@ const hammer = Array.from({ length: 24 }, async () => {
   while (!stop) {
     try {
       await (await fetch(`${base}/api/quote`)).arrayBuffer();
-    } catch (e) {}
+    } catch {
+      // failed calls are ignored on purpose: this loop only adds load
+    }
   }
 });
 await new Promise((r) => setTimeout(r, 400));
