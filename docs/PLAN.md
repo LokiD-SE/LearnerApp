@@ -247,19 +247,19 @@ owner chose about 30 lessons each, real JMeter and Locust runs, and a deliberate
       vulnerable SandPay portal bound to loopback only, with 17 flaws (OWASP Top 10:2021 and API Top 10:2023),
       each closable with `make_app(fixed=...)`; `tests/support` proves every flaw is present and fixable;
       `SEC_TARGET=solutions`.
-- [ ] Track K lessons, in batches of about 6 - 18 of 31 published (2026-11-20). Done: the fundamentals
+- [ ] Track K lessons, in batches of about 6 - 22 of 31 published (2026-11-21). Done: the fundamentals
       module (6), JMeter part 1 (architecture, thread groups and timers, HTTP samplers, correlation,
       assertions and listeners, parameterisation), JMeter part 2 (logic controllers, JSR223/Groovy, HTML
-      dashboard and CI, distributed testing) and Locust part 1 (fundamentals, HTTP validation and grouping).
-      Next: the rest of the Locust module (task sets, events and custom clients, load shapes, distributed and
-      CI), then analysis, CI and the capstone (9).
+      dashboard and CI, distributed testing) and the Locust module (fundamentals, HTTP validation and grouping,
+      task sets, events and custom clients, load shapes, distributed and CI). Next: analysis, CI and the
+      capstone (9).
       Sources: the Apache JMeter user manual and component reference, the Locust documentation, Little's law
       (Lazowska et al.), Google SRE books, the USE and RED methods, web.dev.
-- [ ] Track L lessons, in batches of about 6 - 18 of 30 published (2026-11-20). Done: foundations (6), web
+- [ ] Track L lessons, in batches of about 6 - 20 of 30 published (2026-11-21). Done: foundations (6), web
       vulnerabilities (authentication, sessions, access control/IDOR, SQL injection, XSS, CSRF and clickjacking,
       SSRF and open redirects, file handling and path traversal, misconfiguration, cryptography and data
-      exposure) and API security part 1 (OWASP API Top 10, JWT and OAuth). Next: API security part 2 (mass
-      assignment, business logic and rate limits), DevSecOps (5), and mobile, payments, reporting, capstone and
+      exposure) and API security (OWASP API Top 10, JWT and OAuth, mass assignment and data exposure, business logic and
+      rate limits). Next: DevSecOps (5), and mobile, payments, reporting, capstone and
       mock interview (5). Sources: OWASP WSTG (v4.2 stable), ASVS 5.0.0, Top 10, API Security Top 10:2023,
       MASVS/MASTG, cheat sheets and ZAP docs; RFCs (JWT, OAuth); FIRST CVSS v4.0; PCI DSS v4.0.1. ZAP, Burp,
       Semgrep and similar tools are quoted from their docs, not installed.

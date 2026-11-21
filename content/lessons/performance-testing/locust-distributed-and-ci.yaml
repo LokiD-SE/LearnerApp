@@ -1,0 +1,1579 @@
+id: locust-distributed-and-ci
+title: Distributed Locust and CI runs
+subject: performance-testing
+module: locust
+level: advanced
+status: published
+estimatedMinutes: 140
+summary: 'Scale a Locust test past one CPU core and make it a pipeline step. A master tells workers when to spawn users; each worker is its own Python process that runs users and reports statistics, and the master merges them - histograms add, so merged percentiles are right and the mean of the workers'' percentiles is not. --expect-workers makes a headless master wait, --expect-workers-max-wait stops it waiting for ever, and --processes forks the workers for you (the bind port must be repeated as --master-port). The pipeline reads one thing: the master''s exit code, which a quitting listener can set from a failure ratio and a 95th percentile - on the master only. Every run shown is real Locust 2.47.0 with the master and workers on 127.0.0.1, against the local SandPay practice API.'
+tags:
+  [
+    Locust,
+    distributed load testing,
+    master,
+    worker,
+    --master,
+    --worker,
+    --processes,
+    --expect-workers,
+    --expect-workers-max-wait,
+    --master-bind-host,
+    --master-port,
+    --headless,
+    --run-time,
+    exit code,
+    process_exit_code,
+    quitting event,
+    CI/CD,
+    pipeline gate,
+    percentiles,
+    merging statistics,
+    load generator,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Locust 2.47.0 on Python 3.12.3 with pytest 9.2.0, in `practice/perf/.venv`, on Linux (kernel
+    6.8). Every output in this lesson was produced on 21 November 2026. A cluster here is a master and its
+    workers as separate processes on **one machine, all on `127.0.0.1`**, started by `run_cluster()` in
+    `practice/perf/support/lc_dist_fixture.py`, which picks a free loopback port for every run (Locust's default,
+    5557, is never used in the tests).
+  - **Target (loopback only, synthetic data):** the shared SandPay practice API,
+    `practice/perf/support/sandpay_target.py`. The `error_rate` option makes a share of `POST /v1/payments` fail
+    with `500`, and the settlement report takes ten times the service time. SandPay is a fictional company;
+    `merchant-1`, its secret and every id are invented for this practice project.
+  - **What varies:** request counts and timings depend on the machine, so the numbers below will differ on yours.
+    The relationships do not: the master's totals are the sum of the workers' totals, `-u` and `-t` are given
+    once, on the master, and the exit codes follow the rules shown. Two figures to read with care: the **95th
+    percentile of 100 ms** in the merge section is the settlement report (10 ms service time times ten, from the
+    practice target's configuration), not a measurement of any real system, and the **failure ratio 0.1350** comes
+    from a seeded random error generator, so its exact value changes with the number of requests.
+  - **Hostnames and ids elided:** Locust names a worker `<hostname>_<random hex>`. In the log excerpts the machine
+    name is replaced by `host` and the hex by `<id>`, and the date is dropped from each timestamp. Nothing else was
+    edited.
+  - **Sources, as documented on 21 November 2026:** Locust 2.47.0 documentation -
+    [Distributed load generation](https://docs.locust.io/en/2.47.0/running-distributed.html) (the master and worker
+    roles, `--processes`, one worker per core, `--expect-workers`, the bind and connect options),
+    [Running without the web UI](https://docs.locust.io/en/2.47.0/running-without-web-ui.html) (`--run-time`,
+    `--stop-timeout`, distributed without the web UI, exit codes, running in CI/CD) and
+    [Running in Docker](https://docs.locust.io/en/2.47.0/running-in-docker.html). Quotations are from those pages
+    and from `locust --help` of the installed 2.47.0.
+  - **Read from the Locust 2.47.0 source, not the docs:** the exact percentile algorithm
+    (`calculate_response_time_percentile` in `locust/stats.py`) and how the exit code is chosen (`shutdown()` in
+    `locust/main.py`: `process_exit_code` if set, else `--exit-code-on-error` when there were errors, else 0).
+  - **Found by running it, not documented on those pages:** with `--processes`, a non-default
+    `--master-bind-port` has to be repeated as `--master-port`, or the forked workers look for the master on
+    5557; and a worker's own statistics are empty when it quits (it reports to the master as it goes), so the
+    per-worker numbers in this lesson come from a private `RequestStats` copy kept by a listener.
+  - **From the docs, not run here:** the Docker Compose example (no Docker on the practice machine), the GitHub
+    Actions workflow (no runner), and workers on other machines (`-f -`, `--master-host`). The practice
+    project never leaves the loopback interface.
+  - **Not repeated here:** users, tasks, `wait_time`, headless runs and the exit-code basics -
+    [Locust fundamentals](#/lesson/locust-fundamentals); validation and request names -
+    [HTTP sessions, validation and request grouping](#/lesson/locust-http-validation-and-grouping); the same
+    master and worker idea in JMeter - [Distributed testing in JMeter](#/lesson/jmeter-distributed-testing);
+    percentiles - [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles).
+
+prerequisites:
+  - locust-fundamentals
+  - locust-http-validation-and-grouping
+  - performance-metrics-and-percentiles
+
+concepts:
+  - id: perf-lcdist-cluster
+    name: Master, workers and a cluster on one machine
+    summary: 'A distributed Locust run has one master and one or more workers, all running the same locustfile. The master runs no users: it waits for workers, tells them how many users to spawn and when to stop, and merges what they report. Each worker is one Python process, which uses at most about one core, so you run one worker per core. --master --expect-workers N (with --headless) makes the master wait for N workers; --processes N forks the master and N workers in one command. The master binds to every network interface unless told otherwise (--master-bind-host defaults to *), so on a laptop bind it to 127.0.0.1 and point the workers at 127.0.0.1. Without --expect-workers-max-wait a master waits for ever for workers that never arrive.'
+  - id: perf-lcdist-merge
+    name: What the master merges, and what you can add up
+    summary: 'The master adds the workers'' statistics: request and failure counts, total time, minimum and maximum, and the response-time histogram (rounded milliseconds -> number of requests). Percentiles are read from the merged histogram, so they describe all requests. The mean of the workers'' percentiles does not: a worker that ran few slow requests counts as much as one that ran many. Users are spread across workers by count, but nothing says each worker gets the same mix of user classes, and every worker is its own process, so module-level state in the locustfile (a counter, a list of test data) is per worker, not shared.'
+  - id: perf-lcdist-gate
+    name: The pipeline gate - one exit code from the master
+    summary: 'A pipeline step passes or fails on a process exit code. Locust exits 1 when any request failed (--exit-code-on-error, default 1) and 0 otherwise. A pipeline usually wants its own rule - a failure ratio and a 95th percentile - which a quitting listener sets through environment.process_exit_code. In a cluster the listener runs in every process but only the master has the merged numbers, and only its exit code is read, so the listener returns at once on a worker. Give the run a time limit (-t), a worker wait limit (--expect-workers-max-wait) and a CI job timeout, keep the thresholds in the environment, and keep the results files as artifacts.'
+
+objectives:
+  - Start a headless master and workers on loopback, with the master waiting for its workers, and say what each role does.
+  - Choose the worker count from the cores of the load-generating machine, and recognise when the load generator rather than the system under test is the limit.
+  - Use --processes correctly, including the --master-port that its forked workers need when the port is not the default.
+  - Merge the workers' statistics the way the master does, and show why the mean of per-worker percentiles is wrong.
+  - Write a quitting listener that fails the pipeline from a failure ratio and a 95th percentile, on the master only, and run it in a pipeline with time limits and kept artifacts.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: The idea in plain language
+    body: |
+      Picture a call-centre test. You want to see how a bank copes when 400 customers phone at once, but one
+      supervisor can only dial so fast. So you hire a team: a **coordinator** who says "start now, 100 callers
+      each", and **callers** who actually dial and write down how long every call took. At the end the
+      coordinator collects the callers' notebooks and writes one report.
+
+      Three things can go wrong:
+
+      1. **The coordinator waits for callers who never arrive.** The test never starts, and nobody notices because
+         nothing is printed but "waiting".
+      2. **The coordinator averages the callers' summaries.** One caller dealt only with fast enquiries, another
+         with slow ones; "average of their worst-5-percent figures" is not "worst 5 percent of all calls".
+      3. **The report goes to a machine, not a person.** The deploy pipeline does not read a report; it reads
+         "did the coordinator say pass or fail". If the callers each shout their own verdict, or the coordinator
+         only ever says "pass", the gate is useless.
+
+      That is distributed Locust in a pipeline: a **master** (the coordinator) and **workers** (the callers),
+      statistics that are **merged correctly**, and **one exit code** from the master that means something.
+
+  - id: what
+    kind: what
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: Terms you need
+    body: |
+      | Term | Meaning (Locust 2.47.0 documentation unless noted) |
+      | --- | --- |
+      | **Master** | "tells the workers when to spawn/stop Users"; "doesn't run any Users itself"; started with `--master` |
+      | **Worker** | "run your Users and send statistics back to the master"; started with `--worker` |
+      | **`--processes N`** | launches a master process and N worker processes; "relies on fork() so it doesn't work on Windows"; `locust --help` marks it "Experimental" |
+      | **`--expect-workers N`** | "Used when starting the master node with --headless. The master node will then wait until X worker nodes has connected before the test is started." |
+      | **`--expect-workers-max-wait S`** | from `locust --help`: "How long should the master wait for workers to connect before giving up. Defaults to wait forever" |
+      | **`--master-bind-host` / `--master-bind-port`** | the master's listening address; the host "Defaults to `*` (all available interfaces)", the port to 5557 |
+      | **`--master-host` / `--master-port`** | for a worker: where the master is; "defaults to localhost" and 5557 |
+      | **`-f -`** | on a worker, "get the locustfile from master instead of from its local filesystem"; "only works for single locustfiles" |
+      | **`response_times`** | Locust's per-request histogram: rounded milliseconds -> how many requests took that long; histograms from workers add |
+      | **`--run-time` (`-t`)** | "Locust will shut down once the time is up. Time is calculated from the start of the test (not from when ramp up has finished)." |
+      | **`--exit-code-on-error`** | from `locust --help`: "Sets the process exit code to use when a test result contain any failure or error. Defaults to 1." |
+      | **`environment.process_exit_code`** | "manually control the exit code in your test scripts"; set it in a `quitting` listener |
+      | **Gate** | a rule that turns the results into pass or fail for a pipeline: here a failure ratio and a 95th percentile |
+      | **Cluster (this lesson)** | a master and its workers; here all on one machine and on `127.0.0.1` |
+
+  - id: why
+    kind: why
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: The problems this solves
+    body: |
+      **1. One process is one core.** The docs say "Because Python cannot fully utilize more than one core per
+      process (see GIL), you need to run one worker instance per processor core in order to have access to all
+      your computing power." A single Locust process can do "more than a thousand requests per second, possibly
+      over ten thousand if you use FastHttpUser" for simple plans, but a plan with real think time, parsing and
+      validation (see [validation](#/lesson/locust-http-validation-and-grouping)) uses more CPU per request. If the
+      load generator is out of CPU, its response times include its own queueing and it sends less load than you
+      asked for - and the report blames the system under test. The docs: "If Locust is getting close to running out
+      of CPU resources, it will log a warning." Spreading users over workers is how you keep the generator out of
+      the picture.
+
+      **2. A pipeline needs a verdict, not a report.** A load test in CI is only useful if it can stop a deploy.
+      The step must end by itself, within a time limit, and exit non-zero for the right reasons. "Any request
+      failed" is too strict for a service with an agreed error budget (see
+      [SLOs](#/lesson/performance-requirements-and-slos)); "the pipeline looked green" is too loose when the 95th
+      percentile has doubled.
+
+      **3. Numbers from several processes must still mean something.** Once the statistics live in several
+      processes, somebody has to combine them. The master does it correctly; a script that averages the workers'
+      summaries does not. Knowing *how* the merge works tells you which numbers you can trust and which you must
+      compute yourself.
+
+      **4. A test tool is also a network service.** A master listens for workers. By default it listens on *every*
+      network interface. On a laptop or a shared CI machine that is a port you did not mean to open. Everything in
+      this lesson - and every exercise - binds it to `127.0.0.1`.
+
+      > **Ethics and scope.** Load generation can take a system down. Run distributed tests only against systems
+      > you own or have written permission to test, within the agreed window and load, and never against someone
+      > else's production. The practice project only ever talks to its own local API.
+
+  - id: internals-cluster
+    kind: internals
+    concepts: [perf-lcdist-cluster]
+    title: How a cluster starts and what the options do
+    body: |
+      **The roles.** Every process runs the same locustfile. With `--master` the process runs no users; with
+      `--worker` it runs users and sends statistics to the master. Users (`-u`), spawn rate (`-r`) and run time
+      (`-t`) are given **once, on the master**. The `locust --help` text for workers says it plainly: "Typically ONLY
+      these options (and --locustfile) need to be specified on workers, since other options (-u, -r, -t, ...) are
+      controlled by the master node."
+
+      **Starting a headless run.** Without the web UI nobody presses "start", so the master needs to know how many
+      workers to wait for: `--expect-workers N`. The real log of a master and two workers (8 users, 6 seconds):
+
+      ```text
+      [09:45:03] INFO/locust.main: Starting Locust 2.47.0
+      [09:45:03] INFO/locust.runners: host_<id> (index 0) reported as ready. 1 workers connected.
+      [09:45:03] INFO/locust.runners: host_<id> (index 1) reported as ready. 2 workers connected.
+      [09:45:04] INFO/locust.main: Run time limit set to 6 seconds
+      [09:45:04] INFO/locust.runners: Sending spawn jobs of 8 users at 8.00 spawn rate to 2 ready workers
+      [09:45:04] INFO/locust.runners: All users spawned: {"Payer": 8} (8 total users)
+      [09:45:10] INFO/locust.main: --run-time limit reached, shutting down
+      [09:45:10] INFO/locust.runners: Worker 'host_<id>' (index 0) quit. 0 workers ready.
+      [09:45:10] INFO/locust.runners: Worker 'host_<id>' (index 1) quit. 0 workers ready.
+      [09:45:10] INFO/locust.runners: The last worker quit, stopping test.
+      [09:45:11] INFO/locust.main: Shutting down (exit code 0)
+      ```
+
+      The test starts only after "2 workers connected" - that is `--expect-workers 2`. The run time counts from the
+      start of the test, and the master tells the workers to quit.
+
+      **What if a worker never comes?** `--expect-workers-max-wait` "defaults to wait forever", so a pipeline with a
+      crashed worker would hang until the CI job's own timeout. With a limit, one worker connected and two expected
+      (`--expect-workers-max-wait 4`):
+
+      ```text
+      master exit 1
+      [09:48:12] INFO/locust.runners: host_<id> (index 0) reported as ready. 1 workers connected.
+      [09:48:15] ERROR/locust.main: Gave up waiting for workers to connect
+      ```
+
+      No test ran and the exit code is 1 - which a pipeline reads as a failure, correctly.
+
+      **`--processes`: the one-command form.** `--processes 2` makes the master fork two workers and sets
+      `--expect-workers` itself. One trap, found by running it: the forked workers connect to the master's *default*
+      port. Ask for `--master-bind-port 58109` without `--master-port 58109` and the master waits while the workers
+      look elsewhere:
+
+      ```text
+      [09:45:26] INFO/root: Waiting for workers to be ready, 0 of 2 connected
+      [09:45:51] INFO/locust.runners: Failed to connect to master 127.0.0.1:5557, retry 6/60.
+      [09:45:56] INFO/locust.runners: Failed to connect to master 127.0.0.1:5557, retry 7/60.
+      ```
+
+      (Only the first and a few later lines are shown; the master prints the "Waiting" line every second and this
+      went on until the run was stopped by hand - the workers retry 60 times first.) It is the same class of failure
+      as the missing worker above, and `--expect-workers-max-wait` ends it.
+
+      **Binding.** The docs: `--master-bind-host` "Determines which network interface the master node will bind to.
+      Defaults to `*` (all available interfaces)." For a laptop or a shared CI runner, `--master-bind-host 127.0.0.1`
+      keeps the control port off the network, and workers use `--master-host 127.0.0.1`. Workers on other machines
+      (from the docs, not run here) need a reachable master address and `-f -` or their own copy of the locustfile;
+      then the port belongs behind a firewall or a private network, not on the open internet.
+
+      **One worker per core.** The number of workers is a property of the *generator machine*, not of the
+      test: about one per core, and the more workers share the machine with the system under test, the more they
+      steal from it. Watch for Locust's CPU warning; if it appears, add workers (or cores), do not trust the
+      numbers.
+
+  - id: internals-merge
+    kind: internals
+    concepts: [perf-lcdist-merge]
+    title: What the master merges
+    body: |
+      A worker keeps, for every request name, the number of requests and failures, the total, minimum and maximum
+      response time, and the **histogram**: `response_times`, a dictionary from a rounded response time in
+      milliseconds to how many requests took that long. Locust rounds to keep the histogram small - the source's
+      `bucket_response_time` says it "rounds to ~2 significant digits, so that 147 becomes 150" (below 100 ms, to the
+      nearest millisecond) and that this "is important for bandwidth in distributed mode", which is also why
+      percentiles are whole numbers. Two histograms add key by key, so the master's histogram is exactly the sum of
+      the workers'.
+
+      Percentiles are read from that merged histogram with this algorithm (`calculate_response_time_percentile`,
+      Locust 2.47.0):
+
+      ```python
+      num_of_request = int(num_requests * percent)
+      processed_count = 0
+      for response_time in sorted(response_times.keys(), reverse=True):
+          processed_count += response_times[response_time]
+          if num_requests - processed_count <= num_of_request:
+              return response_time
+      return 0
+      ```
+
+      It walks from the slowest bucket down and returns the bucket where the slowest `(1 - percent)` share is used
+      up. That is a percentile **of all requests**.
+
+      A real two-worker run shows why it matters. The locustfile has three fast `Reader` users (a health check, a
+      few milliseconds) for every `ReportUser` (the settlement report, about 100 ms). The captured run had 8 users on
+      two workers; in this run **both report users landed on worker 0** and none on worker 1. Locust spreads users
+      across workers, but this shows no promise that every worker gets the same mix of user classes.
+
+      ```text
+      worker 0: 280 requests, p95 100 ms, p50 4 ms
+      worker 1: 404 requests, p95 6 ms, p50 4 ms
+      merged: 684 requests, p95 100 ms; naive mean of worker p95s: 53.0
+      ```
+
+      The 72 settlement reports are 10.5 % of all 684 requests, so the real 95th percentile is a report time. The
+      mean of the two workers' 95th percentiles, 53 ms, describes no request that happened: it halves the effect of the
+      slow requests only because the worker that ran them also ran fewer requests overall.
+
+      And the merge itself is exact. Comparing the sum of the two workers' dumps with the master's own totals from the
+      same run:
+
+      ```text
+      /health                  master  610  merged  610  p95 master   6  merged   6
+      /auth/token              master    2  merged    2  p95 master  17  merged  17
+      /v1/reports/settlement   master   72  merged   72  p95 master 110  merged 110
+      ```
+
+      **Two more consequences of "each worker is its own process".**
+
+      - A worker's own statistics are cleared as it reports (a worker's live statistics were empty when it quit, so
+        the per-worker figures above come from a private `RequestStats` copy). If you need per-worker data, record it
+        yourself; for the run's results, use the master's `--json-file` / `--csv` output.
+      - Module-level state is per worker. A `itertools.count()` at the top of the locustfile starts at 1 in *every*
+        worker, so two workers hand out the same "unique" numbers; a list of test data is read once per worker.
+        Make identifiers unique with `uuid4()` or by worker index (`environment.runner.worker_index`), and split
+        data files per worker if records must not repeat.
+
+  - id: internals-gate
+    kind: internals
+    concepts: [perf-lcdist-gate]
+    title: How the exit code is chosen
+    body: |
+      A pipeline step passes or fails on the process's exit code. Locust 2.47.0 chooses it in `shutdown()` (read from
+      `locust/main.py`) after the `quitting` event has fired:
+
+      1. if `environment.process_exit_code` is not `None`, that is the code;
+      2. else, if the run had errors or exceptions, `--exit-code-on-error` (default **1**);
+      3. else **0** (or 2 if a greenlet died with an unhandled exception).
+
+      The docs describe the same default - "an exit code of 1 if there were any failed samples" - and the way to take
+      control: "setting the process_exit_code of the Environment instance ... particularly useful when running Locust
+      as an automated/scheduled test, for example as part of a CI pipeline." Their example sets 1 when more than 1 %
+      of requests failed, the average is over 200 ms or the 95th percentile is over 800 ms, and 0 otherwise.
+
+      **Where it runs.** A `quitting` listener runs in every process: the master and each worker. In a cluster that
+      matters twice:
+
+      - Only the **master** has the merged statistics. A worker's own totals are empty or partial, so a worker that
+        evaluates the thresholds judges the wrong numbers.
+      - The pipeline reads the **master's** exit code. A worker's code is not the verdict.
+
+      The gate in this lesson therefore returns at once when `environment.runner` is a `WorkerRunner`. Run it in
+      real clusters (a master and two workers, loopback) and the codes are what the rules say:
+
+      ```text
+      inside the limits: master exit 0, workers [0, 0]
+      p95 limit 20 ms: master exit 1, workers [0, 0]
+          [09:48:31] ERROR/root: gate failed: 95th percentile 100 ms > 20.0 ms
+      half the payments fail, limit 5 %: master exit 1, workers [0, 0]
+          [09:48:38] ERROR/root: gate failed: failure ratio 0.1350 > 0.05
+      ```
+
+      The 95th-percentile run had **no failed request at all**, so Locust's own rule would have exited 0 - only the gate
+      produced the 1. (The exercise's tests go one step further and start the master with `--exit-code-on-error 0`,
+      so that only the gate *can* produce a 1.) That is the point: the rule is yours, in code, in version control.
+
+      **A pipeline needs three limits, not one.** The gate decides pass or fail on *results*; three more limits
+      decide that the step *ends*: `-t` (the test), `--expect-workers-max-wait` (the wait for workers) and the CI
+      job's own timeout (the docs' workflow sets `timeout-minutes: 15` "just in case something goes wrong").
+      Without them a missing worker or a stuck target hangs the pipeline instead of failing it.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: One cluster, one verdict
+    body: |
+      ```mermaid
+      flowchart TD
+        CI["CI job (timeout-minutes)"] --> M["master: --headless --expect-workers 2 -u 8 -t 6s"]
+        CI --> W1["worker 1"]
+        CI --> W2["worker 2"]
+        W1 -- "stats reports" --> M
+        W2 -- "stats reports" --> M
+        M -- "spawn users, quit" --> W1
+        M -- "spawn users, quit" --> W2
+        W1 --> T["SandPay target"]
+        W2 --> T
+        M --> G{"quitting listener on the master: failure ratio and p95 inside the limits?"}
+        G -- "yes" --> P["exit 0: step passes"]
+        G -- "no" --> F["exit 1: step fails"]
+        M --> A["--csv and --json-file: kept as artifacts"]
+      ```
+
+      Users run only on the workers; the master only coordinates and merges. The verdict is taken once, on the
+      merged numbers, and the pipeline sees one exit code. The results files (from the master) are what you keep.
+
+  - id: code-commands
+    kind: code
+    concepts: [perf-lcdist-cluster]
+    title: 'The code: command lines for a loopback cluster'
+    body: |
+      The solution for the first exercise (`practice/perf/solutions/locust/lc_dist_commands.py`, the module
+      docstring left out). The builders return an argument list - never a shell string - so a test can run exactly
+      what it checked:
+
+      ```python
+      from __future__ import annotations
+
+      LOOPBACK = "127.0.0.1"
+      LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+      def _check(users: int, spawn_rate: float, run_time: str, port: int, workers: int) -> None:
+          if workers < 1:
+              raise ValueError("at least one worker")
+          if users < workers:
+              raise ValueError("fewer users than workers leaves a worker with nothing to do")
+          if spawn_rate <= 0:
+              raise ValueError("spawn_rate must be positive")
+          if not run_time or run_time == "0":
+              raise ValueError("a headless run needs a run time, or it never stops")
+          if not 1024 <= port <= 65535:
+              raise ValueError("port must be 1024-65535")
+
+
+      def master_command(locustfile: str, host: str, users: int, spawn_rate: float, run_time: str, workers: int,
+                         port: int, out_prefix: str, *, locust: str = "locust") -> list[str]:
+          _check(users, spawn_rate, run_time, port, workers)
+          return [locust, "-f", locustfile, "--master", "--master-bind-host", LOOPBACK, "--master-bind-port", str(port),
+                  "--headless", "--expect-workers", str(workers), "-u", str(users), "-r", str(spawn_rate),
+                  "-t", run_time, "--host", host, "--csv", out_prefix, "--json-file", out_prefix, "--only-summary"]
+
+
+      def worker_command(locustfile: str, port: int, *, locust: str = "locust") -> list[str]:
+          return [locust, "-f", locustfile, "--worker", "--master-host", LOOPBACK, "--master-port", str(port),
+                  "--loglevel", "WARNING"]
+
+
+      def processes_command(locustfile: str, host: str, users: int, spawn_rate: float, run_time: str, processes: int,
+                            port: int, out_prefix: str, *, locust: str = "locust") -> list[str]:
+          _check(users, spawn_rate, run_time, port, processes)
+          return [locust, "-f", locustfile, "--headless", "--processes", str(processes), "--master-bind-host", LOOPBACK,
+                  "--master-bind-port", str(port), "--master-port", str(port), "-u", str(users), "-r", str(spawn_rate),
+                  "-t", run_time, "--host", host, "--csv", out_prefix, "--json-file", out_prefix, "--only-summary"]
+
+
+      def _value(argv: list[str], flag: str) -> str | None:
+          for i, a in enumerate(argv[:-1]):
+              if a == flag:
+                  return argv[i + 1]
+          return None
+
+
+      def audit(argv: list[str]) -> list[str]:
+          """Problem ids found in a Locust command line (an empty list means none):
+
+          - ``master-not-loopback``: a master (``--master``, or ``--processes`` without ``--worker``) whose
+            ``--master-bind-host`` is missing or not a loopback address
+          - ``worker-master-not-loopback``: a worker whose ``--master-host`` is given and is not a loopback address
+          - ``no-expect-workers``: a headless ``--master`` without ``--expect-workers``
+          - ``port-mismatch``: ``--processes`` with a ``--master-bind-port`` that differs from ``--master-port``
+            (an absent ``--master-port`` means 5557)
+          - ``no-run-time``: a headless command without ``-t`` / ``--run-time``
+          """
+          problems: list[str] = []
+          worker = "--worker" in argv
+          processes = "--processes" in argv
+          master = "--master" in argv or (processes and not worker)
+          if master and _value(argv, "--master-bind-host") not in LOOPBACK_HOSTS:
+              problems.append("master-not-loopback")
+          if worker:
+              mh = _value(argv, "--master-host")
+              if mh is not None and mh not in LOOPBACK_HOSTS:
+                  problems.append("worker-master-not-loopback")
+          if "--master" in argv and "--headless" in argv and "--expect-workers" not in argv:
+              problems.append("no-expect-workers")
+          if processes and not worker:
+              bind = _value(argv, "--master-bind-port") or "5557"
+              if bind != (_value(argv, "--master-port") or "5557"):
+                  problems.append("port-mismatch")
+          if "--headless" in argv and not ({"-t", "--run-time"} & set(argv)):
+              problems.append("no-run-time")
+          return problems
+      ```
+
+      What the builders print for a master and two workers, and for the one-command form (the same flags, the port
+      repeated), and what `audit()` says about a master that was started carelessly:
+
+      ```text
+      locust -f payer_locustfile.py --master --master-bind-host 127.0.0.1 --master-bind-port 5601 --headless --expect-workers 2 -u 8 -r 4 -t 6s --host http://127.0.0.1:8090 --csv out/run --json-file out/run --only-summary
+         audit -> []
+      locust -f payer_locustfile.py --worker --master-host 127.0.0.1 --master-port 5601 --loglevel WARNING
+         audit -> []
+      locust -f payer_locustfile.py --headless --processes 2 --master-bind-host 127.0.0.1 --master-bind-port 5601 --master-port 5601 -u 8 -r 4 -t 6s --host http://127.0.0.1:8090 --csv out/run --json-file out/run --only-summary
+         audit -> []
+      locust -f payer_locustfile.py --master --headless -u 8 -r 4
+         audit -> ['master-not-loopback', 'no-expect-workers', 'no-run-time']
+      ```
+
+      The last command is the one that hangs a pipeline (it waits for workers for ever, then runs for ever) and
+      listens on every interface while it does. `audit()` finds all three before anything runs.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge]
+    title: The lines that matter
+    body: |
+      - **`--master-bind-host 127.0.0.1`** - without it the master binds to `*`. The audit treats a missing value as
+        wrong because the *default* is the unsafe one.
+      - **`--expect-workers N`** - the master of a headless run starts only when N workers are ready. Too small and
+        the test starts with fewer generators than planned; too large and it waits (see `--expect-workers-max-wait`).
+      - **`-u`, `-r`, `-t` only on the master** - the workers take their orders from it. The builder refuses
+        `users < workers`: a worker with no user is a process that does nothing.
+      - **`--csv` and `--json-file` with one prefix** - on the master; the JSON is written once at the end and holds
+        the final counts (the CSV files lag, as in the fundamentals lesson).
+      - **`--processes` plus `--master-bind-port` plus `--master-port`** - the forked workers are told where the
+        master is only if you say so; the audit's `port-mismatch` is the failure shown above.
+      - **`--loglevel WARNING` on a worker** - a worker's INFO log is short and mostly noise in CI; the master's log is
+        the one to keep.
+      - **`percentile()`** - Locust's own loop. `int(num_requests * fraction)` is how many requests may be *slower*
+        than the answer; the loop walks from the slowest bucket until that allowance is used up.
+      - **`merge_entries()`** - counts and totals add, the minimum is the smallest of the workers' (ignoring `None`),
+        the maximum the largest, and `response_times` add key by key. Nothing is averaged.
+      - **`naive_percentile()`** - the mistake, written out so it can be measured against the merge.
+      - **`isinstance(environment.runner, WorkerRunner)`** (next section) - the whole difference between a gate that
+        works in a cluster and one that judges a fraction of the traffic.
+
+  - id: code-gate
+    kind: code
+    concepts: [perf-lcdist-gate, perf-lcdist-merge]
+    title: 'The code: merging statistics and the gate'
+    body: |
+      The merge (`practice/perf/solutions/locust/lc_dist_merge.py`, docstring left out) - the master's arithmetic,
+      reproduced so that you can check it against the master's own numbers:
+
+      ```python
+      from __future__ import annotations
+
+
+      def _hist(entry: dict) -> dict[int, int]:
+          return {int(k): v for k, v in entry["response_times"].items()}
+
+
+      def percentile(response_times: dict, num_requests: int, fraction: float) -> int:
+          hist = {int(k): v for k, v in response_times.items()}
+          allowed = int(num_requests * fraction)
+          processed = 0
+          for rt in sorted(hist, reverse=True):
+              processed += hist[rt]
+              if num_requests - processed <= allowed:
+                  return rt
+          return 0
+
+
+      def merge_entries(entries: list[dict]) -> dict:
+          merged = {"method": entries[0]["method"], "name": entries[0]["name"], "num_requests": 0, "num_failures": 0,
+                    "total_response_time": 0.0, "min_response_time": None, "max_response_time": 0.0,
+                    "response_times": {}}
+          for e in entries:
+              merged["num_requests"] += e["num_requests"]
+              merged["num_failures"] += e["num_failures"]
+              merged["total_response_time"] += e["total_response_time"]
+              lo = e["min_response_time"]
+              if lo is not None and (merged["min_response_time"] is None or lo < merged["min_response_time"]):
+                  merged["min_response_time"] = lo
+              merged["max_response_time"] = max(merged["max_response_time"], e["max_response_time"])
+              for rt, n in _hist(e).items():
+                  merged["response_times"][rt] = merged["response_times"].get(rt, 0) + n
+          return merged
+
+
+      def merge_workers(worker_dumps: list[list[dict]]) -> dict[str, dict]:
+          by_name: dict[str, list[dict]] = {}
+          for dump in worker_dumps:
+              for e in dump:
+                  by_name.setdefault(e["name"], []).append(e)
+          return {name: merge_entries(es) for name, es in by_name.items()}
+
+
+      def naive_percentile(worker_dumps: list[list[dict]], fraction: float) -> float:
+          """The mistake: the mean of each worker's percentile over all of its requests."""
+          values = []
+          for dump in worker_dumps:
+              total = merge_entries(dump)
+              values.append(percentile(total["response_times"], total["num_requests"], fraction))
+          return sum(values) / len(values)
+
+
+      def even_split(total_users: int, workers: int) -> list[int]:
+          base, extra = divmod(total_users, workers)
+          return [base + (1 if i < extra else 0) for i in range(workers)]
+      ```
+
+      The gate (`practice/perf/solutions/locust/lc_dist_gate_locustfile.py`, docstring left out). The `Prober` user
+      logs in, reads the health check, creates payments (some fail when the target is configured to) and reads the
+      slow settlement report, so both limits have something to bite on:
+
+      ```python
+      import logging
+      import os
+      import uuid
+
+      from locust import HttpUser, constant, events, task
+      from locust.runners import WorkerRunner
+
+
+      class Prober(HttpUser):
+          wait_time = constant(0.05)
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"})
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task(3)
+          def health(self):
+              self.client.get("/health")
+
+          @task(2)
+          def create_payment(self):
+              # fails with a 500 for the share of requests the target is configured to break
+              self.client.post("/v1/payments", json={"amount_minor": 1250, "currency": "EUR"},
+                               headers={"Idempotency-Key": str(uuid.uuid4())})
+
+          @task(1)
+          def settlement(self):
+              # ten times the service time, so a p95 threshold has something to bite on
+              self.client.get("/v1/reports/settlement")
+
+
+      def verdict(fail_ratio: float, p95_ms: float, max_fail_ratio: float, max_p95_ms: float) -> tuple[int, list[str]]:
+          reasons = []
+          if fail_ratio > max_fail_ratio:
+              reasons.append(f"failure ratio {fail_ratio:.4f} > {max_fail_ratio}")
+          if p95_ms > max_p95_ms:
+              reasons.append(f"95th percentile {p95_ms} ms > {max_p95_ms} ms")
+          return (1 if reasons else 0), reasons
+
+
+      @events.quitting.add_listener
+      def gate(environment, **_):
+          if isinstance(environment.runner, WorkerRunner):
+              return
+          total = environment.stats.total
+          code, reasons = verdict(total.fail_ratio, total.get_response_time_percentile(0.95),
+                                  float(os.environ.get("LC_GATE_MAX_FAIL_RATIO", "0.01")),
+                                  float(os.environ.get("LC_GATE_P95_MS", "800")))
+          for r in reasons:
+              logging.error("gate failed: %s", r)
+          environment.process_exit_code = code
+      ```
+
+      The thresholds arrive as environment variables, so one locustfile serves a quick pull-request check and a
+      stricter nightly run. A limit that is *exactly* reached passes (`>` not `>=`), and the reason names the
+      measured value and the limit, so the CI log says why.
+
+  - id: when
+    kind: when
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: When to use it, and when not to
+    body: |
+      **Distribute when** one process cannot produce the planned load without running out of CPU (Locust warns you),
+      or when the plan uses so much per-request logic that a single core is the limit before the system under test
+      is. Use `--processes` on one machine first: it is one command and needs no networking.
+
+      **Use several machines when** one machine's cores are used up, or the load must come from several places. Then
+      the network, the firewall and a copy of the locustfile on each machine become part of the test, and so does
+      the time to start them all. (From the docs, not run here: `locust -f - --worker --master-host <master>
+      --processes 4` on each worker machine.)
+
+      **Don't distribute when** a single process reaches the planned load comfortably: more processes only add
+      moving parts, and a bigger run is not a better run. First check the load generator is not the bottleneck
+      (its CPU, the warning), then check the target.
+
+      **Gate a pipeline when** the test is short, repeatable and compares like with like (same target size, same
+      data, same plan). **Do not gate on a single noisy number from a shared CI runner**; run the heavy tests on a
+      schedule, keep the pull-request check small, and treat a gate failure as "look at the results", not "the system
+      is slower" - the earlier lessons on [percentiles](#/lesson/performance-metrics-and-percentiles) and [test
+      environments](#/lesson/performance-test-environments-and-data) say why.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: Adding a distributed Locust step to a pipeline, step by step
+    body: |
+      1. **Run the plan on one process first.** Check it works, that the names are grouped and the checks are
+         valid (the validation lesson) and watch the generator's CPU. Only distribute what needs it.
+      2. **Pick the worker count from the generator's cores**, leaving room for anything else that shares the
+         machine - especially the system under test if it runs there too.
+      3. **Start the cluster on loopback** (or a private network) with `--expect-workers` *and*
+         `--expect-workers-max-wait`, free ports (never assume 5557 is free on a shared runner), and `-u`, `-r`, `-t`
+         on the master only. With `--processes`, repeat a non-default port as `--master-port`.
+      4. **Make every id unique across workers** (`uuid4()` or the worker index) and decide how test data is split.
+      5. **Write the gate on the master.** Failure ratio and a percentile, thresholds from the environment, a clear
+         reason in the log, and an early `return` on a worker.
+      6. **Set three timeouts:** the test (`-t`), the wait for workers, and the CI job. A step that cannot end by
+         itself will be killed by a human.
+      7. **Keep the artifacts:** the master's `--csv`, `--json-file` and, if you like, `--html`. The exit code says
+         pass or fail; the files say why, and are the baseline for the next run.
+      8. **Test the gate itself.** Run the pipeline step once with a limit you know will fail and once with one that
+         passes. A gate that has never failed has never been shown to work.
+
+      The GitHub Actions snippet from the Locust docs ("Running in CI/CD", for a single instance - from the docs, not
+      run here) shows where the timeout and the headless run go; add your own gate and `--processes` to it:
+
+      ```yaml
+      env:
+        PYTHONUNBUFFERED: 1 # ensure we see output right away
+      jobs:
+        loadtest:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15 # just in case something goes wrong
+      steps:
+        - uses: actions/checkout@v6
+        - uses: actions/setup-python@v7
+          with:
+            python-version: '3.11'
+        - run: pip install locust
+        - run: locust --headless --run-time 5m
+      ```
+
+      The version numbers (`checkout@v6`, `setup-python@v7`, Python 3.11) are the docs' own at 2.47.0; check the
+      current ones when you copy it. Also from the docs, a Compose file starts "a master node and 4 workers" with
+      `docker-compose up --scale worker=4`; its master and worker `command:` lines are the same `--master` and
+      `--worker --master-host master` flags as here.
+
+  - id: example
+    kind: example
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: 'Worked example: the SandPay nightly payment-flow test'
+    body: |
+      *Hypothetical - SandPay is fictional, and the figures are chosen to show the reasoning, not measured.*
+
+      SandPay's nightly test must show that 200 simulated merchants can create payments with a 95th percentile
+      under 800 ms and a failure ratio under 0.5 %. On a single 4-core CI machine:
+
+      1. A one-process trial runs 200 users and Locust logs its CPU warning. The tester concludes the generator is
+         the limit: any percentile from this run includes its own queueing.
+      2. They start `--processes 4` (one per core): master and four workers, bound to `127.0.0.1`, `-u 200 -r 20
+         -t 10m`, `--expect-workers-max-wait 60`, and the matching `--master-port`. The warning is gone.
+      3. Idempotency keys come from `uuid4()`, so four workers never send the same key (a repeated key would be a
+         replay, not a payment).
+      4. The gate reads `LC_GATE_MAX_FAIL_RATIO=0.005` and `LC_GATE_P95_MS=800` from the workflow file. The first
+         night it exits 1: "failure ratio 0.0071 > 0.005". The `--csv` files from the artifact show that the failures
+         are `503` from the target during its own deploy, so the *schedule* is wrong, not the system; the test moves
+         to after the deploy finishes.
+      5. A week later the job takes 40 minutes instead of 12. The workflow's `timeout-minutes` kills it - and a
+         `--expect-workers-max-wait` message in the log shows that two workers did not start, because the runner was
+         short of memory. The step fails fast and visibly.
+
+      The point of each limit is visible: the worker count from cores, the loopback bind, the unique keys, the
+      gate with a reason, and three timeouts.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: How the exercises are tested
+    body: |
+      - `tests/locust/test_lc_dist_commands.py` checks the three builders flag by flag, the `ValueError` cases and a
+        table of command lines for `audit()`. Then it runs **real clusters on 127.0.0.1** with what you built: a master
+        and two workers (4 users, 3 s) and the `--processes` form, each on a free port, and compares the master's JSON
+        with what must have happened (exit codes 0, exactly 4 logins - one per user, whichever worker ran it - and
+        payments created).
+      - `tests/locust/test_lc_dist_merge.py` feeds your merge the **real per-worker dumps** captured from a two-worker
+        run and requires exact agreement with the master's own totals, counts and percentiles; it checks that the
+        input is not modified, that a missing minimum is ignored, and that the mean of the workers' 95th percentiles is
+        at least 30 ms below the true value on that data.
+      - `tests/locust/test_lc_dist_gate.py` runs your gate locustfile in real clusters (a master with
+        `--exit-code-on-error 0` and two workers): inside the limits the master exits 0; a 20 ms p95 limit or a
+        half-failing target makes the master exit 1 with the reason in its log; and the workers exit 0 and never
+        print "gate failed".
+
+      No test checks absolute response times - they depend on the machine. The p95 test works because the settlement
+      report takes ten times the service time of everything else, whatever the machine, and the limit is far below it.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/locust/test_lc_dist_commands.py tests/locust/test_lc_dist_merge.py tests/locust/test_lc_dist_gate.py
+      ```
+
+      Each cluster test takes a few seconds (startup, a 3-4 second run, shutdown). If a test fails with a timeout,
+      look for a stray `locust` process from an earlier interrupted run (`ps -ef | grep locust`) - and use
+      `free_port()`, never 5557.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: Common mistakes
+    body: |
+      1. **Leaving `--master-bind-host` out.** The master listens on every interface. Bind to `127.0.0.1` (or a
+         private address) on purpose.
+      2. **`--expect-workers` without `--expect-workers-max-wait`.** A worker that fails to start leaves the pipeline
+         waiting until the CI job's timeout.
+      3. **`--processes` with a custom bind port and no `--master-port`.** The master waits; the workers retry port
+         5557.
+      4. **Assuming port 5557 is free.** On a shared runner two jobs collide. Pick a free port per run.
+      5. **More users than the load generator can drive.** The CPU warning is the signal; the response times are
+         then the generator's, not the system's.
+      6. **Averaging per-worker percentiles** - or adding them, or taking the maximum of them. Merge the histograms
+         and read the percentile (or use the master's output).
+      7. **Setting the exit code on a worker, or on every process.** Only the master has the merged numbers and only
+         its code is read.
+      8. **Module-level counters and data lists.** Each worker has its own copy; "unique" ids repeat across workers.
+      9. **A gate that has never failed.** Run it once against a limit you know is broken.
+      10. **No time limit on the test.** A headless run without `-t` runs until someone stops it.
+      11. **Starting the heavy test on every pull request.** It is slow, it needs a stable environment and it is
+          noisy on shared runners; schedule it, and gate pull requests on a small, stable check.
+      12. **Pointing a cluster at a system you do not own.** More generators are more load. Written permission,
+          agreed limits, agreed window - and for practice, the local target only.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-lcdist-cluster, perf-lcdist-gate]
+    title: Trade-offs
+    body: |
+      | Choice | Gain | Cost |
+      | --- | --- | --- |
+      | `--processes N` on one machine | one command, no networking, ports bound to loopback | N cores only; marked "Experimental" in `locust --help`; not on Windows |
+      | `--master` plus `--worker` processes started by you | works on Windows and across machines; you choose the ports and the start order | you start, wait for and stop every process; more to go wrong |
+      | Workers on other machines | more cores, load from other places | firewall, copies of the locustfile (or `-f -`), clock and version drift, a port to protect |
+      | Gate = Locust's default (`1` on any failed request) | nothing to write | a single failed request fails the run; no percentile rule |
+      | Custom gate in a `quitting` listener | your own rule, in version control, with reasons in the log | code to test; wrong thresholds block good changes or pass bad ones |
+      | Tight thresholds in every pull request | fast feedback | noisy runners cause false alarms and the team learns to ignore the gate |
+      | Thresholds against a stored baseline | catches a slow drift | needs stored results and a comparable environment (see the CI/CD lesson) |
+
+  - id: summary
+    kind: summary
+    concepts: [perf-lcdist-cluster, perf-lcdist-merge, perf-lcdist-gate]
+    title: Summary
+    body: |
+      - A cluster is a **master** (no users; coordinates and merges) and **workers** (run users; one per core). `-u`,
+        `-r` and `-t` go on the master.
+      - Headless: `--master --expect-workers N`, plus `--expect-workers-max-wait` so a missing worker fails the step
+        instead of hanging it. `--processes N` forks the workers - repeat a custom bind port as `--master-port`.
+      - The master binds to every interface by default; bind it to `127.0.0.1` and connect workers to `127.0.0.1`.
+      - The master merges counts, totals and **histograms**; percentiles from the merged histogram are right. The mean
+        of per-worker percentiles is not.
+      - Every worker is its own process: module-level state is per worker; make ids unique with `uuid4()`.
+      - The pipeline reads the **master's exit code**. Default: 1 if any request failed. Your own rule: a `quitting`
+        listener that sets `environment.process_exit_code` - and returns at once on a worker.
+      - A pipeline step also needs `-t`, a worker wait limit and a CI timeout; keep `--csv` and `--json-file` as
+        artifacts, and show that the gate can fail.
+      - Test only what you own or have permission to test.
+
+exercises:
+  - id: master-users-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: recall
+    title: Who runs the users?
+    prompt: In a distributed Locust run with one master and three workers, which processes run simulated users?
+    options:
+      - id: workers
+        text: 'The three workers only'
+        feedback: 'Correct - the master "doesn''t run any Users itself"; it tells the workers when to spawn and stop users and merges their statistics.'
+      - id: all
+        text: 'All four processes, sharing the users equally'
+        feedback: 'The master runs no users. Counting it as a generator is how a test ends up with a quarter less load than planned.'
+      - id: master
+        text: 'The master only; workers just collect statistics'
+        feedback: 'The other way round - workers run the users and send statistics to the master.'
+      - id: depends
+        text: 'It depends on the number of users'
+        feedback: 'The roles are fixed by --master and --worker, whatever the user count.'
+    correct: [workers]
+    hints:
+      - The docs give each role one sentence.
+    solution: |
+      Only the workers run users. The master coordinates and merges.
+
+  - id: cores-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: application
+    title: How many workers?
+    prompt: |
+      A CI runner has 4 cores and nothing else runs on it. A single-process Locust run logs its CPU warning at 200
+      users. How many workers should the first distributed attempt use, and why?
+    options:
+      - id: four
+        text: 'About four - one per core - because a Python process uses at most about one core'
+        feedback: 'Correct - the docs: "you need to run one worker instance per processor core in order to have access to all your computing power".'
+      - id: one
+        text: 'One, because the master already uses the other cores'
+        feedback: 'The master mostly coordinates and merges; it does not run users. One worker would leave three cores unused and the warning would stay.'
+      - id: users
+        text: 'One worker per 10 users, so 20'
+        feedback: 'There is no per-user rule. More workers than cores just compete for the same cores.'
+      - id: none
+        text: 'None - add more users instead'
+        feedback: 'More users on an overloaded generator make the measurements worse, not better.'
+    correct: [four]
+    hints:
+      - The limit is about cores, not users.
+    solution: |
+      About one worker per core (four here, fewer if something else shares the machine).
+
+  - id: bind-default-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: application
+    title: Where does the master listen?
+    prompt: |
+      You start `locust -f lf.py --master --headless --expect-workers 2 -u 8 -t 30s` on a shared CI machine. Which
+      network interfaces does the master listen on for workers?
+    options:
+      - id: all
+        text: 'All of them - `--master-bind-host` defaults to `*`'
+        feedback: 'Correct - the docs: "Defaults to * (all available interfaces)". Add --master-bind-host 127.0.0.1 and point the workers at 127.0.0.1.'
+      - id: loopback
+        text: 'Only the loopback interface, because it is a test tool'
+        feedback: 'No such default. Locust listens where you tell it to, and the default is every interface.'
+      - id: none
+        text: 'None until the first worker connects'
+        feedback: 'The master must listen before a worker can connect to it.'
+      - id: web
+        text: 'Only the web UI port, 8089'
+        feedback: 'Workers connect to the master port (5557 by default), which is separate from the web UI port.'
+    correct: [all]
+    hints:
+      - Read the docs' sentence on --master-bind-host.
+    solution: |
+      Every interface. Bind to `127.0.0.1` for a single-machine cluster.
+
+  - id: max-wait-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: application
+    title: A worker that never arrives
+    prompt: |
+      A pipeline step starts a headless master with `--expect-workers 2` and two workers. One worker crashes on
+      start-up. The step has no `--expect-workers-max-wait` and no job timeout. What happens?
+    options:
+      - id: hang
+        text: 'The master keeps waiting - the option "defaults to wait forever" - and the pipeline hangs'
+        feedback: 'Correct. With --expect-workers-max-wait 4 in the lesson''s run, the master logged "Gave up waiting for workers to connect" and exited 1 instead.'
+      - id: start
+        text: 'The master starts the test with the one worker that did connect'
+        feedback: 'Not with --expect-workers: it delays the start until that many workers are connected.'
+      - id: pass
+        text: 'The step passes with 0 requests'
+        feedback: 'A step that is still waiting has no exit code yet; with a max wait it fails (exit 1), it does not pass.'
+      - id: restart
+        text: 'Locust restarts the crashed worker'
+        feedback: 'Locust does not supervise your processes; a crashed worker stays down.'
+    correct: [hang]
+    hints:
+      - What is the default of --expect-workers-max-wait?
+    solution: |
+      It waits for ever. Set `--expect-workers-max-wait` (and a job timeout) so a missing worker fails the step.
+
+  - id: processes-port-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: analysis
+    title: The master waits and nobody comes
+    prompt: |
+      `locust -f lf.py --headless --processes 2 --master-bind-port 5602 -u 8 -t 30s` logs "Waiting for workers to be
+      ready, 0 of 2 connected" every second, and later "Failed to connect to master 127.0.0.1:5557, retry 6/60". What
+      is wrong, and what is the fix?
+    options:
+      - id: port
+        text: 'The forked workers use the default port 5557; add `--master-port 5602`'
+        feedback: 'Correct - the log line names the port the workers are trying. The fix is the same port on both sides.'
+      - id: expect
+        text: 'Missing `--expect-workers 2`; add it'
+        feedback: '--processes sets the expected worker count itself; the log already says "of 2".'
+      - id: host
+        text: 'The workers need `--master-host`; add `--master-host 10.0.0.5`'
+        feedback: 'The workers already reach the right machine (127.0.0.1) - it is the port that is wrong. Adding a non-loopback host would also move the cluster off the safe bind.'
+      - id: users
+        text: 'Too few users for two workers'
+        feedback: 'That would leave a worker idle, not stop workers from connecting.'
+    correct: [port]
+    hints:
+      - Compare the port you asked for with the port in the error.
+    solution: |
+      Repeat the bind port as `--master-port` so the forked workers look for the master where it listens.
+
+  - id: uwr-mcq
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: recall
+    title: Where do -u, -r and -t go?
+    prompt: Which processes of a distributed run need `-u`, `-r` and `-t`?
+    options:
+      - id: master
+        text: 'The master only; the workers are controlled by it'
+        feedback: 'Correct - from locust --help: "Typically ONLY these options (and --locustfile) need to be specified on workers, since other options (-u, -r, -t, ...) are controlled by the master node."'
+      - id: workers
+        text: 'Each worker, with its own share of the users'
+        feedback: 'You give the total once, on the master; it divides the users across the workers.'
+      - id: both
+        text: 'Both, and they must match'
+        feedback: 'Not needed - and a mismatch would only be a source of confusion.'
+      - id: none
+        text: 'Neither - they are read from the locustfile'
+        feedback: 'They are command-line (or config) options, not part of the locustfile.'
+    correct: [master]
+    hints:
+      - Who tells the workers when to spawn users?
+    solution: |
+      The master. Workers need the locustfile and where the master is.
+
+  - id: merge-percentile-mcq
+    type: mcq
+    concept: perf-lcdist-merge
+    skill: application
+    title: Merging two workers' numbers
+    prompt: |
+      The master has to report the cluster's 95th percentile. What does it merge so that the figure is right?
+    options:
+      - id: histograms
+        text: 'The response-time histograms (rounded ms -> count), added key by key; the percentile is read from the sum'
+        feedback: 'Correct - the lesson''s merge reproduced the master''s counts and percentiles exactly this way.'
+      - id: mean
+        text: 'The workers'' 95th percentiles, averaged'
+        feedback: 'In the captured run that gave 53 ms where the true value was 100 ms.'
+      - id: max
+        text: 'The workers'' 95th percentiles, taking the larger'
+        feedback: 'It happens to be right when one worker holds all the slow requests, but is wrong in general: it overstates whenever the slow requests are rare on the busier worker.'
+      - id: avg
+        text: 'Each worker''s average response time, weighted by users'
+        feedback: 'An average cannot give a percentile, and the weights would be users, not requests.'
+    correct: [histograms]
+    hints:
+      - What can be added exactly, and what cannot?
+    solution: |
+      Histograms add; percentiles are read from the merged histogram. Percentiles themselves cannot be combined.
+
+  - id: naive-average-mcq
+    type: mcq
+    concept: perf-lcdist-merge
+    skill: analysis
+    title: Why 53 ms is wrong
+    prompt: |
+      Worker 0 ran 280 requests (95th percentile 100 ms) and worker 1 ran 404 requests (95th percentile 6 ms); the 72
+      slow requests were all on worker 0. The mean of the two 95th percentiles is 53 ms. Why is the cluster's real 95th
+      percentile 100 ms?
+    options:
+      - id: share
+        text: 'The 72 slow requests are 10.5 % of all 684 - more than the 5 % a 95th percentile allows - so the 95th percentile is a slow value'
+        feedback: 'Correct - the mean of the two percentiles ignores how many requests each worker ran and what the combined histogram looks like.'
+      - id: rounding
+        text: 'Locust rounds percentiles up'
+        feedback: 'Rounding changes a value by a few percent, not from 53 to 100.'
+      - id: master
+        text: 'The master adds a correction for network time'
+        feedback: 'It adds nothing; it only merges what the workers measured.'
+      - id: bug
+        text: 'One worker is mis-reporting'
+        feedback: 'Both report correctly; the mean of their summaries is the wrong operation.'
+    correct: [share]
+    hints:
+      - What share of all requests is slow?
+    solution: |
+      72 of 684 requests (10.5 %) are slow, above the 5 % that the 95th percentile excludes, so the merged 95th
+      percentile is a slow value.
+
+  - id: module-state-mcq
+    type: mcq
+    concept: perf-lcdist-merge
+    skill: application
+    title: The counter that repeats
+    prompt: |
+      A locustfile has `order_numbers = itertools.count(1)` at module level and each user takes the next number
+      for its payment reference. With one process the references are unique. What happens with `--processes 4`?
+    options:
+      - id: repeat
+        text: 'Each worker is its own process with its own counter, so the same references are produced several times'
+        feedback: 'Correct. Use uuid4(), or combine environment.runner.worker_index with a per-worker counter.'
+      - id: shared
+        text: 'The master hands out the numbers, so they stay unique'
+        feedback: 'The master runs no users and shares no Python variables with the workers.'
+      - id: error
+        text: 'Locust refuses to start with module-level state'
+        feedback: 'It starts fine; the duplicates only show up in the system under test.'
+      - id: fine
+        text: 'Nothing - forked processes share memory'
+        feedback: 'A forked process gets its own copy; changes in one are not seen by another.'
+    correct: [repeat]
+    hints:
+      - How many Python processes run users?
+    solution: |
+      Four counters, each starting at 1. Make identifiers unique another way (`uuid4()` or the worker index).
+
+  - id: exit-default-mcq
+    type: mcq
+    concept: perf-lcdist-gate
+    skill: recall
+    title: The default exit code
+    prompt: A Locust run finishes with 3 failed requests out of 5,000 and no gate of your own. What is the master's exit code?
+    options:
+      - id: one
+        text: '1 - "an exit code of 1 if there were any failed samples"; `--exit-code-on-error` changes it'
+        feedback: 'Correct - any failure is enough, however small the ratio.'
+      - id: zero
+        text: '0 - a ratio of 0.06 % is below any sensible limit'
+        feedback: 'Locust has no ratio by default; any failure gives the error exit code.'
+      - id: two
+        text: '2'
+        feedback: '2 is used when a greenlet died with an unhandled exception.'
+      - id: depends
+        text: 'It depends on the percentile'
+        feedback: 'Percentiles play no part unless your own listener sets process_exit_code.'
+    correct: [one]
+    hints:
+      - Read the sentence in "Controlling the exit code of the Locust process".
+    solution: |
+      1. Any failed request gives the `--exit-code-on-error` code (default 1).
+
+  - id: gate-worker-mcq
+    type: mcq
+    concept: perf-lcdist-gate
+    skill: application
+    title: Which process gates?
+    prompt: |
+      Your `quitting` listener compares `environment.stats.total.fail_ratio` and the 95th percentile with limits and
+      sets `process_exit_code`. In a cluster, where should it do that?
+    options:
+      - id: master
+        text: 'On the master only - return at once when `environment.runner` is a WorkerRunner'
+        feedback: 'Correct - only the master has the merged statistics, and the pipeline reads the master''s exit code.'
+      - id: all
+        text: 'On every process, so each one checks its own slice'
+        feedback: 'A worker''s own statistics are empty or partial at the end, and its exit code is not read by the pipeline.'
+      - id: workers
+        text: 'On the workers only, because they see the requests'
+        feedback: 'Workers see their own requests only, and the step''s result is the master''s exit code.'
+      - id: either
+        text: 'On whichever process quits last'
+        feedback: 'The workers quit before the master; the master is the process whose verdict counts.'
+    correct: [master]
+    hints:
+      - Who has the whole picture, and whose exit code does the pipeline see?
+    solution: |
+      The master. Guard the listener with `isinstance(environment.runner, WorkerRunner)`.
+
+  - id: three-limits-mcq
+    type: mcq
+    concept: perf-lcdist-gate
+    skill: application
+    title: A step that cannot hang
+    prompt: Which set of limits makes a distributed Locust pipeline step end by itself, whatever goes wrong?
+    options:
+      - id: three
+        text: '`-t` for the test, `--expect-workers-max-wait` for the workers, and a CI job timeout'
+        feedback: 'Correct - the test, the wait for workers and the job as a whole each need an end.'
+      - id: gate
+        text: 'A gate on the failure ratio'
+        feedback: 'The gate decides pass or fail once the run ends; it cannot make a run end.'
+      - id: rate
+        text: 'A low spawn rate'
+        feedback: 'The spawn rate shapes the ramp; it has no effect on when the run stops.'
+      - id: stop
+        text: '`--stop-timeout` alone'
+        feedback: '--stop-timeout lets tasks finish an iteration at shutdown; it does not bound the run or the wait.'
+    correct: [three]
+    hints:
+      - 'Three things can wait - the test, the workers and the whole job.'
+    solution: |
+      `-t`, `--expect-workers-max-wait` and the CI job's own timeout.
+
+  - id: gate-proof-mcq
+    type: mcq
+    concept: perf-lcdist-gate
+    skill: analysis
+    title: Is the gate working?
+    prompt: |
+      A team's gate has passed for six months. What is the best evidence that it works?
+    options:
+      - id: fail-once
+        text: 'A run against a limit (or a target) that is known to be broken makes it exit 1 with a reason in the log'
+        feedback: 'Correct - a check that has never failed has never been shown to be able to.'
+      - id: green
+        text: 'Six months of green runs'
+        feedback: 'A gate that is wired wrongly (for example one that judges a worker''s empty statistics) is green every day.'
+      - id: thresholds
+        text: 'The thresholds are written in the workflow file'
+        feedback: 'That shows what it intends to check, not that it checks it.'
+      - id: peer
+        text: 'Two people reviewed the listener'
+        feedback: 'Reviews help, but only a run shows the exit code the pipeline will actually see.'
+    correct: [fail-once]
+    hints:
+      - What would a broken gate look like from outside?
+    solution: |
+      Make it fail on purpose and confirm the exit code and the reason.
+
+  - id: steps-order
+    type: order
+    concept: perf-lcdist-gate
+    skill: application
+    title: One distributed step, in order
+    prompt: Put the life of a headless distributed Locust step in the order it happens.
+    items:
+      - id: master
+        text: 'The master starts with --expect-workers 2, bound to 127.0.0.1'
+      - id: workers
+        text: 'Two workers connect to 127.0.0.1 and report ready'
+      - id: spawn
+        text: 'The master spawns the users on the workers'
+      - id: limit
+        text: 'The run time limit is reached and the master tells the workers to quit'
+      - id: gate
+        text: 'The quitting listener on the master reads the merged statistics and sets process_exit_code'
+      - id: exit
+        text: 'The master exits with that code and the pipeline step passes or fails'
+    hints:
+      - The gate needs the merged statistics, so it comes after the run.
+    solution: |
+      Master, workers ready, spawn, time limit, gate, exit. The test starts only after the expected workers have
+      connected; the verdict is taken once the run has ended.
+
+  - id: gate-debug
+    type: debug
+    concept: perf-lcdist-gate
+    skill: analysis
+    title: Four defects in one gate
+    prompt: |
+      This listener is meant to fail a pipeline when more than 1 % of requests failed or the 95th percentile is
+      over 800 ms, in a cluster. Click every line that is a defect.
+    language: python
+    code: |
+      @events.quitting.add_listener
+      def gate(environment, **_):
+          total = environment.stats.total
+          avg = total.avg_response_time
+          if total.fail_ratio > 0.01 and avg > 800:
+              environment.process_exit_code = 1
+          logging.error("gate failed")
+    correctLines: [3, 4, 5, 7]
+    lineNotes:
+      - line: 3
+        note: No worker guard - the listener runs in every process, and a worker's statistics are not the cluster's. Return first when `isinstance(environment.runner, WorkerRunner)`.
+      - line: 4
+        note: The average hides the slow tail; the rule is about the 95th percentile (`get_response_time_percentile(0.95)`).
+      - line: 5
+        note: '`and` fails the run only when both limits are broken; either one should fail it.'
+      - line: 7
+        note: Logged on every run, passing or not, and with no reason. Log inside the failing branch and say which limit and by how much.
+    hints:
+      - There is one missing guard, one wrong statistic, one wrong operator and one misplaced message.
+    solution: |
+      Guard against workers (line 3), use the 95th percentile (line 4), `or` instead of `and` (line 5), and log the
+      reason only when a limit is broken (line 7).
+
+  - id: merge-short
+    type: short
+    concept: perf-lcdist-merge
+    skill: analysis
+    title: Can you get the cluster p95 from the workers' p95s?
+    prompt: |
+      Two workers report a 95th percentile of 120 ms (900 requests) and 30 ms (100 requests). A colleague says "so the
+      cluster's p95 is about 111 ms - the request-weighted average". Is that right? What can you say for certain, and
+      what do you need to get the real figure?
+    modelAnswer: |
+      No. A percentile is not additive, so a weighted average of percentiles is not the percentile of the combined
+      requests. From the two figures alone you can bound it but not find it: at most 5 % of each worker's requests are
+      slower than its p95, so at most 45 + 5 = 50 of the 1,000 requests are slower than 120 ms, which puts the
+      cluster's p95 at or below 120 ms - but where, depends on how the two workers' times are spread. (If worker 1's
+      slow requests were just 45 outliers and everything else was fast, the cluster's p95 could be as low as 30 ms.)
+      To get the real figure you need the response-time histograms (or the raw times) from both workers: add them
+      bucket by bucket and read the percentile from the sum, as the master does - or use the master's own output.
+    rubric:
+      - Says the weighted average is not valid, because percentiles cannot be averaged.
+      - Gives at most a bound, not a value, from the two figures alone.
+      - Asks for the histograms (or raw times), merges them and reads the percentile from the sum.
+    hints:
+      - What would you need to know about the shape of each worker's results?
+    solution: |
+      Not valid. Merge the workers' histograms and read the percentile from the sum (or use the master's output).
+
+  - id: nightly-testdesign
+    type: testdesign
+    concept: perf-lcdist-gate
+    skill: application
+    title: Design the nightly distributed step
+    prompt: |
+      SandPay wants a nightly load test of `POST /v1/payments` on a 4-core CI runner, run with Locust, failing the
+      pipeline when more than 0.5 % of requests fail or the 95th percentile exceeds 800 ms. Design the cluster command
+      lines, the gate, the limits that make the step end by itself, and how you will show the gate works.
+    modelAnswer: |
+      **Cluster.** One machine, so `locust --headless --processes 4`: master and four workers (one per core), bound to
+      `127.0.0.1` (`--master-bind-host 127.0.0.1`), a free port repeated as `--master-bind-port` and `--master-port`,
+      `-u`, `-r` and `-t` on the command line once, `--expect-workers-max-wait 60`, `--csv` and `--json-file` with
+      a run folder for artifacts, `--only-summary`.
+
+      **Data.** Idempotency keys and references from `uuid4()`; no module-level counters; test data split per worker if
+      records must not repeat.
+
+      **Gate.** A `quitting` listener that returns on a `WorkerRunner`, reads `fail_ratio` and
+      `get_response_time_percentile(0.95)` from `environment.stats.total`, compares them with
+      `LC_GATE_MAX_FAIL_RATIO=0.005` and `LC_GATE_P95_MS=800` from the workflow file, logs each broken limit with the
+      measured value, and sets `process_exit_code` to 1 or 0.
+
+      **Limits.** `-t 10m`, the worker wait limit and `timeout-minutes` on the job.
+
+      **Proof.** Unit-test the verdict function on edge values (a limit exactly met passes); run the step once with
+      `LC_GATE_P95_MS=1` to see exit 1 and the reason, and once against a target configured to fail half the
+      payments; check the workers exit 0 and never log "gate failed"; compare the master's JSON total with the
+      sum of the target's own counters. Keep the artifacts.
+
+      | Check | Expected | Evidence |
+      | --- | --- | --- |
+      | limits met | exit 0 | pipeline step green |
+      | p95 limit 1 ms | exit 1, "95th percentile ... > 1.0 ms" | master log |
+      | half the payments fail | exit 1, "failure ratio ... > 0.005" | master log |
+      | a worker started late | the master still waits, within the limit | log |
+      | a worker never starts | exit 1 after the wait limit | "Gave up waiting for workers" |
+    rubric:
+      - Uses one worker per core, bound to loopback, with the port repeated for --processes.
+      - Puts -u, -r and -t on the master and sets a worker wait limit and a job timeout.
+      - Writes the gate on the master only, with thresholds from the environment and reasons in the log.
+      - Makes ids unique across workers.
+      - Shows the gate can fail, and keeps the results files.
+    hints:
+      - What can wait for ever? What must the gate not run on?
+      - How do you show a gate can fail?
+    solution: |
+      `--processes 4` on loopback with the port repeated, `-t` and a worker wait limit and a job timeout, a master-only
+      gate with environment thresholds, unique ids, a deliberate failing run, and kept artifacts.
+
+  - id: pipeline-interview
+    type: interview
+    concept: perf-lcdist-cluster
+    skill: analysis
+    title: 'Interview: running Locust at scale in a pipeline'
+    prompt: |
+      "Our Locust test can't generate enough load from one process and we want it in the nightly pipeline. How would you
+      scale it, and how would you make the pipeline fail for the right reasons?"
+    modelAnswer: |
+      First I'd confirm the generator really is the limit: Locust logs a warning when it is close to running out of CPU,
+      and a single Python process uses about one core. If it is, I'd distribute: one master (no users) and one worker per
+      core. On one machine that is `--processes N`, which forks the workers; across machines it is `--master` and
+      `--worker --master-host ...` with the locustfile on each. The master gets `-u`, `-r` and `-t`, and in a headless run
+      `--expect-workers`, plus `--expect-workers-max-wait` so a missing worker fails the step instead of hanging it.
+
+      I'd bind the master to loopback (or a private address) because the default is every interface, use a free port per
+      run, and repeat a custom bind port as `--master-port` for `--processes`. In the locustfile, identifiers come from
+      `uuid4()` or the worker index, because every worker is its own process and module-level counters repeat.
+
+      For the verdict I'd rely on the master's exit code. Locust's default is 1 on any failed request; for a real
+      service I'd write a `quitting` listener that sets `environment.process_exit_code` from the failure ratio and the 95th
+      percentile, thresholds from the environment, a log line with the reason, and an early return on a worker, since only the
+      master has the merged numbers. Percentiles come from the merged histogram, never an average of the workers'.
+
+      Last, three timeouts (the test, the worker wait, the CI job), the master's CSV and JSON kept as artifacts, a heavy
+      run on a schedule rather than every pull request, and a deliberate failing run to prove the gate. And of course only
+      against systems we own or have permission to test.
+    rubric:
+      - Checks the generator is the limit before distributing, and sizes workers by cores.
+      - Names the master and worker roles and --expect-workers / --processes, with the master-only options.
+      - Handles the wait for workers, the loopback bind and the unique-id problem.
+      - Gates on the master's exit code with a quitting listener, ignoring workers, with percentiles from the merged data.
+      - Adds time limits, keeps artifacts and shows the gate can fail.
+    followUps:
+      - What would you look at if the 95th percentile doubled in the gate but the dashboards show nothing wrong?
+      - How would you keep the pull-request check fast and stable?
+      - What changes when the workers run on other machines?
+    hints:
+      - Start with whether the generator is the bottleneck.
+    solution: |
+      Check the generator, distribute with one worker per core, wait for workers with a limit, bind to loopback,
+      unique ids, a master-only gate on merged numbers, three timeouts, artifacts, and a gate proven to fail.
+
+  - id: commands-code
+    type: coding
+    concept: perf-lcdist-cluster
+    skill: application
+    title: Command lines for a loopback cluster
+    prompt: |
+      Complete `locust/lc_dist_commands.py`. Four functions: `master_command`, `worker_command` and `processes_command`
+      return Locust argument lists for a headless distributed run that lives entirely on `127.0.0.1`, and `audit` reads
+      a command line and returns the list of problems (`master-not-loopback`, `worker-master-not-loopback`,
+      `no-expect-workers`, `port-mismatch`, `no-run-time`). The docstrings give the exact flags. The tests check
+      every flag, the `ValueError` cases, a table of command lines for the audit, and then start **real clusters** - a
+      master with two workers, and the `--processes` form - with your command lines.
+    project: perf
+    files:
+      - exercises/locust/lc_dist_commands.py
+    test: tests/locust/test_lc_dist_commands.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_dist_commands.py
+    modelAnswer: |
+      See "The code: command lines for a loopback cluster". What the tests rely on:
+
+      - `--master-bind-host 127.0.0.1`, `--expect-workers N` and `-u -r -t --host --csv --json-file --only-summary` on
+        the master; `--master-host 127.0.0.1 --master-port P` on a worker.
+      - For `--processes`, `--master-bind-port P` **and** `--master-port P`.
+      - `ValueError` for `workers < 1`, `users < workers`, `spawn_rate <= 0`, an empty or `"0"` run time and a port
+        outside 1024-65535.
+      - `audit()` reads flag values by position; a missing `--master-port` means 5557.
+
+      A cluster built from these runs to exit code 0 with exactly one login per user in the master's JSON.
+    rubric:
+      - Every test in tests/locust/test_lc_dist_commands.py passes
+      - The master and the workers use loopback addresses only
+      - The one-command form repeats the bind port as --master-port
+      - audit() returns exactly the listed problem ids, in order
+    hints:
+      - 'Build the list from the docstring and convert every number to str.'
+      - 'For audit, write a small helper that returns the value after a flag.'
+      - 'With --processes and no --worker, the process is the master.'
+    solution: |
+      Return the argument lists given in the docstrings, validate the inputs, and write `audit()` as five independent
+      checks.
+
+  - id: merge-code
+    type: coding
+    concept: perf-lcdist-merge
+    skill: analysis
+    title: Merge the workers' statistics
+    prompt: |
+      Complete `locust/lc_dist_merge.py`: `percentile` (Locust's own algorithm), `merge_entries` and `merge_workers` (add
+      the workers' statistics), `naive_percentile` (the mistake: the mean of the workers' percentiles) and
+      `even_split`. The tests use the **real per-worker statistics of a two-worker run** and require your merge to equal
+      the master's own totals and percentiles exactly, and the naive mean to be at least 30 ms below the true value.
+    project: perf
+    files:
+      - exercises/locust/lc_dist_merge.py
+    test: tests/locust/test_lc_dist_merge.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_dist_merge.py
+    modelAnswer: |
+      See "The code: merging statistics and the gate". The details the tests check:
+
+      - `percentile` walks the buckets from the slowest down and returns the bucket where the allowance
+        `int(num_requests * fraction)` is used up; keys may be strings.
+      - `merge_entries` sums counts and totals, takes the smallest minimum (ignoring `None`) and the largest maximum, and
+        adds histograms key by key; the input is not modified.
+      - `naive_percentile` merges each worker's entries first and takes one percentile per worker, then the plain mean.
+      - `even_split(10, 3) == [4, 3, 3]`.
+
+      On the captured run: merged p95 100 ms against a naive 53.0 ms.
+    rubric:
+      - Every test in tests/locust/test_lc_dist_merge.py passes
+      - Histograms are added bucket by bucket, never averaged
+      - The percentile uses Locust's algorithm and accepts string keys
+      - The input data is not modified
+    hints:
+      - 'Convert the histogram keys with int() first; they are strings when they come from JSON.'
+      - 'For the minimum, skip None before comparing.'
+      - 'divmod(total, workers) gives the base size and how many workers get one more.'
+    solution: |
+      Copy Locust's loop for `percentile`, add counts and histograms for `merge_entries`, group by name for
+      `merge_workers`, and use `divmod` for `even_split`.
+
+  - id: gate-code
+    type: coding
+    concept: perf-lcdist-gate
+    skill: application
+    title: A pipeline gate for a cluster
+    prompt: |
+      Complete `locust/lc_dist_gate_locustfile.py` (the `Prober` user is given): `verdict` turns a failure ratio and a
+      95th percentile into an exit code and reasons, and the `gate` listener applies it on the master, with limits from
+      `LC_GATE_MAX_FAIL_RATIO` and `LC_GATE_P95_MS`, and does nothing on a worker. The tests run **real clusters** (a master
+      and two workers on loopback): inside the limits it must exit 0; a 20 ms p95 limit or a half-failing target must
+      make the master exit 1 with the reason in its log; and the workers must exit 0 and stay silent.
+    project: perf
+    files:
+      - exercises/locust/lc_dist_gate_locustfile.py
+    test: tests/locust/test_lc_dist_gate.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_dist_gate.py
+    modelAnswer: |
+      See "The code: merging statistics and the gate". The details the tests check:
+
+      - `verdict` returns `(1, reasons)` when a limit is *exceeded* (a limit exactly reached passes) and `(0, [])`
+        otherwise, with the exact reason texts from the docstring.
+      - The listener returns at once when `isinstance(environment.runner, WorkerRunner)`, so workers neither gate nor log.
+      - It reads `environment.stats.total.fail_ratio` and `get_response_time_percentile(0.95)`, logs each reason with
+        `logging.error("gate failed: %s", ...)` and sets `environment.process_exit_code`.
+      - The tests start the master with `--exit-code-on-error 0`, so only your listener can make the exit code 1.
+    rubric:
+      - Every test in tests/locust/test_lc_dist_gate.py passes
+      - The listener does nothing on a worker
+      - Thresholds come from the environment with the documented defaults
+      - Each broken limit is logged with the measured value and the limit
+    hints:
+      - 'isinstance(environment.runner, WorkerRunner) is the guard; return before reading any statistics.'
+      - 'os.environ.get("LC_GATE_P95_MS", "800") gives a string - convert it with float().'
+      - 'Format the ratio with f"{fail_ratio:.4f}" to match the expected reason text.'
+    solution: |
+      Guard on `WorkerRunner`, read the totals, call `verdict`, log the reasons and set `process_exit_code`.
+
+placement:
+  - id: place-bind
+    type: mcq
+    concept: perf-lcdist-cluster
+    skill: application
+    title: Starting a master safely
+    prompt: |
+      You are about to start a distributed Locust run on a shared CI machine and want the master reachable only from
+      that machine. Which flag do you add to the master, and what do the workers connect to?
+    options:
+      - id: bind
+        text: '`--master-bind-host 127.0.0.1` on the master; `--master-host 127.0.0.1` on the workers'
+        feedback: 'Correct - the default bind is every interface.'
+      - id: expect
+        text: '`--expect-workers 127.0.0.1`'
+        feedback: '--expect-workers takes a number of workers, not an address.'
+      - id: headless
+        text: '`--headless`, which keeps everything local'
+        feedback: '--headless only turns the web UI off; the master port still listens on every interface.'
+      - id: nothing
+        text: 'Nothing - Locust only listens on loopback'
+        feedback: 'The documented default is `*`, all interfaces.'
+    correct: [bind]
+    solution: |
+      Bind the master to `127.0.0.1` and point the workers at `127.0.0.1`.
+
+  - id: place-percentile
+    type: mcq
+    concept: perf-lcdist-merge
+    skill: application
+    title: The cluster's percentile
+    prompt: Worker A's 95th percentile is 20 ms, worker B's is 300 ms. How do you get the cluster's 95th percentile?
+    options:
+      - id: histograms
+        text: 'Add their response-time histograms and read the percentile from the sum, or take the master''s figure'
+        feedback: 'Correct - histograms add; percentiles do not.'
+      - id: mean
+        text: 'Average the two: 160 ms'
+        feedback: 'An average of percentiles describes no request.'
+      - id: sum
+        text: 'Add them: 320 ms'
+        feedback: 'Percentiles are values, not amounts; adding them means nothing.'
+      - id: median
+        text: 'Take the median of the two: also 160 ms'
+        feedback: 'Same problem - it ignores how many requests each worker ran.'
+    correct: [histograms]
+    solution: |
+      Merge the histograms, or use the master's own result.
+
+  - id: place-gate
+    type: mcq
+    concept: perf-lcdist-gate
+    skill: analysis
+    title: Green for the wrong reason
+    prompt: |
+      A distributed pipeline step passes every night, although the system's 95th percentile has doubled. The gate is a
+      `quitting` listener that checks the 95th percentile and sets `process_exit_code`. Which cause is most likely?
+    options:
+      - id: worker
+        text: 'The listener also runs on the workers, whose last statistics are empty, and sets exit code 0 there - while nothing checks the master, or the master''s code is never read'
+        feedback: 'Correct - a gate must judge the master''s merged statistics and the master''s exit code; a worker''s numbers and code are not the cluster''s.'
+      - id: percentile
+        text: 'Locust cannot compute a 95th percentile in a cluster'
+        feedback: 'It can - it merges the histograms.'
+      - id: users
+        text: 'Too many users'
+        feedback: 'More users would make the percentile worse, not hide it.'
+      - id: csv
+        text: 'The CSV files lag by a second'
+        feedback: 'A one-second lag changes a count slightly; it cannot hide a doubled percentile.'
+    correct: [worker]
+    solution: |
+      The gate is looking at the wrong process's numbers or exit code. Gate on the master.
+
+recall:
+  - id: recall-roles
+    concept: perf-lcdist-cluster
+    prompt: What do the master and the workers do in a distributed Locust run?
+    answer: The master runs no users - it tells workers when to spawn and stop users and merges their statistics. Workers run the users and report. -u, -r and -t go on the master only.
+  - id: recall-cores
+    concept: perf-lcdist-cluster
+    prompt: How many workers, and what is the warning to watch?
+    answer: About one per core of the load-generating machine (a Python process uses about one core). Locust logs a warning when it is close to running out of CPU - then the generator is the limit, not the system under test.
+  - id: recall-headless
+    concept: perf-lcdist-cluster
+    prompt: The options for a headless cluster that cannot hang?
+    answer: --master --expect-workers N with --expect-workers-max-wait (default is wait forever), -t for the test, a CI job timeout; or --processes N (repeat a custom --master-bind-port as --master-port).
+  - id: recall-bind
+    concept: perf-lcdist-cluster
+    prompt: What is the master's default bind, and what do you do about it?
+    answer: --master-bind-host defaults to * (all interfaces). Bind to 127.0.0.1 (or a private address) and connect workers with --master-host 127.0.0.1.
+  - id: recall-merge
+    concept: perf-lcdist-merge
+    prompt: What does the master add up, and what must you never average?
+    answer: Counts, totals, min and max, and the response-time histograms (bucket by bucket). Percentiles are read from the merged histogram; never average, add or take the max of the workers' percentiles.
+  - id: recall-process
+    concept: perf-lcdist-merge
+    prompt: Why do module-level counters break in a cluster?
+    answer: Every worker is its own process with its own copy, so a counter starting at 1 repeats in every worker. Use uuid4() or the worker index for unique ids.
+  - id: recall-exit
+    concept: perf-lcdist-gate
+    prompt: How does Locust pick its exit code, and how do you set your own?
+    answer: environment.process_exit_code if set; else --exit-code-on-error (default 1) when there were failures; else 0. Set it in a quitting listener.
+  - id: recall-gate
+    concept: perf-lcdist-gate
+    prompt: Where must a cluster gate run, and what proves it works?
+    answer: On the master only (return on a WorkerRunner), because only the master has the merged statistics and the pipeline reads its exit code. A run against a limit known to be broken proves it - a gate that never failed is untested.
+
+next:
+  - performance-testing-in-ci-cd
+  - reading-load-test-results
+  - bottleneck-analysis

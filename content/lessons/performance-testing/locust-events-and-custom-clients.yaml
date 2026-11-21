@@ -1,0 +1,1469 @@
+id: locust-events-and-custom-clients
+title: Event hooks, custom metrics and custom clients
+subject: performance-testing
+module: locust
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: 'Hook into the Locust run and load systems that are not HTTP. Locust fires events through the whole life of a run - init, test_start, spawning_complete, request, test_stopping, test_stop, quitting and quit - and a listener is just a function that takes keyword arguments. The request event carries every finished request, so a listener can build the audit the built-in statistics do not give you (slow requests, failure reasons, a per-merchant breakdown from the request context). A custom client for a TCP ledger shows that Locust only knows what you fire into request - so you measure, fire, and report failures yourself - and a quitting listener turns the final statistics into an exit code, a quality gate for a pipeline. Every run shown is real Locust 2.47.0 against local SandPay practice targets whose wrong answers come from a counter, so the counts are exact.'
+tags:
+  [
+    Locust,
+    events,
+    event hooks,
+    request event,
+    test_start,
+    test_stop,
+    quitting,
+    listeners,
+    request context,
+    custom client,
+    custom metrics,
+    non-HTTP,
+    TCP,
+    User,
+    events.request.measure,
+    process_exit_code,
+    exit code,
+    quality gate,
+    CI,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Locust 2.47.0 on Python 3.12.3 with pytest 9.2.0, in `practice/perf/.venv`. Locust always runs
+    headless in a subprocess (`support/load_tools.py` -> `run_locust`, or the `locust` command). Every output in
+    this lesson was produced on Linux on 21 November 2026.
+  - **Targets (loopback only, synthetic data):**
+    - `practice/perf/support/lc_events_fixture.py` - a SandPay *ledger* written for this lesson. It speaks a
+      one-line-request, one-line-reply protocol over TCP (`BALANCE <merchant>`, `TRANSFER <from> <to> <amount>`), so
+      Locust's `HttpUser` cannot test it. Transfer call number c is declined (`ERR insufficient_funds`) when c is
+      divisible by 5, and takes 120 ms instead of 5 ms when c is divisible by 4. The outcome comes from a counter,
+      so the ledger's own counters are exact on any machine.
+    - `practice/perf/support/lc_valid_fixture.py` - the SandPay legacy gateway from the previous lesson (always
+      HTTP `200`; every 4th charge declined, every 7th an HTML page), reused for the audit and gate exercises.
+    - `practice/perf/support/sandpay_target.py` - the shared SandPay practice API, used once to print the
+      arguments of the `request` event and the order of the events.
+  - **What varies:** how many requests run in 3 seconds depends on the machine, so request **counts** differ run
+    to run; the **relationships** (failures = declines, one connection per user, slow requests = the 120 ms
+    transfers) do not. A call still in flight when Locust stops is counted by the server but not by Locust, so
+    the server can be ahead by at most one call per user.
+  - **Synthetic data:** SandPay is a fictional payments company; `merchant-1` ... `merchant-50`, their secrets,
+    transaction ids (`tx_...`) and charge ids are invented for this practice project.
+  - **Sources, as documented on 21 November 2026:** Locust 2.47.0 documentation -
+    [Event hooks](https://docs.locust.io/en/2.47.0/extending-locust.html) (the request listener, `**kwargs`,
+    distributed setup with `MasterRunner`, Request context, custom command line arguments),
+    [Testing other systems/protocols](https://docs.locust.io/en/2.47.0/testing-other-systems.html) (the XML-RPC
+    client that fires the request event), [Running without the web UI](https://docs.locust.io/en/2.47.0/running-without-web-ui.html)
+    (Controlling the exit code of the Locust process) and the
+    [API reference](https://docs.locust.io/en/2.47.0/api.html) (the list of events and their arguments,
+    `EventHook.measure()`, `Environment.process_exit_code`). Quotations are from those pages.
+  - **Read from Locust 2.47.0 itself, not from the docs:** that `EventHook.fire()` runs each listener in its own
+    try/except (`locust/event.py`), and the order in which `shutdown()` in `locust/main.py` fires `quitting`,
+    reads `process_exit_code` and chooses the exit code - both shown by real runs below.
+  - **Not repeated here:** users, tasks and running headless - [Locust fundamentals](#/lesson/locust-fundamentals);
+    `catch_response`, names and sessions - [HTTP sessions, validation and request grouping](#/lesson/locust-http-validation-and-grouping);
+    percentiles - [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles); reading the
+    results - [Reading load test results](#/lesson/reading-load-test-results); pipelines in general -
+    [Performance testing in CI/CD](#/lesson/performance-testing-in-ci-cd); the same idea in JMeter -
+    [Assertions, listeners and results files](#/lesson/jmeter-assertions-and-listeners).
+
+prerequisites:
+  - locust-fundamentals
+  - locust-http-validation-and-grouping
+  - performance-metrics-and-percentiles
+
+concepts:
+  - id: perf-lcevents-request-event
+    name: Event hooks and the request event
+    summary: 'Locust fires named events during a run (init, test_start, spawning_complete, request, test_stopping, test_stop, quitting, quit ...) and a listener is a function registered with events.<name>.add_listener. It is called with keyword arguments, so take the ones you need and end with **kwargs - Locust adds arguments over time. The request event fires once for every finished request, successful or not, with request_type, name, response_time (milliseconds), response_length, response, context, exception and more; that makes it the place to build custom metrics such as slow-request counts or failure reasons. Request context carries your own data (a merchant, a tag) to the listener. A listener that raises is logged and skipped - the run continues, the request is still counted, and the process later exits with code 2.'
+  - id: perf-lcevents-custom-client
+    name: Custom clients for non-HTTP systems
+    summary: 'Locust measures what is reported to it. HttpSession reports every HTTP call by firing the request event; a client for another protocol (a TCP ledger, XML-RPC, gRPC, a database) must do the same - time the call in milliseconds, fire request_type, name, response_time, response_length and exception - or Locust records nothing and the run looks perfectly green. Use a fixed name per operation, make a protocol error or a socket timeout a failed request instead of a crash, and prefer pure-Python libraries that gevent can patch. events.request.measure() fires the event for you around a with-block.'
+  - id: perf-lcevents-exit-gate
+    name: Exit codes and quality gates
+    summary: 'By default Locust exits with 1 if any request failed and 0 otherwise, so a pipeline either breaks on one stray error or never judges response times. A listener on quitting can read environment.stats.total (fail_ratio, percentiles, num_requests) and set environment.process_exit_code - which takes precedence over the default rules. A good gate states its limits, logs why it failed, and fails a run that made no requests at all.'
+
+objectives:
+  - List the Locust events in the order they fire in a headless run and say which one to use for setup, per-request metrics, summary output and the exit code.
+  - Write a request-event listener that tolerates new event arguments and builds a custom metric from the arguments and the request context.
+  - Build a client for a TCP service that reports every call to Locust with the correct units, names and failure handling.
+  - Explain what happens to a run when a listener raises and when a custom client forgets to fire the event.
+  - Write a quitting listener that sets process_exit_code from fail ratio and a percentile, and test it against runs that pass and fail.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: The idea in plain language
+    body: |
+      Think of a Locust run as a football match with a referee, a scoreboard and a stats team.
+
+      - The **referee blows a whistle** at every important moment: kick-off, the last player entering the pitch,
+        the final whistle. Those are the **events**. Anybody can stand on the touchline with a notebook and write
+        something down when a whistle blows - that is a **listener**.
+      - The **scoreboard** is Locust's own statistics: one row per request name, with counts and percentiles. It
+        only learns about a shot on goal when somebody **reports** it - for an HTTP match the home team's
+        photographer (`HttpSession`) reports every shot. If you play a different sport - a TCP ledger, a gRPC
+        service - nobody reports, and the scoreboard stays at 0-0 while the players run themselves ragged. A
+        **custom client** is your own photographer.
+      - After the final whistle somebody has to decide: **did the team do well enough to go through to the next
+        round?** "Any goal conceded means we are out" is Locust's default. A **quality gate** is the coach
+        saying "we go through if we conceded fewer than one goal in twenty and the slowest 5 % of passes were
+        quick enough".
+
+      This lesson gives you the three tools: **listen** (`request` and the lifecycle events), **report** (a
+      client that fires `request` for a system Locust does not know) and **decide** (a listener on `quitting`
+      that sets the exit code).
+
+  - id: what
+    kind: what
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Terms you need
+    body: |
+      | Term | Meaning (Locust 2.47.0 documentation) |
+      | --- | --- |
+      | **Event hook** | "Locust comes with a number of event hooks that can be used to extend Locust in different ways" - instances of `locust.events.EventHook`, reachable as `locust.events.<name>` at module level and `environment.events.<name>` inside a run |
+      | **Listener** | a function registered with `events.<name>.add_listener(fn)` (or the `@events.<name>.add_listener` decorator); called with keyword arguments when the event fires |
+      | **`init`** | "Fired when Locust is started, once the Environment instance and locust runner instance have been created" |
+      | **`test_start` / `test_stop`** | "Fired on each node when a new load test is started" / "stopped"; not fired again when the number of users changes |
+      | **`spawning_complete`** | "Fired when all simulated users has been spawned" (argument `user_count`) |
+      | **`test_stopping`** | "Fired on each node when a load test is about to stop - before stopping users" |
+      | **`quitting` / `quit`** | `quitting`: "Fired when the locust process is exiting" (argument `environment`); `quit`: "Fired after quitting events, just before process is exited" (argument `exit_code`) |
+      | **`request`** | "Fired when a request in completed" with `request_type`, `name`, `response_time`, `response_length`, `response`, `context` and `exception` ("None if request was successful") |
+      | **`response_time`** | "Time in milliseconds until exception was thrown" - milliseconds, not seconds |
+      | **Request context** | the `context` argument of the request event, which "enable[s] you to pass data about the request (things like username, tags etc)" - set in the request call or by overriding `User.context()`; it "doesn't change how Locust's regular statistics are calculated" |
+      | **`**kwargs`** | the documentation: "it is highly recommended that you add a wildcard keyword argument in your event listeners to prevent your code from breaking if new arguments are added in a future version" |
+      | **Custom client** | any object a `User` uses to talk to a system; for non-HTTP systems "it is important that the protocol libraries you use can be monkey-patched by gevent" |
+      | **`events.request.measure(request_type, name, ...)`** | "Convenience method for firing the event with automatically calculated response time and automatically marking the request as failed if an exception is raised" - marked *Experimental* |
+      | **`environment.process_exit_code`** | "If set it'll be the exit code of the Locust process" |
+      | **`environment.stats.total`** | the aggregated `StatsEntry`: `num_requests`, `fail_ratio`, `avg_response_time`, `get_response_time_percentile(p)` |
+      | **Quality gate** | a rule that decides pass or fail from the run's numbers; here, a function over `stats.total` that sets the exit code |
+
+  - id: why
+    kind: why
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Why it matters - three runs that look fine and are not
+    body: |
+      **1. The silent client.** A tester writes a `User` for the SandPay ledger. It opens a socket, sends
+      `BALANCE merchant-1`, reads the answer. Locust is started for 2 seconds with 2 users:
+
+      ```text
+      Type     Name        # reqs      # fails |    Avg     Min     Max    Med
+      ---------|-----------|-----------|----------|-------|-------|-------|-------
+               Aggregated       0     0(0.00%) |      0       0       0      0
+
+      exit code 0   ledger balances served: 32
+      ```
+
+      The ledger served 32 balance calls. Locust recorded **none** - and exited with code 0, "no failures". The
+      client never told Locust about its calls, so as far as the statistics are concerned they never happened.
+      (Run: real Locust 2.47.0, `forgot_locustfile.py`, 21 November 2026.)
+
+      **2. The run that is red for the wrong reason.** The same ledger test with the real client: 886 requests, 43
+      of them `ERR insufficient_funds` - a business answer the test expects from time to time. Locust's default
+      rule is that *any* failed request exits with code **1**. A pipeline that trusts that code stops on every
+      run, so the team stops trusting the pipeline. And the reverse: a run where every request succeeded but the
+      95th percentile is 5 seconds exits with 0.
+
+      **3. The question the statistics cannot answer.** "How many transfers were slow, and what exactly failed?"
+      Locust's table has averages and percentiles per name; the error report groups failures by message. It
+      does not say "54 transfers took more than 100 ms" or "which merchants were hit". A listener on the
+      `request` event sees every request as it finishes, so it can keep whatever counters you need.
+
+      All three have one cause: Locust only knows what it is told, and only judges by its default rules. Events
+      are how you tell it more (a client that reports), listen to what it knows (a listener that audits), and
+      replace its verdict (a gate).
+
+  - id: internals-events
+    kind: internals
+    concepts: [perf-lcevents-request-event]
+    title: 'Internals: events, listeners and the request event'
+    body: |
+      **Registering.** At module level of the locustfile the `Environment` does not exist yet, so use the
+      module-level hooks (`from locust import events`); inside a task use `self.environment.events`. A listener
+      can be a decorated function, or any callable:
+
+      ```python
+      from locust import events
+
+      @events.request.add_listener
+      def on_request(request_type, name, response_time, response_length, exception=None, **kwargs):
+          ...
+      ```
+
+      **Keyword arguments.** `EventHook.fire(**kwargs)` calls `handler(**kwargs)` for each listener. A listener
+      must therefore accept every keyword that is passed. The lesson's real run of a listener that spells out
+      all the arguments of the `request` event, for an `HttpUser` request to `/health`:
+
+      ```text
+      event request
+         request_type    GET
+         name            /health
+         response_time   float (milliseconds)
+         response_length 16
+         response        ResponseContextManager
+         context         {}
+         exception       None
+         url             http://127.0.0.1:<port>/health
+         start_time      epoch seconds
+      ```
+
+      `HttpSession` passes `response` (a `requests.Response` subclass), `url` and `start_time` as well. A client
+      for another protocol may pass fewer - the documentation says so: "it is entirely possible to implement a
+      client that does not supply all parameters for this event ... Remove any such missing field from your
+      listener function definition or use default arguments." That is why the lesson's audit listener has
+      `exception=None, context=None, **kwargs`: it works for HTTP and for the ledger client.
+
+      **The order of events** in one headless run (printed by a real listener on each event; 2 users, 2 seconds):
+
+      ```text
+      event init           runner: LocalRunner
+      event test_start
+      event spawning_complete users: 2
+      event request  ... (one per finished request)
+      event test_stopping  users still running: 2
+      event test_stop
+      event quitting       exit code so far: None
+      event quit           exit_code: 0
+      ```
+
+      | Event | Use it for |
+      | --- | --- |
+      | `init` | things that need the `Environment`: open a results file, add a web route, `gevent.spawn` a monitor |
+      | `init_command_line_parser` | add your own `--option` (before init) |
+      | `test_start` | per-node setup, such as loading test data; check `isinstance(environment.runner, MasterRunner)` to skip it on the master of a distributed run |
+      | `spawning_complete` | "all users are up" - the end of the ramp-up |
+      | `request` | every finished request: custom metrics, per-request logs |
+      | `test_stopping` | "about to stop - before stopping users": last chance to look at a running system |
+      | `test_stop` | per-node cleanup |
+      | `quitting` | final results in `environment.stats`, set `process_exit_code` |
+      | `quit` | read-only: the exit code that was chosen |
+
+      **Context.** The request call can carry a dict that arrives in the listener as `context`:
+      `self.client.post(url, json=body, context={"merchant": self.merchant})`, or override `User.context()` to
+      give every request of a user the same data. Context is for *your* listeners; it does not change Locust's own
+      statistics.
+
+      **What a listener must never do: raise.** Read from Locust 2.47.0 itself (`locust/event.py`): `fire()` wraps
+      every handler in `try ... except Exception`, logs "Uncaught exception in event handler" and sets
+      `log.unhandled_greenlet_exception`. Run with a listener that does `response_time["ms"]` (a float is not
+      subscriptable): the log shows the traceback four times for four requests, the statistics still list the
+      four `GET /health` requests - Locust's own listener ran - and the process exited with code **2**. A broken
+      listener is a bug, never a silent no-op, and you only see it in the log and the exit code.
+
+      **Distributed runs** (the details are in the distributed lesson): `test_start`, `test_stop` and `request`
+      fire on each node; the master receives aggregated numbers by `worker_report`. A listener that keeps its own
+      counters sees only the requests of the process it runs in.
+
+  - id: internals-client
+    kind: internals
+    concepts: [perf-lcevents-custom-client]
+    title: 'Internals: what a client has to do for Locust'
+    body: |
+      `HttpSession` is a `requests.Session` that, around every call, takes the start time, performs the call,
+      decides success or failure, and fires the `request` event. The statistics listener turns each event into a
+      row update. **There is no other path into the statistics.** A custom client therefore has to do exactly the
+      same four things:
+
+      1. **Time the call** with `time.perf_counter()` (a monotonic clock - `time.time()` can jump) and convert to
+         **milliseconds** - Locust's `response_time` is in ms.
+      2. **Perform the call** inside `try`, and turn every way it can go wrong into an exception object: a protocol
+         error (`ERR insufficient_funds` becomes a `LedgerError`), and also socket errors - timeouts, resets, the
+         server closing the connection.
+      3. **Fire the event** once per call, with a **fixed name per operation**. `TRANSFER`, never
+         `TRANSFER merchant-17` - the name is the statistics row key, exactly as in the previous lesson.
+      4. **Return** the reply to the task (or None on failure).
+
+      The documentation's XML-RPC client does this in `__getattr__`: it builds a `request_meta` dict with
+      `request_type`, `name`, `start_time`, `response_length`, `response`, `context` and `exception`, measures
+      with `time.perf_counter()`, and calls `self._request_event.fire(**request_meta)`. The user class passes
+      `environment.events.request` to the client, which is why the client does not import Locust and can be tested
+      without it.
+
+      **Failures.** Locust counts a request as failed when `exception` is not None; the error report groups by
+      `method name: repr(exception)`, so the text for `LedgerError("insufficient_funds")` in the real run is
+
+      ```text
+      # occurrences      Error
+      43                 LEDGER TRANSFER: LedgerError('insufficient_funds')
+      ```
+
+      Use exception classes with a stable reason, never a message with an id in it, or the report gets one line
+      per id.
+
+      **`measure()`.** `events.request.measure("LEDGER", "BALANCE")` is a context manager that stores the start
+      time, yields a `request_meta` dict, and on exit fires the event with `response_time` computed and
+      `exception` set if the block raised. In a real run (`measure_locustfile.py`, 2 users, 3 s):
+
+      ```text
+      Type     Name       # reqs      # fails |    Avg     Min     Max    Med
+      LEDGER   BALANCE      1338     0(0.00%) |      3       3      42      4
+      ```
+
+      It is marked *Experimental* in the API reference, and it only catches exceptions *raised* in the block, so
+      a protocol-level `ERR` reply has to be turned into a raise (as the example does with `RuntimeError`).
+
+      **gevent.** Locust runs users as gevent greenlets in one process. Pure-Python socket code is patched
+      automatically, so a plain `socket` client with 4 users works; a library that does its I/O in compiled code
+      "will block the whole Locust/Python process (in practice limiting you to running a single User per worker
+      process)". Check before you choose a driver.
+
+  - id: internals-gate
+    kind: internals
+    concepts: [perf-lcevents-exit-gate]
+    title: 'Internals: how the exit code is chosen'
+    body: |
+      When the run ends, `shutdown()` in `locust/main.py` does three things in this order (read from the source,
+      and confirmed by the runs below):
+
+      1. fires `quitting` - **with `reverse=True`, so listeners run in the opposite order to registration**;
+      2. chooses the exit code: if `environment.process_exit_code is not None` it wins; otherwise if any request
+         failed or any exception was recorded it is `--exit-code-on-error` (default **1**); otherwise if a
+         listener or greenlet raised it is **2**; otherwise **0**;
+      3. writes the `--csv` and `--json-file` outputs.
+
+      Two consequences. First, a `quitting` listener can *replace* the verdict: set `process_exit_code = 0` and
+      a run with failures exits 0; set it to 1 and a run with no failures exits 1. Second, an unconditional
+      `process_exit_code = 0` also hides the exit code 2 of a broken listener, so a gate sets 0 only after it has
+      checked what it cares about, and logs why when it sets 1.
+
+      The documentation's example sets 1 when `fail_ratio > 0.01`, or `avg_response_time > 200`, or
+      `get_response_time_percentile(0.95) > 800`, else 0, with the remark that "this code could go into the
+      locustfile.py or in any other file that is imported in the locustfile". The lesson's gate keeps that idea
+      and adds the case the example misses: **a run with no requests**. With zero requests `fail_ratio` is 0 and
+      the percentile is 0, so every limit passes - a gate that cannot fail an empty run lets a broken test
+      through. (That is the silent-client run from the *why* section.)
+
+      Real run, the same 3-user run against the legacy gateway under three rules:
+
+      | Rule | Exit code | Log line |
+      | --- | --- | --- |
+      | Locust's default (no gate) | 1 | - |
+      | Gate, `max_fail_ratio` 90 % | 0 | - |
+      | Gate, `max_fail_ratio` 5 % | 1 | `GATE FAILED: fail ratio 35.7% is above the limit of 5.0%` |
+
+      The gateway declines every 4th charge and answers every 7th with an HTML page, so 10 of every 28 charges
+      fail (35.7 %); a lenient gate passes the run that Locust's default fails, and a strict one fails it with a
+      reason.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Who fires what, and who listens
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant T as Task
+        participant C as LedgerClient
+        participant E as events.request
+        participant S as Stats listener
+        participant A as Audit listener
+        T->>C: transfer(merchant-1, merchant-2, 1250)
+        C->>C: send line, read reply, time it
+        C->>E: fire(request_type, name, response_time, exception ...)
+        E->>S: update the row "LEDGER TRANSFER"
+        E->>A: count slow and failed, keep the reason
+        C-->>T: reply or None
+      ```
+
+      The client fires once per call. Locust's own statistics listener and your audit listener both receive the
+      same event; neither knows about the other. If the client does not fire, **both** are blind.
+
+      ```mermaid
+      flowchart TD
+        I["init: environment exists"] --> TS["test_start"]
+        TS --> SC["spawning_complete: all users up"]
+        SC --> R["request: once per finished request"]
+        R --> R
+        R --> TG["test_stopping: users still running"]
+        TG --> TE["test_stop: users stopped"]
+        TE --> Q["quitting: stats are final, set process_exit_code"]
+        Q --> X["exit code chosen, then quit(exit_code)"]
+      ```
+
+      The last two boxes matter for pipelines: `quitting` is the last point where code can influence the exit
+      code, and `quit` only shows the result.
+
+  - id: code-audit
+    kind: code
+    concepts: [perf-lcevents-request-event]
+    title: 'The code: a request audit'
+    body: |
+      The solution of the first exercise (`practice/perf/solutions/locust/lc_events_audit.py`). It never imports
+      Locust, so a unit test can call `on_request` directly:
+
+      ```python
+      import json
+      from collections import Counter
+
+
+      class RequestAudit:
+          def __init__(self, slow_ms: float = 500.0) -> None:
+              self.slow_ms = slow_ms
+              self._rows: dict[str, dict] = {}
+
+          def on_request(self, request_type, name, response_time, response_length,
+                         exception=None, context=None, **kwargs):
+              row = self._rows.setdefault(f"{request_type} {name}", {
+                  "requests": 0, "failures": 0, "slow": 0,
+                  "reasons": Counter(), "merchants": Counter()})
+              row["requests"] += 1
+              if response_time > self.slow_ms:
+                  row["slow"] += 1
+              if exception is not None:
+                  row["failures"] += 1
+                  row["reasons"][str(exception)] += 1
+                  merchant = (context or {}).get("merchant")
+                  if merchant is not None:
+                      row["merchants"][merchant] += 1
+
+          def summary(self) -> dict:
+              return {key: {**row, "reasons": dict(row["reasons"]),
+                            "merchants": dict(row["merchants"])}
+                      for key, row in sorted(self._rows.items())}
+
+          def write(self, path) -> None:
+              with open(path, "w") as f:
+                  json.dump(self.summary(), f, indent=2, sort_keys=True)
+
+
+      def install(events, audit: RequestAudit, path) -> None:
+          events.request.add_listener(audit.on_request)
+          events.quitting.add_listener(lambda environment, **kwargs: audit.write(path))
+      ```
+
+      It is switched on by two lines in a locustfile. The real run below used the ledger user from the next
+      section (4 users, 3 seconds) with `slow_ms=100`:
+
+      ```python
+      from lc_events_audit import RequestAudit, install
+      from locust import events
+
+      install(events, RequestAudit(slow_ms=100), "ledger-audit.json")
+      ```
+
+      ```json
+      {
+        "LEDGER BALANCE":  {"failures": 0,  "merchants": {}, "reasons": {},
+                            "requests": 715, "slow": 0},
+        "LEDGER TRANSFER": {"failures": 43, "merchants": {},
+                            "reasons": {"insufficient_funds": 43},
+                            "requests": 222, "slow": 54}
+      }
+      ```
+
+      (The real file is pretty-printed over more lines; it is condensed here.) The ledger's counters for that run:
+      224 transfers, 44 declined - one declined call was still in flight when Locust stopped, which is the
+      "server is ahead by at most one call per user" rule. Every 4th transfer sleeps 120 ms on the ledger, so 224 / 4 =
+      56 transfers were slow; the audit counted 54 of them, the other two being in flight too. `merchants` is empty
+      because this client puts no context on its calls; with the legacy gateway and
+      `context={"merchant": self.merchant}` the same audit gave `merchant-1: 264, merchant-2: 235, merchant-3: 245`
+      failures for 744 failed charges.
+
+  - id: code-client
+    kind: code
+    concepts: [perf-lcevents-custom-client]
+    title: 'The code: a client for the ledger and its Locust user'
+    body: |
+      The solution of the second exercise (`solutions/locust/lc_events_client.py` and
+      `lc_events_ledger_locustfile.py`). The client never imports Locust - the event arrives as a parameter:
+
+      ```python
+      import socket
+      import time
+
+
+      class LedgerError(Exception):
+          """The ledger answered ERR <reason>; str(error) is the reason."""
+
+
+      class LedgerClient:
+          def __init__(self, host: str, request_event, timeout: float = 5.0) -> None:
+              address, _, port = host.rpartition(":")
+              self._request_event = request_event
+              self._sock = socket.create_connection((address, int(port)), timeout=timeout)
+              self._reader = self._sock.makefile("rb")
+
+          def close(self) -> None:
+              self._reader.close()
+              self._sock.close()
+
+          def balance(self, merchant: str) -> str | None:
+              return self._call("BALANCE", f"BALANCE {merchant}")
+
+          def transfer(self, source: str, target: str, amount_minor: int) -> str | None:
+              return self._call("TRANSFER", f"TRANSFER {source} {target} {amount_minor}")
+
+          def _call(self, name: str, line: str) -> str | None:
+              meta = {"request_type": "LEDGER", "name": name, "start_time": time.time(),
+                      "response": None, "response_length": 0, "context": {}, "exception": None}
+              started = time.perf_counter()
+              try:
+                  self._sock.sendall(line.encode() + b"\n")
+                  reply = self._reader.readline().decode().rstrip("\n")
+                  if not reply:
+                      raise ConnectionError("the ledger closed the connection")
+                  meta["response"], meta["response_length"] = reply, len(reply)
+                  if reply.startswith("ERR "):
+                      meta["exception"] = LedgerError(reply[4:])
+              except OSError as error:   # timeouts and resets are failed requests, not crashes
+                  meta["exception"] = error
+              meta["response_time"] = (time.perf_counter() - started) * 1000
+              self._request_event.fire(**meta)
+              return meta["response"] if meta["exception"] is None else None
+      ```
+
+      ```python
+      from locust import User, constant, task
+      from lc_events_client import LedgerClient
+
+
+      class LedgerUser(User):
+          wait_time = constant(0)
+
+          def on_start(self):
+              self.client = LedgerClient(self.host, self.environment.events.request)
+
+          def on_stop(self):
+              self.client.close()
+
+          @task(3)
+          def balance(self):
+              self.client.balance("merchant-1")
+
+          @task(1)
+          def transfer(self):
+              self.client.transfer("merchant-1", "merchant-2", 1250)
+      ```
+
+      Run with 4 users for 3 seconds (the host is the ledger's `127.0.0.1:<port>`; this is the end of Locust's
+      output, columns trimmed):
+
+      ```text
+      Type     Name        # reqs      # fails |    Avg     Min     Max    Med
+      LEDGER   BALANCE        667     0(0.00%) |      3       3      42      3
+      LEDGER   TRANSFER       219    43(19.63%)|     33       5     135      6
+               Aggregated     886    43(4.85%) |     10       3     135      4
+
+      Type     Name        50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+      LEDGER   BALANCE       3      4      4      4      4      4      4      4     43     43     43    667
+      LEDGER   TRANSFER      6      6      6    120    120    120    120    120    140    140    140    219
+
+      Error report: 43   LEDGER TRANSFER: LedgerError('insufficient_funds')
+      exit code 1
+      ledger counters: connections 4, balances 667, transfers 221, declined 44
+      ```
+
+      Read it: the ledger's own counters say 667 balances and 221 transfers; Locust says 667 and 219 (two in
+      flight). 43 failures against 44 declines (one in flight). The transfer percentiles are **bimodal** - 6 ms
+      for most, 120 ms from the 80th percentile up - exactly the ledger's "every 4th call takes 120 ms", which an
+      average of 33 ms would have hidden. And `connections: 4`: one TCP connection per simulated user, opened in
+      `on_start`. The exit code is 1 because Locust's default rule saw the 43 declines.
+
+  - id: code-gate
+    kind: code
+    concepts: [perf-lcevents-exit-gate]
+    title: 'The code: a quality gate'
+    body: |
+      The solution of the third exercise (`solutions/locust/lc_events_gate.py`):
+
+      ```python
+      import logging
+
+
+      def violations(stats, max_fail_ratio: float, p95_ms: float) -> list[str]:
+          total = stats.total
+          if total.num_requests == 0:
+              return ["no requests were made - the run proves nothing"]
+          found = []
+          if total.fail_ratio > max_fail_ratio:
+              found.append(f"fail ratio {total.fail_ratio:.1%} is above the limit of {max_fail_ratio:.1%}")
+          p95 = total.get_response_time_percentile(0.95)
+          if p95 > p95_ms:
+              found.append(f"p95 {p95:.0f} ms is above the limit of {p95_ms:.0f} ms")
+          return found
+
+
+      def install(events, max_fail_ratio: float, p95_ms: float) -> None:
+          def gate(environment, **kwargs):
+              found = violations(environment.stats, max_fail_ratio, p95_ms)
+              for reason in found:
+                  logging.error("GATE FAILED: %s", reason)
+              environment.process_exit_code = 1 if found else 0
+
+          events.quitting.add_listener(gate)
+      ```
+
+      In a locustfile: `install(events, max_fail_ratio=0.01, p95_ms=800)`. The decision is a plain function of
+      the statistics object, so it is unit-tested with a stand-in object and no Locust process; only the wiring
+      needs a real run (see the tests section). The limits come from the team's SLOs, not from this example - see
+      [SLOs and error budgets](#/lesson/performance-metrics-and-percentiles).
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Why the important lines are written that way
+    body: |
+      | Line | Why |
+      | --- | --- |
+      | `def on_request(self, request_type, name, response_time, response_length, exception=None, context=None, **kwargs)` | named arguments for what the audit uses, defaults for what a non-HTTP client may not pass, `**kwargs` for what a future Locust adds |
+      | `f"{request_type} {name}"` as the key | two protocols can use the same name (`LEDGER BALANCE` vs `POST balance`); the pair is what identifies a row in Locust's table too |
+      | `if response_time > self.slow_ms` | strictly greater: a request exactly at the limit meets it. A test pins this boundary |
+      | `row["reasons"][str(exception)]` | the reason is the grouping key - a `CatchResponseError("declined: insufficient_funds")` and a `LedgerError("insufficient_funds")` both read well. An exception message that contains an id would make one reason per request |
+      | `(context or {}).get("merchant")` | `context` is None for some clients and `{}` for others; a failure without context is still a failure |
+      | `events.quitting.add_listener(lambda environment, **kwargs: ...)` | `quitting` is called with `environment=...`; `**kwargs` again for what Locust adds |
+      | `time.perf_counter()` and `* 1000` | a monotonic clock, converted to the milliseconds Locust expects. Seconds would make every response look 1000 times faster |
+      | `except OSError as error: meta["exception"] = error` | timeouts, resets and a server that hangs up are all `OSError`; each becomes a failed request. Left alone they would raise out of the task: an exception report entry and no statistics row |
+      | `raise ConnectionError("the ledger closed the connection")` for an empty reply | `readline()` returns an empty string at end of stream; without the check it would look like a successful empty answer |
+      | `name` is `"TRANSFER"`, never built from the arguments | one statistics row per operation, however many merchants and amounts |
+      | `request_event.fire(**meta)` once, after the `try` | exactly one event per call, success or failure; a second fire would double-count |
+      | `total.num_requests == 0` first in `violations` | an empty run must fail, and its ratios and percentiles are meaningless |
+      | `environment.process_exit_code = 1 if found else 0` | set in both directions: 0 overrides Locust's "any failure is 1" rule on purpose |
+
+  - id: when
+    kind: when
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: When to use each - and what it does not replace
+    body: |
+      **Use a request listener when** the built-in table cannot answer a question you will be asked: counts over a
+      threshold, failure reasons by customer or tag, a per-request log for later analysis (Locust 2.47.0 ships
+      `locust.contrib.csv_request_logger.CsvRequestLogger` for exactly that: "one CSV row per completed request",
+      for any protocol, so check it before writing your own), or pushing numbers to a monitoring system. Keep the
+      listener cheap - it runs inside every request.
+
+      **Use lifecycle events when** setup or teardown belongs to the run rather than to a user: loading a CSV once
+      (`test_start`, not on every `on_start`), starting a background monitor (`init`), writing a file or setting an
+      exit code (`quitting`). Per-user setup stays in `on_start`.
+
+      **Write a custom client when** the system under test is not HTTP and no maintained Locust client exists for
+      it. The documentation's examples cover XML-RPC and gRPC; many protocols have community packages. Writing your
+      own is right for a small protocol, or when you need control of exactly what is timed.
+
+      **Use a gate when** a pipeline needs a decision. It does **not** replace reading the report: a pass only
+      says "within the limits you wrote".
+
+      **What this does not replace:**
+
+      - **Locust's statistics.** The audit adds to the table; it is not a second source of truth. The totals must
+        agree (the exercise test compares them).
+      - **Server-side metrics.** A client measures what the client saw; see
+        [Observability for web apps](#/lesson/observability-for-web-apps) and
+        [Logs, metrics and traces](#/lesson/logs-metrics-traces).
+      - **A real protocol test of correctness.** A custom client that sends valid lines proves the service copes
+        with load; whether `TRANSFER` moves the right money is a functional test.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: 'Steps: add events and a client to a test'
+    body: |
+      1. **Decide the question.** "How many transfers took more than 100 ms?" or "does the pipeline go red only when
+         the SLO is broken?" Pick the event that carries the answer.
+      2. **Start the target** (a stub with known behaviour first):
+         `.venv/bin/python -c "import sys; sys.path.insert(0, 'support'); import lc_events_fixture as f, time; l = f.serve().__enter__(); print(l.host); time.sleep(3600)"`.
+      3. **Write the client** (non-HTTP only): time in milliseconds, one event per call, a fixed name, errors as
+         exceptions. Test it **without Locust** by passing a stand-in whose `fire` records its arguments.
+      4. **Write the user:** a `User` (not `HttpUser`) whose `on_start` builds the client with
+         `self.environment.events.request`, and tasks that call it.
+      5. **Run it for a few seconds** and compare Locust's request and failure counts with the **target's own
+         counters**. A table that is empty or too small means the client is not firing.
+      6. **Add listeners** with `install(...)` or decorators. Run again and compare the listener's totals with
+         Locust's.
+      7. **Add the gate** last, and prove it on two runs of the same stub: one that must pass, one that must fail,
+         and a unit test for the empty run.
+      8. **Look at the log** for "Uncaught exception in event handler" and at the exit code: 2 means a listener
+         raised.
+
+  - id: example
+    kind: example
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: 'A SandPay scenario: the ledger before month end'
+    body: |
+      SandPay's ledger service sits behind the payment API and is called by settlement jobs over a TCP protocol, not
+      HTTP. Before month end the team wants to know whether it holds up at the settlement rate. This is what a
+      tester does, with the three tools of this lesson.
+
+      1. **A client** (as in this lesson) with two operations, `BALANCE` and `TRANSFER`. Names are the operations
+         only.
+      2. **A baseline run** against the stub: the table shows `LEDGER TRANSFER` with a 6 ms median and 120 ms from
+         the 80th percentile - the stub's slow path - and 19.6 % `insufficient_funds`. The tester checks that the
+         ledger's counters (221 transfers, 44 declined) match Locust's (219, 43) within one in-flight call per user.
+      3. **An audit** with `slow_ms=100` answers the product owner's question - "how many transfers were slow?" - with
+         a number (54) rather than a percentile, and its `reasons` show only `insufficient_funds`, no connection
+         errors.
+      4. **A gate for the nightly job:** the expected declines are business outcomes, so the gate allows a
+         `max_fail_ratio` of 25 % for this stub and a p95 limit from the SLO. A stricter ratio goes red for the right
+         reason, with the log line saying so. (Against the real ledger the limits would come from its SLOs; the
+         numbers here belong to the stub.)
+
+      What the tester reports: the table with its date and machine, the stub's counters beside it, the limits and
+      where they came from, and that the transfer's bimodal latency is the stub's design - **not a finding about the
+      real ledger**.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: 'Tests: proving a listener, a client and a gate work'
+    body: |
+      | # | Case | Expected result | Evidence |
+      | --- | --- | --- | --- |
+      | 1 | **Positive:** feed the audit six synthetic requests (one exactly at the limit, one failure without context) | `requests`, `slow`, `failures`, `reasons`, `merchants` match hand-counted values; the request at the limit is not slow | unit test, no Locust |
+      | 2 | **Positive:** call the listener with a keyword Locust does not have yet (`future_argument=True`) | counted, no exception | unit test |
+      | 3 | **Positive:** run Locust on the legacy gateway with the audit installed | per-name `requests` and `failures` equal Locust's `--json-file` totals; failure reasons equal what the gateway sent (within one in-flight call per user) | audit JSON beside `<prefix>.json` and the gateway's counters |
+      | 4 | **Positive:** client with a recording stand-in, `BALANCE` and `TRANSFER` | one event per call, `request_type` `LEDGER`, name without arguments, `response_time` in ms, the 4th transfer at least 100 ms | event dicts |
+      | 5 | **Negative:** the 5th transfer is declined | `exception` is a `LedgerError("insufficient_funds")`, the call returns None, the other four have `exception` None | event dicts |
+      | 6 | **Negative:** the server hangs up mid-call | one event with an `OSError`, `response_length` 0, no exception out of the client | event dict |
+      | 7 | **Positive:** real Locust on the ledger user | rows `BALANCE` and `TRANSFER` of type `LEDGER`; failures = declines (within in-flight); `connections` = users | JSON and ledger counters |
+      | 8 | **Positive and negative:** gate on stand-in statistics | clean passes; each broken limit gets its own reason; the limit itself passes; a run with 0 requests fails with one reason | return value of `violations` |
+      | 9 | **Positive and negative:** the same gateway run under `max_fail_ratio` 0.9 and 0.05 | exit code 0, then exit code 1 with `GATE FAILED: fail ratio` in the log | subprocess return codes |
+
+      Real run of the 28 tests of this lesson against the reference solutions, 21 November 2026:
+
+      ```text
+      tests/locust/test_lc_events_audit.py  ...........   [ 39%]
+      tests/locust/test_lc_events_client.py .........     [ 71%]
+      tests/locust/test_lc_events_gate.py   ........      [100%]
+      28 passed, 151 deselected, 4 warnings in 18.65s
+      ```
+
+      (The warnings are gevent's DeprecationWarning about fork() in a multi-threaded process; they come from
+      starting Locust in a subprocess. The 151 deselected tests belong to other lessons.) Against the unsolved
+      exercises the same files fail, which `scripts/verify.py` checks.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Common mistakes and how to find them
+    body: |
+      | Mistake | What you see | How to find it |
+      | --- | --- | --- |
+      | The client never fires `request` | an empty statistics table and exit code 0 while the target is busy | compare Locust's request count with the target's counters; the lesson's `forgot` run: 32 served, 0 recorded |
+      | `response_time` in seconds | every response "0 ms" or "1 ms"; percentiles collapse | compare with a call you know takes 120 ms; the unit is milliseconds |
+      | `time.time()` for the duration | durations can be negative or jump when the clock is adjusted | use `time.perf_counter()` |
+      | The name contains an argument (`TRANSFER merchant-17`) | one statistics row per merchant | rows with a few requests each, as in the previous lesson |
+      | No `try` around the socket call | a timeout raises out of the task; no statistics row; `_exceptions.csv` has entries | the exceptions report; request count below the target's |
+      | The listener raises | "Uncaught exception in event handler" in the log, once per request; exit code 2; statistics still correct | look at the log and the exit code; unit-test the listener |
+      | The listener has no `**kwargs` | works today, raises `TypeError` after a Locust upgrade adds an argument | always end with `**kwargs` |
+      | Treating `quitting` as in registration order | a gate that reads something another `quitting` listener should have written first sees nothing | `quitting` is fired with `reverse=True`; do not depend on order, or put both steps in one function |
+      | A gate that sets 0 unconditionally | a broken run passes, even exit code 2 from a failed listener is hidden | set the code from checks, log reasons, and fail a run with no requests |
+      | A gate without a way to see why | the pipeline is red and nobody knows the reason | `logging.error` each reason |
+      | Expecting a distributed master to have per-request listener data | the master's own counters are empty | `request` fires on the workers; use `worker_report` / `report_to_master` to aggregate |
+      | A blocking library inside a user | one user at a time, throughput does not scale with users | gevent cannot patch compiled I/O; use a patched or pure-Python library |
+
+      **Debugging method:** (1) run 2 users for 2 seconds against a stub whose counters you can read, (2) compare
+      Locust's table with the stub's counters, (3) print the arguments of the first event you receive, (4) read the
+      log for "Uncaught exception", (5) check the exit code against the rule that chose it.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Trade-offs and alternatives
+    body: |
+      - **Listener cost.** Every listener runs inside every request in the greenlet that made it. A cheap counter
+        is free; a file write per request, a database insert or an HTTP call to a metrics server is not, and it
+        slows the very load you are measuring. Buffer, write at `quitting`, or use `CsvRequestLogger`'s
+        `flush_interval`. Locust's CPU warning (`cpu_warning`, at 90 % by default) tells you the generator itself is
+        the bottleneck.
+      - **Listener state in a distributed run.** A module-level counter is per process. For totals, use the data
+        the master already aggregates (`environment.stats`), or send your own through `report_to_master` and
+        `worker_report`.
+      - **Own client or existing package.** A 40-line client is easy to read and test, but a mature driver handles
+        reconnects, pooling and protocol corners. Write your own for small protocols; for gRPC and others follow the
+        documentation's example.
+      - **`measure()` or `fire()`.** `measure()` is shorter and measures the block, but is marked experimental and
+        only sees raised exceptions. `fire()` is explicit and lets you set the exception, the response and the
+        context yourself. Both put the same event on the same hook.
+      - **Gate in the locustfile or in the pipeline.** A gate in the locustfile travels with the test and works
+        wherever Locust runs. A gate in the pipeline can read `--csv` or `--json-file` files with any tool, gate on
+        several runs, and compare with a baseline. Many teams do both: Locust's gate for the hard limits, the
+        pipeline for trends - see [Performance testing in CI/CD](#/lesson/performance-testing-in-ci-cd).
+      - **The exit code is one bit of information.** A report with the reasons, the table and the artefacts is what
+        a human needs after a red run.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-lcevents-request-event, perf-lcevents-custom-client, perf-lcevents-exit-gate]
+    title: Summary
+    body: |
+      - Locust fires events through a run: `init`, `test_start`, `spawning_complete`, `request` (per request),
+        `test_stopping`, `test_stop`, `quitting`, `quit`. A listener is a function registered with
+        `events.<name>.add_listener`.
+      - Listeners get keyword arguments: name what you need, give defaults to what may be missing, end with `**kwargs`.
+      - `request` carries `request_type`, `name`, `response_time` (**ms**), `response_length`, `response`, `context`,
+        `exception`; failed means `exception` is not None. `context` carries your own data to listeners.
+      - A listener that raises is logged and skipped; the request is still counted and the exit code becomes 2.
+      - Locust only knows what is **reported**: a custom client times the call (`perf_counter`, milliseconds),
+        fires `request` once per call with a fixed name, and turns protocol errors and socket errors into exceptions.
+      - Not firing = an empty table and exit code 0. Compare Locust's counts with the target's counters.
+      - `events.request.measure()` fires for you around a with-block (experimental; raised exceptions only).
+      - `quitting` runs (in reverse registration order) before the exit code is chosen; `process_exit_code`, if set,
+        wins over `--exit-code-on-error` and the default rules.
+      - A gate: read `environment.stats.total`, compare with stated limits, log each reason, set 1 or 0, and fail
+        a run with no requests.
+      - Prove every piece: unit-test with stand-ins, then run Locust on a stub with exact counters.
+
+exercises:
+  - id: which-event-mcq
+    type: mcq
+    concept: perf-lcevents-request-event
+    skill: recall
+    title: One event per request
+    prompt: Which Locust event fires once for every finished request, successful or failed?
+    options:
+      - id: request
+        text: '`events.request`'
+        feedback: Correct - it carries request_type, name, response_time, response_length, response, context and exception.
+      - id: test-start
+        text: '`events.test_start`'
+        feedback: That fires once per node when the load test starts, not per request.
+      - id: spawning
+        text: '`events.spawning_complete`'
+        feedback: That fires when all users have been spawned, once per ramp-up.
+      - id: user-error
+        text: '`events.user_error`'
+        feedback: That fires when an exception escapes a User, not for each request.
+    correct: [request]
+    hints:
+      - The event has the same name as what it reports.
+    solution: |
+      `request`. Every finished request - HTTP or from a custom client that fires it - produces one event;
+      `exception` is None when it succeeded.
+
+  - id: kwargs-mcq
+    type: mcq
+    concept: perf-lcevents-request-event
+    skill: application
+    title: Why the wildcard
+    prompt: |
+      A listener is `def on_request(request_type, name, response_time, response_length, exception=None)`. It works
+      today. Why can it break after a Locust upgrade, and what is the fix?
+    options:
+      - id: kwargs
+        text: Locust may add event arguments; the listener has no `**kwargs`, so `handler(**kwargs)` raises TypeError. Add `**kwargs`
+        feedback: Correct - the documentation recommends a wildcard keyword argument for exactly this reason.
+      - id: positional
+        text: Locust may switch to positional arguments; add `*args`
+        feedback: Listeners are called with keyword arguments only.
+      - id: decorator
+        text: The decorator form is deprecated; use `events.request.fire`
+        feedback: add_listener (and its decorator form) is the documented way; fire is what clients call.
+      - id: defaults
+        text: Defaults like `exception=None` are not allowed
+        feedback: Defaults are fine and useful for arguments a custom client may not pass.
+    correct: [kwargs]
+    hints:
+      - How does EventHook.fire call a handler?
+    solution: |
+      `fire(**kwargs)` calls `handler(**kwargs)`. An unexpected keyword raises TypeError, which Locust logs as an
+      uncaught exception in the event handler. End every listener with `**kwargs`.
+
+  - id: units-mcq
+    type: mcq
+    concept: perf-lcevents-custom-client
+    skill: application
+    title: Seconds or milliseconds
+    prompt: |
+      A custom client measures `elapsed = time.perf_counter() - started` and fires
+      `response_time=elapsed`. The ledger takes about 120 ms on some calls. What does Locust's table show for them?
+    options:
+      - id: tenth
+        text: About 0 - the value 0.12 is read as 0.12 milliseconds
+        feedback: Correct - response_time is in milliseconds, so every response looks 1000 times faster.
+      - id: hundred-twenty
+        text: 120 ms - Locust converts seconds automatically
+        feedback: Locust does not convert; it takes the number as milliseconds.
+      - id: error
+        text: An error, because the value is not an integer
+        feedback: Floats are accepted; the numbers are just wrong.
+      - id: failure
+        text: The request is marked failed
+        feedback: Failure is decided by exception, not by the time.
+    correct: [tenth]
+    hints:
+      - The API reference describes response_time as "Time in milliseconds".
+    solution: |
+      Multiply by 1000: `response_time=(time.perf_counter() - started) * 1000`.
+
+  - id: silent-mcq
+    type: mcq
+    concept: perf-lcevents-custom-client
+    skill: analysis
+    title: Green and empty
+    prompt: |
+      A Locust run against the ledger ends with exit code 0 and an empty statistics table, but the ledger's own
+      counters show 32 balance calls. What is the most likely cause?
+    options:
+      - id: not-firing
+        text: The client makes the calls but never fires the `request` event
+        feedback: Correct - Locust only records what is reported; the calls happened, so the target counted them.
+      - id: wait
+        text: wait_time is too long
+        feedback: Then the ledger would not have served 32 calls.
+      - id: csv
+        text: The CSV files lag, so the table is empty
+        feedback: The console table and the JSON are final; the lag applies to the CSV files only.
+      - id: ledger
+        text: The ledger is rejecting every call
+        feedback: Rejected calls would be failed requests in the table - if the client reported them.
+    correct: [not-firing]
+    hints:
+      - Where do the statistics come from, for a client that is not HttpSession?
+    solution: |
+      Statistics are built from `request` events. Compare Locust's count with the target's, find the missing
+      `fire`, and add a test that a call produces one event.
+
+  - id: listener-raises-mcq
+    type: mcq
+    concept: perf-lcevents-request-event
+    skill: analysis
+    title: A listener that raises
+    prompt: |
+      A `request` listener has a bug and raises `TypeError` on every call. In the lesson's run, what happened?
+    options:
+      - id: continues
+        text: The log showed "Uncaught exception in event handler" for each request, the statistics still counted the requests, and the exit code was 2
+        feedback: Correct - fire() catches each handler's exception, logs it and carries on.
+      - id: stops
+        text: Locust stopped the run at the first exception
+        feedback: Only StopUser, StopTest and the reschedule exceptions are re-raised; others are logged.
+      - id: silent
+        text: Nothing - exceptions in listeners are ignored silently
+        feedback: They are logged with a traceback and change the exit code to 2.
+      - id: missing
+        text: The requests were dropped from the statistics
+        feedback: Locust's own statistics listener is separate and still ran.
+    correct: [continues]
+    hints:
+      - Think about what EventHook.fire does around each handler.
+    solution: |
+      Logged, skipped, exit code 2 (if nothing else set the code). That is why a listener needs its own unit test.
+
+  - id: quitting-mcq
+    type: mcq
+    concept: perf-lcevents-exit-gate
+    skill: application
+    title: Where the exit code is set
+    prompt: Which hook can still change the process exit code, and with what?
+    options:
+      - id: quitting
+        text: A `quitting` listener, by setting `environment.process_exit_code`
+        feedback: Correct - shutdown() fires quitting, then reads process_exit_code.
+      - id: quit
+        text: A `quit` listener, by returning a number
+        feedback: quit receives the exit code that was already chosen; it cannot change it.
+      - id: test-stop
+        text: A `test_stop` listener, by raising an exception
+        feedback: An exception in a listener is logged and makes the code 2, not a code you chose.
+      - id: request
+        text: The `request` listener of the last request
+        feedback: The last request is not known in advance, and the code is read after quitting.
+    correct: [quitting]
+    hints:
+      - The documentation's example for controlling the exit code uses this hook.
+    solution: |
+      `quitting`, with `environment.process_exit_code = n`. It takes precedence over `--exit-code-on-error`.
+
+  - id: default-rule-mcq
+    type: mcq
+    concept: perf-lcevents-exit-gate
+    skill: analysis
+    title: Red for the wrong reason
+    prompt: |
+      The ledger run has 43 declines out of 886 requests (4.85 %), all expected business outcomes. The pipeline
+      shows red on every run. Why, and what is the right fix?
+    options:
+      - id: default
+        text: Locust exits 1 when any request failed; add a gate on quitting with a ratio limit and set the code yourself
+        feedback: Correct - the default rule is "any failure is 1"; a gate states what you actually accept.
+      - id: ignore
+        text: Add `|| true` to the pipeline step
+        feedback: That hides real failures and slow runs as well.
+      - id: remove
+        text: Mark declines as successes so they are not counted
+        feedback: That removes real information from the statistics; the gate is the place to say how many are acceptable.
+      - id: users
+        text: Run with fewer users
+        feedback: The ratio stays about the same.
+    correct: [default]
+    hints:
+      - Read the documentation's "Controlling the exit code" section.
+    solution: |
+      Set `environment.process_exit_code` from checks on `stats.total` in a `quitting` listener, with limits that
+      come from the SLO, and log the reason for a failure.
+
+  - id: empty-gate-mcq
+    type: mcq
+    concept: perf-lcevents-exit-gate
+    skill: analysis
+    title: The gate that cannot fail
+    prompt: |
+      A gate checks `fail_ratio > 0.01` and `p95 > 800` and otherwise sets exit code 0. A broken test makes no
+      requests at all. What does the gate do, and why is that a bug?
+    options:
+      - id: passes
+        text: It passes - with zero requests the fail ratio is 0 and the percentile is 0 - so a test that proves nothing goes green
+        feedback: Correct - the gate needs an explicit check for no requests.
+      - id: fails
+        text: It fails, because Locust has no statistics
+        feedback: Locust still has a total entry with zeros; the checks pass.
+      - id: crash
+        text: It crashes with a division by zero
+        feedback: fail_ratio is defined as 0 for no requests.
+      - id: default
+        text: Locust's default rule overrides it
+        feedback: process_exit_code, once set, wins over the default rules.
+    correct: [passes]
+    hints:
+      - Which numbers does an empty run produce?
+    solution: |
+      All limits pass. Check `total.num_requests == 0` first and report "no requests were made".
+
+  - id: context-mcq
+    type: mcq
+    concept: perf-lcevents-request-event
+    skill: application
+    title: Getting the merchant to the listener
+    prompt: |
+      The audit must count failures per merchant. How does the merchant get from the task to the `request`
+      listener?
+    options:
+      - id: context
+        text: 'Pass `context={"merchant": ...}` in the request call (or override `User.context()`) and read the `context` argument'
+        feedback: Correct - context is the documented way to pass data about a request to listeners.
+      - id: name
+        text: Put the merchant in the request name
+        feedback: That creates one statistics row per merchant.
+      - id: global
+        text: Store it in a module-level variable before each request
+        feedback: Many users run concurrently as greenlets; the variable would be overwritten between requests.
+      - id: exception
+        text: Put it in the failure message only
+        feedback: Messages group failures by text; one message per merchant would swamp the error report.
+    correct: [context]
+    hints:
+      - The event has an argument for your own data.
+    solution: |
+      `context`. It does not change Locust's statistics; it only arrives in listeners.
+
+  - id: measure-mcq
+    type: mcq
+    concept: perf-lcevents-custom-client
+    skill: analysis
+    title: What measure() fails
+    prompt: |
+      A task uses `with self.environment.events.request.measure("LEDGER", "TRANSFER"):` around a call that returns
+      `ERR insufficient_funds` without raising. How does Locust record it?
+    options:
+      - id: success
+        text: As a success - measure() only marks a request failed when the block raises, so the code must raise for an ERR reply
+        feedback: Correct - turn protocol errors into exceptions inside the block.
+      - id: failure
+        text: As a failure, because the reply starts with ERR
+        feedback: measure() cannot read replies.
+      - id: nothing
+        text: It is not recorded
+        feedback: It is recorded - as a success.
+      - id: error
+        text: Locust raises a LocustError
+        feedback: No error is raised.
+    correct: [success]
+    hints:
+      - Read what measure() says it does with exceptions.
+    solution: |
+      Success. Raise inside the block (or use `fire()` and set `exception` yourself).
+
+  - id: lifecycle-order
+    type: order
+    concept: perf-lcevents-request-event
+    skill: recall
+    title: The events of one run
+    prompt: Put these events in the order they fire in a headless run.
+    items:
+      - id: init
+        text: init
+      - id: test-start
+        text: test_start
+      - id: spawning
+        text: spawning_complete
+      - id: request
+        text: request (one per finished request)
+      - id: stopping
+        text: test_stopping
+      - id: stop
+        text: test_stop
+      - id: quitting
+        text: quitting
+      - id: quit
+        text: quit
+    hints:
+      - Setup first, load in the middle, shutdown last, and the exit code is chosen between the last two.
+    solution: |
+      init, test_start, spawning_complete, request ..., test_stopping, test_stop, quitting, quit - the order
+      printed by the lesson's real run.
+
+  - id: client-debug
+    type: debug
+    concept: perf-lcevents-custom-client
+    skill: analysis
+    title: Four defects in one client call
+    prompt: |
+      This method is meant to report one ledger transfer to Locust. Click every line that is a defect.
+    language: python
+    code: |
+      def transfer(self, source, target, amount_minor):
+          started = time.time()
+          self._sock.sendall(f"TRANSFER {source} {target} {amount_minor}\n".encode())
+          reply = self._reader.readline().decode().strip()
+          elapsed = time.time() - started
+          failed = reply.startswith("ERR")
+          self._request_event.fire(request_type="LEDGER", name=f"TRANSFER {source}",
+                                   response_time=elapsed, response_length=len(reply),
+                                   exception=LedgerError(reply) if failed else None)
+          return reply
+    correctLines: [2, 4, 5, 7]
+    lineNotes:
+      - line: 2
+        note: time.time() is not monotonic; use time.perf_counter().
+      - line: 4
+        note: A timeout or reset raises here, out of the task - no event, no statistics row. Wrap the call in try/except OSError and fire the failure.
+      - line: 5
+        note: The elapsed time is in seconds; Locust expects milliseconds, so multiply by 1000.
+      - line: 6
+        note: This line is fine - ERR replies are detected here.
+      - line: 7
+        note: The name contains the merchant, so there is one statistics row per merchant. Use "TRANSFER".
+    hints:
+      - Look for the clock, the units, the name and what happens on a socket error.
+    solution: |
+      Line 2 (`time.perf_counter()`), line 4 (no `try`), line 5 (seconds, not ms) and line 7 (the name with an
+      argument). The event arguments themselves are right.
+
+  - id: absent-listener-short
+    type: short
+    concept: perf-lcevents-request-event
+    skill: analysis
+    title: 54 slow, or 56?
+    prompt: |
+      In the lesson's ledger run, 224 transfers reached the ledger and every 4th takes 120 ms, so 56 were slow;
+      the audit with `slow_ms=100` counted 54, and Locust's own table counts 222 transfers. Which numbers are
+      right, why do they differ, and what would be a bug?
+    modelAnswer: |
+      Both are right about different things. The ledger counted every call it received (224 transfers, 56 slow
+      ones). Locust and the audit count a call when the client reports it finished; a call that is still in flight
+      when the run stops is counted by the server only. With 4 users, at most 4 can be in flight, here 2 (224 vs
+      222 transfers) of them slow ones (56 vs 54). A real bug would be a difference larger than one per user, or
+      the audit's totals differing from Locust's table - the exercise tests compare those two exactly.
+    rubric:
+      - Says the server counts received calls and the client counts finished ones.
+      - Bounds the difference by one in-flight call per user.
+      - Notes that the audit and Locust's table must agree exactly.
+    hints:
+      - Who counts what, and when?
+    solution: |
+      In-flight calls at the end of the run explain a difference of up to one per user; the audit and the table
+      must agree exactly because they receive the same events.
+
+  - id: gate-testdesign
+    type: testdesign
+    concept: perf-lcevents-exit-gate
+    skill: application
+    title: Prove a gate before the pipeline trusts it
+    prompt: |
+      Your team adds a Locust quality gate to the nightly job: fail if the fail ratio is above 1 % or the p95 is
+      above 800 ms. Design the checks that prove the gate decides correctly, including the cases that usually go
+      wrong.
+    modelAnswer: |
+      **Preconditions:** a stub with counter-driven answers (a known failure ratio, a known slow path), Locust
+      2.47.0 headless, the gate installed with limits passed in, the stub's counters readable.
+
+      | Case | Setup | Expected exit code | Evidence |
+      | --- | --- | --- | --- |
+      | Within limits | stub with 0 % failures, fast | 0 | return code, no GATE line |
+      | Fail ratio over | stub failing 20 % of calls, limit 1 % | 1 | log "fail ratio 20.0% is above the limit of 1.0%" |
+      | Fail ratio under, though failures exist | same stub, limit 90 % | 0 | proves the gate overrides Locust's default 1 |
+      | Slow path | stub with a 1 s slow path on 10 % of calls, p95 limit 800 | 1 | log "p95 ... ms" |
+      | Exactly at a limit | stand-in statistics with fail ratio equal to the limit | 0 | unit test |
+      | No requests | locustfile whose user never fires (or a stand-in with 0 requests) | 1 | log "no requests were made" |
+      | Both broken | failure and slowness together | 1 | two reasons, not one |
+
+      Unit-test the decision function on stand-in statistics; use two or three real runs for the wiring. Compare
+      the stub's counters with Locust's totals so the numbers the gate sees are the numbers you think.
+    rubric:
+      - Uses a stub with known, counter-driven behaviour.
+      - Covers pass, fail on each limit, both broken, and exactly at a limit.
+      - Includes the case where failures exist but the gate passes (overriding the default).
+      - Includes a run with no requests that must fail.
+      - Checks the exit code and the logged reason, and unit-tests the decision separately.
+    hints:
+      - Which run must pass even though Locust's default would fail it?
+      - What does an empty run look like to the checks?
+    solution: |
+      A table of stub-driven cases with exit code and log evidence, the override case and the empty-run case, plus a
+      unit test of the decision function.
+
+  - id: events-interview
+    type: interview
+    concept: perf-lcevents-custom-client
+    skill: analysis
+    title: 'Interview: load testing a service that is not HTTP'
+    prompt: |
+      "We need to load test an internal ledger service that speaks a custom TCP protocol. Our tool is Locust. How do
+      you do it, and how do you make sure the results can be trusted and the pipeline reacts sensibly?"
+    modelAnswer: |
+      Locust's statistics are built from the `request` event, which `HttpSession` fires for HTTP. For a TCP protocol
+      I write a small client that does the same: time each call with `time.perf_counter()` in milliseconds, send
+      the line and read the reply, turn protocol errors and socket errors (timeouts, resets) into exceptions rather
+      than crashes, and fire `request` once per call with request type, a fixed name per operation (never the
+      merchant or the amount), response time, response length and the exception. The user class builds the client in
+      `on_start` from `self.environment.events.request`, so the client itself does not import Locust and can be unit
+      tested with a stand-in for the event. I check that the library does its I/O in pure Python, which gevent can
+      patch, so users run concurrently.
+
+      To trust it, I run a few seconds against a stub whose answers come from a counter and compare Locust's request
+      and failure counts with the stub's own counters - they should differ by at most one in-flight call per user. A
+      table that is empty while the target is busy means the client is not firing.
+
+      For extra numbers - slow calls over a threshold, failure reasons - I add a listener on `request` with `**kwargs`
+      and a `context` for tags. For the pipeline I add a `quitting` listener that sets `process_exit_code` from the
+      fail ratio and a percentile, logs the reasons, and fails a run with no requests. The limits come from the SLO.
+      Locust's default is "any failed request exits 1", which makes expected business errors turn the build red.
+    rubric:
+      - Explains that statistics come from the request event and that a custom client must fire it.
+      - Covers units (ms), fixed names, error handling and one event per call.
+      - Validates counts against the target's counters; spots a silent client.
+      - Mentions gevent compatibility.
+      - Describes a gate on quitting with process_exit_code and why the default rule is not enough.
+    followUps:
+      - How would you notice that your listener raised during a run?
+      - What changes for custom listeners in a distributed run?
+      - When would you choose a gRPC or other existing client over your own?
+    hints:
+      - Start from where Locust's numbers come from.
+      - End with how the build decides pass or fail.
+    solution: |
+      Fire the request event from your own client (ms, fixed names, errors as exceptions), prove it against a
+      counter-driven stub, add listeners with **kwargs, and gate the exit code on quitting.
+
+  - id: audit-code
+    type: coding
+    concept: perf-lcevents-request-event
+    skill: application
+    title: Build a request audit
+    prompt: |
+      Complete `locust/lc_events_audit.py`: a `RequestAudit` that is fed by Locust's `request` event and keeps, per
+      `"<request_type> <name>"`, the number of requests, failures, slow requests (strictly over `slow_ms`), the
+      failure reasons and the failures per merchant from the request context, plus `summary()`, `write(path)` and
+      `install(events, audit, path)` which wires `request` and writes the file on `quitting`. The tests call the
+      listener directly, then run real Locust against the legacy gateway and compare your totals with Locust's own.
+    project: perf
+    files:
+      - exercises/locust/lc_events_audit.py
+    test: tests/locust/test_lc_events_audit.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_events_audit.py
+    modelAnswer: |
+      See "The code: a request audit". The details the tests check:
+
+      - one row per `f"{request_type} {name}"`, created with `setdefault`;
+      - `response_time > slow_ms` (strictly greater);
+      - `reasons` keyed by `str(exception)`, `merchants` from `(context or {}).get("merchant")`;
+      - `**kwargs` on the listener, and `summary()` returning plain dicts that JSON can serialise;
+      - `install` adds `audit.on_request` to `events.request` and a lambda taking `environment, **kwargs` to
+        `events.quitting`.
+    rubric:
+      - Every test in tests/locust/test_lc_events_audit.py passes.
+      - The listener ends with **kwargs and tolerates a missing context.
+      - The audit's totals equal Locust's own statistics.
+      - Summary values are plain dicts, so the file is valid JSON.
+    hints:
+      - "Use a dict of dicts with `setdefault`; Counters make the reasons easy."
+      - "`context` can be None or {}, so use `(context or {}).get(...)`."
+      - "`events.quitting` calls its listeners with `environment=...` and maybe more."
+    solution: |
+      One row per type and name; count requests; count slow with `>`; on exception count the failure, the reason and
+      the merchant; JSON-friendly summary; `install` registers two listeners.
+
+  - id: client-code
+    type: coding
+    concept: perf-lcevents-custom-client
+    skill: application
+    title: A Locust client for a TCP ledger
+    prompt: |
+      Complete `locust/lc_events_client.py` (a `LedgerClient` that reports every call through the `request_event`
+      it is given) and `locust/lc_events_ledger_locustfile.py` (a `LedgerUser` with tasks `balance` and `transfer`
+      weighted 3 : 1). Calls fire `request_type="LEDGER"`, names `BALANCE` and `TRANSFER`, a response time in
+      milliseconds, the reply and its length, and an exception for an `ERR` reply (`LedgerError`) or a socket
+      error. The tests use a recording stand-in first, then real Locust against the ledger fixture.
+    project: perf
+    files:
+      - exercises/locust/lc_events_client.py
+      - exercises/locust/lc_events_ledger_locustfile.py
+    test: tests/locust/test_lc_events_client.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_events_client.py
+    modelAnswer: |
+      See "The code: a client for the ledger and its Locust user". The details the tests check:
+
+      - `time.perf_counter()` times the call; `* 1000` gives milliseconds;
+      - the `try` covers send and read; `OSError` becomes the event's exception; an empty reply raises
+        `ConnectionError`;
+      - the name is the operation only; one `fire(**meta)` per call, after the `try`;
+      - the user builds the client in `on_start` with `self.environment.events.request` and closes it in `on_stop`.
+    rubric:
+      - Every test in tests/locust/test_lc_events_client.py passes.
+      - Response time is measured with perf_counter and reported in milliseconds.
+      - Socket errors are failed requests, not crashes.
+      - Names never contain arguments, and there is exactly one event per call.
+    hints:
+      - "`socket.create_connection((address, int(port)))` and `makefile('rb')` for `readline()`."
+      - "Build one dict of event arguments and call `fire(**meta)` once."
+      - "A task weight is `@task(3)`."
+    solution: |
+      Time, send, read, classify the reply, fire once; the user opens a client per simulated user.
+
+  - id: gate-code
+    type: coding
+    concept: perf-lcevents-exit-gate
+    skill: application
+    title: A quality gate for the exit code
+    prompt: |
+      Complete `locust/lc_events_gate.py`: `violations(stats, max_fail_ratio, p95_ms)` returns the reasons a run
+      fails (one "no requests" reason for an empty run; "fail ratio ..." and "p95 ..." for the limits, inclusive)
+      and `install(events, max_fail_ratio, p95_ms)` sets `environment.process_exit_code` to 1 or 0 on `quitting`
+      and logs each reason. The tests decide on stand-in statistics, then run real Locust twice against the legacy
+      gateway - a lenient and a strict limit.
+    project: perf
+    files:
+      - exercises/locust/lc_events_gate.py
+    test: tests/locust/test_lc_events_gate.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_events_gate.py
+    modelAnswer: |
+      See "The code: a quality gate". The details the tests check:
+
+      - the empty-run check comes first and returns a single reason;
+      - limits are inclusive (`>` not `>=`);
+      - the 95th percentile is `get_response_time_percentile(0.95)`;
+      - the exit code is set in both directions, and each reason goes to `logging.error`.
+    rubric:
+      - Every test in tests/locust/test_lc_events_gate.py passes.
+      - A run with no requests fails with exactly one reason.
+      - A limit equal to the measured value passes.
+      - The exit code is set to 0 as well as to 1, and reasons are logged.
+    hints:
+      - "Check `stats.total.num_requests == 0` before anything else."
+      - "`quitting` listeners are called with `environment=` and may get more keywords."
+    solution: |
+      Empty-run check, two limit checks with `>`, and a quitting listener that logs the reasons and sets 1 or 0.
+
+placement:
+  - id: place-request-event
+    type: mcq
+    concept: perf-lcevents-request-event
+    skill: application
+    title: Writing a listener that survives upgrades
+    prompt: |
+      You add a listener to count requests slower than 500 ms. Which signature and body are right for Locust 2.47?
+    options:
+      - id: kwargs
+        text: '`def on_request(name, response_time, exception=None, **kwargs):` and count when `response_time > 500`'
+        feedback: Correct - the arguments you need, defaults for optional ones, **kwargs for the rest, and milliseconds.
+      - id: exact
+        text: '`def on_request(request_type, name, response_time, response_length, response, context, exception, start_time, url):`'
+        feedback: Every argument spelled out breaks on a new one, and a non-HTTP client may not pass response or url.
+      - id: seconds
+        text: '`def on_request(name, response_time, **kwargs):` and count when `response_time > 0.5`'
+        feedback: response_time is in milliseconds, so this counts nearly everything.
+      - id: positional
+        text: '`def on_request(*args):` and read `args[1]`'
+        feedback: Listeners are called with keyword arguments only.
+    correct: [kwargs]
+    solution: |
+      Name what you use, default what may be absent, end with `**kwargs`, and compare in milliseconds.
+
+  - id: place-custom-client
+    type: mcq
+    concept: perf-lcevents-custom-client
+    skill: application
+    title: A client Locust cannot see
+    prompt: |
+      A custom TCP client makes calls fine, but Locust's table is empty and the exit code is 0. What do you add?
+    options:
+      - id: fire
+        text: Time each call in milliseconds and fire `events.request` with a fixed name, the length and the exception
+        feedback: Correct - Locust only records what is reported through that event.
+      - id: httpuser
+        text: Make the user an HttpUser
+        feedback: HttpUser's client speaks HTTP; it would not talk to the ledger.
+      - id: csv
+        text: Pass --csv so the statistics are written
+        feedback: The CSV files hold the same statistics, which are empty.
+      - id: more
+        text: Run more users
+        feedback: More users make more unreported calls.
+    correct: [fire]
+    solution: |
+      The `request` event is the only path into the statistics: fire it once per call.
+
+  - id: place-gate
+    type: mcq
+    concept: perf-lcevents-exit-gate
+    skill: analysis
+    title: Which run does the gate let through?
+    prompt: |
+      A gate on `quitting` sets exit code 1 if `fail_ratio > 0.01` or p95 above 800 ms, else 0. Which broken run
+      still exits 0?
+    options:
+      - id: empty
+        text: A run in which the users never made a request
+        feedback: Correct - with zero requests the ratio and percentile are 0, so every check passes; an explicit "no requests" check is needed.
+      - id: slow
+        text: A run whose p95 is 2 seconds
+        feedback: The p95 check catches this one.
+      - id: failing
+        text: A run where 5 % of requests failed
+        feedback: The fail ratio check catches this one.
+      - id: both
+        text: A run that is both slow and failing
+        feedback: Either check alone fails it.
+    correct: [empty]
+    solution: |
+      The empty run. Check `num_requests == 0` first and fail with a clear reason.
+
+recall:
+  - id: recall-request-event
+    concept: perf-lcevents-request-event
+    prompt: What does the request event carry, and what is the unit of response_time?
+    answer: request_type, name, response_time (milliseconds), response_length, response, context, exception (None on success) and more such as start_time and url. It fires once for every finished request.
+  - id: recall-kwargs
+    concept: perf-lcevents-request-event
+    prompt: Why must a listener end with **kwargs?
+    answer: Locust calls it with keyword arguments and adds arguments over time; a client may also not pass all of them. Without **kwargs a new or missing argument raises TypeError.
+  - id: recall-order
+    concept: perf-lcevents-request-event
+    prompt: The order of Locust's events in a headless run?
+    answer: init, test_start, spawning_complete, request (many), test_stopping, test_stop, quitting, quit.
+  - id: recall-listener-raises
+    concept: perf-lcevents-request-event
+    prompt: What happens when a listener raises?
+    answer: Locust logs "Uncaught exception in event handler", skips it, still records the request, and the process exits with code 2 unless process_exit_code was set.
+  - id: recall-client
+    concept: perf-lcevents-custom-client
+    prompt: The four jobs of a custom Locust client?
+    answer: Time the call with perf_counter in milliseconds, perform it in a try and turn protocol and socket errors into exceptions, fire request once with a fixed name, return the reply (or None).
+  - id: recall-silent
+    concept: perf-lcevents-custom-client
+    prompt: Symptom and check for a client that forgets to fire?
+    answer: An empty table and exit code 0 while the target is busy; compare Locust's request count with the target's own counters.
+  - id: recall-exit
+    concept: perf-lcevents-exit-gate
+    prompt: How is Locust's exit code chosen?
+    answer: quitting fires first; then process_exit_code if set, else --exit-code-on-error (default 1) if any request failed, else 2 if a listener raised, else 0.
+  - id: recall-gate
+    concept: perf-lcevents-exit-gate
+    prompt: What does a good gate check and log?
+    answer: A run with no requests (fail), fail_ratio and a percentile against stated limits (inclusive), logging each reason; it sets 1 or 0 on quitting.
+
+next:
+  - locust-load-shapes
+  - locust-distributed-and-ci
+  - reading-load-test-results

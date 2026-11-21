@@ -1,0 +1,1606 @@
+id: locust-task-sets-and-user-flows
+title: Task sets, weights and realistic user flows
+subject: performance-testing
+module: locust
+level: intermediate
+status: published
+estimatedMinutes: 120
+summary: 'Make a Locust user behave like the workload model says. A task weight is a share of picks, not of requests, so a one-request task and a three-request flow with the same weight do not load the server equally; a TaskSet groups tasks into a screen the user enters and leaves with interrupt() - leave it out and the user never comes back; a SequentialTaskSet runs steps in the order they are declared and repeats; and state lives in three places - the user, one visit to a TaskSet, the module - each with different sharing rules. The docs also say a whole flow in one plain task is often easier than a TaskSet, and the lesson shows when that is true. Every run is real Locust 2.47.0 against the local SandPay practice API.'
+tags:
+  [
+    Locust,
+    task weights,
+    "@task",
+    tasks attribute,
+    TaskSet,
+    SequentialTaskSet,
+    MarkovTaskSet,
+    interrupt,
+    on_start,
+    user flows,
+    workload model,
+    test data,
+    weight,
+    fixed_count,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Locust 2.47.0 on Python 3.12.3 with pytest 9.2.0, in `practice/perf/.venv`. Locust always runs
+    headless in a subprocess (`support/load_tools.py` -> `run_locust`), with `--csv` and `--json-file`; final counts
+    are read from the JSON file (`read_locust_stats`). Every output in this lesson was produced on Linux on
+    21 November 2026.
+  - **Target (loopback only, synthetic data):** `practice/perf/support/sandpay_target.py`, the shared SandPay
+    practice API (bearer tokens from `POST /auth/token`, payments with `Idempotency-Key`, a slow
+    `/v1/reports/settlement`, `/metrics` counters with the status codes it served). `merchant-1` has 250 seeded
+    payments, `pay_100001` to `pay_100250`; `merchant-4` and up have none.
+  - **What varies:** how many requests run in a few seconds depends on the machine, so the **counts** differ from run
+    to run; the **relationships** (opens greater than users, reads at most creates, shares near the model) do not.
+    Task choice is random, so a mix converges on its weights but never equals them exactly. A request still in
+    flight when Locust stops reaches the server but not Locust's statistics, so the server can be ahead by at most
+    one request per user.
+  - **Synthetic data:** SandPay is a fictional payments company; the merchants, secrets, tokens and payment ids
+    (`pay_...`) are invented for this practice project.
+  - **Sources, as documented on 21 November 2026:** Locust 2.47.0 documentation -
+    [Writing a locustfile](https://docs.locust.io/en/2.47.0/writing-a-locustfile.html) (weight and fixed_count
+    attributes; on_start and on_stop methods; the @task decorator and its weight argument; the tasks attribute) and
+    [TaskSet class](https://docs.locust.io/en/2.47.0/tasksets.html) (TaskSet, interrupting a TaskSet, differences
+    between tasks in TaskSet and User classes, SequentialTaskSet, MarkovTaskSet). Quotations are from those pages.
+  - **Read from Locust 2.47.0 itself, not from the docs:** a nested TaskSet is created afresh each time a task picks it
+    (`TaskSet.execute_task` calls `task(self.user).run()`, so its `on_start` runs on every entry and a
+    SequentialTaskSet restarts at its first task); `interrupt()` raises `InterruptTaskSet`; and what
+    `ResponseContextManager.__exit__` does with an exception raised inside a `catch_response` block (reports the
+    request only if you already called `failure()` or `success()`, or if the exception is a `ResponseError`).
+    Both are shown by real runs below.
+  - **Not repeated here:** users, tasks, `wait_time` and running headless - [Locust fundamentals](#/lesson/locust-fundamentals);
+    `catch_response`, request names, logging in once and correlation -
+    [HTTP sessions, validation and request grouping](#/lesson/locust-http-validation-and-grouping); where the
+    shares come from - [Workload modelling from production data](#/lesson/workload-modelling-from-production); the
+    same ideas in JMeter - [Logic controllers in JMeter](#/lesson/jmeter-logic-controllers); why a replay reuses its
+    key - [Idempotency keys](#/lesson/idempotency-keys).
+
+prerequisites:
+  - locust-fundamentals
+  - locust-http-validation-and-grouping
+  - workload-modelling-from-production
+
+concepts:
+  - id: perf-lcflow-weights
+    name: Task weights and the workload mix
+    summary: 'A weight is a share of picks. @task(3) and @task(1) make Locust pick the first three times as often, by expanding the tasks into a list and calling random.choice; the same weights work in a tasks dict, and a User class has its own weight (or a fixed_count) to set the mix of user types. A pick is not a request: a task that sends three requests loads the server three times as much as a one-request task with the same weight, so a workload model of requests must be divided by requests per pick before it becomes weights, and the run''s observed request mix must be compared with the model, not assumed from the weights.'
+  - id: perf-lcflow-tasksets
+    name: TaskSets, interrupt and sequential flows
+    summary: 'A TaskSet is a class of tasks that a user enters and works inside - a screen of the application. A user that enters a TaskSet stays there until a task calls self.interrupt(), which hands control back to the parent; with no interrupt the user never leaves. Each entry creates a new instance, so on_start runs again and instance attributes start fresh. A SequentialTaskSet runs its tasks in declaration order, repeating the list, which suits a fixed flow; MarkovTaskSet picks the next task from transition probabilities. The docs add that TaskSets are rarely useful and that a plain Python loop or one long task often does the same with less machinery.'
+  - id: perf-lcflow-state
+    name: State, test data and where it lives
+    summary: 'A simulated user has three places to keep state. Attributes on the User live as long as the user and hold identity: the token, the merchant, the session. Attributes on a TaskSet instance live for one visit to that TaskSet: the payment id of this checkout, a fresh Idempotency-Key. Module-level objects are shared by every user: the right place for a counter that hands each user its own merchant, the wrong place for anything one user must not see. A TaskSet reaches the user through self.user and shares its client, so the token set in the user''s on_start is sent from inside the TaskSet too.'
+
+objectives:
+  - Turn a workload model into integer task weights, and explain why a weight is a share of picks and not of requests.
+  - Compare the request mix of a run with the model, and account for the difference when tasks send different numbers of requests or leave a TaskSet.
+  - Build a nested TaskSet that a user enters and leaves with interrupt(), and show from the run that the user came back.
+  - Write a SequentialTaskSet for a fixed flow that shares the id between steps, and end it when a step fails.
+  - Decide where each piece of test data lives - user, TaskSet visit or module - and choose between a TaskSet and plain Python for a flow.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: The idea in plain language
+    body: |
+      Picture a bank branch on a busy Saturday. People do not all do the same thing. Most come to look at their
+      balance, a few pay a bill, one in ten asks for a statement. And they do not do it one request at a time: a
+      customer **walks into the payments screen**, looks at a few things, and **walks out again**. Paying a bill is
+      a short fixed routine - fill in the slip, hand it over, take the receipt - and the receipt must be the one for
+      *their* slip.
+
+      A Locust script that only has a flat list of tasks is a crowd of people who teleport between counters:
+
+      1. **It picks by weight - but weight counts visits, not work.** Give "pay a bill" and "check a balance" equal
+         weight and the pay routine, with three requests inside it, loads the bank three times as hard as the
+         balance check.
+      2. **It has no rooms.** Nothing says "you are in the payments screen now; stay for a few actions, then leave".
+         A `TaskSet` is that room - and a room with no door (`interrupt()`) keeps the customer inside for the whole
+         test.
+      3. **It has no routine.** A random pick will happily read a receipt before the slip was filled in. A
+         `SequentialTaskSet` is the fixed routine, in order, with the slip number passed from step to step.
+
+      And the customer's name, their slip and the branch's ticket counter are three different kinds of memory: what
+      the customer is (their account), what they are doing right now (this slip) and what everybody shares (the
+      ticket machine). Putting the slip number on the ticket machine makes everyone's receipt wrong.
+
+  - id: what
+    kind: what
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Terms you need
+    body: |
+      | Term | Meaning (Locust 2.47.0 documentation) |
+      | --- | --- |
+      | **`@task(weight)`** | declares a task; "task2 will be twice as likely to be selected as task1" when its weight is twice as large |
+      | **`tasks` attribute** | "either a list of Tasks, or a <Task : int> dict, where Task is either a python callable or a TaskSet class"; a list picks at random, a dict by the ints as ratio |
+      | **User `weight`** | "spawn 3 times as many WebUsers as MobileUsers" when `weight = 3` and `weight = 1`; with several user classes in a file and no weights, Locust spawns an equal number of each |
+      | **`fixed_count`** | "only that exact number users will be spawned", the weight ignored, spawned before the weighted ones |
+      | **TaskSet** | "a collection of tasks that will be executed much like the ones declared directly on a User class"; it can be nested "any number of levels" |
+      | **`interrupt(reschedule=True)`** | "Interrupt the TaskSet and hand over execution control back to the parent TaskSet"; with `reschedule` the parent "will immediately re-schedule, and execute, a new task" |
+      | **`self.user` / `self.parent` / `self.client`** | in a TaskSet, the User instance, the parent TaskSet instance, and a shortcut to the user's `client` |
+      | **`SequentialTaskSet`** | "a TaskSet whose tasks will be executed in the order that they are declared"; with a dict, "each task will be repeated by the amount given by the integer" |
+      | **`MarkovTaskSet`** | "a probabilistic sequence of tasks using a Markov chain", with `@transition` and `@transitions` giving the next task and its weight |
+      | **`on_start` / `on_stop`** | on a User, when it starts and stops; on a TaskSet, "when a simulated user starts executing that TaskSet" and "when interrupt() is called, or the user is killed" |
+      | **Pick** | one choice of a task by Locust. One pick can send zero, one or many requests |
+      | **Task ratio** | `--show-task-ratio` prints the share of picks each task gets from the weights alone |
+
+  - id: why
+    kind: why
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Why it matters - the same weights, a different load
+    body: |
+      A workload model says what real users do. The load test is only as good as the way the script turns that model
+      into picks and requests. Three things go wrong, all quietly:
+
+      **1. Weights that look right and load wrong.** Suppose the model says SandPay merchants spend 75 % of their
+      actions browsing the payment list and 25 % downloading a statement, and a statement is three pages. With
+      `@task(3)` for the browse and `@task(1)` for the statement, the picks are 3 : 1 - and a real run, four users
+      for four seconds, shows what that does to the server:
+
+      ```text
+      GET /v1/payments                      requests= 313
+      GET /v1/payments (statement page)     requests= 334
+      ```
+
+      Half of the requests are statement pages, not a quarter. The picks were right; the load was double what the
+      model asked for on the statement side. (The code is in the "Internals" section; the numbers are from a real
+      Locust 2.47.0 run on 21 November 2026 and will differ in your run, but not the 1 : 1 shape.)
+
+      **2. Users that never leave a screen.** A merchant console test has a Browse screen and a slow settlement
+      report. Written as a TaskSet without the line `self.interrupt()`, a run of 4 users for 6 seconds shows:
+
+      ```text
+      GET /v1/payments (open)              requests=   4
+      GET /v1/reports/settlement           requests=   4
+      GET /v1/payments                     requests= 184
+      GET /v1/payments/{id}                requests= 111
+      ```
+
+      Four users, four opens: every user entered Browse once and stayed there forever. The four reports are only
+      what some users picked *before* their first pick of Browse. The report that was 25 % of the top-level picks is
+      4 of 307 requests, 1.3 %. With the interrupt, the same test opens Browse 85 times and requests the report 31
+      times.
+
+      **3. Flows that run out of order.** A "create, then read it back" flow written as two plain tasks reads before it
+      creates. Four users for three seconds:
+
+      ```text
+      POST /v1/payments                    requests=1294 failures=  0
+      GET /v1/payments/{id}                requests=1265 failures=  5
+      server statuses: {'200': 1265, '201': 1295, '404': 5}
+      ```
+
+      Five reads asked for `/v1/payments/None` - reads that were picked before their user's first create - and the
+      server's `404`s are blamed on the read endpoint. Random order is fine for a *mix* of independent actions and
+      wrong for a *flow*.
+
+      All three runs are in the lesson below, with the code.
+
+  - id: internals-weights
+    kind: internals
+    concepts: [perf-lcflow-weights]
+    title: How weights become picks - and why a pick is not a request
+    body: |
+      **Where the weights go.** `@task(3)` on a method, an int in the `tasks` dict, and the `weight` of a user class
+      are three different dials:
+
+      | Dial | Sets | Example |
+      | --- | --- | --- |
+      | `@task(w)` on a method | how often this task is picked inside its user or TaskSet | `@task(3) def browse` |
+      | `tasks = {Browse: 3, report: 1}` | the same, for callables and TaskSet classes, in one place | the console below |
+      | `weight` on a User class | how many users of this class are spawned, relative to the other classes | `WebUser.weight = 3` |
+      | `fixed_count` on a User class | an exact number of users, spawned first | one `AdminUser` |
+
+      The docs spell out the mechanism: "Internally the above dict will actually be expanded into a list (and the
+      tasks attribute is updated) that looks like this: `[my_task, my_task, my_task, another_task]` and then Python's
+      `random.choice()` is used to pick tasks from the list." So a mix converges on the weights - 75 % and 25 % over
+      many picks - but a run of a few dozen picks will be off by a few points either way.
+
+      **A pick is not a request.** The weight sets how often Locust *calls* a task. What the call sends is up to the
+      task: nothing, one request, or three. A small demonstration locustfile written for this lesson (not one of the exercises; its `on_start` logs in as
+      `merchant-1`, and `wait_time` is `constant(0.02)`) produced the numbers above. It is two tasks:
+
+      ```python
+      @task(3)
+      def browse(self):                       # weight 3, one request per pick
+          self.client.get("/v1/payments?limit=10", name="GET /v1/payments")
+
+      @task(1)
+      def statement(self):                    # weight 1, three requests per pick
+          for page in range(3):
+              self.client.get(f"/v1/payments?limit=10&starting_after=pay_{100001 + page}",
+                              name="GET /v1/payments (statement page)")
+      ```
+
+      Picks are 3 : 1, requests are 3 : 3, so the request shares are 50 % and 50 %. The general rule is
+
+      > request share of a task = weight x requests per pick, divided by the sum of that over all tasks.
+
+      Work it the other way round when you start from a model of *requests* (an access log): divide each share by the
+      task's requests per pick before you turn it into weights. The exercise `lc_flow_mix.py` has the helper:
+
+      ```text
+      >>> request_shares({"browse": 1, "pay": 1, "report": 1}, {"browse": 1, "pay": 3, "report": 1})
+      {'browse': 0.2, 'pay': 0.6, 'report': 0.2}
+      >>> request_shares({"browse": 3, "pay": 1}, {"browse": 1, "pay": 3})
+      {'browse': 0.5, 'pay': 0.5}
+      ```
+
+      **From shares to small integers.** Locust weights are integers, and every weight adds an entry to the list that
+      `random.choice` draws from, so small is better. `mix_to_weights` tries total n = 3, 4, 5 ... and rounds each
+      share times n (never below 1) until every share is within a tolerance:
+
+      ```text
+      >>> mix_to_weights({"browse": 0.6, "pay": 0.3, "report": 0.1})
+      {'browse': 6, 'pay': 3, 'report': 1}
+      >>> mix_to_weights({"browse": 0.55, "pay": 0.3, "report": 0.15}, tolerance=0.001)
+      {'browse': 11, 'pay': 6, 'report': 3}
+      >>> mix_to_weights({"browse": 0.55, "pay": 0.3, "report": 0.15}, tolerance=0.05)
+      {'browse': 4, 'pay': 2, 'report': 1}
+      ```
+
+      The tolerance is a decision, not a detail: 4 : 2 : 1 is 57 % / 29 % / 14 % - off by two points from the model
+      at a third of the weight total. Whether two points matter depends on how sure you are of the model, which is
+      usually less than that.
+
+      **Weights are not the final word either.** `--show-task-ratio` prints the share of *picks* the weights give.
+      With a TaskSet that can be left, the real share differs, as the next section shows.
+
+  - id: internals-tasksets
+    kind: internals
+    concepts: [perf-lcflow-tasksets]
+    title: How a TaskSet is entered, left and restarted
+    body: |
+      **Entering.** A User (or a TaskSet) picks a task. If the task is a TaskSet *class*, Locust creates a new instance
+      and runs it: in 2.47.0, `task(self).run()` for a User and `task(self.user).run()` inside a TaskSet. Three things
+      follow, and they are why a TaskSet behaves like a screen the user walks into:
+
+      - the instance's `on_start` runs at **every** entry - the place for "open the screen";
+      - instance attributes start empty at every entry;
+      - a `SequentialTaskSet` starts again at its first task, because each instance builds its own cycle.
+
+      **Working inside.** Inside the TaskSet, tasks are picked by weight just as at the top. The docs: "the
+      thread will sleep for a duration specified by the User's wait_time function (unless a wait_time function has
+      been declared directly on the TaskSet class, in which case it'll use that function instead)". And the task's `self` is the TaskSet, not the user:
+      "The User instance can be accessed from within a TaskSet instance through the TaskSet.user"; `self.client` is a
+      shortcut to the user's client, so the token the *user* put on the session is sent from inside the TaskSet too.
+
+      **Leaving.** "TaskSets will never stop executing their tasks, and hand over execution back to their parent
+      User/TaskSet, by themselves." A task must call `self.interrupt()`. Locust implements it by raising
+      `InterruptTaskSet` (read from `locust/user/task.py`), which the parent catches. Together with weights this
+      is a probability of leaving: with `leave` at weight 2 out of 10 (5 + 3 + 2), the user leaves on 20 % of its
+      picks inside the screen, so a visit lasts 1 / 0.2 = 5 picks on average, the last of them the `leave`.
+
+      **The task ratio is not the request mix.** For the console the weights give:
+
+      ```text
+      Total task ratio
+      --------------------------------------------------------------------------------
+       100.0      MerchantUser
+         75.0       Browse
+           37.5       list_payments
+           22.5       view_payment
+           15.0       leave
+         25.0       run_settlement_report
+      ```
+
+      That table assumes each pick is independent. But after Browse is picked (75 % of top-level picks) the user makes
+      about 5 picks inside it before leaving. Per top-level pick that is `0.75 x 5 + 0.25 = 4.0` picks, and the
+      requests are:
+
+      | Request | per top-level pick | share of requests |
+      | --- | --- | --- |
+      | `GET /v1/payments (open)` (on entering) | 0.75 | 18.8 % |
+      | `GET /v1/payments` (5 of 10 inside picks, 5 x 0.5 = 2.5 per visit) | 0.75 x 2.5 = 1.875 | 46.9 % |
+      | `GET /v1/payments/{id}` (1.5 per visit) | 0.75 x 1.5 = 1.125 | 28.1 % |
+      | `GET /v1/reports/settlement` | 0.25 | 6.3 % |
+
+      The real run, 4 users for 6 seconds, gave 85 / 205 / 102 / 31 requests - 20.1 %, 48.5 %, 24.1 % and 7.3 %. The
+      `mix_deviations` exercise helper puts the two side by side:
+
+      ```text
+      GET /v1/payments               +0.016
+      GET /v1/payments (open)        +0.013
+      GET /v1/payments/{id}          -0.040
+      GET /v1/reports/settlement     +0.011
+      ```
+
+      Within a few points - on 423 requests that is the noise you expect from random choice. The *table of weights*
+      said the report is 25 % and `list_payments` 37.5 %; the *requests* were 7 % and 48 %. A report of "browse
+      37.5 %" would have been wrong by about ten points, and the model was right all along.
+
+      **SequentialTaskSet.** Tasks run in declaration order and the list repeats. "If the <Task : int> dictionary is
+      used, each task will be repeated by the amount given by the integer at the point of declaration" - so
+      `@task(3)` on a task in a SequentialTaskSet means "three times here", not "a third of the time". It does not
+      stop by itself either: after the last task it starts the first again. Calling `self.interrupt()` in the last
+      step (or in any step that fails) ends the visit; the user's next pick enters a **new** instance, so the second
+      cycle gets a new key and an empty `payment_id`.
+
+      **MarkovTaskSet** (Locust 2.47 docs) replaces "random pick" and "fixed order" with transition probabilities:
+      `@transition("view_payment")` says what always follows `list_payments`, `@transitions({"view_payment": 1,
+      "list_payments": 3})` what follows `view_payment`, 25 % and 75 %. A demonstration file written for this lesson (not an exercise) has two
+      tasks - `list_payments` then `view_payment`, with `view_payment` leading back to `list_payments` 75 % of the time -
+      and its four-second run (4 users, `wait_time` `constant(0.02)`, same login as above) gave 190 list requests and
+      272 payment views, 59 % views - the chain's long-run split, where a view is followed by a list 75 % of the time:
+      the views are 1 / 1.75 = 57 % of requests. It is in the runs only to show that the class works; the lesson does
+      not build on it. Use it when "what a user does next depends on what
+      they just did" is a finding of your production data, not a guess; tags are not supported on it, and "All tasks
+      must eventually be reachable from the first task".
+
+      **When not to use any of this.** The docs are blunt: "TaskSets are an advanced feature and only rarely useful.
+      Most of the time, you're better off using regular Python loops and control statements to achieve the same
+      thing. There are a few gotchas as well, the most frequent one being forgetting to call self.interrupt()". And
+      for SequentialTaskSet: "you dont need SequentialTaskSets to just do some requests in order. It is often easier
+      to just do a whole user flow in a single task." The next sections show the cost and the benefit.
+
+  - id: internals-state
+    kind: internals
+    concepts: [perf-lcflow-state, perf-lcflow-tasksets]
+    title: Where state lives - user, visit, module
+    body: |
+      | Place | Lives | Shared with | Use it for | Example |
+      | --- | --- | --- | --- | --- |
+      | attribute on the **User** (`self.user.x`, or `self.x` in the user's methods) | as long as the simulated user | nobody; a TaskSet reaches it through `self.user` | identity: token, merchant, session cookies, `client.headers` | the bearer token set in the user's `on_start` |
+      | attribute on a **TaskSet** instance (`self.x` inside it) | one visit: from entry to `interrupt()` | the tasks of that visit | what this flow is doing right now | `self.payment_id`, `self.key` of this checkout |
+      | **module** variable | the whole test process | every user | counters that hand out unique things; read-only data | `_numbers = itertools.count(4)` |
+
+      Three rules follow:
+
+      1. **Identity on the user, so every simulated user is somebody.** The merchant is chosen once, in the User's
+         `on_start`, from a module-level counter (`next(_numbers)`) - the one place where sharing is the point,
+         because it is what keeps two users from being the same merchant. The token goes on `self.client.headers`; a
+         TaskSet's `self.client` is `self.user.client`, so it is sent from inside every nested TaskSet.
+      2. **Flow state on the TaskSet, so a failed flow cannot leak into the next.** The payment id belongs to one
+         visit; because each entry creates a new instance and runs `on_start`, `self.payment_id = None` there means a
+         new checkout always starts clean. The same id kept on the user would still be there after a failed create
+         and the next read would use a stale id.
+      3. **Nothing mutable and per-user at module level.** A module-level `payment_id` is overwritten by whichever
+         user created last; every user reads somebody else's payment and the failures look like a server bug.
+
+      **Per-user test data.** Distinct merchants are the simplest case. For files of data (cards, customers) the same
+      idea holds: take the next row at the user's `on_start` from a shared iterator, and decide what happens when the
+      rows run out - wrap round, or stop the user. Locust has no per-user data feature beyond that; the pattern is
+      plain Python. A module-level `itertools.count` is safe across greenlets because Locust's users are gevent
+      greenlets on one OS thread - a counter is not interrupted mid-call - but it is **not** shared across worker
+      processes in a distributed run, a point for the *Distributed Locust and CI runs* lesson.
+
+      **Where the user's wait goes.** The user's `wait_time` runs between *every* pick, at any depth. A TaskSet can
+      override it with its own `wait_time`. A flow that thinks between steps (a human reads the page) gets the wait;
+      a flow that is one API call after another does not need it.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: One merchant's walk through the console, and one checkout
+    body: |
+      ```mermaid
+      flowchart TD
+        S["User on_start: POST /auth/token, token on client.headers"] --> P{"pick at the top: Browse 3, report 1"}
+        P -- "3 of 4" --> O["Browse on_start: GET /v1/payments (open)"]
+        P -- "1 of 4" --> R["GET /v1/reports/settlement"]
+        R --> P
+        O --> Q{"pick inside Browse: list 5, view 3, leave 2"}
+        Q -- "5 of 10" --> L["GET /v1/payments"]
+        Q -- "3 of 10" --> V["GET /v1/payments/id"]
+        L --> Q
+        V --> Q
+        Q -- "2 of 10: interrupt" --> P
+      ```
+
+      The user's pick at the top and the pick inside Browse are separate draws. The only way out of the inner loop is
+      the `leave` arrow, which calls `interrupt()`. Because each entry through `O` is a new Browse, `on_start` sends
+      the open request every time - that is what the run counted 85 times.
+
+      ```mermaid
+      flowchart LR
+        subgraph Visit["one visit to Checkout - a new instance"]
+          C["create_payment: POST /v1/payments"] --> RD["read_payment: GET /v1/payments/id"]
+          RD --> RP["replay_payment: POST /v1/payments, same key"]
+        end
+        U["User: on_start login, one merchant"] --> Visit
+        C -- "failure: interrupt" --> U
+        RD -- "failure: interrupt" --> U
+        RP -- "done: interrupt" --> U
+      ```
+
+      The checkout is a straight line. Every exit goes back to the user, and the user's next pick enters a fresh
+      Checkout - a new key, an empty `payment_id`.
+
+  - id: code-console
+    kind: code
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: 'The code: the merchant console with a nested TaskSet'
+    body: |
+      The solution for the first exercise (`practice/perf/solutions/locust/lc_flow_console_locustfile.py`):
+
+      ```python
+      """The SandPay merchant console as nested TaskSets - reference solution.
+
+      One simulated merchant:
+
+      1. User.on_start: logs in once (merchant-1, which has seeded payments to read) and keeps the bearer token on
+         self.client.headers. A TaskSet's self.client is the same session, so the token is sent from inside the TaskSet too.
+      2. Top level (tasks = {...}): Browse with weight 3, run_settlement_report with weight 1 - a merchant is in the
+         payments screen three times as often as they open the slow report.
+      3. Browse (a TaskSet): on_start sends "GET /v1/payments (open)" when the user enters the screen. Inside it:
+         list_payments (weight 5), view_payment (weight 3, one name for all ids) and leave (weight 2), which calls
+         self.interrupt() - without that call the user would stay in Browse for the whole test.
+
+      Run by hand: .venv/bin/python support/sandpay_target.py --port 8090, then
+          .venv/bin/locust -f solutions/locust/lc_flow_console_locustfile.py --headless -u 4 -r 4 -t 10s \\
+              --host http://127.0.0.1:8090
+      """
+
+      import random
+
+      from locust import HttpUser, TaskSet, constant, task
+
+
+      class Browse(TaskSet):
+          def on_start(self):
+              self.client.get("/v1/payments?limit=1", name="GET /v1/payments (open)")
+
+          @task(5)
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=10", name="GET /v1/payments")
+
+          @task(3)
+          def view_payment(self):
+              self.client.get(f"/v1/payments/pay_{random.randint(100001, 100250)}", name="GET /v1/payments/{id}")
+
+          @task(2)
+          def leave(self):
+              self.interrupt()
+
+
+      class MerchantUser(HttpUser):
+          wait_time = constant(0.05)
+          tasks = {Browse: 3}
+
+          def on_start(self):
+              r = self.client.post("/auth/token", json={"client_id": "merchant-1", "client_secret": "secret-1"},
+                                   name="POST /auth/token")
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task(1)
+          def run_settlement_report(self):
+              self.client.get("/v1/reports/settlement", name="GET /v1/reports/settlement")
+      ```
+
+      **A real run** - 4 users for 6 seconds on 21 November 2026 against `sandpay_target.py` with 5 ms of service time:
+
+      ```text
+      POST /auth/token                     requests=   4 failures=  0
+      GET /v1/payments (open)              requests=  85 failures=  0
+      GET /v1/payments                     requests= 205 failures=  0
+      GET /v1/reports/settlement           requests=  31 failures=  0
+      GET /v1/payments/{id}                requests= 102 failures=  0
+      server statuses: {'200': 427}
+      ```
+
+      - One login per user; no failures; the server's 427 `200`s are the 423 requests plus at most one in flight per
+        user.
+      - Five rows for the run: the ids are in the name, not the URL.
+      - 85 opens for 4 users: each user entered Browse about 21 times, so `leave` and `interrupt()` work.
+
+      **The same locustfile without `self.interrupt()`** - `leave` does nothing (`pass`). Same users, same seconds:
+
+      ```text
+      POST /auth/token                     requests=   4 failures=  0
+      GET /v1/reports/settlement           requests=   4 failures=  0
+      GET /v1/payments (open)              requests=   4 failures=  0
+      GET /v1/payments/{id}                requests= 111 failures=  0
+      GET /v1/payments                     requests= 184 failures=  0
+      server statuses: {'200': 307}
+      ```
+
+      Four opens: nobody left. Nothing in the run is red - no failure, no exception - and the workload is wrong. The
+      way to catch it is to compare the request mix with the model, which is what the helper functions below are for.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: The lines that matter
+    body: |
+      - **`tasks = {Browse: 3}` plus `@task(1) def run_settlement_report`** - the dict and the decorator are merged, so
+        the user's top-level pool is Browse x 3 and the report x 1: 75 % / 25 % of top-level picks.
+      - **`class Browse(TaskSet)` with `@task(5)`, `@task(3)`, `@task(2)`** - the inner pool is separate; the user is
+        inside it until `interrupt()`.
+      - **`def on_start(self)` in Browse** - runs at every entry, so the "open the screen" request is counted once per
+        visit.
+      - **`self.client.get(..., name="GET /v1/payments/{id}")`** - inside a TaskSet `self.client` is `self.user.client`;
+        the bearer token the *user* put on `self.client.headers` goes with it, and the dynamic id still gets one name.
+      - **`self.interrupt()`** - raises `InterruptTaskSet`; the parent User re-schedules and picks again. With the
+        default `reschedule=True` that happens at once.
+      - **`wait_time = constant(0.05)` on the user** - applies between every pick, in the TaskSet too. It is short here
+        only to get many picks into a few seconds; a real model sets the think time from the workload (Little's law).
+      - **`on_start` of the *user* logs in** - the TaskSet has no login of its own; one token per user, not one per visit.
+
+  - id: code-checkout
+    kind: code
+    concepts: [perf-lcflow-tasksets, perf-lcflow-state]
+    title: 'The code: a checkout as a SequentialTaskSet'
+    body: |
+      The solution for the second exercise (`solutions/locust/lc_flow_checkout_locustfile.py`):
+
+      ```python
+      """A checkout as a SequentialTaskSet - reference solution.
+
+      Each simulated merchant (merchant-4, merchant-5, ... - no seeded payments, so every payment it reads is one it
+      created) logs in once in User.on_start. Then the Checkout SequentialTaskSet runs its tasks in the order they are
+      declared, and repeats:
+
+      1. create_payment: POST /v1/payments with a fresh Idempotency-Key; on 201 keep the id in self.payment_id;
+      2. read_payment:   GET /v1/payments/{id} for that id;
+      3. replay_payment: POST /v1/payments again with the SAME key and body, expecting Idempotent-Replayed: true.
+
+      If a step fails it is marked failed with response.failure(...) and, AFTER the with-block, self.interrupt() hands
+      control back to the user, which enters a fresh Checkout (new instance, so self.payment_id starts empty). The
+      interrupt is outside the with-block on purpose: inside it, interrupt() only works safely after failure() or
+      success() has been called (Locust 2.47 then still reports the request); with no verdict yet, an exception other
+      than a Locust ResponseError makes the request vanish from the statistics.
+
+      Run by hand: .venv/bin/python support/sandpay_target.py --port 8090, then
+          .venv/bin/locust -f solutions/locust/lc_flow_checkout_locustfile.py --headless -u 4 -r 4 -t 10s \\
+              --host http://127.0.0.1:8090
+      """
+
+      import itertools
+      import random
+      import uuid
+
+      from locust import HttpUser, SequentialTaskSet, constant, task
+
+      _numbers = itertools.count(4)
+
+
+      class Checkout(SequentialTaskSet):
+          def on_start(self):
+              self.payment_id = None
+              self.key = str(uuid.uuid4())
+              self.order = {"amount_minor": random.randint(100, 50000), "currency": "EUR"}
+
+          @task
+          def create_payment(self):
+              ok = False
+              with self.client.post("/v1/payments", json=self.order, headers={"Idempotency-Key": self.key},
+                                    name="POST /v1/payments", catch_response=True) as r:
+                  if r.status_code != 201:
+                      r.failure(f"create: HTTP {r.status_code}")
+                  else:
+                      self.payment_id = r.json().get("id")
+                      ok = self.payment_id is not None
+                      if not ok:
+                          r.failure("create: no id in the response")
+              if not ok:
+                  self.interrupt()
+
+          @task
+          def read_payment(self):
+              ok = False
+              with self.client.get(f"/v1/payments/{self.payment_id}", name="GET /v1/payments/{id}",
+                                   catch_response=True) as r:
+                  if r.status_code != 200:
+                      r.failure(f"read back: HTTP {r.status_code}")
+                  else:
+                      ok = True
+              if not ok:
+                  self.interrupt()
+
+          @task
+          def replay_payment(self):
+              with self.client.post("/v1/payments", json=self.order, headers={"Idempotency-Key": self.key},
+                                    name="POST /v1/payments (replay)", catch_response=True) as r:
+                  if r.headers.get("Idempotent-Replayed") != "true":
+                      r.failure(f"replay: not marked as replayed (HTTP {r.status_code})")
+                  elif r.json().get("id") != self.payment_id:
+                      r.failure("replay: a different payment id - the retry created a second payment")
+              self.interrupt()
+
+
+      class MerchantUser(HttpUser):
+          wait_time = constant(0)
+          tasks = [Checkout]
+
+          def on_start(self):
+              n = next(_numbers)
+              r = self.client.post("/auth/token", json={"client_id": f"merchant-{n}", "client_secret": f"secret-{n}"},
+                                   name="POST /auth/token")
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+      ```
+
+      **Clean run** - 4 users for 3 seconds, no injected errors (merchants 4-7, no seeded payments):
+
+      ```text
+      POST /auth/token                     requests=   4 failures=  0
+      POST /v1/payments                    requests= 749 failures=  0
+      GET /v1/payments/{id}                requests= 748 failures=  0
+      POST /v1/payments (replay)           requests= 746 failures=  0
+      server statuses: {'200': 753, '201': 1496}  created: 749  replays: 747
+      ```
+
+      749 creates, 748 reads, 746 replays: the counts stay within one cycle per user of each other because each user
+      is somewhere in create -> read -> replay. The server created 749 payments - one per create, none per replay.
+      There are no `404`s: every read used an id its own create returned.
+
+      **With `error_rate=0.25`** (a quarter of creates fail with `500`):
+
+      ```text
+      POST /v1/payments                    requests= 862 failures=228
+      GET /v1/payments/{id}                requests= 633 failures=  0
+      POST /v1/payments (replay)           requests= 631 failures=  0
+      server statuses: {'200': 638, '201': 1267, '500': 228}
+      ```
+
+      862 creates, 228 failed; 634 succeeded and 633 reads followed - a failed create ends the visit, so no read ever
+      used a missing id, and the server saw no `404`. (The error count varies a little between runs: one shared random
+      generator decides which creates fail.)
+
+      **The same flow as two plain tasks** - a demonstration file written for this lesson, not one of the exercises:
+      the user's `on_start` logs in and sets `self.payment_id = None`, then two ordinary tasks run in random order:
+
+      ```python
+      @task
+      def create_payment(self):
+          r = self.client.post("/v1/payments", json={"amount_minor": 500, "currency": "EUR"},
+                               headers={"Idempotency-Key": str(uuid.uuid4())}, name="POST /v1/payments")
+          self.payment_id = r.json().get("id")
+
+      @task
+      def read_payment(self):
+          self.client.get(f"/v1/payments/{self.payment_id}", name="GET /v1/payments/{id}")
+      ```
+
+      Four users, three seconds:
+
+      ```text
+      POST /v1/payments                    requests=1294 failures=  0
+      GET /v1/payments/{id}                requests=1265 failures=  5
+      server statuses: {'200': 1265, '201': 1295, '404': 5}
+      ```
+
+      Faster, because there is no replay and no key bookkeeping, and wrong in a way that is easy to miss: five reads
+      asked for `/v1/payments/None`.
+
+  - id: code-interrupt-in-block
+    kind: code
+    concepts: [perf-lcflow-tasksets]
+    title: 'The code: why interrupt() goes after the with-block'
+    body: |
+      Locust 2.47.0 `ResponseContextManager.__exit__` makes the difference between the two placements. Two tiny
+      locustfiles, each a SequentialTaskSet with one task that reads a payment id that does not exist (`404`), with a
+      user that logs in once. They differ only in the order inside the block:
+
+      ```python
+      # interruptinside.py - the verdict first, then interrupt, inside the block
+      with self.client.get("/v1/payments/pay_does_not_exist", name="GET /v1/payments/{id}",
+                           catch_response=True) as r:
+          if r.status_code != 200:
+              r.failure(f"read: HTTP {r.status_code}")
+              self.interrupt()
+      ```
+
+      ```python
+      # interruptbefore.py - interrupt inside the block, before any verdict
+      with self.client.get("/v1/payments/pay_does_not_exist", name="GET /v1/payments/{id}",
+                           catch_response=True) as r:
+          if r.status_code != 200:
+              self.interrupt()
+      ```
+
+      Two users for 3 seconds each:
+
+      ```text
+      interruptinside.py:
+        GET /v1/payments/{id}     requests=1478 failures=1478
+        server statuses: {'200': 2, '404': 1480}
+
+      interruptbefore.py:
+        (no GET /v1/payments/{id} row at all)
+        server statuses: {'200': 2, '404': 1640}
+      ```
+
+      With a verdict already set (`failure()` or `success()`), `__exit__` reports the request and lets the
+      `InterruptTaskSet` propagate: 1478 recorded failures for 1480 server `404`s (the other two are the one request in
+      flight per user when the run stopped). With no verdict, an exception that is not a Locust `ResponseError` makes
+      `__exit__` return `False` without reporting: the server answered 1640 requests and Locust recorded **none** of
+      them - no row, no failure, nothing in the console. The solution therefore keeps a flag, leaves the block, and
+      interrupts afterwards, a pattern that is safe in every path.
+
+  - id: code-mix
+    kind: code
+    concepts: [perf-lcflow-weights]
+    title: 'The code: from a model to weights and back'
+    body: |
+      The third exercise is plain Python - no Locust, no server. The solution
+      (`solutions/locust/lc_flow_mix.py`, the three functions without the docstrings):
+
+      ```python
+      def mix_to_weights(mix, tolerance=0.01, max_total=100):
+          if not mix or any(v <= 0 for v in mix.values()):
+              raise ValueError("every share must be positive")
+          if abs(sum(mix.values()) - 1) > 0.001:
+              raise ValueError(f"shares add up to {sum(mix.values()):.3f}, not 1")
+          for n in range(len(mix), max_total + 1):
+              weights = {k: max(1, round(v * n)) for k, v in mix.items()}
+              total = sum(weights.values())
+              if all(abs(weights[k] / total - mix[k]) <= tolerance for k in mix):
+                  return weights
+          raise ValueError(f"no weights with total <= {max_total} are within {tolerance} of the model")
+
+
+      def request_shares(weights, requests_per_pick):
+          load = {k: w * requests_per_pick[k] for k, w in weights.items()}
+          total = sum(load.values())
+          return {k: v / total for k, v in load.items()}
+
+
+      def mix_deviations(observed, model):
+          total = sum(observed.values())
+          return {k: (observed.get(k, 0) / total if total else 0.0) - model.get(k, 0.0)
+                  for k in sorted(set(observed) | set(model))}
+      ```
+
+      - **`max(1, round(v * n))`** - a rare action must stay in the pool; `round(0.01 * 10)` is 0, and a weight of 0
+        would remove the report from the test.
+      - **`range(len(mix), ...)`** - the smallest total that gives every action at least a weight of 1.
+      - **`mix_deviations`** - signed (positive: seen more than modelled) and covers names in only one of the two,
+        so a surprise request or a missing one shows up as a deviation instead of being ignored.
+
+      The test with the console run's numbers (85, 205, 102, 31 against the model computed above) is the output shown
+      in "How a TaskSet is entered, left and restarted". The deviation helper has no tolerance on purpose: how many
+      points are "close enough" depends on the number of requests (about 2 points of noise at 400 requests, under 1 at
+      4000) and on the SLO, so the helper reports and a person (or a CI gate with a number from the test plan)
+      decides.
+
+  - id: when
+    kind: when
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: When to use which
+    body: |
+      | Situation | Use |
+      | --- | --- |
+      | independent actions in a fixed proportion (browse, search, pay) | `@task(weight)` on a flat User |
+      | the same, but a few actions belong together as a "screen" the user stays in for a while | a nested `TaskSet` with `leave` -> `interrupt()` |
+      | a fixed flow of steps that share an id (create, read, replay) | **one task** that does the steps, with `return` on a failed step - or a `SequentialTaskSet` if the steps need separate weights, names in the task ratio, or reuse across flows |
+      | the next step depends on the previous one by known probabilities (a funnel from production data) | `MarkovTaskSet` |
+      | two kinds of user with different habits (merchants and support agents) | separate User classes with `weight` (or `fixed_count` for a single admin) |
+      | the same flow, repeated a few times (retry 3 times) | a Python `for` loop in the task, not a TaskSet |
+      | a step that needs per-visit data (key, id) | attributes on the TaskSet instance, set in its `on_start` |
+      | identity that must outlive visits (merchant, token) | attributes or headers on the User |
+      | a test with an absolute rate target | a load shape or paced users (`constant_throughput`), not weights - weights set proportions only |
+
+      **TaskSet or plain task for a flow?** The docs' advice is plain Python first. A SequentialTaskSet earns its place
+      when (a) each step needs its own `--show-task-ratio` line or tag, (b) the same steps appear in several flows, or
+      (c) a step has its own think time (`wait_time` on the TaskSet). It costs a class, a flag-and-interrupt idiom for
+      every failure, and the risk of the "stays forever" mistake. The single task in `lc_valid_flow_locustfile.py`
+      (the previous lesson) does the same checkout as one function with `return` for failures; the TaskSet in this
+      lesson is longer for the same load.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Building a workload model into a locustfile, step by step
+    body: |
+      1. **Write the model as shares of user actions** (from production data - see the workload modelling lesson):
+         browse 60 %, pay 30 %, report 10 %.
+      2. **Count the requests per action** - a browse is 1, a pay flow is 3, a report is 1. Convert to shares of *picks*
+         if the model counts requests: divide by requests per pick, then rescale.
+      3. **Turn shares into small integer weights** with a tolerance you can defend (`mix_to_weights`).
+      4. **Decide the structure:** flat tasks for independent actions; a TaskSet for a screen the user stays in;
+         one task (or a SequentialTaskSet) for a fixed flow.
+      5. **Give every TaskSet a door.** One `leave` task that calls `self.interrupt()`, with a weight that sets the
+         visit length (weight of `leave` / total = 1 / picks per visit).
+      6. **Put state where it belongs.** Identity on the user (counter-allocated merchant, token on the headers);
+         flow state on the TaskSet in `on_start`.
+      7. **Run it briefly and read the rows.** Names grouped, one login per user, no failures, no server `404`s.
+      8. **Compare the observed request mix with the model** (`mix_deviations`). Expect a few points of noise; look for
+         a task that never runs (a TaskSet with no door) or one that dominates (a flow with more requests than
+         weight suggested).
+      9. **Print `--show-task-ratio` and keep it in the test plan** - and say in the plan that it is a ratio of picks.
+
+  - id: example
+    kind: example
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets]
+    title: 'Worked example: a model with three actions'
+    body: |
+      This is a **hypothetical** model, chosen to show the arithmetic; the numbers are not from a real SandPay
+      workload. A merchant session in production is, per 100 actions: 60 browse the list, 30 pay, 10 open the settlement
+      report. A pay is three requests (create, read, replay-on-retry), the rest one each.
+
+      1. **Picks or requests?** If those 60 / 30 / 10 are actions, weights come straight from the shares:
+         `mix_to_weights` gives `browse 6, pay 3, report 1`.
+      2. **Requests this produces:** `request_shares({"browse": 6, "pay": 3, "report": 1},
+         {"browse": 1, "pay": 3, "report": 1})` -> browse 6 / 16 = 37.5 %, pay 9 / 16 = 56.3 %, report 1 / 16 = 6.3 %.
+         The server sees mostly payment traffic. Whether that is what the SLO or the capacity plan expects depends on
+         whether the access log counted actions or requests; if it counted requests, the weights must be
+         `browse 60, pay 10, report 10` -> `6 : 1 : 1`.
+      3. **If the browse screen is a TaskSet** with inner weights 5 : 3 : 2 (`leave` = 2 of 10), a visit lasts 5 picks
+         on average, four list or view actions and the `leave`. The top level then counts *visits*, not actions: to
+         keep 60 browse actions against 30 pays and 10 reports, Browse needs 60 / 4 = 15 visits for every 30 pays and
+         10 reports, so the top-level weights are `Browse 15, pay 30, report 10` -> `3 : 6 : 2`. (Each visit also sends
+         the open request, one more request per visit.) This is a hand estimate - the run in the next step is what
+         confirms it.
+      4. **Run it** for a few seconds, read the JSON, and call `mix_deviations`. A deviation of 2-4 points at a few
+         hundred requests is noise; 10 points or a missing row is a defect in the script (a TaskSet with no door, a
+         step that returns early, a weight of the wrong flow).
+
+      The last check is the one the lesson's runs repeat: the weights were right, the console without `interrupt()`
+      looked healthy, and the mix was wrong by a factor of six.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: How the exercises are tested
+    body: |
+      - `tests/locust/test_lc_flow_console.py` runs your console locustfile with `--show-task-ratio-json` and checks the
+        nested structure and the weights (`Browse` 0.75 and the report 0.25 at the top; 0.5 / 0.3 / 0.2 inside), then
+        runs it headless for 4 seconds against the practice API and checks the five names, one login per user, no
+        failures, that Browse was entered more than twice per user (so `interrupt()` returns control) and that the
+        report ran (so users left Browse), and that list requests outnumber views.
+      - `tests/locust/test_lc_flow_checkout.py` runs your checkout twice against the shared API, clean and with
+        `error_rate=0.25`: four names; creates >= reads >= replays and within one cycle per user; no server `404`s;
+        replays create nothing (`payments_created` equals creates, replays equal `idempotent_replays`); one token per
+        user; and with errors on, failed creates are reported and reads equal the successful creates.
+      - `tests/locust/test_lc_flow_mix.py` checks `mix_to_weights`, `request_shares` and `mix_deviations` on tables:
+        clean shares, a rare action, loose versus tight tolerance, bad models, picks versus requests and a missing
+        name.
+
+      None of the tests check response times. They check structure, counts and how the counts relate.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/locust/test_lc_flow_console.py tests/locust/test_lc_flow_checkout.py tests/locust/test_lc_flow_mix.py
+      ```
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Common mistakes
+    body: |
+      - **A TaskSet with no `interrupt()`.** The user enters once and never leaves. Nothing fails; the other
+        tasks simply stop running. The docs call it "the most frequent" gotcha.
+      - **Reading `--show-task-ratio` as the request mix.** It is the share of *picks*, from weights alone - it ignores
+        requests per pick and the visits cut short by `interrupt()`.
+      - **Equal weights for flows of different length.** A three-request flow with the same weight as a one-request
+        browse sends three times the requests.
+      - **Weights as the load target.** Weights set proportions. The rate comes from the number of users and their
+        `wait_time` (or a throughput-paced user or a shape).
+      - **`@task(3)` in a SequentialTaskSet read as "three in ten".** It means "repeat three times here".
+      - **A flow written as random tasks.** The read runs before the create; the `404` is blamed on the read endpoint.
+      - **Flow state on the user.** The id of a failed create is still there at the next visit. Reset per-visit state in the
+        TaskSet's `on_start`.
+      - **Per-user data at module level.** `payment_id = None` as a global: every user overwrites everyone's id.
+      - **A counter shared across workers.** `itertools.count` is per process. Two workers each start at 4 and
+        hand out the same merchants.
+      - **`interrupt()` before any `failure()` or `success()` inside a `catch_response` block.** The request is not
+        recorded: the server served it, Locust did not count it. Set the verdict first, or interrupt after the block.
+      - **A TaskSet where one task would do.** More classes, more places to forget the door, no benefit - unless
+        the steps need separate weights, tags, or their own wait time.
+      - **Comparing a short run with the model to the last decimal.** A few hundred random picks give two or three
+        points of noise either way. Compare with a tolerance, over a long enough run.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Trade-offs
+    body: |
+      - **Weights versus a fixed schedule.** Weights give a realistic random mix but a bounded run is noisy; a
+        fixed sequence repeats exactly. For a bounded run where the mix must be exact (say, 100 pays and 10 reports),
+        count in the task or use a load shape; for a long run, weights are fine.
+      - **TaskSet versus plain Python.** A TaskSet makes the structure of the application visible in the code and in
+        `--show-task-ratio`; a plain task with a loop and `return` is shorter and has fewer ways to go wrong. The docs
+        favour plain Python for most flows; a TaskSet is for a *screen* with several actions, not for a list of steps.
+      - **SequentialTaskSet versus one task.** The TaskSet gives one function per step and a ratio line per step; one
+        task gives one function per flow and one place to reason about state. Use the TaskSet when a step is
+        reused or needs its own think time.
+      - **MarkovTaskSet versus a flat mix.** Transition probabilities model "what comes next" and need production data
+        to set them; a flat mix needs only shares. The chain is only as good as the data behind it, and an
+        invented chain is a more elaborate guess.
+      - **Per-visit state versus per-user state.** Per-visit is safer (a failure cannot leak), per-user is cheaper (no
+        recreation) and right for identity. Put each thing where its lifetime is.
+      - **Short wait versus a modelled think time.** A short `wait_time` gives many picks quickly (good for a lesson
+        or a smoke test); realistic think times give the arrival rate your capacity model needs. State which you
+        used.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-lcflow-weights, perf-lcflow-tasksets, perf-lcflow-state]
+    title: Summary
+    body: |
+      - A task weight is a share of **picks**: `@task(w)`, the `tasks` dict and the user `weight` are three dials, all
+        resolved by `random.choice`. Request share = weight x requests per pick, normalised.
+      - `--show-task-ratio` prints the share of picks. It is not the request mix; compare a run with the model.
+      - A TaskSet is a screen: a new instance at every entry, `on_start` at every entry, and **no way out except
+        `self.interrupt()`**.
+      - A SequentialTaskSet runs in declaration order and repeats; end a visit with `interrupt()` (after the
+        `with`-block), and the next visit starts a fresh instance.
+      - The docs: TaskSets are "only rarely useful"; a whole flow in one plain task is often easier.
+      - State: identity on the user (`next(counter)` for a merchant, token on `client.headers`), flow state on the
+        TaskSet, shared counters at module level - which are per process, not per worker cluster.
+      - Prove it from the run: names, one login per user, no server `404`s, an interrupt visible as more entries than
+        users, and request shares within noise of the model.
+
+exercises:
+  - id: pick-share-mcq
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: recall
+    title: What a weight counts
+    prompt: 'A flat user has `@task(3) def browse` and `@task(1) def report`. What does the 3 : 1 describe?'
+    options:
+      - id: picks
+        text: How often Locust picks each task - 75 % of picks are `browse`, 25 % are `report`
+        feedback: Correct - weights are a share of picks, resolved by random.choice over an expanded list.
+      - id: requests
+        text: The share of requests sent to the server
+        feedback: Only if each task sends the same number of requests. A weight counts picks; a pick can send zero, one or many requests.
+      - id: time
+        text: The share of the run's time spent in each task
+        feedback: Time also depends on response time and wait_time; weights say nothing about it.
+      - id: users
+        text: How many users run each task
+        feedback: Every user picks from both tasks. User counts are set by the user classes' weight or fixed_count.
+    correct: [picks]
+    hints:
+      - The docs say the dict "will actually be expanded into a list" and then random.choice is used.
+    solution: |
+      A share of picks. Convert to requests with requests per pick.
+
+  - id: dict-share-mcq
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: application
+    title: The top-level share
+    prompt: |
+      `tasks = {Browse: 3}` and `@task(1) def run_settlement_report` on the same user. What share of the user's
+      top-level picks is the report?
+    options:
+      - id: quarter
+        text: 25 % - the pool is Browse x 3 and the report x 1
+        feedback: Correct - the dict and the decorator are merged into one pool of four entries.
+      - id: third
+        text: 33 % - one task out of three
+        feedback: The dict value 3 is a weight, not a count of tasks. The pool has four entries.
+      - id: tenth
+        text: 10 %
+        feedback: That would need weights summing to 10. These sum to 4.
+      - id: zero
+        text: 0 % - a task decorated with @task is ignored when `tasks` is set
+        feedback: Both forms are merged in Locust 2.47; the run shows 31 report requests.
+    correct: [quarter]
+    hints:
+      - Add the weights.
+    solution: |
+      1 / (3 + 1) = 25 % of top-level picks.
+
+  - id: request-share-mcq
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: application
+    title: Equal weights, unequal load
+    prompt: |
+      `browse` (weight 1) sends one request per pick; `statement` (weight 1) sends three. Which share of the
+      requests is statement traffic?
+    options:
+      - id: three-quarters
+        text: 75 %
+        feedback: Correct - requests are 1 x 1 and 1 x 3, so 3 of 4.
+      - id: half
+        text: 50 %
+        feedback: That is the share of picks. Requests per pick make statement three times heavier.
+      - id: quarter
+        text: 25 %
+        feedback: That is browse's share of the requests, upside down.
+      - id: third
+        text: 33 %
+        feedback: 'Not the arithmetic of 1 x 1 : 1 x 3.'
+    correct: [three-quarters]
+    hints:
+      - request share = weight x requests per pick, divided by the sum.
+    solution: |
+      (1 x 3) / (1 x 1 + 1 x 3) = 75 %.
+
+  - id: user-weight-mcq
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: recall
+    title: Types of user
+    prompt: |
+      A locustfile has `WebUser` (`weight = 3`) and `MobileUser` (`weight = 1`), and you run 8 users. How many of each
+      does Locust spawn, and what does `fixed_count = 1` on an `AdminUser` change?
+    options:
+      - id: six-two
+        text: About 6 web and 2 mobile; an `AdminUser` with `fixed_count = 1` is spawned first, as exactly one user, and its weight is ignored
+        feedback: Correct - weight sets the relative number of users of a class; fixed_count sets an exact number, spawned before the weighted ones.
+      - id: four-four
+        text: 4 and 4 - weight only matters for tasks
+        feedback: Without weights Locust spawns an equal number of each class; with them it spawns 3 times as many web users.
+      - id: three-one
+        text: 3 web and 1 mobile - the weights are user counts
+        feedback: The weights are proportions of the total users you run, not counts.
+      - id: admin-all
+        text: The admin takes over all 8 users
+        feedback: fixed_count is an exact number; the rest of the users are spawned from the other classes.
+    correct: [six-two]
+    hints:
+      - The docs - "spawn 3 times as many WebUsers as MobileUsers".
+    solution: |
+      A 3 : 1 ratio over the users that are left, plus exactly one admin spawned first.
+
+  - id: interrupt-mcq
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: The user that never leaves
+    prompt: |
+      A user's `tasks` has `Browse` (a TaskSet) and `report` at 3 : 1. No task in `Browse` calls `self.interrupt()`.
+      What does the run look like?
+    options:
+      - id: stuck
+        text: Each user enters Browse once and stays; `report` runs only if it was picked before the first Browse pick
+        feedback: Correct - "TaskSets will never stop executing their tasks ... by themselves". Nothing is reported as an error.
+      - id: error
+        text: Locust raises an error after the first Browse task
+        feedback: Locust does not warn; the run looks healthy with the wrong mix.
+      - id: automatic
+        text: Locust leaves Browse after one pass through its tasks
+        feedback: That is SequentialTaskSet's cycle, and even that repeats. A plain TaskSet never ends by itself.
+      - id: random
+        text: The wait_time ends the visit
+        feedback: wait_time only paces the picks.
+    correct: [stuck]
+    hints:
+      - "The lesson's run with `leave: pass` has 4 opens for 4 users."
+    solution: |
+      Four users, four opens, report 1.3 % of requests - the run is green and the mix is wrong.
+
+  - id: new-instance-mcq
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: analysis
+    title: What a fresh visit resets
+    prompt: |
+      A `SequentialTaskSet` calls `self.interrupt()` in its last task. The user picks it again. What is true of the next
+      visit (Locust 2.47.0)?
+    options:
+      - id: fresh
+        text: It is a new instance - `on_start` runs again, instance attributes are empty, and the sequence starts at the first task
+        feedback: Correct - a TaskSet class picked as a task is instantiated and run each time.
+      - id: resume
+        text: It resumes at the task after the one that called interrupt
+        feedback: The cycle belongs to the instance, and the instance is new.
+      - id: shared
+        text: It keeps `self.payment_id` from the last visit
+        feedback: Instance attributes belong to the old instance; only user and module state survive.
+      - id: first-only
+        text: '`on_start` runs only for the first visit of the user'
+        feedback: A TaskSet's on_start runs "when a simulated user starts executing that TaskSet" - every entry.
+    correct: [fresh]
+    hints:
+      - "`task(self.user).run()` creates the instance."
+    solution: |
+      A fresh instance: on_start again, empty attributes, first task first.
+
+  - id: sequential-weight-mcq
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: recall
+    title: A weight in a sequence
+    prompt: In a `SequentialTaskSet`, `@task(3)` is on `read_payment`, declared between `create_payment` and `replay_payment`. What happens?
+    options:
+      - id: three-times
+        text: It runs three times in a row at that point of the sequence, then the cycle continues
+        feedback: Correct - "each task will be repeated by the amount given by the integer at the point of declaration".
+      - id: random-three
+        text: It is picked three times as often as the others, at random
+        feedback: That is a plain TaskSet. In a sequential one the order is fixed.
+      - id: ignored-error
+        text: Locust refuses to start - weights are not allowed
+        feedback: Weights are allowed; they mean repeat counts.
+      - id: first
+        text: It moves to the front of the sequence
+        feedback: Order is the order of declaration.
+    correct: [three-times]
+    hints:
+      - Think "repeat", not "probability".
+    solution: |
+      Three consecutive runs at that position, every cycle.
+
+  - id: plain-task-mcq
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: TaskSet or one task?
+    prompt: |
+      A flow is "create a payment, read it back, replay the create" - three requests that share the id and stop at the
+      first failure. No step needs its own weight, tag or wait time. What do the Locust docs suggest?
+    options:
+      - id: one-task
+        text: Do the whole flow in a single task with plain Python, and return when a step fails
+        feedback: Correct - "It is often easier to just do a whole user flow in a single task", and TaskSets are "only rarely useful".
+      - id: sequential
+        text: Always a SequentialTaskSet - it exists for flows
+        feedback: It works, but the docs say you do not need it just to do requests in order.
+      - id: markov
+        text: A MarkovTaskSet with probability 1 on each transition
+        feedback: A fixed order needs no probabilities.
+      - id: three-users
+        text: Three user classes, one per step
+        feedback: Users are simulated people, not steps.
+    correct: [one-task]
+    hints:
+      - Look for the sentence about "requests in order".
+    solution: |
+      One task with `return` on failure; a SequentialTaskSet only when steps need separate weights, tags or wait times.
+
+  - id: state-place-mcq
+    type: mcq
+    concept: perf-lcflow-state
+    skill: application
+    title: Where does the payment id live?
+    prompt: |
+      A checkout flow creates a payment and reads it back. The create can fail. Where should the id be kept so that a
+      failed create never leaves a stale id for the next flow?
+    options:
+      - id: taskset
+        text: On the TaskSet instance, set to `None` in its `on_start`
+        feedback: Correct - each visit is a new instance, so a failed flow cannot leak into the next.
+      - id: user
+        text: On the user, set once in its `on_start`
+        feedback: It survives visits - after a failed create the next read would use the old id.
+      - id: module
+        text: In a module-level variable
+        feedback: All users share it; each overwrites the others' ids.
+      - id: header
+        text: In `self.client.headers`
+        feedback: Headers are for what every request carries (a token), not for flow state.
+    correct: [taskset]
+    hints:
+      - Which place has the lifetime of one visit?
+    solution: |
+      TaskSet instance attribute, reset in on_start.
+
+  - id: interrupt-block-mcq
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: analysis
+    title: interrupt() inside catch_response
+    prompt: |
+      Inside `with self.client.get(url, catch_response=True) as r:` a task calls `self.interrupt()` when the status is
+      404, **without** calling `r.failure()` or `r.success()` first (Locust 2.47.0). What does Locust record?
+    options:
+      - id: nothing
+        text: Nothing - the server serves the request, but no row or failure appears in the statistics
+        feedback: Correct - with no verdict set, an exception other than ResponseError makes __exit__ return False without reporting.
+      - id: failure
+        text: A failure, because 404 is an error status
+        feedback: Only if the block reaches its end or sets the failure first; the exception skips the default verdict.
+      - id: success
+        text: A success - the block simply exited
+        feedback: An exception left the block; the request is not reported.
+      - id: crash
+        text: The Locust process stops
+        feedback: InterruptTaskSet is caught by the parent; the test continues.
+    correct: [nothing]
+    hints:
+      - The lesson ran both orders; one had no row at all.
+    solution: |
+      Not recorded. Set the verdict first, or interrupt after the with-block.
+
+  - id: ratio-mcq
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: analysis
+    title: 37.5 %, or 48 %?
+    prompt: |
+      `--show-task-ratio` says `list_payments` is 37.5 % of the console's picks, but a run shows about 48 % of the requests
+      going to `GET /v1/payments`. Why, and which is right about the load?
+    options:
+      - id: visits
+        text: The ratio counts picks from the weights alone - it ignores that each Browse visit lasts about 5 inner picks and sends an open request; the request mix is what loads the server
+        feedback: Correct - the ratio is picks from weights alone; the visits cut by interrupt() and the extra open request change the request mix.
+      - id: bug
+        text: A bug in Locust - the ratio is wrong
+        feedback: The ratio is correct for what it says; it just is not the request mix.
+      - id: noise
+        text: Random noise - with enough requests both converge to 37.5 %
+        feedback: The difference is systematic; more requests converge to the interrupt-adjusted shares (46.9 %), not to 37.5 %.
+      - id: cache
+        text: Response caching on the server
+        feedback: Caching affects response times, not how many requests the locustfile sends.
+    correct: [visits]
+    hints:
+      - Compute picks per top-level pick - the lesson has the table.
+    solution: |
+      The load is the request mix. Compare a run with the model, not the printed ratio.
+
+  - id: steps-order
+    type: order
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: One user in the console
+    prompt: Put one simulated merchant's first actions in the order the console locustfile runs them.
+    items:
+      - id: login
+        text: User on_start - POST /auth/token, token on self.client.headers
+      - id: pick-top
+        text: Pick at the top - Browse is chosen (weight 3 of 4)
+      - id: open
+        text: Browse on_start - GET /v1/payments (open)
+      - id: inner
+        text: Picks inside Browse - list_payments, view_payment ...
+      - id: leave
+        text: leave is picked and calls self.interrupt()
+      - id: pick-again
+        text: Back at the top, the user picks again - a new Browse instance, a new open request
+    hints:
+      - The login is the user's, once; the open request belongs to each visit.
+    solution: |
+      Login, top-level pick, Browse on_start, inner picks, leave and interrupt, the next top-level pick.
+
+  - id: checkout-debug
+    type: debug
+    concept: perf-lcflow-tasksets
+    skill: analysis
+    title: Four defects in one checkout
+    prompt: |
+      This SequentialTaskSet is meant to create a payment, read it back, and repeat. Click every line that is a defect.
+    language: python
+    code: |
+      class Checkout(SequentialTaskSet):
+          @task(3)
+          def read_payment(self):
+              self.client.get(f"/v1/payments/{self.payment_id}")
+
+          @task
+          def create_payment(self):
+              r = self.client.post("/v1/payments", json=ORDER, headers={"Idempotency-Key": "checkout-key-1"})
+              self.payment_id = r.json()["id"]
+    correctLines: [2, 4, 8, 9]
+    lineNotes:
+      - line: 2
+        note: In a SequentialTaskSet the weight is a repeat count and the order is the order of declaration - the read (three times) would run before the create it needs.
+      - line: 4
+        note: No name=, so one statistics row per payment id.
+      - line: 8
+        note: A fixed Idempotency-Key - every create after the first is a replay of the first payment, not a new payment. Use a fresh key per visit.
+      - line: 9
+        note: A failed create has no id (KeyError, and the flow carries on), and nothing ends the visit - add a check, a failure and self.interrupt() after the block.
+    hints:
+      - Look at the order, the weight, the name and the key; then at what happens after a failure.
+    solution: |
+      Declare `create_payment` first and drop the weight; name the read `GET /v1/payments/{id}`; make the key a uuid4 set
+      in `on_start`; validate the create with `catch_response`, and after a failure call `self.interrupt()`.
+
+  - id: ratio-short
+    type: short
+    concept: perf-lcflow-weights
+    skill: analysis
+    title: Why the console report is 7 %, not 25 %
+    prompt: |
+      In the lesson's console run, `run_settlement_report` has weight 1 against `Browse` weight 3 - 25 % of top-level
+      picks - but only 31 of 423 requests (7.3 %) are reports. Explain the difference, and say how you would check that
+      the locustfile still matches a model that says "a merchant opens the report in 1 of 16 requests".
+    modelAnswer: |
+      The 25 % is a share of top-level picks. Each Browse pick starts a visit of about 5 inner picks (the `leave` task has
+      weight 2 of 10, so a visit lasts 1 / 0.2 = 5 picks), and each visit also sends an open request. Per top-level
+      pick that is 0.75 x 5 + 0.25 = 4 picks, and 4.0 requests: the open (0.75), list and view (0.75 x 4 = 3.0) and
+      the report (0.25) - so the report is 0.25 / 4.0 = 6.3 % of requests. The run's 7.3 % is within noise of that. To check a model of "1 in 16 requests (6.25 %)", I
+      compare the **request mix** of a run with the model - `mix_deviations` on the JSON counts - and accept a few
+      points of noise at a few hundred requests. This one matches: the deviation for the report row is +1 point.
+    rubric:
+      - Says the 25 % is a share of top-level picks, not of requests.
+      - Explains that a Browse visit lasts about 5 inner picks (leave weight 2 of 10) and sends the open request too.
+      - Gets about 6 % of requests for the report (0.25 of 4.0) and relates it to the run.
+      - Proposes comparing the observed request mix with the model rather than the weights.
+    hints:
+      - How many picks does one Browse visit contain on average?
+    solution: |
+      Visits of about 5 picks dilute the report; per top-level pick the report is 0.25 of 4.0 requests (6.3 %). Check
+      with the observed request mix.
+
+  - id: merchant-day-testdesign
+    type: testdesign
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: Structure for a merchant day
+    prompt: |
+      SandPay's merchants, per 100 actions, browse payments 55 times, create a payment 25 times (a create is
+      `POST /v1/payments` then a read-back), open the settlement report 15 times and change settings 5 times. A browse
+      "screen" visit contains about 4 actions. Design the Locust structure (user classes, TaskSets or plain tasks,
+      weights, where the state lives) and the checks that prove the run matches the model.
+    modelAnswer: |
+      **Structure.** One `MerchantUser` (HttpUser). `on_start`: log in once as the next merchant from a module-level
+      `itertools.count` (identity on the user, token on `client.headers`).
+
+      - **Browse** - a TaskSet with `list`, `view` and `leave` (`interrupt()`); `on_start` sends the open request. With 4
+        actions per visit and 55 browse actions per 100, Browse is chosen 55 / 4 = about 14 times per 100 top-level
+        visits-equivalents.
+      - **Create** - one plain task: create with a new key, `catch_response`, read it back, `return` if the create fails
+        (two requests per pick; no TaskSet needed - the steps need no weight or wait time of their own).
+      - **Report** and **settings** - plain tasks, one request each.
+
+      Top-level weights (per 100 actions, with browse counted in visits): Browse 14, create 25, report 15, settings 5.
+      Divide by their greatest common factor or let `mix_to_weights` pick small integers within a tolerance of 1-2
+      points.
+
+      **State.** Merchant and token on the user; the payment id and key are local variables of the create task (or
+      attributes of a per-visit TaskSet if a TaskSet is used); the merchant counter at module level and, in a
+      distributed run, a per-worker offset.
+
+      **Checks.** Names without ids (`GET /v1/payments/{id}`); one login per user; no server `404` (every read used an id
+      its own create returned); more Browse entries than users (the door works); the request mix from the JSON counts
+      compared with the model via `mix_deviations`, remembering a create is two requests and a browse visit has an
+      open request - expect a few points of noise, investigate 10; `--show-task-ratio` printed and labelled "picks".
+    rubric:
+      - One user class, identity on the user (counter-allocated merchant, token on the headers).
+      - Browse as a TaskSet with a leave task that calls interrupt, the create flow as a plain task with return on failure.
+      - Weights computed from the model, accounting for visit length and requests per pick.
+      - Per-visit or local state for the payment id, module-level counter for merchants.
+      - Checks - one login per user, no 404s, entries per user above one, request mix against the model with tolerance.
+    hints:
+      - How many actions are in a Browse visit, and how many requests in a create?
+      - Which pieces need to survive a failed flow?
+    solution: |
+      Browse as a TaskSet with `leave`/`interrupt()`, create as one plain task with `return`, weights from the model
+      divided by actions per visit, merchant counter at module level, and checks on names, logins, 404s, entries and the
+      observed request mix.
+
+  - id: flows-interview
+    type: interview
+    concept: perf-lcflow-weights
+    skill: analysis
+    title: 'Interview: modelling realistic user behaviour in Locust'
+    prompt: |
+      "How do you make a Locust test behave like real users - the mix of actions, the order of steps within a flow - and
+      how do you check that it does?"
+    modelAnswer: |
+      I start from the workload model - shares of user actions from production data - and turn them into task weights.
+      A weight is a share of picks, resolved by `random.choice`, so I convert with requests per pick in mind: a
+      three-request flow with the same weight as a one-request browse sends three times the requests. I use small integer
+      weights and a stated tolerance.
+
+      For structure I follow the docs: plain tasks and plain Python by default. A flow of steps that share an id is one task
+      with `return` when a step fails. A `TaskSet` is for a screen the user stays in for a while - and it needs a task that
+      calls `self.interrupt()`, because a TaskSet never ends by itself; I have seen a run where nobody left the screen and the
+      report was 1 % of requests with no failure to flag it. `SequentialTaskSet` only if steps need their own weight, tag or
+      wait time; `MarkovTaskSet` if production data shows next-step probabilities.
+
+      State: identity on the user (merchant from a counter, token on `client.headers`), flow state on the TaskSet instance
+      (a new instance every entry, reset in `on_start`), shared counters at module level - and in a distributed run the
+      counter is per worker, so I offset it.
+
+      I check by looking at the run: names grouped, one login per user, no unexpected `404`s, more TaskSet entries than users,
+      and the observed request mix compared with the model with a tolerance of a few points. `--show-task-ratio` is a ratio
+      of picks, not requests, so I never quote it as the load.
+    rubric:
+      - Weights are shares of picks; converts with requests per pick.
+      - Prefers plain tasks; TaskSet for a screen, and knows interrupt() is required.
+      - Places state correctly - user, TaskSet instance, module - and mentions the worker-process caveat.
+      - Checks the run - names, logins, 404s, entries per user, request mix against the model.
+    followUps:
+      - How would you model a user who sometimes abandons a checkout half way?
+      - What changes when the test runs on several workers?
+      - How would you keep the model and the weights in sync when production data changes?
+    hints:
+      - Start with what a weight counts.
+    solution: |
+      Weights from the model with requests per pick, plain tasks by default, TaskSets with interrupt for screens, state in
+      the right place, and a run compared with the model.
+
+  - id: console-code
+    type: coding
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: The merchant console with a nested TaskSet
+    prompt: |
+      Complete `locust/lc_flow_console_locustfile.py`. A `MerchantUser` logs in once as `merchant-1`, then picks `Browse`
+      (a TaskSet, weight 3) or `run_settlement_report` (weight 1). Inside `Browse`: `on_start` sends an "open" request,
+      then `list_payments` (weight 5), `view_payment` (weight 3, one name for all ids) and `leave` (weight 2), which hands
+      control back to the user. The test checks the ratios with `--show-task-ratio-json`, then runs the file with real
+      Locust and checks that users leave Browse and come back.
+    project: perf
+    files:
+      - exercises/locust/lc_flow_console_locustfile.py
+    test: tests/locust/test_lc_flow_console.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_flow_console.py
+    modelAnswer: |
+      See "The code: the merchant console with a nested TaskSet". The details the tests check:
+
+      - `tasks = {Browse: 3}` and `@task(1)` on the report: 0.75 / 0.25 at the top; 5 / 3 / 2 inside.
+      - `Browse.on_start` sends `GET /v1/payments (open)` once per visit.
+      - `leave` calls `self.interrupt()` - without it, 4 opens for 4 users and no report.
+      - One login per user in the user's `on_start`; the TaskSet's `self.client` sends the token.
+      - Names without ids: five rows.
+    rubric:
+      - Every test in tests/locust/test_lc_flow_console.py passes.
+      - The nested TaskSet has a task that calls self.interrupt().
+      - The token is set once on the user and used from inside the TaskSet.
+      - Dynamic ids are grouped under one name.
+    hints:
+      - "`tasks = {Browse: 3}` can sit beside an `@task(1)` method on the user."
+      - "`self.interrupt()` is what returns control to the user."
+      - "Inside a TaskSet, `self.client` is the user's client."
+    solution: |
+      `Browse(TaskSet)` with `on_start`, three weighted tasks and `leave` -> `self.interrupt()`; the user logs in once and sets
+      the token on `self.client.headers`; `tasks = {Browse: 3}` plus the report task.
+
+  - id: checkout-code
+    type: coding
+    concept: perf-lcflow-state
+    skill: application
+    title: A checkout as a SequentialTaskSet
+    prompt: |
+      Complete `locust/lc_flow_checkout_locustfile.py`: each user logs in as the next merchant from a module-level counter,
+      then runs a `Checkout` SequentialTaskSet - create (new key, keep the id on the TaskSet), read it back, replay the create
+      with the same key. A failed step is reported with `failure()` and ends the visit with `self.interrupt()` after the
+      with-block; the last step interrupts too, so every cycle gets a new key. The test runs it clean and with 25 % of creates
+      failing.
+    project: perf
+    files:
+      - exercises/locust/lc_flow_checkout_locustfile.py
+    test: tests/locust/test_lc_flow_checkout.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_flow_checkout.py
+    modelAnswer: |
+      See "The code: a checkout as a SequentialTaskSet". The details the tests check:
+
+      - Tasks declared in order: create, read, replay.
+      - `self.payment_id`, `self.key` and the order set in the TaskSet's `on_start` - new for every visit.
+      - A failed create ends the visit - with errors on, reads equal the successful creates and the server sees no `404`.
+      - The replay reuses key and body - `payments_created` equals creates, replays equal `idempotent_replays`.
+      - One login per user, a different merchant per user, token from the user's `on_start`.
+    rubric:
+      - Every test in tests/locust/test_lc_flow_checkout.py passes.
+      - Per-visit state lives on the TaskSet and is reset in on_start.
+      - Failures are reported with failure() and the visit ends with interrupt() outside the with-block.
+      - Merchant identity comes from a module-level counter and the token is set once per user.
+    hints:
+      - Tasks run in the order they are declared.
+      - "Set a flag inside the block and call `self.interrupt()` after it."
+      - "`itertools.count(4)` at module level gives each new user the next merchant."
+    solution: |
+      Declare create, read, replay in order; keep id and key on the TaskSet (set in `on_start`); `catch_response` for each step,
+      `interrupt()` after the block on failure and after the replay; merchant and token in the user's `on_start`.
+
+  - id: mix-code
+    type: coding
+    concept: perf-lcflow-weights
+    skill: analysis
+    title: From a model to weights and back
+    prompt: |
+      Implement `locust/lc_flow_mix.py`: `mix_to_weights` (smallest integer weights within a tolerance of the model, never
+      below 1), `request_shares` (weight x requests per pick as a share of the total) and `mix_deviations` (observed share
+      minus model share for every name, sorted). The tests use the lesson's numbers.
+    project: perf
+    files:
+      - exercises/locust/lc_flow_mix.py
+    test: tests/locust/test_lc_flow_mix.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_flow_mix.py
+    modelAnswer: |
+      See "The code: from a model to weights and back". The key ideas:
+
+      - Try totals n from `len(mix)` upwards, `round(share * n)` with a floor of 1; the first n within the tolerance wins.
+      - Reject a model that does not add up to 1, has a non-positive share, or fits no total up to `max_total`.
+      - `request_shares` multiplies weight by requests per pick before normalising.
+      - `mix_deviations` covers names in either dict and treats an empty run as zero shares.
+    rubric:
+      - Every test in tests/locust/test_lc_flow_mix.py passes.
+      - A rare action keeps a weight of at least 1.
+      - Names that appear only in the run, or only in the model, show up as deviations.
+    hints:
+      - "`range(len(mix), max_total + 1)` and `max(1, round(share * n))`."
+      - Normalise by the sum of weight x requests per pick.
+      - "`sorted(set(observed) | set(model))` gives the names."
+    solution: |
+      Search the smallest total with a floor of 1 per weight; multiply by requests per pick before normalising; subtract
+      shares over the union of names.
+
+placement:
+  - id: place-weights
+    type: mcq
+    concept: perf-lcflow-weights
+    skill: application
+    title: Equal weights, three requests
+    prompt: |
+      Two tasks have the same weight. One sends one request per pick, the other sends three. What share of the
+      requests does the three-request task get?
+    options:
+      - id: three-quarters
+        text: 75 %
+        feedback: Correct - weight x requests per pick is 1 and 3.
+      - id: half
+        text: 50 %
+        feedback: That is the share of picks.
+      - id: third
+        text: 33 %
+        feedback: That is the share the one-request task would get if weights were requests.
+      - id: depends
+        text: It depends on the wait_time
+        feedback: wait_time paces picks; it does not change which task is picked or how many requests it sends.
+    correct: [three-quarters]
+    solution: |
+      Requests are weight x requests per pick: 1 : 3.
+
+  - id: place-taskset
+    type: mcq
+    concept: perf-lcflow-tasksets
+    skill: application
+    title: The TaskSet with no door
+    prompt: A user enters a TaskSet and none of its tasks calls `self.interrupt()`. How long does the user stay?
+    options:
+      - id: forever
+        text: For the whole test - a TaskSet never hands control back by itself
+        feedback: Correct - "TaskSets will never stop executing their tasks ... by themselves".
+      - id: one-pass
+        text: Until each task has run once
+        feedback: A plain TaskSet picks tasks at random for ever.
+      - id: wait
+        text: Until the next wait_time
+        feedback: wait_time is the pause between picks, not the end of a visit.
+      - id: error
+        text: Locust stops the user with an error
+        feedback: Locust does not warn - which is why this mistake is easy to make.
+    correct: [forever]
+    solution: |
+      Forever. Add a task that calls `self.interrupt()`.
+
+  - id: place-state
+    type: mcq
+    concept: perf-lcflow-state
+    skill: application
+    title: One merchant per user
+    prompt: Each simulated user must be a different merchant. Where does the code that hands out merchants live?
+    options:
+      - id: module-counter
+        text: A module-level `itertools.count`, read with `next()` in the user's `on_start`
+        feedback: Correct - shared by all users so that each takes the next one; the identity is then kept on the user.
+      - id: per-user-var
+        text: A variable inside the user's `on_start` that starts at 4
+        feedback: Every user would start at 4 and be merchant-4.
+      - id: taskset-attr
+        text: An attribute on a TaskSet
+        feedback: It lives for one visit and is not shared with other users.
+      - id: header
+        text: In `self.client.headers`
+        feedback: Headers carry the identity after it is chosen; they do not choose it.
+    correct: [module-counter]
+    solution: |
+      A shared module-level counter hands out identities; the user keeps its own.
+
+recall:
+  - id: recall-weight
+    concept: perf-lcflow-weights
+    prompt: What does a Locust task weight count, and how is it resolved?
+    answer: A share of picks (not requests). The dict is expanded into a list and random.choice picks from it. Request share = weight x requests per pick, normalised.
+  - id: recall-ratio
+    concept: perf-lcflow-weights
+    prompt: What does --show-task-ratio print, and what does it not show?
+    answer: The share of picks from weights alone. It ignores requests per pick and visits cut short by interrupt(), so it is not the request mix.
+  - id: recall-interrupt
+    concept: perf-lcflow-tasksets
+    prompt: How does a user leave a TaskSet?
+    answer: Only when a task calls self.interrupt() (it raises InterruptTaskSet); a TaskSet never stops by itself. The parent re-schedules at once by default.
+  - id: recall-instance
+    concept: perf-lcflow-tasksets
+    prompt: What happens each time a user picks a TaskSet class?
+    answer: A new instance is created and run - on_start runs again, instance attributes start empty, and a SequentialTaskSet starts at its first task.
+  - id: recall-sequential
+    concept: perf-lcflow-tasksets
+    prompt: How does a SequentialTaskSet use weights, and what do the docs say about when to use it?
+    answer: Tasks run in declaration order and repeat; a weight is a repeat count at that point. The docs say you do not need it just to do requests in order - often one task is easier.
+  - id: recall-state
+    concept: perf-lcflow-state
+    prompt: The three places for state in a Locust user, and what goes in each?
+    answer: User attributes (identity - token, merchant); TaskSet instance attributes (one visit - payment id, key); module variables (shared - counters; per process, not per worker cluster).
+
+next:
+  - locust-events-and-custom-clients
+  - locust-load-shapes
+  - locust-distributed-and-ci

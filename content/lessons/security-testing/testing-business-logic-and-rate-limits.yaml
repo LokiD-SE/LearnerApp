@@ -1,0 +1,1428 @@
+id: testing-business-logic-and-rate-limits
+title: Testing business logic, races and rate limits
+subject: security-testing
+module: api-security
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: Test the flaws that no scanner can find because the code does exactly what it was told - the rules just do not match the business. Write abuse cases for a refund service (a double refund, a refund of a declined payment, a negative amount), prove a check-then-act rule breaks when two requests arrive together, and probe a sign-in endpoint for a missing rate limit - each probe with a control, a baseline and a negative control, so it finds the flaw in a practice target and stays quiet once the flaw is fixed.
+tags:
+  [
+    business logic,
+    abuse case,
+    misuse case,
+    workflow,
+    state machine,
+    state transition,
+    refund,
+    double refund,
+    negative amount,
+    race condition,
+    TOCTOU,
+    time-of-check to time-of-use,
+    atomic,
+    concurrency,
+    idempotency,
+    rate limit,
+    "429",
+    Retry-After,
+    brute force,
+    unrestricted resource consumption,
+    sensitive business flow,
+    API4:2023,
+    API6:2023,
+    WSTG-BUSL-01,
+    WSTG-BUSL-05,
+    WSTG-BUSL-06,
+    WSTG-BUSL-10,
+    OWASP Cheat Sheet,
+    payments,
+    API security,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, on Linux. Every
+    output marked as run here was printed by the code shown, on 21 November 2026. The two probes that use the
+    network talk to the practice portal on `127.0.0.1`; the refund and race probes are in-process and send nothing at
+    all. Timings are not shown, because they depend on the machine; every test checks behaviour (status codes, totals),
+    never speed.
+  - **Practice targets:** (1) `practice/security/support/sandpay_vuln.py`, the **deliberately vulnerable** SandPay
+    merchant portal, flaw id `no-rate-limit` on `POST /api/login` (`make_app({"no-rate-limit"})` closes it). It binds
+    to loopback only. (2) `practice/security/support/logic_fixture.py`, a small in-process **refund service**
+    (`RefundDesk`) written for this lesson because the portal has no refund endpoint. Its flaws are `double-refund`,
+    `state-bypass`, `negative-amount` and `race`, and `RefundDesk(fixed={...})` fixes the ones you name. SandPay, its
+    users, payments and amounts are fictional.
+  - **What is real and what is not:** the race in the lesson is real - two threads really do both pass the check - but
+    it is made reliable on purpose: the fixture sleeps 50 ms between the check and the write, and the probe releases
+    both threads with a barrier. On a real service the window is usually far smaller, which is why real race tests send
+    bursts and use the techniques described in the WSTG (last-byte synchronisation, the single-packet attack); those
+    are quoted from the WSTG and **not run here**. Nothing in this lesson sends a burst to a real system.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. Business
+    logic abuse touches money and stock: a race test can create duplicate refunds, orders or emails, and a rate-limit
+    test can lock real customers out. Use test accounts and test data, agree the burst size and the time window in
+    writing (the WSTG suggests small bursts, for example 20 to 30 requests), and say how any money that moved will be
+    reversed. Practice runs only against the local targets.
+  - **Standards and testing guide (read on 21 November 2026):** OWASP API Security Top 10:2023 -
+    [API4:2023 Unrestricted Resource Consumption](https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/)
+    and
+    [API6:2023 Unrestricted Access to Sensitive Business Flows](https://owasp.org/API-Security/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/).
+    OWASP Web Security Testing Guide, development version on GitHub (the business logic chapter is numbered 14 there;
+    the latest stable release, v4.2, numbers it 10 - check the release you cite in a report) -
+    [Introduction to Business Logic](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/00-Introduction_to_Business_Logic.md),
+    [Business Logic Data Validation (WSTG-BUSL-01)](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/01-Business_Logic_Data_Validation.md),
+    [Process Timing (WSTG-BUSL-04)](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/04-Process_Timing.md),
+    [Number of Times a Function Can Be Used Limits (WSTG-BUSL-05)](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/05-Number_of_Times_a_Function_Can_Be_Used_Limits.md),
+    [Circumvention of Work Flows (WSTG-BUSL-06)](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/06-Circumvention_of_Work_Flows.md)
+    and [Payment Functionality (WSTG-BUSL-10)](https://github.com/OWASP/wstg/blob/master/document/14-Business_Logic/10-Payment_Functionality.md),
+    including its Race Conditions section.
+  - **Cheat sheet:** OWASP
+    [Business Logic Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Business_Logic_Security_Cheat_Sheet.html)
+    (Enforce Workflows as Explicit State Machines; Prevent Race Conditions on Sensitive Operations), as documented on
+    21 November 2026.
+  - **Tools named, not run here:** Burp Suite (Repeater's parallel sending, Turbo Intruder) and curl or a script for
+    bursts are the tools the WSTG names for race tests. This lesson builds the equivalent in Python.
+  - **Not repeated here:** the full list of API risks - [The OWASP API Security Top 10](#/lesson/owasp-api-security-top-10);
+    the developer's view of limits - [Pagination, filtering and rate limits](#/lesson/pagination-filtering-rate-limits);
+    how a retry is made safe - [Idempotency keys](#/lesson/idempotency-keys); sign-in testing - [Testing authentication](#/lesson/testing-authentication).
+
+prerequisites:
+  - security-testing-fundamentals
+  - owasp-api-security-top-10
+  - http-security-for-testers
+  - testing-authentication
+
+concepts:
+  - id: sec-logic-rules-and-state
+    name: Business rules, state and abuse cases
+    summary: A business logic flaw is a rule the business has (a refund can never exceed what was captured, only a captured payment can be refunded, a step must come before the next) that the application does not enforce. The code works as written, so scanners see nothing. A tester writes the rules down, then writes one abuse case per rule - the same request repeated, sent in the wrong state, with an odd value - and checks the server refuses it. The state of a workflow belongs on the server, never in the client.
+  - id: sec-logic-race-conditions
+    name: Races between a check and the write
+    summary: "Any rule shaped like \"check a condition, then act on it\" breaks if two requests run at the same time - both pass the check, both act. This is time-of-check to time-of-use (TOCTOU). A tester first proves the rule holds for requests sent one after another (the control), then sends the same request from several threads released together and compares the total with the limit. The fix is to make the check and the write one atomic step."
+  - id: sec-logic-rate-limits
+    name: Rate limits and unrestricted resource consumption
+    summary: An endpoint that lets a client repeat an action without limit - guessing passwords, requesting SMS codes, buying all the stock - is vulnerable even if every single request is valid (API4:2023 and API6:2023). A tester sends a short, agreed burst against an endpoint with a harmless identity, records where the first 429 comes, whether Retry-After is sent, and whether the limit hurts other users; a limit that is missing, too high, or shared across accounts is a finding.
+
+objectives:
+  - Turn a business requirement into a list of rules, and each rule into an abuse case with an expected refusal.
+  - Write a probe for a double refund, a refund of a declined payment and a negative amount, with a control request and no false positive.
+  - Explain a time-of-check to time-of-use race, prove a rule holds sequentially and breaks concurrently, and say what makes the fix correct.
+  - Probe a sign-in endpoint for a missing rate limit and read the result - where the 429 starts, the Retry-After header and whether other accounts are affected.
+  - Choose a safe burst size and test data for a business logic test and describe how to reverse what it changed.
+  - Design a test plan for a payment API's refund and sign-in flows with expected results and evidence for each case.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: The idea in plain language
+    body: |
+      Picture a shop's returns desk. The rule on the wall says: "Refunds only for goods paid for, only once, and never
+      more than the receipt." A clerk who follows it exactly is safe. Now picture three ways the desk fails:
+
+      - **The clerk who never writes the first refund on the receipt.** A customer brings the same receipt back and gets
+        paid again. Every refund was "valid" - the shop just forgot that it had already happened. That is a
+        **double refund**.
+      - **The clerk who refunds a receipt stamped "payment declined".** Nothing was ever paid, so there is nothing to
+        give back. The clerk checked the receipt exists, not what state it is in. That is a **workflow or state flaw**.
+      - **Two clerks, one receipt, one customer who asks both at the same moment.** Each looks at the receipt - "no
+        refund written yet" - and each pays. The rule is fine for one clerk and breaks for two. That is a **race
+        condition**.
+
+      A vulnerability scanner cannot see any of this. Nothing is injected, nothing is reflected, every request is well
+      formed. The OWASP cheat sheet puts it exactly: the code does what the developer told it to do, but what the
+      developer told it to do does not match what the business actually needs.
+
+      Rate limits belong in the same picture. Even when every request is honest, the *number* of them can be the attack:
+      a thousand password guesses a minute, a thousand "send me a code" taps that cost money per SMS, a script that buys
+      the whole stock of a console in a second. The rule on the wall there is "how many times, how fast, per whom" - and
+      most desks forget to write it down.
+
+      Your job as a tester is to read the business rules, write each one as something the application must refuse, and
+      then **try to break each one - once, twice, backwards, together and fast**.
+
+  - id: what
+    kind: what
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: What this kind of testing is
+    body: |
+      **Business logic testing** checks that the application enforces the rules of the business, not just the rules of
+      HTTP and input validation. The WSTG says the testing is similar to what functional testers do with logical and
+      finite-state testing, but you develop *abuse and misuse cases*: ways a dishonest user would use a legitimate
+      feature. It also says automating these cases is generally not possible - they depend on knowing the complete
+      business process. A tool can *send* your abuse cases; it cannot *invent* them.
+
+      Three families cover most of what you will meet in an API:
+
+      | Family | The rule that is broken | Example in SandPay | WSTG / OWASP |
+      | --- | --- | --- | --- |
+      | **Rules and state** | a limit, a precondition or an order of steps is not enforced | refund a payment twice; refund a declined payment; refund a negative amount | WSTG-BUSL-01, -05, -06, -10 |
+      | **Races** | a rule is enforced, but not when requests overlap | two refunds of the same payment at the same moment | WSTG-BUSL-10 (Race Conditions) |
+      | **Rate and resource limits** | the *number* or *speed* of requests is not limited | unlimited wrong passwords for one account | API4:2023, API6:2023, WSTG-BUSL-05 |
+
+      Four terms to hold on to:
+
+      - **Abuse case (misuse case)**: a test written from the point of view of someone who wants to break a rule - "what
+        if I send this twice?", "what if I skip step 2?", "what if the amount is negative?".
+      - **State machine**: the allowed states of an object (a payment can be *authorised*, *captured*, *declined*,
+        *refunded*) and the allowed moves between them. A refund is a move that is only allowed from *captured*.
+      - **TOCTOU (time of check to time of use)**: the gap between *looking* at a value and *changing* it. The WSTG
+        defines a race condition as behaviour that depends on the timing or sequence of events that are not properly
+        controlled, and calls the check-then-act gap a TOCTOU flaw.
+      - **Rate limit**: a cap on how many requests a client may make in a time window; an over-limit request is answered
+        with `429 Too Many Requests`, ideally with a `Retry-After` header saying when to try again.
+
+  - id: why
+    kind: why
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Why it matters
+    body: |
+      - **It is money.** In a payment system, a business logic flaw is a direct loss: the same refund paid twice, a
+        negative amount that turns a refund into a charge in the attacker's favour, a "declined" order that still ships.
+        The WSTG's payment chapter lists races in financial transactions, one-time codes, limited inventory and attempt
+        counters among the places they bite.
+      - **Scanners do not find it.** The WSTG says tools "have no means" of detecting that a user can circumvent a
+        process flow by editing parameters or reordering steps. If you do not test it, nobody does.
+      - **It is cheap to exploit.** OWASP rates API4:2023 exploitation as needing "simple API requests", and notes that
+        most tools aimed at it are built for denial of service, not for subtle abuse. A script and a loop are enough.
+      - **A missing limit turns a small flaw into a large one.** A weak password policy is bad; a weak policy with no
+        limit on guesses is a breach. A per-request SMS cost with no limit is a bill. OWASP lists "third-party service
+        providers' spending limit" and "number of operations to perform in a single API client request" among the limits
+        whose absence makes an API vulnerable.
+      - **It survives refactoring.** The rules live in people's heads and in documents. When the code is rewritten, a rule
+        that was only enforced by accident disappears. An automated abuse-case test is the only thing that remembers it.
+      - **Whole businesses are exposed.** API6:2023 describes flows where *excessive but valid* access is the harm: buying
+        all the stock to resell it, reserving every time slot, posting spam. No single request is wrong.
+
+  - id: rules-and-state
+    kind: internals
+    concepts: [sec-logic-rules-and-state]
+    title: Rules, state and abuse cases
+    body: |
+      **Start from the rule, not from the endpoint.** For each feature, write the business rules in one sentence each.
+      For the SandPay refund:
+
+      1. A refund is only allowed on a payment that is **captured** (not declined, not already fully refunded).
+      2. The amounts refunded for one payment must **never add up to more than was captured**.
+      3. The amount is a **positive whole number** of minor units (cents).
+      4. A refund happens **once** per request; a retry of the same request must not pay twice (see idempotency).
+
+      Each rule becomes one abuse case with an expected refusal:
+
+      | Rule | Abuse case | Secure answer |
+      | --- | --- | --- |
+      | only captured payments | refund a payment that was declined | `409` (conflict with the current state) |
+      | total <= captured | refund the full amount twice | second request `409`, total unchanged |
+      | positive integer | refund `-500`, `0`, `1.5`, `"10"`, a huge number | `422` (or `400`), nothing changes |
+      | once per request | repeat the same request with the same key | same answer, one refund |
+
+      **Where the rules are checked is the whole story.** The Business Logic Security Cheat Sheet is direct: *always
+      re-derive security-relevant values (prices, permissions, ownership) on the server; client state is input, not
+      truth*, and *enforce workflows as explicit state machines - do not rely on the UI to gate the order of steps*. An
+      attacker does not use your UI. If the only thing stopping "refund a declined payment" is that the button is hidden,
+      the rule does not exist.
+
+      **Workflow abuse (WSTG-BUSL-06).** Multi-step flows - sign-up, checkout, approval, refund request then approval -
+      are tested by: skipping a step by calling a later endpoint directly; repeating or reordering requests; replaying a
+      state identifier from another step; changing a `status` or `step` field the client sends; and running dependent
+      actions in parallel. The WSTG's examples: shipping an order without a confirmed payment, or editing a post after it
+      passed a moderation check that is never run again.
+
+      **Data validation (WSTG-BUSL-01).** The WSTG calls out negative quantities and amounts, values at the edges of a
+      range, wrong types, and totals that stay positive while one line item is negative (a bulk payment of +1000 and
+      -400 and +50). Test each field's *business* limits, not just that it is a number.
+
+      **Numbers of times (WSTG-BUSL-05).** "Identify functions that must set limits to the times they can be called."
+      Coupons, refunds, one-time codes, free trials, downloads per month. The WSTG remediation: make the limit a hard
+      control "at the database level" or a counter on the backend per user - not a hidden page or a cookie.
+
+      **Time (WSTG-BUSL-04).** Reservations that never expire, price quotes that stay valid all day, and responses that
+      take longer for a valid user name than an invalid one (an account enumeration signal) are timing logic flaws.
+
+  - id: race-internals
+    kind: internals
+    concepts: [sec-logic-race-conditions]
+    title: Races - when the check and the write are two steps
+    body: |
+      The refund service in this lesson does this, in the order the code runs it:
+
+      ```
+      1. read:  how much is left to refund?          (check)
+      2. decide: is the requested amount <= left?     (check)
+      3. ...slow part (database call, a message to the card network)...
+      4. write: refunded = refunded + amount          (act)
+      ```
+
+      One request at a time, this is correct. Two requests at the same moment can both run steps 1 and 2 before either
+      runs step 4, so both see "all of it is left" and both pay. The WSTG describes the shape exactly: they "both read
+      the old value, both decide the same thing, and both write" (the cheat sheet's words) - and it names where to look:
+      financial transactions, one-time tokens and coupons, limited inventory, attempt counters, and state transitions
+      that should happen exactly once.
+
+      **Why a wider window helps the tester.** The window is step 3. The longer the slow part, the easier the race. The
+      WSTG tells testers to watch for "responses that take noticeably longer than others" (several queries, a call to
+      another service) and for background jobs triggered by a change - both signs that state is updated in more than
+      one step.
+
+      **Why the network used to hide races, and no longer does.** Older guidance called these windows too small to exploit
+      across the internet, because network jitter spreads requests apart. The WSTG describes the two techniques that
+      removed the excuse - *last-byte synchronisation* (send every request except the last byte, then send all the last
+      bytes together) and the *single-packet attack* (the same idea with HTTP/2 frames in one TCP packet). They are built
+      into the common tools. (From the WSTG, not run here.)
+
+      **How a tester proves a race - three steps.**
+
+      1. **Baseline.** Send the request a few times *in sequence* and note the normal responses - the WSTG says to.
+      2. **Control for "it is not a race at all".** If the second sequential request is already accepted, the rule is
+         simply missing (a double refund). That is a different finding, and a race test would only confuse the report.
+      3. **Burst.** Send the same request from several threads released together - small, agreed number - and compare the
+         **end state** (the total refunded) with the limit. The status codes are evidence; the end state is the verdict.
+
+      **The fix is atomicity.** The check and the write must be one indivisible step: a database transaction with a row
+      lock or a conditional update (`UPDATE ... SET refunded = refunded + :a WHERE refunded + :a <= captured`, and check
+      how many rows changed), a unique constraint, or an idempotency key stored together with the result. A bigger sleep,
+      a retry or "checking twice" does not fix a race.
+
+      **Idempotency is a cousin, not the same thing.** An idempotency key makes a *retry* of one request safe (the same key
+      gives the same answer and one refund - see [Idempotency keys](#/lesson/idempotency-keys)). It does not stop two
+      *different* refund requests, and it does not by itself stop two requests that carry the same key at the same
+      moment unless the key's reservation is itself atomic.
+
+  - id: rate-limit-internals
+    kind: internals
+    concepts: [sec-logic-rate-limits]
+    title: Rate limits - what to look for and what a good one does
+    body: |
+      OWASP API4:2023 says an API is vulnerable if at least one of its limits is missing or set inappropriately - and
+      lists execution timeouts, memory, file descriptors, processes, upload size, **the number of operations in a single
+      client request** (GraphQL batching), **the number of records per page**, and a **third-party spending limit**.
+      Prevention: define and enforce a maximum size on all inputs, **limit how often a client can interact with the API
+      in a defined timeframe**, fine-tune it to the business ("some API endpoints might require stricter policies"), and
+      limit how often a single client or user can perform one operation - for example, validating a code or requesting
+      one.
+
+      **API6:2023 is the same idea at business level.** A flow is sensitive if *excessive access* harms the business -
+      buying out the stock, spamming, reserving every slot. The question is not "is the request valid?" but "what happens
+      if this is done a million times by a script?".
+
+      **What a tester records for a sign-in endpoint** (`POST /api/login`):
+
+      | Observation | Why it matters |
+      | --- | --- |
+      | the statuses of N wrong attempts for **one** account | is there any `429` at all? |
+      | the number of the **first** `429` | the limit - five attempts a minute is not the same as five thousand |
+      | the `Retry-After` header | a client can back off politely; it is also useful in the report |
+      | what a **second** account sees afterwards | a limit keyed only on the IP address or a shared counter can lock everybody out |
+      | whether the limit survives a changed header, a new session or a different IP | bypass checks (only with permission, see the ethics note) |
+
+      **Good limits are keyed correctly.** Per **account** protects against guessing one user's password; per **client or
+      IP** protects against one source trying many users (credential stuffing); neither alone is enough. A limit keyed on
+      something the attacker controls - a header, a cookie, a username with a changed capital letter - is bypassed, not
+      limited. And a lock-out that blocks the real owner after a few wrong guesses by a stranger is a denial of service
+      you have handed the stranger; many designs use delays or extra challenges instead of a hard lock.
+
+      **Remember where it bites.** Sign-in, password reset, one-time-code verification, SMS or email sending, coupon
+      and gift-card validation, search and export endpoints, and anything with a per-request cost.
+
+  - id: when
+    kind: when
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: When to use each kind of test
+    body: |
+      | Situation | Test |
+      | --- | --- |
+      | A new payment, refund, reward, coupon or booking feature | list the rules, write one abuse case per rule before release |
+      | A function that must happen once or N times | repeat it, reorder it, replay it; then run it concurrently |
+      | A rule of the form "if enough, then deduct" (balance, stock, limit, one-time code) | race test |
+      | A multi-step flow (checkout, KYC, approval) | skip, repeat, reorder, edit the state parameter |
+      | Any endpoint that checks a secret (password, OTP, coupon) | rate-limit test with a harmless identity |
+      | A feature that costs money per call (SMS, email, KYC check) | per-account and per-client limits, and a spending limit |
+      | A bug report "customers got refunded twice" | reproduce sequentially first, then concurrently |
+      | Regression after a rewrite | the abuse cases as automated tests |
+
+      **When not to run them.** On production without written permission and a rollback plan; with real customer
+      accounts; with bursts bigger than agreed. A race test creates real duplicate records. A rate-limit test can lock a
+      real person out. Use test tenants, and write down how each side effect is undone.
+
+  - id: visual-race
+    kind: visual
+    concepts: [sec-logic-race-conditions]
+    title: Two refunds at the same moment
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant A as Request 1
+        participant B as Request 2
+        participant S as Refund service
+        participant D as Payment p_4 (captured 2500, refunded 0)
+        A->>S: refund 2500
+        B->>S: refund 2500
+        S->>D: read left to refund (request 1)
+        D-->>S: 2500 left
+        S->>D: read left to refund (request 2)
+        D-->>S: 2500 left
+        Note over S: both checks pass - the slow part runs for both
+        S->>D: write refunded + 2500 (request 1)
+        S->>D: write refunded + 2500 (request 2)
+        D-->>S: refunded is now 5000
+        S-->>A: 200
+        S-->>B: 200
+        Note over D: 5000 refunded on a payment captured for 2500
+      ```
+
+      Read the diagram top to bottom: neither request is wrong, and each is checked against a value that is **already
+      out of date** by the time it writes. The two `200` answers look like success; only the **end state** (5000 against
+      2500) shows the loss. That is why a race probe asserts on the total, not on the status codes alone.
+
+  - id: visual-testing-flow
+    kind: visual
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: How a logic or limit probe earns its verdict
+    body: |
+      ```mermaid
+      flowchart TD
+        A["Write the rule in one sentence"] --> B["Control: a normal request succeeds"]
+        B -- "no" --> X["Raise an error - no verdict"]
+        B -- "yes" --> C["Abuse case, sent one after another"]
+        C -- "accepted" --> F1["Finding: the rule is missing"]
+        C -- "refused" --> D["Same request, sent together or in a burst"]
+        D -- "end state breaks the rule" --> F2["Finding: race or no limit"]
+        D -- "rule holds" --> E["Quiet"]
+        F1 --> N["Negative control on the fixed build: must be quiet"]
+        F2 --> N
+        E --> N
+      ```
+
+      Every probe in this lesson follows this shape. The control (a normal request works) keeps "refused" meaningful. The
+      sequential case runs **before** the concurrent one so that a missing rule is not mistaken for a race. And the
+      negative control, on a build where the flaw is fixed, is what stops the probe from crying wolf.
+
+  - id: raw-requests
+    kind: code
+    concepts: [sec-logic-rules-and-state, sec-logic-rate-limits]
+    title: The refund and rate-limit behaviour, by hand
+    body: |
+      First the refund rules, called directly on the practice desk. The vulnerable desk is `RefundDesk()`; the fixed one
+      enforces the three sequential rules.
+
+      ```python
+      from logic_fixture import RefundDesk
+
+      d = RefundDesk()
+      print(d.refund("p_1", 5000), d.refund("p_1", 5000), d.total_refunded("p_1"))     # twice the full amount
+      d = RefundDesk({"double-refund", "state-bypass", "negative-amount"})
+      print(d.refund("p_1", 5000), d.refund("p_1", 5000))
+      d = RefundDesk()
+      print(d.refund("p_2", 1000))                                                       # p_2 was declined
+      print(d.refund("p_3", -500), d.total_refunded("p_3"))                              # a negative amount
+      d = RefundDesk({"double-refund", "state-bypass", "negative-amount", "race"})
+      print(d.refund("p_2", 1000), d.refund("p_3", -500))
+      ```
+
+      Output (run on 21 November 2026):
+
+      ```
+      (200, {'refunded': 5000, 'total_refunded': 5000}) (200, {'refunded': 5000, 'total_refunded': 10000}) 10000
+      (200, {'refunded': 5000, 'total_refunded': 5000}) (409, {'error': 'refund is more than the amount left'})
+      (200, {'refunded': 1000, 'total_refunded': 1000})
+      (200, {'refunded': -500, 'total_refunded': -500}) -500
+      (409, {'error': 'cannot refund a payment that is declined'}) (422, {'error': 'amount must be a positive integer'})
+      ```
+
+      Line 1: payment `p_1` was captured for 5000, and the vulnerable desk paid 5000 **twice** - 10000 refunded.
+      Line 3: the declined payment `p_2` was refunded. Line 4: a refund of -500 was accepted, and the total went
+      **negative** - a negative refund is a charge in the customer's favour, and it frees headroom for a later refund. The
+      last line shows the fixed desk answering `409` (wrong state) and `422` (invalid amount). The statuses are the
+      fixture's own choice; the lesson's point is *that a refusal exists*, not which number it carries.
+
+      Now the rate limit. The probe sends eight wrong sign-ins for one account that does not exist, then one for a second
+      such account. On the vulnerable portal:
+
+      ```python
+      from sandpay_vuln import make_app, serve
+      from logic_rate_limit import probe_login_limit, assess
+
+      for name, fixed in (("vulnerable", set()), ("fixed", {"no-rate-limit"})):
+          with serve(make_app(fixed)) as base:
+              r = probe_login_limit(base)
+          print(name, r.statuses, r.first_429_at, r.retry_after, r.other_account_status, assess(r))
+      ```
+
+      ```
+      vulnerable [401, 401, 401, 401, 401, 401, 401, 401] None None 401 no-rate-limit
+      fixed [401, 401, 401, 401, 401, 429, 429, 429] 6 60 401 None
+      ```
+
+      Eight wrong passwords, eight `401`: nothing ever pushes back. After the fix, the sixth attempt is the first `429`
+      (the limit is five attempts per account per 60-second window, from `LOGIN_LIMIT` and `LOGIN_WINDOW_S`), the response
+      carries `Retry-After: 60`, and a **different** account still gets a normal `401` - so one person's mistakes do not
+      lock another out. The accounts used do not exist, so no real user was ever locked or guessed.
+
+  - id: probes-code
+    kind: code
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: The three probes
+    body: |
+      **1. The refund abuse-case probe** (`exercises/api/logic_refund_probe.py` is the unsolved version).
+
+      ```python
+      def probe_refunds(desk: RefundDesk) -> list[str]:
+          status, _ = desk.refund("p_4", 1000)                        # control: a normal refund works
+          if status != 200 or desk.total_refunded("p_4") != 1000:
+              raise RuntimeError(f"control failed: a normal refund of 1000 returned {status}")
+          found = []
+          first, _ = desk.refund("p_1", 5000)
+          if first != 200:
+              raise RuntimeError(f"control failed: the first full refund of p_1 returned {first}")
+          second, _ = desk.refund("p_1", 5000)                        # the abuse case: the same refund again
+          if second == 200:
+              found.append("double-refund")
+          declined, _ = desk.refund("p_2", 1000)                      # refund a payment that was declined
+          if declined == 200:
+              found.append("state-bypass")
+          negative, _ = desk.refund("p_3", -500)                      # a negative amount
+          if negative == 200:
+              found.append("negative-amount")
+          return sorted(found)
+      ```
+
+      Each abuse case uses its **own payment**, so one case cannot change the answer of another.
+
+      **2. The race probe** (`exercises/api/logic_race.py`).
+
+      ```python
+      def fire_together(call, n):
+          barrier = threading.Barrier(n)
+          results = [None] * n
+
+          def worker(index):
+              barrier.wait(timeout=5)          # every thread waits here...
+              results[index] = call()          # ...and they all go at once
+
+          threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+          for thread in threads: thread.start()
+          for thread in threads: thread.join(timeout=10)
+          return results
+
+
+      def probe_race(make_desk, workers=2):
+          control = make_desk()
+          first, _ = control.refund(PAYMENT, CAPTURED)
+          second, _ = control.refund(PAYMENT, CAPTURED)
+          if first != 200:
+              raise RuntimeError(f"control failed: the first full refund returned {first}")
+          if second == 200:
+              raise RuntimeError("the second sequential refund already works - that is a double-refund flaw, not a race")
+          desk = make_desk()                   # a FRESH desk for the burst
+          results = fire_together(lambda: desk.refund(PAYMENT, CAPTURED), workers)
+          statuses = sorted(status for status, _ in results)
+          refunded = desk.total_refunded(PAYMENT)
+          return RaceResult(refunded > CAPTURED, statuses, refunded, CAPTURED)
+      ```
+
+      **3. The rate-limit probe** (`exercises/api/logic_rate_limit.py`).
+
+      ```python
+      def probe_login_limit(base_url, attempts=LOGIN_LIMIT + 3):
+          if attempts < 2:
+              raise ValueError("need at least two attempts to see a limit")
+          statuses, first_429_at, retry_after = [], None, None
+          for number in range(1, attempts + 1):
+              resp = _wrong_login(base_url, ACCOUNT_A)
+              if number == 1 and resp.status_code != 401:
+                  raise RuntimeError(f"control failed: a wrong sign-in should answer 401, got {resp.status_code}")
+              statuses.append(resp.status_code)
+              if resp.status_code == 429 and first_429_at is None:
+                  first_429_at = number
+                  header = resp.headers.get("Retry-After")
+                  retry_after = int(header) if header is not None and header.isdigit() else None
+          other = _wrong_login(base_url, ACCOUNT_B).status_code
+          return LimitResult(statuses, first_429_at, retry_after, other)
+      ```
+
+      Running the two probes that need no network (21 November 2026):
+
+      ```python
+      S = {"double-refund", "state-bypass", "negative-amount"}
+      print(probe_refunds(RefundDesk()), probe_refunds(RefundDesk(S)))
+      print(probe_race(lambda: RefundDesk(S)))
+      print(probe_race(lambda: RefundDesk(S | {"race"})))
+      try:
+          probe_race(lambda: RefundDesk())
+      except RuntimeError as e:
+          print("RuntimeError:", e)
+      ```
+
+      ```
+      ['double-refund', 'negative-amount', 'state-bypass'] []
+      RaceResult(vulnerable=True, statuses=[200, 200], refunded=5000, captured=2500)
+      RaceResult(vulnerable=False, statuses=[200, 409], refunded=2500, captured=2500)
+      RuntimeError: the second sequential refund already works - that is a double-refund flaw, not a race
+      ```
+
+      Read the three result lines in turn. The vulnerable desk shows all three flaws, the fixed one none. With the race
+      flaw present, **both** concurrent refunds returned `200` and the total is twice the capture. With check and write
+      made atomic the second request got `409` and the total is exactly the capture. And the last line is the probe
+      refusing to call something a race that is really a missing rule.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Why the important lines are written that way
+    body: |
+      - `desk.refund("p_4", 1000)` with `if status != 200 ...: raise RuntimeError` - the **control**. If a normal refund
+        does not work, then "the second refund was refused" could just mean the desk is down. A probe that cannot set up
+        its precondition must say so, not report "secure".
+      - `first, _ = desk.refund("p_1", 5000)` must be `200` **before** the abuse case. A refused second refund only means
+        something if the first was accepted.
+      - A separate payment for each abuse case (`p_1`, `p_2`, `p_3`) - the cases are independent. Refunding `p_2` cannot
+        change what the `p_1` case sees.
+      - `if second == 200:` - a finding only when the answer is exactly `200`. Any refusal (`409`, `422`, `400`) is the
+        rule working; the probe does not care which number the developers chose.
+      - `barrier.wait(timeout=5)` then `call()` - the barrier is what turns "several threads" into "several threads at
+        the same moment". Without it, thread 1 may finish its whole request before thread 2 starts, and the probe says
+        "safe" for a flawed service. The `timeout` makes a broken barrier fail loudly instead of hanging the test run.
+      - `second == 200: raise RuntimeError("... not a race")` - the **sequential control** inside the race probe. If the
+        second *sequential* refund works, no concurrency is needed to break the rule, and reporting "race" would send the
+        developer looking in the wrong place.
+      - `desk = make_desk()` - a **fresh** desk for the burst, so the control's refunds do not use up the payment.
+      - `RaceResult(refunded > CAPTURED, ...)` - the verdict comes from the **end state**, not from the status codes. Two
+        `200`s could be fine if the payment had been captured for twice as much.
+      - `if number == 1 and resp.status_code != 401: raise` - the rate-limit control: a wrong sign-in must answer `401`. If
+        it answers `200`, `404` or `500`, the endpoint is not behaving like a sign-in and "no `429`" tells you nothing.
+      - `ACCOUNT_A` and `ACCOUNT_B` **do not exist** - the burst cannot lock a real person out or guess a real password.
+      - `other = _wrong_login(base_url, ACCOUNT_B)` is sent *after* A hit the limit: if it is also a `429`, the limit is
+        shared across accounts, which is a denial of service for everybody else.
+      - `header.isdigit()` - `Retry-After` may also be an HTTP date; the probe reads only the seconds form and otherwise
+        records `None`, rather than crashing on a valid header.
+
+  - id: steps
+    kind: steps
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: A procedure you can follow
+    body: |
+      **A. Rules and state (about 60 minutes per feature)**
+
+      1. **Get the rules.** Read the spec, the support playbook and the finance team's reconciliation rules; ask "what
+         must never happen?". Write each rule as one sentence. Two or three rules per function is typical.
+      2. **Draw the state machine** of the object (payment: authorised, captured, declined, refunded). Mark which move is
+         allowed from which state.
+      3. **Write one abuse case per rule** and one per forbidden transition: repeat, wrong state, invalid value, skipped
+         step, edited status field, another user's object.
+      4. **Run a control** (a normal, legitimate request) and record that it works. Run each abuse case once, **in
+         sequence**, and record the status and the end state (read the object back with a `GET`).
+      5. **Check the end state, not just the status.** A `200` that changes nothing and a `409` that changes something are
+         both possible. Read back the amount, the balance, the stock.
+
+      **B. Races (about 30 minutes per function)**
+
+      1. Pick functions of the shape *check, then act* - balance, stock, one-time code, attempt counter, "exactly once"
+         transition. Note any that are slow or send an email or a message afterwards.
+      2. **Agree the burst in writing:** a small number of requests (the WSTG suggests 20 to 30 as an upper range), a
+         test account, a test object, and how side effects will be reversed.
+      3. **Sequential baseline** - send the request twice, one after the other. If the second succeeds, stop: report a
+         missing rule.
+      4. **Burst** - send the same request from several threads or with the tool's parallel feature (Burp Repeater's
+         parallel sending, Turbo Intruder, or a script like `fire_together`). Use the tool's single-packet or
+         last-byte synchronisation mode if the window is small (from the WSTG, not run here).
+      5. **Compare the end state** with the rule. Repeat a few times - races are probabilistic on real systems.
+      6. **Report** the exchanges, the end state before and after, how many times you ran it, and the reproduction rate.
+
+      **C. Rate limits (about 20 minutes per endpoint)**
+
+      1. List endpoints that check a secret or cost money. Choose a **harmless identity** - an account that does not exist,
+         or your own test account - never a customer's.
+      2. Send the agreed number of requests; record each status, the first `429`, `Retry-After`, and one request for a
+         **second** identity afterwards.
+      3. If there is no limit, say how many requests you sent and over how long - "no limit in 8 attempts" is a statement
+         about 8, not a proof about 8,000. Agree before sending more.
+      4. With permission, try the usual bypasses (new session, changed header, same user with changed case) and note what
+         the limit is keyed on.
+      5. **Negative control:** re-run against a build where the flaw is fixed; the probe must be quiet.
+
+  - id: example
+    kind: example
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: A worked example - testing the SandPay refund feature
+    body: |
+      *(A hypothetical engagement on the fictional SandPay, using the practice desk's behaviour. Written permission, a
+      test merchant account and a test tenant are agreed.)*
+
+      **Rules gathered from the spec and from finance:** refunds on captured payments only; total refunds never above the
+      capture; positive integer amounts; a retry with the same idempotency key must not pay twice.
+
+      **Control.** Refund 1000 on a fresh captured payment: `200`, the payment shows 1000 refunded. The feature works.
+
+      **Abuse cases, one after another.**
+
+      | # | Case | What happened (vulnerable build) | Verdict |
+      | --- | --- | --- | --- |
+      | 1 | refund 5000 twice on a payment captured for 5000 | `200` then `200`; total 10000 | **Finding 1** - the total is not checked against the capture |
+      | 2 | refund a declined payment | `200` | **Finding 2** - refunds are not tied to the payment's state |
+      | 3 | refund -500 | `200`; total refunded -500 | **Finding 3** - the amount is not validated; also makes later refunds possible |
+
+      **Race, after fixing finding 1 in a test build.** Sequential: `200` then `409`. Burst of two simultaneous full
+      refunds: `200` and `200`, total 2x the capture. **Finding 4** - the check "is there enough left?" and the write are
+      separate steps. The developers' first fix (check the total twice) did not help; the second, a conditional update
+      with a row lock, did - the burst then gave `200` and `409` and the total equalled the capture.
+
+      **Sign-in.** Eight wrong attempts for a non-existent account, no `429`, no `Retry-After`. **Finding 5** - sign-in has
+      no rate limit. Severity depends on the password policy: with 6-digit PINs, this is critical; with long passwords, it
+      is high. After the fix the sixth attempt got `429` with `Retry-After: 60`, and a second account was unaffected.
+
+      **Report.** Each finding has the rule, the exchange, the end state, the severity, and the fix - written so a
+      developer can turn it into a regression test. The five abuse cases became automated tests that run on every build.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Test cases with expected results and evidence
+    body: |
+      | # | Case | Steps | Expected (secure) | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Control | a normal refund on a captured payment | `200`, refunded amount recorded | request, response, read-back |
+      | 2 | Double refund | refund the full amount, then again | second refused; total unchanged | both exchanges and the total |
+      | 3 | Over-refund in one request | refund more than the capture | refused | request, response |
+      | 4 | Wrong state | refund a declined, authorised-only or fully refunded payment | refused (conflict) | the payment's state and the response |
+      | 5 | Invalid amounts | `-500`, `0`, `1.5`, `"10"`, a huge number, missing | refused (validation error); no change | each request and the read-back |
+      | 6 | Another merchant's payment | refund a payment of merchant B as merchant A | refused as not found or forbidden | exchange (see access control) |
+      | 7 | Skipped or reordered step | call the approval or shipping step without the prior step | refused | the call and the object's state |
+      | 8 | Edited state field | send `status` or `step` in the body | ignored or refused | request, response, read-back |
+      | 9 | Retry safety | repeat the same request with the same idempotency key | same answer, one refund | both exchanges |
+      | 10 | Race | the same full refund from 2 to 5 simultaneous requests (agreed burst) | exactly one succeeds; total <= capture | statuses, end state, number of runs |
+      | 11 | Sign-in rate limit | N wrong attempts for one harmless identity | `429` after the documented number, with `Retry-After` | the statuses, the header |
+      | 12 | Limit is per identity | after the limit, one wrong attempt for a second identity | normal answer, not `429` | the status |
+      | 13 | Limit bypass (permission needed) | new session, changed header or username case | still limited | the requests and responses |
+      | 14 | Negative control | run cases 2, 4, 5, 10 and 11 against a build with the flaws fixed | nothing reported | the same probes, quiet |
+
+      Case 14 keeps the others honest. A probe that also fires against the fixed build is measuring something else - and a
+      race probe that stays quiet on a build you *know* is racy has too small a window or too few requests.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Common mistakes
+    body: |
+      - **Testing only the happy path and the validation.** "The amount must be a number" is not a business rule. "The
+        total refunded must not exceed the capture" is. Start from the rules.
+      - **Trusting the status code.** A `200` with no change, or a `409` that still wrote to the database, both fool a test
+        that reads only the status. Read the object back.
+      - **Calling a missing rule a race.** If the second *sequential* request already succeeds, no concurrency is needed.
+        Run the sequential control first.
+      - **A race test with no synchronisation.** Starting threads in a loop is not "at the same time". Use a barrier, or
+        the tool's parallel mode, and repeat the test; then say how many times you ran it.
+      - **Too big a burst on a real system.** A thousand-request race against a live refund endpoint creates a thousand
+        side effects. Agree a small number, and agree the reversal.
+      - **"No limit" from eight requests.** Eight requests say nothing about a limit at 100 or at 10,000. State what you
+        sent, and ask permission to send more if it matters.
+      - **Rate-limiting by the wrong key.** A limit per IP address is bypassed by a botnet and blocks a whole office; a
+        limit per username is bypassed by trying many usernames. Check what the limit is keyed on, and whether a second
+        identity is affected.
+      - **Locking out real users while testing.** Use identities that do not exist or your own test account.
+      - **Fixing a race by checking twice, sleeping or retrying.** None of them is atomic. The fix is one transaction or one
+        conditional update.
+      - **Fixing the UI, not the server.** Hiding the refund button on a declined order does not stop a direct request.
+      - **Reporting a symptom without the rule.** "Refund returned 200 twice" is weaker than "the rule 'total refunded <=
+        captured' is not enforced; reproduction: ...".
+      - **Forgetting to clean up.** Reverse the test refunds and delete test orders, and tell the owner what moved.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Trade-offs and alternatives
+    body: |
+      | Choice | Advantage | Cost |
+      | --- | --- | --- |
+      | Abuse cases written by hand | find flaws that need business knowledge | slow; depend on the tester knowing the rules |
+      | Property-based or randomised tests of the rules (for example "any sequence of refunds never exceeds the capture") | find combinations nobody imagined | need a model of the rule in code |
+      | Row lock or transaction for atomicity | simple, correct for one database | contention under load; deadlocks if misused |
+      | Conditional update (`WHERE refunded + :a <= captured`) | no explicit lock; one statement | needs the database to support it and the rows-changed count to be checked |
+      | Idempotency key | makes a client's retry safe | does not by itself stop two different requests |
+      | Hard lock-out after N failures | stops guessing completely | a stranger can lock the owner out (denial of service) |
+      | Progressive delay or extra challenge | less harm to the owner | more complex; slows but may not stop a patient attacker |
+      | Rate limit per account only | stops guessing one user | does not stop one source trying many users |
+      | Rate limit per client or IP only | stops one source | shared addresses are blocked together; a botnet gets round it |
+      | Race test in production | the only place with real timing | real duplicates, real money - needs explicit written permission |
+      | Race test in a test environment | safe | timing may differ; a window that is wide in test may be narrow in production |
+
+      **Alternative or complement:** reconciliation. Finance's daily check that "sum of refunds <= sum of captures" per
+      payment finds the damage even when the preventive control failed - a detective control to sit beside the
+      preventive ones, not instead of them.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-logic-rules-and-state, sec-logic-race-conditions, sec-logic-rate-limits]
+    title: Summary
+    body: |
+      - A **business logic flaw** is a business rule the application does not enforce. The code works as written, so
+        scanners see nothing; the testing is manual thinking, then automated repetition.
+      - Start from the **rules**, write one **abuse case** per rule - repeat, wrong state, invalid value, skipped step - and
+        check the **end state**, not only the status code.
+      - State lives on the server. A hidden button or a client-sent `status` field is not a control.
+      - A **race** exists when "check, then act" is two steps. Prove the rule holds **sequentially** first (control), then
+        send several requests **released together** and judge by the **total**; the fix is **atomicity**, not checking twice.
+      - An endpoint with no **rate limit** on a secret or a paid action is vulnerable even when every request is valid
+        (API4:2023, API6:2023). Record the first `429`, `Retry-After`, and whether a **second identity** is affected.
+      - Every probe needs a **control**, a **sequential baseline** and a **negative control** on the fixed build.
+      - Get **written permission**, a **small agreed burst**, test data, and a plan to **reverse** what moved.
+
+exercises:
+  - id: scanner-blind
+    type: mcq
+    concept: sec-logic-rules-and-state
+    skill: analysis
+    title: Why a scanner misses a double refund
+    prompt: |
+      A DAST scan of the refund API reports nothing. A tester then refunds one payment twice and both requests return
+      `200`. Which statement explains the difference?
+    options:
+      - id: rule
+        text: "Every request was well formed; the flaw is a business rule (total refunded <= captured) that no scanner knows, so only a test written from the rule can find it."
+        feedback: "Correct. The WSTG says tools cannot detect a user circumventing a business process - they lack the application's rules."
+      - id: payload
+        text: "The scanner did not use a strong enough injection payload."
+        feedback: "Nothing is injected in a double refund. Stronger payloads would not help."
+      - id: tls
+        text: "The scanner could not read the traffic because of TLS."
+        feedback: "Scanners read TLS traffic fine. The limitation is knowledge of the business rules."
+      - id: speed
+        text: "The scanner sent the requests too slowly."
+        feedback: "Speed is relevant to races, not to a plain double refund that works one request after the other."
+    correct: [rule]
+    hints:
+      - Is there anything malformed in either request?
+      - What does a scanner know about "refunds must not exceed the capture"?
+    solution: |
+      The requests are valid. The flaw is an unenforced business rule, and scanners do not know your rules, so the test
+      must be written from the rule (WSTG business logic introduction).
+
+  - id: status-vs-state
+    type: mcq
+    concept: sec-logic-rules-and-state
+    skill: analysis
+    title: A refused request that still changed something
+    prompt: |
+      You refund `-500` on a payment and get `422`. A read-back of the payment then shows `refunded: -500`. How do you
+      rate it?
+    options:
+      - id: finding
+        text: "A finding - the validation error was returned, but the value was written; the end state shows the rule is not enforced."
+        feedback: "Correct. The verdict comes from the end state. A status code is only what the server says it did."
+      - id: ok
+        text: "Not a finding - the server answered 422."
+        feedback: "The status is evidence of what the server claims. The read-back shows what actually happened."
+      - id: cosmetic
+        text: "A cosmetic issue in the response format."
+        feedback: "The stored amount is wrong. It can be used to create headroom for a later refund."
+      - id: client
+        text: "The client's problem - it should not have sent a negative amount."
+        feedback: "Client behaviour is not a control. The server must enforce the rule on what it stores."
+    correct: [finding]
+    hints:
+      - What did the read-back show?
+      - Which is more reliable - what the server says, or what it stored?
+    solution: The stored value breaks the rule, whatever status was returned. Always read the object back after an abuse case.
+
+  - id: state-skip
+    type: mcq
+    concept: sec-logic-rules-and-state
+    skill: application
+    title: Where must the order of steps be enforced?
+    prompt: |
+      A checkout is "cart, address, payment, confirm". The web app only shows the confirm button after payment. The
+      confirm API has no state check. What do you test, and what is the expected result?
+    options:
+      - id: direct-call
+        text: "Call the confirm endpoint directly for a cart with no payment; expect a refusal because the server checks the order's state."
+        feedback: "Correct. This is WSTG-BUSL-06 and the cheat sheet's 'enforce workflows as explicit state machines'."
+      - id: ui-test
+        text: "Check that the button is hidden in the UI before payment."
+        feedback: "A hidden button is not a control. An attacker does not use your UI."
+      - id: speed-test
+        text: "Measure how long the confirm call takes."
+        feedback: "Timing is a separate concern. This case is about order of steps."
+      - id: tls-test
+        text: "Check that the confirm call uses HTTPS."
+        feedback: "Transport security does not enforce a business sequence."
+    correct: [direct-call]
+    hints:
+      - Who enforces the order if the UI is bypassed?
+    solution: The server must enforce the order. Call the later step directly and expect a refusal.
+
+  - id: toctou-define
+    type: mcq
+    concept: sec-logic-race-conditions
+    skill: recognition
+    title: Which operation is a race candidate?
+    prompt: Which of these is the best candidate for a race condition test?
+    options:
+      - id: redeem
+        text: "Redeem a single-use gift card: read the balance, check it is enough, then deduct."
+        feedback: "Correct. Check-then-act on a shared value, and the thing that must happen once. Two simultaneous redemptions can both pass the check."
+      - id: static
+        text: "Fetch the terms and conditions page."
+        feedback: "A read-only request with no state change cannot go wrong by overlapping."
+      - id: health
+        text: "Call GET /health."
+        feedback: "A health check changes nothing, so there is nothing to race."
+      - id: logout
+        text: "Sign out (delete the caller's own session)."
+        feedback: "Two sign-outs of the same session end in the same state - the operation is naturally safe to repeat."
+    correct: [redeem]
+    hints:
+      - Which operation reads a value, decides, and then writes?
+    solution: The gift card redemption has the check-then-act shape on a shared value that must change once.
+
+  - id: race-verdict
+    type: mcq
+    concept: sec-logic-race-conditions
+    skill: analysis
+    title: Reading a race test result
+    prompt: |
+      A payment was captured for 2500. A burst of two simultaneous full refunds returns `200` and `409`. A second burst
+      on a fresh payment returns `200` and `200`, and the read-back shows 5000 refunded. What is your conclusion?
+    options:
+      - id: race-found
+        text: "The rule holds sometimes and breaks sometimes, so there is a race; the 5000 total is the proof, and the first run only means the window was missed."
+        feedback: "Correct. Races are probabilistic. One safe-looking run proves nothing; one broken total proves the flaw."
+      - id: safe
+        text: "Secure - the first burst was refused correctly."
+        feedback: "A single quiet run does not clear a race. The second run produced a total double the capture."
+      - id: server-bug
+        text: "A flaw in the testing tool, because the same request cannot give two results."
+        feedback: "The same request legitimately gives different results when its outcome depends on timing - that is the definition of a race."
+      - id: double-flaw
+        text: "A missing double-refund rule, not a race."
+        feedback: "A missing rule would also fail the sequential control. Here the first burst refused one of the requests, so the rule exists."
+    correct: [race-found]
+    hints:
+      - Can a rule that is always enforced give different results for identical requests?
+      - Which result is the evidence - the quiet one or the broken one?
+    solution: Different outcomes for the same request point to timing. The total above the capture proves it; repeat the test and report the rate.
+
+  - id: atomic-fix
+    type: mcq
+    concept: sec-logic-race-conditions
+    skill: application
+    title: Which fix actually removes the race?
+    prompt: A developer proposes four fixes for the double refund race. Which one is correct?
+    options:
+      - id: conditional-update
+        text: "One conditional update that adds the amount only if the total stays within the capture, and refuse the request when no row changed."
+        feedback: "Correct. The check and the write are one atomic statement, so two requests cannot both pass the check."
+      - id: check-twice
+        text: "Check the remaining amount a second time just before writing."
+        feedback: "A second check is still separate from the write. The window is smaller, not gone."
+      - id: retry
+        text: "If the refund fails, retry it automatically."
+        feedback: "Retries add more requests. They do not make the check and the write atomic."
+      - id: sleep
+        text: "Wait 100 ms between the check and the write so the first request finishes."
+        feedback: "A delay widens the window for another request. Nothing about it is atomic."
+    correct: [conditional-update]
+    hints:
+      - What would make "check" and "write" impossible to separate?
+    solution: Make check and write one atomic step - a transaction with a lock or a conditional update - and test the rows changed.
+
+  - id: idem-vs-race
+    type: mcq
+    concept: sec-logic-race-conditions
+    skill: recognition
+    title: Does an idempotency key stop this?
+    prompt: |
+      Refunds require an `Idempotency-Key` header. Two different clients send two refunds, each with its own key, for the
+      same payment at the same moment. What does the key do?
+    options:
+      - id: nothing
+        text: "Nothing for this case - the keys differ, so both requests are 'new'; the race on the payment total remains."
+        feedback: "Correct. An idempotency key makes the retry of ONE request safe; it does not coordinate different requests."
+      - id: stops
+        text: "It stops the second request, because only one refund per payment is allowed per key."
+        feedback: "Keys are per request, not per payment. Different keys are different requests."
+      - id: both
+        text: "It makes both requests succeed and merges them."
+        feedback: "Idempotency does not merge distinct requests."
+      - id: tls
+        text: "It is only an authentication header."
+        feedback: "The key identifies a request for safe retry; it is not authentication."
+    correct: [nothing]
+    hints:
+      - What does the key identify - a request, or a payment?
+    solution: The key protects retries of the same request. The payment total still needs an atomic check and write.
+
+  - id: first-429
+    type: mcq
+    concept: sec-logic-rate-limits
+    skill: analysis
+    title: What the statuses say
+    prompt: |
+      You send eight wrong sign-ins for an account that does not exist and get `401` eight times. Then you send one for
+      another non-existent account and get `401`. Which statement is best supported?
+    options:
+      - id: no-limit-seen
+        text: "No rate limit was observed within eight attempts per account; that is a finding for this endpoint, with the caveat that more requests were not sent."
+        feedback: "Correct. State what you sent. Eight attempts show no limit at eight; ask permission before sending thousands."
+      - id: proven
+        text: "The endpoint has no rate limit at any number of attempts."
+        feedback: "Eight requests cannot prove anything about eight thousand. Be exact about what you measured."
+      - id: secure
+        text: "The endpoint is secure because every answer was 401."
+        feedback: "A 401 for every wrong password is the problem: nothing slows a guesser down."
+      - id: blocked
+        text: "The second account was blocked."
+        feedback: "It returned 401, a normal wrong-password answer. It was not blocked."
+    correct: [no-limit-seen]
+    hints:
+      - What is the difference between "no 429 in 8" and "no 429 ever"?
+    solution: Report the observation precisely (no 429 in 8 attempts), classify it as a missing limit for the burst tested, and ask before sending more.
+
+  - id: limit-key
+    type: mcq
+    concept: sec-logic-rate-limits
+    skill: analysis
+    title: What is the limit keyed on?
+    prompt: |
+      A sign-in limit counts attempts per **source IP address** only. Which two problems should a tester look for?
+    options:
+      - id: botnet-and-office
+        text: "An attacker with many addresses is never limited, and many honest users behind one shared address are limited together."
+        feedback: "Correct. A single key has failure modes in both directions - too weak against distribution, too harsh for shared addresses."
+      - id: none
+        text: "None - the IP address is the best possible key."
+        feedback: "No single key is best. Account, client and address limits protect against different attacks."
+      - id: tls
+        text: "The limit will also break HTTPS."
+        feedback: "The key has nothing to do with TLS."
+      - id: slow
+        text: "The sign-in page will load more slowly."
+        feedback: "Performance is not the concern. The issue is who the limit does and does not stop."
+    correct: [botnet-and-office]
+    hints:
+      - Who shares an IP address? Who can use many?
+    solution: Per-IP limits miss distributed attackers and punish shared addresses; combine per-account and per-client controls.
+
+  - id: sensitive-flow
+    type: mcq
+    concept: sec-logic-rate-limits
+    skill: recognition
+    title: What makes a flow "sensitive" in API6:2023?
+    prompt: According to OWASP API6:2023, when is an endpoint vulnerable?
+    options:
+      - id: excess
+        text: "When it exposes a business flow whose excessive access harms the business - for example buying all the stock or reserving every slot - without appropriately restricting access to it."
+        feedback: "Correct. The harm comes from the volume or automation of valid requests."
+      - id: invalid
+        text: "Only when it accepts invalid input."
+        feedback: "API6 is about valid requests used excessively."
+      - id: nohttps
+        text: "Only when it does not use HTTPS."
+        feedback: "Transport security is a separate risk."
+      - id: auth
+        text: "Only when it has no authentication."
+        feedback: "An authenticated user can still abuse a flow at scale."
+    correct: [excess]
+    hints:
+      - Think of scalping and spam - is any single request wrong?
+    solution: A flow is sensitive when excessive access harms the business; the API is vulnerable if it exposes such a flow without restricting access.
+
+  - id: test-order
+    type: order
+    concept: sec-logic-race-conditions
+    skill: application
+    title: Run a race test in a trustworthy order
+    prompt: Put the steps of a race test for a refund endpoint in order.
+    items:
+      - id: rules
+        text: Write down the rule ("total refunded <= captured") and agree the burst size, test data and reversal in writing
+      - id: control
+        text: Send one normal refund and confirm it works and the read-back matches
+      - id: sequential
+        text: Send the full refund twice in sequence and confirm the second is refused
+      - id: burst
+        text: Send the same full refund from several threads released together
+      - id: end-state
+        text: Read the payment back and compare the total refunded with the capture
+      - id: repeat
+        text: Repeat the burst several times and note how often the rule breaks
+      - id: cleanup
+        text: Reverse the test refunds and report the exchanges, the end state and the rate
+    hints:
+      - You cannot interpret a burst until you know the normal behaviour.
+      - Clean up last, but plan it first.
+    solution: |
+      Rules and permission first, then the control, then the sequential baseline (so a missing rule is not mistaken for a
+      race), then the burst, the end-state comparison, repetition for the rate, and cleanup with the report.
+
+  - id: limit-debug
+    type: debug
+    concept: sec-logic-race-conditions
+    skill: analysis
+    title: Which line is the race?
+    prompt: |
+      This function performs a refund. Two requests for the same payment can both succeed even though the rule says the
+      total must not exceed the capture. Pick the line that makes it possible.
+    language: python
+    code: |
+      def refund(payment_id, amount):
+          payment = db.get(payment_id)
+          left = payment.captured - payment.refunded
+          if amount > left:
+              return 409
+          db.save(payment_id, refunded=payment.refunded + amount)
+          return 200
+    correctLines: [6]
+    hints:
+      - Which line writes a value computed from an earlier read?
+      - What happens if another request reads between the check and this line?
+    lineNotes:
+      - line: 2
+        note: Reading the payment is normal. The problem is using it later as if nothing changed.
+      - line: 4
+        note: The check is correct for one request. It is the gap between the check and the write that breaks it.
+      - line: 5
+        note: Refusing on a failed check is right.
+    solution: |
+      Line 6 writes `payment.refunded + amount` using the value read on line 2. Another request may have written in the
+      meantime, so this overwrites it and both pass the check. The fix is one atomic step - a locked transaction, or an
+      update that adds the amount only when `refunded + amount <= captured` and then checks the rows changed.
+
+  - id: abuse-short
+    type: short
+    concept: sec-logic-rules-and-state
+    skill: analysis
+    title: Write the abuse cases for a coupon
+    prompt: |
+      SandPay lets a merchant apply a promotional coupon "once per account, 10% off the next fee invoice, not combinable
+      with other coupons". Write the business rules and one abuse case for each, with the expected result.
+    modelAnswer: |
+      Rules and abuse cases:
+
+      1. **Once per account** - apply the same coupon twice, in sequence (expect the second refused), and from two
+         simultaneous requests (expect exactly one to succeed). Also: apply it from two sessions, and as a second user of
+         the same merchant account.
+      2. **10 percent off the next invoice only** - apply it, then check that the discount is exactly 10 percent of the
+         next invoice and not of earlier ones; send a different discount value in the request body (expect it ignored).
+      3. **Not combinable** - apply coupon A, then coupon B (expect the second refused); apply B then A; apply both
+         simultaneously.
+      4. **Valid coupon and state** - an expired coupon, a coupon of another merchant, a cancelled invoice (expect
+         refusals).
+
+      Each case ends with a read-back of the invoice and the coupon's state - the end state, not just the status.
+    rubric:
+      - Turns the sentence into separate rules (once per account, amount, not combinable).
+      - Includes a sequential repeat and a simultaneous repeat for the once-only rule.
+      - Tests that the server ignores a client-sent discount value.
+      - Checks the end state with a read-back.
+    hints:
+      - Split the sentence at each "and" and "not".
+      - What happens if two requests arrive together?
+    solution: One abuse case per rule - repeat in sequence and in parallel, an altered discount value, a second coupon in both orders - and read the invoice back after each.
+
+  - id: refund-testdesign
+    type: testdesign
+    concept: sec-logic-rules-and-state
+    skill: application
+    title: Test plan for the SandPay refund and sign-in
+    prompt: |
+      The SandPay merchant API has `POST /v1/payments/{id}/refunds` (full or partial refunds, `Idempotency-Key` header
+      supported) and `POST /v1/login` (documented limit: 5 wrong attempts per account per minute, then `429` with
+      `Retry-After`). Design the test cases - preconditions, steps, expected result and evidence for each.
+    modelAnswer: |
+      Preconditions for all: written scope and permission, a test merchant and test payments (captured, declined,
+      fully refunded), a way to read each payment back, an agreed burst size (for example 5) and a plan to reverse
+      test refunds.
+
+      1. **Control** - refund a captured payment partially. Expected: success; the read-back shows the amount.
+      2. **Total limit** - refund the remainder, then one more unit. Expected: the last is refused; total = capture.
+      3. **Double full refund** - same full refund twice. Expected: second refused; total unchanged.
+      4. **State** - refund a declined payment and a fully refunded one. Expected: refused.
+      5. **Amounts** - `-500`, `0`, `1.5`, a string, a value above the capture, a missing amount. Expected: validation errors; no change.
+      6. **Ownership** - refund merchant B's payment as merchant A. Expected: not found or forbidden.
+      7. **Idempotency** - repeat one request with the same key and body; then the same key with a different amount.
+         Expected: same result and one refund; the changed body is refused or returns the original result.
+      8. **Race** - after case 3 passes, send the same full refund from 2 to 5 threads released together; repeat. Expected:
+         exactly one success; total never above the capture. Evidence: statuses, read-back, number of runs.
+      9. **Sign-in limit** - 8 wrong attempts for one harmless identity. Expected: the sixth is `429` with `Retry-After`.
+      10. **Limit scope** - one wrong attempt for another identity afterwards. Expected: normal `401`.
+      11. **Limit bypass (with permission)** - new session, header changes, username with another case. Expected: still limited.
+      12. **Negative control** - the same probes on a build with the flaws fixed. Expected: quiet.
+    rubric:
+      - Starts from the rules (limit, state, amount, ownership) and includes a control request.
+      - Covers double refund, wrong state and invalid amounts with a read-back of the end state.
+      - Includes an idempotency test and a race test with a small agreed burst and repetition.
+      - Tests the sign-in limit with a harmless identity, the Retry-After header and a second identity.
+      - Mentions permission, test data, cleanup and a negative control.
+    hints:
+      - List the rules first, then one abuse case per rule.
+      - Which cases need a read-back, and which need a burst?
+    solution: Rules first, a control, one abuse case per rule with read-backs, an idempotency check, a small repeated race, the sign-in limit with a second identity, and a negative control.
+
+  - id: interview-logic
+    type: interview
+    concept: sec-logic-race-conditions
+    skill: analysis
+    title: 'Interview: how do you find a race condition in a payment API?'
+    prompt: '"A customer says they were refunded twice for one payment. Walk me through how you would investigate and test for it."'
+    modelAnswer: |
+      I start from the rule: the total refunded for a payment must never exceed what was captured. I reproduce the report
+      in the simplest way first - the same refund twice in sequence, with a control that a normal refund works. If the
+      second request succeeds, the rule is simply missing, and that is the finding; no concurrency is needed.
+
+      If the sequential case is refused, I suspect a race: the check and the write are separate steps. I look for the
+      shape "read, decide, write", and for slow steps or follow-up jobs that widen the window. With written permission and
+      a test payment I send the same request from a small number of threads released together - or with the tool's
+      parallel or single-packet mode if the window is small - and compare the **end state** with the rule, not just the
+      status codes. I repeat it, because races are probabilistic, and report the rate.
+
+      For the fix I would look for atomicity - a transaction with a lock or a conditional update that checks the rows
+      changed - not a second check or a retry. An idempotency key helps with retries but does not coordinate two different
+      requests. Finally I automate the sequential case and the burst as regression tests, with a negative control on the
+      fixed build, and ask finance to reconcile refunds against captures as a detective control.
+    rubric:
+      - Starts from the rule and reproduces sequentially first (a missing rule is not a race).
+      - Describes a controlled burst with permission, test data and a small size, and judges by the end state.
+      - Notes that races are probabilistic and need repetition.
+      - Names atomicity (lock or conditional update) as the fix and explains idempotency's limits.
+      - Mentions regression tests and a negative control.
+    followUps:
+      - What if the window is too small to hit over the network?
+      - How would you test it if refunds are processed through a queue?
+      - How would you protect production while testing?
+    hints:
+      - Rule, sequential, concurrent, end state, fix, regression.
+    solution: Rule, sequential control, small agreed burst judged by end state, repetition, atomic fix, regression test with a negative control.
+
+  - id: refund-code
+    type: coding
+    concept: sec-logic-rules-and-state
+    skill: application
+    title: Write the refund abuse-case probe
+    prompt: |
+      In `practice/security/exercises/api/logic_refund_probe.py`, implement `probe_refunds`. The tests run it on the
+      in-process `RefundDesk`: it must report `double-refund`, `state-bypass` and `negative-amount` on the vulnerable
+      desk, report each one alone when only that flaw is present, report nothing when all three rules are enforced, and
+      raise `RuntimeError` instead of a verdict when the control request fails.
+    project: security
+    files: [exercises/api/logic_refund_probe.py]
+    test: tests/api/test_logic_refund_probe.py
+    command: .venv/bin/python -m pytest tests/api/test_logic_refund_probe.py
+    modelAnswer: |
+      ```python
+      status, _ = desk.refund("p_4", 1000)
+      if status != 200 or desk.total_refunded("p_4") != 1000:
+          raise RuntimeError("control failed")
+      found = []
+      first, _ = desk.refund("p_1", 5000)
+      if first != 200:
+          raise RuntimeError("control failed")
+      if desk.refund("p_1", 5000)[0] == 200:
+          found.append("double-refund")
+      if desk.refund("p_2", 1000)[0] == 200:
+          found.append("state-bypass")
+      if desk.refund("p_3", -500)[0] == 200:
+          found.append("negative-amount")
+      return sorted(found)
+      ```
+
+      Each abuse case has its own payment. A case is a finding only when the answer is exactly `200`, and the control
+      comes before any abuse case.
+    rubric:
+      - Every test in tests/api/test_logic_refund_probe.py passes.
+      - A control refund is made first and a failure raises RuntimeError.
+      - The double refund case checks that the first refund worked before judging the second.
+      - Each abuse case uses its own payment and counts only a 200 as a finding.
+      - It reports nothing against the desk with every rule enforced.
+    hints:
+      - Use p_1, p_2, p_3 and p_4 for four independent cases.
+      - Return the ids sorted.
+    solution: Control on p_4, the full refund twice on p_1, a declined p_2, a negative amount on p_3 - a finding only on 200 - and return the ids sorted.
+
+  - id: race-code
+    type: coding
+    concept: sec-logic-race-conditions
+    skill: application
+    title: Write the race probe
+    prompt: |
+      In `practice/security/exercises/api/logic_race.py`, implement `fire_together` and `probe_race`. The tests check
+      that the calls really start together (a `threading.Barrier`), that the probe finds the race when the check and the
+      write are separate steps, stays quiet when they are atomic, refuses to call a missing rule a race, and uses a fresh
+      desk for the burst.
+    project: security
+    files: [exercises/api/logic_race.py]
+    test: tests/api/test_logic_race.py
+    command: .venv/bin/python -m pytest tests/api/test_logic_race.py
+    modelAnswer: |
+      ```python
+      def fire_together(call, n):
+          barrier = threading.Barrier(n)
+          results = [None] * n
+          def worker(i):
+              barrier.wait(timeout=5)
+              results[i] = call()
+          threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+          for t in threads: t.start()
+          for t in threads: t.join(timeout=10)
+          return results
+      ```
+
+      `probe_race` runs two sequential refunds on one fresh desk (the second must be refused, else raise), then fires the
+      burst on another fresh desk, and decides from `desk.total_refunded(PAYMENT) > CAPTURED`.
+    rubric:
+      - Every test in tests/api/test_logic_race.py passes.
+      - fire_together releases all threads at the same moment with a barrier and joins them.
+      - The sequential control runs first and a succeeding second refund raises RuntimeError.
+      - The burst runs on a fresh desk and the verdict comes from the total refunded, not the statuses.
+      - It reports nothing when check and write are atomic.
+    hints:
+      - Threads that are only started in a loop do not start together - use a barrier.
+      - Compare the total with CAPTURED.
+      - ValueError for fewer than two workers.
+    solution: A barrier-released burst, a sequential control that rejects a missing rule, a fresh desk for the burst, and a verdict from the total refunded.
+
+  - id: limit-code
+    type: coding
+    concept: sec-logic-rate-limits
+    skill: application
+    title: Write the rate-limit probe
+    prompt: |
+      In `practice/security/exercises/api/logic_rate_limit.py`, implement `probe_login_limit` and `assess`. The tests run
+      the probe against the loopback portal: on `make_app()` it must see no `429` in eight attempts and `assess` must
+      return `no-rate-limit`; on `make_app({"no-rate-limit"})` it must see the first `429` on attempt 6, read
+      `Retry-After`, see that a second account is not affected, and `assess` must return `None`.
+    project: security
+    files: [exercises/api/logic_rate_limit.py]
+    test: tests/api/test_logic_rate_limit.py
+    command: .venv/bin/python -m pytest tests/api/test_logic_rate_limit.py
+    modelAnswer: |
+      ```python
+      for number in range(1, attempts + 1):
+          resp = _wrong_login(base_url, ACCOUNT_A)
+          if number == 1 and resp.status_code != 401:
+              raise RuntimeError("control failed")
+          statuses.append(resp.status_code)
+          if resp.status_code == 429 and first_429_at is None:
+              first_429_at = number
+              header = resp.headers.get("Retry-After")
+              retry_after = int(header) if header is not None and header.isdigit() else None
+      other = _wrong_login(base_url, ACCOUNT_B).status_code
+
+      def assess(result):
+          if not result.limited:
+              return "no-rate-limit"
+          if result.other_account_status == 429:
+              return "shared-lockout"
+          return None
+      ```
+
+      The accounts do not exist, the first attempt is the control, and the second account is tried only after the first
+      reached its limit.
+    rubric:
+      - Every test in tests/api/test_logic_rate_limit.py passes.
+      - The first wrong sign-in is a control (401) and a failure raises RuntimeError.
+      - It records the number of the first 429 and the Retry-After seconds.
+      - It tries a second account after the first one's burst.
+      - assess separates a missing limit, a shared lock-out and a healthy limit, and is quiet on the fixed portal.
+    hints:
+      - Use the two account constants - they do not exist, so no real user is affected.
+      - Retry-After is a string; convert it only when it is all digits.
+    solution: Wrong sign-ins for account A with a 401 control, record the first 429 and Retry-After, try account B afterwards, and let assess classify missing, shared and healthy.
+
+placement:
+  - id: place-rule
+    type: mcq
+    concept: sec-logic-rules-and-state
+    skill: analysis
+    title: Is the refund endpoint sound?
+    prompt: |
+      You refund a captured payment of 5000 for 5000 and get `200`. You send the same request again and get `200`, and the
+      payment now shows 10000 refunded. Verdict?
+    options:
+      - id: missing-rule
+        text: "Vulnerable - the rule that refunds cannot exceed the capture is not enforced; no concurrency was needed."
+        feedback: "Correct. The second sequential request succeeded, so the rule is missing - a double refund."
+      - id: race
+        text: "A race condition - two requests overlapped."
+        feedback: "The requests were sent one after the other. A race needs overlap; this is a missing rule."
+      - id: fine
+        text: "Sound - both requests returned 200."
+        feedback: "Both succeeding is the problem. The total exceeds what was captured."
+    correct: [missing-rule]
+    solution: The second sequential refund succeeded and the total exceeds the capture - the rule is missing, which is simpler than a race.
+
+  - id: place-race
+    type: mcq
+    concept: sec-logic-race-conditions
+    skill: analysis
+    title: Why does the same request give two answers?
+    prompt: |
+      The second sequential refund is refused. Two simultaneous refunds both return `200` and the total is double the
+      capture. What explains it?
+    options:
+      - id: toctou
+        text: "The check and the write are separate steps, so both requests pass the check before either writes (time of check to time of use)."
+        feedback: "Correct. The rule exists, but it is checked against a value that is stale by the time of the write."
+      - id: missing
+        text: "The rule is missing entirely."
+        feedback: "A missing rule would fail the sequential test too. Here the sequential case is refused."
+      - id: tls
+        text: "TLS reordered the packets."
+        feedback: "Transport does not change what the application decides. The gap is in the application's own steps."
+    correct: [toctou]
+    solution: The rule holds sequentially but not under overlap - the check and the write are not atomic.
+
+  - id: place-limit
+    type: mcq
+    concept: sec-logic-rate-limits
+    skill: analysis
+    title: What does this rate-limit result show?
+    prompt: |
+      After the limit of five attempts, the sixth wrong sign-in for account A returns `429` with `Retry-After: 60`. A wrong
+      sign-in for account B immediately afterwards returns `429` as well. Verdict?
+    options:
+      - id: shared
+        text: "A finding - the limit is shared across accounts, so one source can lock everybody out (denial of service)."
+        feedback: "Correct. A healthy per-account limit leaves account B with a normal 401."
+      - id: healthy
+        text: "Healthy - the limit works."
+        feedback: "It works too broadly. Another account should not be affected by A's attempts."
+      - id: none
+        text: "No rate limit exists."
+        feedback: "A 429 shows a limit exists. The issue is what it is keyed on."
+    correct: [shared]
+    solution: The limit should be per identity; a 429 for a different account means the counter is shared.
+
+recall:
+  - id: recall-rule
+    concept: sec-logic-rules-and-state
+    prompt: Why can a scanner not find a business logic flaw, and where do you start instead?
+    answer: Every request is valid and nothing is injected - the flaw is a business rule the application does not enforce, and the scanner does not know the rules. Start from the rules, write one abuse case per rule, and check the end state.
+  - id: recall-state
+    concept: sec-logic-rules-and-state
+    prompt: Where must the order of steps and the state of an object be enforced, and why?
+    answer: On the server, as an explicit state machine. The client, a hidden button or a client-sent status field is input, not truth - an attacker calls the later endpoint directly (WSTG-BUSL-06, the cheat sheet).
+  - id: recall-toctou
+    concept: sec-logic-race-conditions
+    prompt: What is TOCTOU and what shape of operation is a race candidate?
+    answer: Time of check to time of use - the gap between looking at a value and changing it. Any "check a condition, then act" on a shared value - balance, stock, one-time code, attempt counter, exactly-once transition.
+  - id: recall-race-proof
+    concept: sec-logic-race-conditions
+    prompt: In what order do you prove a race, and what is the verdict based on?
+    answer: Control, sequential baseline (a succeeding second request means a missing rule, not a race), then a small burst released together, repeated. The verdict is the end state compared with the rule, not the status codes.
+  - id: recall-atomic
+    concept: sec-logic-race-conditions
+    prompt: What fixes a race, and what does not?
+    answer: Making check and write one atomic step - a locked transaction or a conditional update with the rows-changed check. Checking twice, sleeping, retrying and idempotency keys alone do not.
+  - id: recall-limit
+    concept: sec-logic-rate-limits
+    prompt: What four things do you record in a sign-in rate-limit test?
+    answer: The statuses of N attempts for one harmless identity, the number of the first 429, the Retry-After header, and what a second identity sees afterwards. Also state how many requests you sent.
+  - id: recall-safe
+    concept: sec-logic-rate-limits
+    prompt: How do you keep a rate-limit or race test safe?
+    answer: Written permission and scope, test identities and test data (accounts that do not exist for sign-in), a small agreed burst (the WSTG suggests 20 to 30 at most), a plan to reverse side effects, and a negative control on a fixed build.
+
+next:
+  - owasp-api-security-top-10
+  - testing-mass-assignment-and-data-exposure
+  - security-regression-automation
+  - payments-security-testing

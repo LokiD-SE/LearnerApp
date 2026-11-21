@@ -1,0 +1,1487 @@
+id: locust-load-shapes
+title: 'Load shapes - steps, spikes and soak'
+subject: performance-testing
+module: locust
+level: intermediate
+status: published
+estimatedMinutes: 140
+summary: 'Take control of how many Locust users run, and when. A LoadTestShape class has one method, tick(), that Locust calls about once a second; it returns the user count and spawn rate to aim for, or None to end the test. This lesson builds step, spike and soak profiles from a plain list of stages, shows what Locust does with -u, -r and -t when a shape is present (ignores them - and a shape that never returns None never ends), why a stage whose users cannot be started in time is replaced half-way, how get_current_user_count() lets a stage start its clock only when its users are running, and how to read a run by phase from the history CSV instead of the windowed columns. Every run shown is real Locust 2.47.0 against the local SandPay practice API.'
+tags:
+  [
+    Locust,
+    LoadTestShape,
+    tick,
+    get_run_time,
+    get_current_user_count,
+    spawn rate,
+    ramp-up,
+    step load,
+    spike test,
+    soak test,
+    endurance test,
+    stages,
+    load profile,
+    user_classes,
+    stats history,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Locust 2.47.0 on Python 3.12.3 with pytest 9.2.0, in `practice/perf/.venv`. Locust runs headless in a
+    subprocess (`support/load_tools.py` -> `run_locust`, or the `locust` command), with `--csv` so it writes
+    `<prefix>_stats_history.csv` (one row per second) and `--json-file` for the final totals. Every output in this
+    lesson was produced on Linux on 21 November 2026. The machine name that Locust prints in its log lines is
+    replaced by `HOST`.
+  - **Target (loopback only, synthetic data):** `practice/perf/support/sandpay_target.py`, the shared SandPay practice
+    API. The runs that need a ceiling use `TargetConfig(latency_ms=20, capacity=4)`: at most 4 requests are served at
+    once and each takes about 20 ms of service time, so the API tops out near 4 / 0.020 = 200 requests per second and
+    queues the rest (a worker pool of fixed size - [Little's law and workload models](#/lesson/littles-law-and-workload-models)).
+    The step-load exercise uses `latency_ms=5`.
+  - **Demonstration files (written for this lesson, in `practice/perf/support/`):** `lc_shape_users.py` (the
+    `Dashboard` user), `lc_shape_spike.py`, `lc_shape_slowramp.py` and `lc_shape_patient.py` (one shape each). A run
+    names two files, `-f lc_shape_users.py,lc_shape_spike.py`.
+  - **What varies:** requests per second depend on the machine, so the request counts and rates printed differ from run
+    to run. What does not vary: which user counts appear, in which order, when each stage starts (to the nearest
+    second, because `tick()` runs about once a second), and that a shape without an end never ends.
+  - **Synthetic data:** SandPay is a fictional payments company; `merchant-1` ... `merchant-50` and their secrets are
+    invented for this practice project.
+  - **Sources, as documented on 21 November 2026:** Locust 2.47.0 documentation -
+    [Configuration](https://docs.locust.io/en/2.47.0/configuration.html) (the sections "Custom load shapes", "Combining
+    Users with different load profiles", "Restricting which user types to spawn in each tick", "Reusing common options in
+    custom shapes", "Save test statistics in CSV format", and the command line options for `-u`, `-r`, `-t` and workers)
+    and the [API reference](https://docs.locust.io/en/2.47.0/api.html) (`LoadTestShape`). Quotations are from those pages.
+  - **Read from Locust 2.47.0's own source, not from the docs:** `locust/runners.py` (`shape_worker`: the once-a-second
+    loop, a changed tuple calls `start()`, `None` stops the test), `locust/main.py` (with a shape, `-u -r -t` are ignored
+    with a warning; the `-t` timer is armed only after the shape has finished) and `locust/stats.py` (the 10-second window
+    of the history columns). Each of these is also shown by a real run below.
+  - **Not run here:** the Locust project's example shapes on GitHub that the documentation names (a double wave, "time
+    based stages like K6", a "step load pattern like Visual Studio") - they are mentioned, not run.
+  - **Not repeated here:** users, tasks and `wait_time` - [Locust fundamentals](#/lesson/locust-fundamentals); what a
+    spike, soak or stress test is for - [Types of performance testing](#/lesson/performance-testing-types); why the
+    request rate stops growing at a ceiling - [Little's law and workload models](#/lesson/littles-law-and-workload-models);
+    percentiles - [Performance metrics and percentiles](#/lesson/performance-metrics-and-percentiles).
+
+prerequisites:
+  - locust-fundamentals
+  - performance-testing-types
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-lcshape-tick
+    name: The tick contract of a LoadTestShape
+    summary: 'A class that inherits LoadTestShape and defines tick() takes over the user count. Locust calls tick() about once a second; it returns (user_count, spawn_rate) - optionally with a third element, a list of User classes - or None. None stops the test. When the tuple differs from the last one, the runner starts or stops users to reach the new count at the spawn rate; an unchanged tuple does nothing. get_run_time() is the clock. With a shape present, -u, -r and -t are ignored (Locust logs a warning), so the shape alone decides how long the test runs - and a shape that never returns None never ends. Several shapes can sit in different files, picked by the -f list; a reusable base class needs abstract = True.'
+  - id: perf-lcshape-profiles
+    name: Building step, spike and soak profiles from stages
+    summary: 'A profile is data: a list of stages, each {"duration": end second, "users": n, "spawn_rate": r}. "duration" is the end of the stage since the test started (cumulative), not its length - writing lengths there is the classic mistake. The same tick() loop serves every profile; only the list changes. A step load climbs in equal stages to find where a system degrades; a spike jumps to a high count and back to see how the system takes and recovers from a burst; a soak holds a moderate count for hours to expose leaks and drift; a ramp or wave follows a daily pattern. Keep the plan as data so a plan can be checked, reviewed and reused before it costs a test run.'
+  - id: perf-lcshape-ramp-reading
+    name: Ramps that fit, and reading a run by phase
+    summary: 'Locust starts and stops users at spawn_rate per second, so a stage that asks for N more users needs N / spawn_rate seconds. If that is longer than the stage, the next stage replaces it and the target is never reached - the run looks like a test of a smaller load than the plan says. A plan check (ramp seconds against stage length) finds this before the run; get_current_user_count() lets a stage start its clock only when its users are running. To read the result, split the history CSV into phases by user count and use the growth of "Total Request Count" for the rate: the Requests/s and percentile columns are a 10-second sliding window, so they smear a short spike across the stages after it.'
+
+objectives:
+  - Write a LoadTestShape whose tick() follows a list of stages and returns None after the last one, and explain what Locust does with -u, -r and -t when a shape is present.
+  - Build a step-load, a spike and a soak profile as data, using cumulative end times, and check a plan for stages that can never be reached or whose ramp cannot finish.
+  - Compute how long a ramp takes from the user counts and the spawn rate, and use get_current_user_count() so a stage's clock starts when its users are running.
+  - Split a Locust stats history into phases by user count and read each phase's request rate from the running total instead of the windowed columns.
+  - Combine a user file with a shape file, and restrict which User classes run in a tick.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: The idea in plain language
+    body: |
+      A plain Locust test is a single instruction to a stadium steward: "let in 200 people, 5 a second, and close the
+      gates after ten minutes". That is enough to ask "can the stadium hold 200 people?". It cannot ask the questions
+      that decide a payments launch:
+
+      - "What happens when 40 people rush a gate at once, then leave?" (a **spike**)
+      - "At which crowd size do the queues start?" (a **step** load: let in 20, wait, let in 20 more, wait...)
+      - "Is anything wrong after the same steady crowd has been inside for eight hours?" (a **soak**)
+
+      A **load shape** replaces the single instruction with a steward who looks at the clock every second and
+      decides: "How many people should be inside right now, and how fast should I let people in or out?" The steward is
+      your `tick()` method. When the steward has no more instructions, the match is over.
+
+      Two things go wrong in practice, and the rest of the lesson is about them:
+
+      1. **The instructions cannot be carried out.** Telling the steward "have 10 people inside by second 3" while
+         letting only one person in per second means the target is never met - and the plan you thought you tested was
+         not the one that ran.
+      2. **The result is read through a smeared window.** The scoreboard shows the average of the last ten seconds, so a
+         five-second burst appears to last fifteen.
+
+  - id: what
+    kind: what
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles]
+    title: Terms you need
+    body: |
+      | Term | Meaning (Locust 2.47.0 documentation unless marked) |
+      | --- | --- |
+      | **LoadTestShape** | a class you define in your locust file; "If this type of class is found then it will be automatically used by Locust" |
+      | **`tick()`** | "returns a tuple with the desired user count and spawn rate (or None to stop the test). Locust will call the tick() method approximately once per second." |
+      | **user count** | the total number of simulated users that should be running |
+      | **spawn rate** | "Rate to spawn users at (users per second)"; in a shape it is the rate at which users are started or stopped to reach a new user count |
+      | **`get_run_time()`** | "for checking how long the test has run for" |
+      | **`get_current_user_count()`** | "returns the total number of active users" - lets a shape wait until "the desired number of users has been reached" |
+      | **user_classes (third tuple element)** | "None or a List of userclasses to be spawned in it tick" (API reference) - restricts which User types run in that tick |
+      | **abstract = True** | keeps a reusable base shape from being "picked as Shape when imported" |
+      | **use_common_options** | makes a shape read `-u`, `-r` and `-t` itself instead of ignoring them |
+      | **Stage** (a convention, not a Locust class) | one row of a plan: `{"duration": end second, "users": n, "spawn_rate": r}`; the documentation's stage examples use this layout |
+      | **Step load** | stages that add the same number of users each time |
+      | **Spike** | a quiet baseline, a sudden jump to a high count, then back to the baseline |
+      | **Soak (endurance)** | a moderate, constant count held for a long time |
+      | **History CSV** | `--csv <prefix>` writes `<prefix>_stats_history.csv`, which "will get new rows with the current (10 seconds sliding window) stats appended during the whole test run" |
+
+  - id: why
+    kind: why
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: Why it matters - the same API, two profiles
+    body: |
+      The SandPay practice API serves at most 4 requests at once, about 20 ms each. A merchant dashboard user asks for
+      the payment list, waits 50 ms and asks again. Here are two real runs against that API (21 November 2026), one
+      per profile, summarised by phase with the `phases()` function you will write in the third exercise:
+
+      | Profile | Phase | Users | Seconds | Requests | Requests per second |
+      | --- | --- | --- | --- | --- | --- |
+      | `-u 2` constant | whole run | 2 | not run | - | the same all the time |
+      | Spike (this lesson) | baseline | 2 | 6 | 160 | 26.7 |
+      | Spike | **spike** | 24 | 10 | 1931 | **193.1** |
+      | Spike | recovery | 2 | 10 | 269 | 26.9 |
+
+      With two users the API is nearly idle. With 24 users the rate stopped at 193 requests per second: close to the 200
+      the API can do (4 workers / 0.020 s) - 12 times the baseline rate for 12 times the users, and no more.
+      The windowed latency columns (explained below) went from about 25 ms to about 75 ms in the spike. A constant
+      `-u 2` test would have reported "fast and healthy" and the first merchant rush would have been the test.
+
+      What the shape gives you:
+
+      - **A question per profile.** A step load finds the user count where latency leaves the SLO; a spike finds how the
+        system behaves *during* a burst and whether it is back to normal *after* it; a soak finds slow leaks. `-u -r -t`
+        can only draw a single ramp followed by a flat line.
+      - **A test that ends itself.** The shape knows when its last stage is over. No `-t` to forget.
+      - **A plan you can review.** The profile is a short list of numbers, so a colleague can read it, and a function can
+        check it (the first exercise) before it costs a test run.
+
+  - id: internals-tick
+    kind: internals
+    concepts: [perf-lcshape-tick]
+    title: How Locust runs a shape
+    body: |
+      A shape is just a class. The mechanics - from the documentation, and where marked, from Locust 2.47.0's
+      source (`runners.py`, `main.py`):
+
+      1. **Discovery.** Locust loads the locust files named by `-f` and uses the `LoadTestShape` subclass it finds. A
+         subclass that defines `abstract = True` is skipped, so a reusable base class does not run by itself.
+         *Documentation:* "Define a class inheriting the LoadTestShape class in your locust file. If this type of class is
+         found then it will be automatically used by Locust."
+      2. **The loop.** In headless mode the runner starts a "shape worker" that, about once a second, calls `tick()`.
+         *Source (`shape_worker`):* it sleeps `max(1 - time spent, 0)` seconds between calls.
+      3. **The three outcomes of `tick()`:**
+         - `None` - the runner stops the test (headless: it quits). *Documentation:* "(or None to stop the test)".
+         - a tuple **equal to the previous one** - nothing happens. The users keep running.
+         - a **different** tuple - the runner calls `start(user_count, spawn_rate, user_classes)`, which starts or stops
+           users at `spawn_rate` per second until `user_count` is reached. *Source:* the log line is
+           `Shape test updating to N users at R spawn rate`.
+      4. **The clock.** `get_run_time()` is the seconds since the shape started (`reset_time()` sets it to 0 when the
+         shape test starts).
+      5. **`-u`, `-r` and `-t` are ignored.** *Source (`main.py`):* with a shape class that does not set
+         `use_common_options`, Locust logs a warning and ignores `--users`, `--spawn-rate` and `--run-time`. *Documentation:*
+         "When using shapes, the Users, Spawn Rate and Run Time options will be hidden from the UI, and if you specify
+         them on command line Locust will log a warning."
+      6. **The test ends when the shape ends.** In `main.py` the headless run waits for the shape to finish
+         (`shape_greenlet.join()`), and only afterwards arms the `-t` timer. So `-t` could not stop a shape that never
+         returns `None` even if it were honoured - and the run below shows a shape like that running past `-t 5s`.
+
+      Two documented details for bigger plans: **user classes per stage** - the tuple may have a third element, a list of
+      `User` classes, so one stage runs only `UserA` and the next runs `UserA` and `UserB` (the documentation's
+      `StagesShapeWithCustomUsers` example); and **one file per concern** - "it often more flexible to have your User
+      definitions in one file and your LoadTestShape in a separate one", chosen on the command line: `locust -f
+      locustfile.py,low_load.py`.
+
+      **Distributed runs.** The documentation says of workers: "Typically ONLY these options (and --locustfile) need to
+      be specified on workers, since other options (-u, -r, -t, ...) are controlled by the master node." Running a shape
+      across machines is the subject of [Distributed Locust and CI runs](#/lesson/locust-distributed-and-ci); nothing more
+      is claimed here.
+
+  - id: internals-profiles
+    kind: internals
+    concepts: [perf-lcshape-profiles]
+    title: One loop, many profiles
+    body: |
+      Every profile in this lesson is the same `tick()` over a different list. A stage is
+      `{"duration": 16, "users": 24, "spawn_rate": 50}` - read it as "**until second 16**, aim for 24 users, change at 50
+      users per second". `duration` is **cumulative**: the end time since the test started, as in the documentation's
+      `StagesShapeWithCustomUsers` example (10, 30, 60, 120).
+
+      ```python
+      def tick(stages, run_time):
+          for stage in stages:
+              if run_time < stage["duration"]:
+                  return stage["users"], stage["spawn_rate"]
+          return None
+      ```
+
+      | Profile | The question it answers | The list (users at each stage) | Spawn rate |
+      | --- | --- | --- | --- |
+      | **Step load** | At what user count does latency or the error rate leave the requirement? | equal climbs: 10, 20, 30, 40 ... each held long enough to measure | modest - the ramp is not the point |
+      | **Spike** | How does the system take a sudden burst, and does it recover? | baseline, a jump to many times the baseline, baseline again | **high** - a spike that takes a minute to build is a ramp |
+      | **Soak (endurance)** | Does anything degrade with time at a normal load - memory, connections, disk, queues? | one long stage at a moderate count (hours) | low; one ramp up, one ramp down |
+      | **Ramp up and down / wave** | How does the system follow a daily or weekly pattern? | users following a curve, in many short stages or computed in `tick()` | matched to the slope |
+
+      Because the plan is data, you can **generate** it (`from_steps(10, 10, 4, 60, 5)` in the first exercise gives four
+      60-second steps of 10, 20, 30 and 40 users), **read it** in a review, and **check** it with a function before the
+      test runs - which is where the next section matters.
+
+  - id: internals-ramp
+    kind: internals
+    concepts: [perf-lcshape-ramp-reading]
+    title: A ramp takes time - and a stage can be replaced half-way
+    body: |
+      Locust changes the user count at `spawn_rate` users per second, in both directions. So going from `a` users to `b`
+      users takes **`|b - a| / spawn_rate` seconds**. Meanwhile the clock of the stage runs. A plan "10 users at 1 user per
+      second, for 3 seconds" asks for a 10-second ramp inside a 3-second stage.
+
+      This is the `slowramp` run (three stages: until 3 s, 10 users at rate 1; until 6 s, 4 users; until 9 s, 2 users). The
+      log lines are Locust's own, shortened:
+
+      ```text
+      [09:41:11,669] HOST/INFO/locust.runners: Shape test updating to 10 users at 1.00 spawn rate
+      [09:41:11,669] HOST/INFO/locust.runners: Ramping to 10 users at a rate of 1.00 per second
+      [09:41:14,673] HOST/INFO/locust.runners: Shape test updating to 4 users at 10.00 spawn rate
+      [09:41:14,675] HOST/INFO/locust.runners: Ramping to 4 users at a rate of 10.00 per second
+      [09:41:14,676] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 4} (4 total users)
+      ```
+
+      There is **no** "All users spawned ... 10 total users" line. After 3 seconds - 3 users running - the next stage's tuple
+      replaced the ramp. The history shows what really ran:
+
+      ```text
+      t  users
+      0  0
+      1  1
+      2  2
+      3  3
+      4  4       <- stage 2 replaced the ramp; stage 1's target of 10 was never reached
+      5  4
+      6  4
+      7  2
+      8  2
+      9  2
+      ```
+
+      The peak was 4 users, not 10. **The test passed and tested a different load than the plan said.** (A comment in
+      `runners.py` says a slow ramp blocks the shape so that later stages are skipped; in this run that did not happen -
+      the next stage replaced the ramp. Check what your own run does; do not rely on either description.)
+
+      **Two fixes.**
+
+      1. **Make the plan fit.** Check `ramp_seconds(previous_users, users, spawn_rate) <= stage length` for every stage
+         before the run (the first exercise's `stage_problems`). Raise the spawn rate, or lengthen the stage.
+      2. **Start the clock when the users are there.** `get_current_user_count()` returns the users running now. A shape
+         can keep returning the same tuple until the count matches, and only then start the stage's hold timer (the
+         `patient` shape below). Then every stage lasts `hold` seconds *at its target*, however long the ramp took. This
+         costs predictability: the test's total length is no longer a sum you know in advance.
+
+  - id: internals-reading
+    kind: internals
+    concepts: [perf-lcshape-ramp-reading]
+    title: Reading a shaped run - by phase, not by window
+    body: |
+      With `--csv run`, Locust appends one row per second to `run_stats_history.csv`. The columns that matter here:
+
+      | Column | What it is |
+      | --- | --- |
+      | `User Count` | the users running when the row was written |
+      | `Total Request Count` | every request since the start - a running total |
+      | `Requests/s`, `50%` ... `100%` | **current** statistics over a sliding window: "the current (10 seconds sliding window) stats" |
+
+      The window is the trap. In the spike run (24 users from second 7 to second 16, 2 users after), the per-second rows
+      look like this (new requests = growth of `Total Request Count` over the row before):
+
+      | t (s) | Users | New requests that second | `Requests/s` column | `95%` column (ms) |
+      | --- | --- | --- | --- | --- |
+      | 3 | 2 | 27 | 6.0 | 25 |
+      | 7 | 24 | 182 | 22.4 | 120 |
+      | 10 | 24 | 194 | 46.3 | 75 |
+      | 16 | 24 | 193 | 145.0 | 75 |
+      | 19 | 2 | 27 | **192.3** | 75 |
+      | 22 | 2 | 28 | 141.9 | 75 |
+      | 26 | 2 | 27 | 74.9 | 75 |
+
+      At second 19, with only **2 users** running for the last 3 seconds and 27 requests that second, the `Requests/s`
+      column says 192.3 - the average of a window that is mostly spike. At second 7, the first second of the spike, it
+      says 22.4. The column **lags by the window** and the percentiles still show the spike's latency 10 seconds after it
+      ended. For a profile with 60-second stages the smear is a small fraction of each stage; for a 10-second spike it is
+      the whole picture.
+
+      The reliable per-phase number is the **growth of the running total**:
+
+      1. Group consecutive rows with the same `User Count` into a phase.
+      2. `requests` = total at the end of the phase minus the total just before it; `seconds` = number of rows.
+      3. `rps = requests / seconds`.
+
+      That is what the third exercise's `phases()` does, and it printed the "why" table above. Three limits to remember: the
+      row's user count is a sample once a second, so phases have a one-second resolution; the last history row is written
+      about a second before the end (the phases of the spike run add to 2,360 requests, the JSON totals say 2,361 - 24
+      logins plus 2,337 list calls); and requests include the `on_start` logins, which land at the start of a phase that
+      adds users.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-lcshape-tick, perf-lcshape-ramp-reading]
+    title: What the shape worker does every second
+    body: |
+      ```mermaid
+      flowchart TD
+        T["about once a second: tick()"] --> N{"returns None?"}
+        N -- "yes" --> S["stop the test (headless: quit)"]
+        N -- "no" --> D{"same tuple as last time?"}
+        D -- "yes" --> W["nothing: users keep running"]
+        D -- "no" --> R["start(users, spawn_rate): ramp at spawn_rate per second"]
+        R --> P{"ramp done before the next tick returns a new tuple?"}
+        P -- "yes" --> OK["target user count reached"]
+        P -- "no" --> X["replaced half-way: target never reached"]
+        W --> T
+        OK --> T
+        X --> T
+      ```
+
+      The two dangerous boxes are on the right. `tick()` has no idea whether the last ramp finished - it only
+      returns a tuple. Whether the **target is reached** is a property of your numbers (users, spawn rate and stage
+      length), which is why the plan check and `get_current_user_count()` exist. And `None` is the only way out: no
+      `-t`, no stage count, no timer ends a shape that keeps returning tuples.
+
+  - id: code-step
+    kind: code
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles]
+    title: 'The code: a step-load shape in a locustfile'
+    body: |
+      The solution of the second exercise (`practice/perf/solutions/locust/lc_shape_locustfile.py`, docstring
+      shortened). The user class is finished in the exercise; the learner writes `StepShape.tick`:
+
+      ```python
+      import itertools
+
+      from locust import HttpUser, LoadTestShape, constant, task
+
+      _merchants = itertools.count(1)
+
+
+      class Dashboard(HttpUser):
+          host = "http://127.0.0.1:8090"
+          wait_time = constant(0.1)
+
+          def on_start(self):
+              n = next(_merchants) % 50 + 1  # merchant-1 .. merchant-50
+              r = self.client.post("/auth/token", json={"client_id": f"merchant-{n}", "client_secret": f"secret-{n}"})
+              self.client.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
+
+          @task
+          def list_payments(self):
+              self.client.get("/v1/payments?limit=10", name="/v1/payments")
+
+
+      class StepShape(LoadTestShape):
+          # "duration" is the END of the stage, in seconds since the start of the test
+          stages = [
+              {"duration": 3, "users": 1, "spawn_rate": 10},
+              {"duration": 6, "users": 3, "spawn_rate": 10},
+              {"duration": 9, "users": 5, "spawn_rate": 10},
+          ]
+
+          def tick(self):
+              run_time = self.get_run_time()
+              for stage in self.stages:
+                  if run_time < stage["duration"]:
+                      return stage["users"], stage["spawn_rate"]
+              return None  # no stage left: Locust stops the test
+      ```
+
+      Run with the command line you would use for any headless test - and, to see the warning, with `-u`, `-r` and `-t` too
+      (the second run below, with `-u 1 -r 1 -t 60s`):
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python support/sandpay_target.py --port 8090 &
+      .venv/bin/locust -f solutions/locust/lc_shape_locustfile.py --headless --csv run --only-summary -u 1 -r 1 -t 60s
+      ```
+
+      Locust's log (21 November 2026, `HOST` is the machine name, lines shortened):
+
+      ```text
+      [09:41:52,670] HOST/WARNING/locust.main: --run-time, --users or --spawn-rate have no impact on LoadShapes unless the shape class explicitly reads them. See: ...
+      [09:41:52,670] HOST/WARNING/locust.main: The following option(s) will be ignored: --users, --spawn-rate, --run-time
+      [09:41:52,673] HOST/INFO/locust.runners: Shape worker starting
+      [09:41:52,673] HOST/INFO/locust.runners: Shape test updating to 1 users at 10.00 spawn rate
+      [09:41:52,675] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 1} (1 total users)
+      [09:41:55,678] HOST/INFO/locust.runners: Shape test updating to 3 users at 10.00 spawn rate
+      [09:41:55,679] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 3} (3 total users)
+      [09:41:58,681] HOST/INFO/locust.runners: Shape test updating to 5 users at 10.00 spawn rate
+      [09:41:58,682] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 5} (5 total users)
+      [09:42:01,717] HOST/INFO/locust.runners: Shape test stopping
+      [09:42:01,766] HOST/INFO/locust.main: Shape test completed, shutting down
+      [09:42:01,766] HOST/INFO/locust.main: Run time limit set to 60 seconds
+      [09:42:01,766] HOST/INFO/locust.main: Shutting down (exit code 0)
+      ```
+
+      The run lasted 10 seconds, not 60: the stages ended it. The history, summarised with `phases()`:
+
+      ```text
+      {'users': 0, 'seconds': 1, 'requests': 0, 'rps': 0.0}
+      {'users': 1, 'seconds': 3, 'requests': 29, 'rps': 9.7}
+      {'users': 3, 'seconds': 3, 'requests': 85, 'rps': 28.3}
+      {'users': 5, 'seconds': 3, 'requests': 140, 'rps': 46.7}
+      ```
+
+      The rate grows with the users (9.7, 28.3, 46.7 - about 9.5 requests per second per user: a 100 ms wait plus a few
+      milliseconds of service). `/auth/token` was called 5 times - once per user, because no user was stopped and
+      restarted between stages - and `/v1/payments` 249 times, with 0 failures.
+
+  - id: code-spike
+    kind: code
+    concepts: [perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: 'The code: a spike, and the run that proves what it did'
+    body: |
+      The spike shape (`support/lc_shape_spike.py`). The user class is in a **separate file**, `support/lc_shape_users.py`
+      (the same `Dashboard` as above with `wait_time = constant(0.05)`), and the two are combined on the command line,
+      as the documentation shows for high and low load files:
+
+      ```python
+      from locust import LoadTestShape
+
+
+      class SpikeShape(LoadTestShape):
+          # "duration" is the END of the stage, in seconds since the start of the test
+          stages = [
+              {"duration": 6, "users": 2, "spawn_rate": 50},    # baseline
+              {"duration": 16, "users": 24, "spawn_rate": 50},  # the spike
+              {"duration": 26, "users": 2, "spawn_rate": 50},   # recovery
+          ]
+
+          def tick(self):
+              run_time = self.get_run_time()
+              for stage in self.stages:
+                  if run_time < stage["duration"]:
+                      return stage["users"], stage["spawn_rate"]
+              return None
+      ```
+
+      ```bash
+      .venv/bin/locust -f support/lc_shape_users.py,support/lc_shape_spike.py --headless --csv run --loglevel INFO
+      ```
+
+      The target here was `TargetConfig(latency_ms=20, capacity=4)`. Locust's log shows each stage start about a second
+      after the end of the previous one only because `tick()` runs once a second - here they fell on time:
+
+      ```text
+      [09:40:31,857] HOST/INFO/locust.runners: Shape test updating to 2 users at 50.00 spawn rate
+      [09:40:37,865] HOST/INFO/locust.runners: Shape test updating to 24 users at 50.00 spawn rate
+      [09:40:37,870] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 24} (24 total users)
+      [09:40:47,879] HOST/INFO/locust.runners: Shape test updating to 2 users at 50.00 spawn rate
+      [09:40:57,900] HOST/INFO/locust.runners: Shape test stopping
+      ```
+
+      The jump from 2 to 24 users took 5 ms: 22 users at 50 per second needs 0.44 s, and the shape worker's first tick
+      after second 6 came at 6.008 s. That is what makes it a spike. The phases are in the "why" table above (26.7, **193.1**
+      and 26.9 requests per second), and the windowed columns are in the "reading" section. Final totals: 24 logins and
+      2,337 list calls, 0 failures - **a spike that the API absorbed without one error**, because this API queues instead of
+      shedding load. The cost showed as latency (the windowed `95%` column went from 25 to 75 ms), not as errors. A
+      different target would fail differently; the shape only creates the burst.
+
+  - id: code-patient
+    kind: code
+    concepts: [perf-lcshape-ramp-reading, perf-lcshape-tick]
+    title: 'The code: a shape that waits for its users'
+    body: |
+      The `slowramp` plan again, written with `get_current_user_count()` so that each stage's hold time starts only when
+      the stage's users are running (`support/lc_shape_patient.py`):
+
+      ```python
+      from locust import LoadTestShape
+
+
+      class PatientShape(LoadTestShape):
+          stages = [
+              {"users": 10, "spawn_rate": 1, "hold": 3},
+              {"users": 4, "spawn_rate": 10, "hold": 3},
+              {"users": 2, "spawn_rate": 10, "hold": 3},
+          ]
+
+          def __init__(self):
+              super().__init__()
+              self.index = 0
+              self.reached_at = None  # run time at which this stage's user count was first seen
+
+          def tick(self):
+              if self.index >= len(self.stages):
+                  return None
+              stage = self.stages[self.index]
+              now = self.get_run_time()
+              if self.reached_at is None:
+                  if self.get_current_user_count() == stage["users"]:
+                      self.reached_at = now
+              elif now - self.reached_at >= stage["hold"]:
+                  self.index += 1
+                  self.reached_at = None
+                  return self.tick()
+              return stage["users"], stage["spawn_rate"]
+      ```
+
+      The log of the real run (same target, `HOST` for the machine name):
+
+      ```text
+      [09:41:22,112] HOST/INFO/locust.runners: Shape test updating to 10 users at 1.00 spawn rate
+      [09:41:31,131] HOST/INFO/locust.runners: All users spawned: {"Dashboard": 10} (10 total users)
+      [09:41:35,138] HOST/INFO/locust.runners: Shape test updating to 4 users at 10.00 spawn rate
+      [09:41:39,142] HOST/INFO/locust.runners: Shape test updating to 2 users at 10.00 spawn rate
+      [09:41:43,148] HOST/INFO/locust.runners: Shape test stopping
+      ```
+
+      The 10-user stage was **reached after 9 seconds** (the ramp at 1 user per second) and then held; the history phases
+      are `1 ... 9` users for one second each, **10 users for 4 seconds**, 4 users for 4 and 2 users for 4. The hold
+      is "3 seconds" but shows as 4 rows because `tick()` runs once a second and the check is `>=` on the tick after the
+      third second. The whole run took 22 seconds instead of 9 - the price of being patient, and the reason a patient
+      shape is wrong for a test that must end at a fixed time.
+
+      Note `super().__init__()`: the base class's `__init__` records the start time that `get_run_time()` uses. Forgetting
+      it is an `AttributeError` on the first tick.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: The lines that matter
+    body: |
+      - **`class StepShape(LoadTestShape):`** - inheriting is what makes Locust use it; there is nothing to register.
+      - **`"duration": 9`** - the **end** second, not "9 seconds long". Three stages written `3, 3, 3` would run the first
+        stage for 3 seconds and then stop the test: the other two can never be reached.
+      - **`run_time = self.get_run_time()`** - the shape's own clock, seconds since the shape started. Not `time.time()`
+        (the epoch) and not a counter you increment by one per tick (ticks drift).
+      - **`if run_time < stage["duration"]`** - strictly less: at exactly the end time the next stage owns the moment.
+      - **`return stage["users"], stage["spawn_rate"]`** - a tuple. Returning the same tuple on the next tick changes
+        nothing; returning a new one starts the ramp.
+      - **`return None`** - the only way the test ends. The comment is not decoration: without it the fall-through also
+        returns `None` in Python, but a loop that returns the *last* stage's tuple after the end - a common "fix" for a
+        warning - runs forever.
+      - **`"spawn_rate": 50` in the spike** - 22 more users in under half a second. With `"spawn_rate": 2` the same
+        "spike" would take 11 seconds to build: a ramp, with a different name.
+      - **`get_current_user_count() == stage["users"]`** - the exact count. It only matches when the ramp finished, which
+        is the point; a stage that can never match (a user crashed in `on_start`, for example) would wait forever, so a
+        production shape also needs a timeout.
+      - **`super().__init__()`** - the base class sets `start_time`.
+      - **`-f users.py,shape.py`** - the user and shape live in separate files; swapping the shape file swaps the profile
+        without touching the users.
+
+  - id: when
+    kind: when
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: When to use a shape - and which
+    body: |
+      | Situation | Use |
+      | --- | --- |
+      | one ramp to a count, hold, stop - and you will watch the run | plain `-u`, `-r`, `-t` |
+      | you want the same test to end by itself, in CI, at a planned time | a shape that returns `None` |
+      | find the user count where latency or errors leave the requirement | **step load**: equal climbs, each held long enough to measure |
+      | find out what a burst does and whether the system recovers | **spike**: a high spawn rate, a baseline before and after |
+      | find leaks and drift at a normal load | **soak**: one long stage - hours - and a plan for watching the server, not only Locust |
+      | follow a daily or weekly traffic pattern | a ramp or wave: many short stages or a formula in `tick()` |
+      | different groups of users join at different times | a third tuple element (`user_classes`) per stage |
+      | a stage must last N seconds *at* its target whatever the ramp cost | `get_current_user_count()` and a hold timer |
+      | the stage lengths must add up exactly | a plain stage list, with a plan check |
+      | the same shape for several user files | a shape file of its own, chosen with `-f` |
+
+      **What a shape does not decide:** what each user does (`wait_time` and the tasks - [Locust fundamentals](#/lesson/locust-fundamentals)),
+      how many requests per second that makes (users divided by the time one task takes - [Little's law](#/lesson/littles-law-and-workload-models)),
+      and whether the generator machine can keep up. Know the user count your generator can sustain before reading a
+      ceiling in the results as the system's.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: Adding a shape to a locustfile, step by step
+    body: |
+      1. **Write the question.** "Where does p95 pass 400 ms?" is a step load; "Does it recover after a payroll-time
+         burst?" is a spike; "Is anything different after 8 hours?" is a soak.
+      2. **Write the plan as data.** A list of stages with end times, users and spawn rates. Put a comment on every
+         number: why 24 users, why 50 per second.
+      3. **Check the plan before the run.** Are the end times increasing? Is `|users - previous users| / spawn_rate` shorter
+         than the stage for each stage? (`stage_problems` in the first exercise.)
+      4. **Write the shape** - the same `tick()` loop, ending in `return None`. Put it in its own file next to the
+         users, and run `locust -f users.py,shape.py`.
+      5. **Run it headless with `--csv`** and without `-u -r -t` (they will only be ignored with a warning).
+      6. **Check that the plan ran.** From the history CSV: did the user counts of the plan appear, in order? (`missed_targets`
+         and `phases` in the third exercise.) Check the log for the `All users spawned` line of each stage.
+      7. **Read each phase by its own numbers**: requests per second from the growth of `Total Request Count`; error rate
+         and percentiles from the part of the run you can isolate, not from the 10-second window right after a change.
+      8. **State the result against the requirement**, and keep the stage list, the history CSV and the log with it.
+
+  - id: example
+    kind: example
+    concepts: [perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: 'Worked example: a spike plan, reviewed before the run'
+    body: |
+      *This example is hypothetical; the numbers are made up to show the review, not measured.*
+
+      A team prepares a spike test for a payments page before a promotion. The plan, as a developer wrote it:
+
+      ```python
+      stages = [
+          {"duration": 120, "users": 20,  "spawn_rate": 10},   # baseline, 2 minutes
+          {"duration": 60,  "users": 400, "spawn_rate": 10},   # the spike, 1 minute
+          {"duration": 120, "users": 20,  "spawn_rate": 10},   # recovery, 2 minutes
+      ]
+      ```
+
+      The reviewer runs `stage_problems(stages)` instead of reading carefully:
+
+      1. `(1, "not-increasing")` - the second stage ends at 60, before the first one's end at 120. The developer wrote
+         **lengths** (2 minutes, 1 minute, 2 minutes). As written the test is 120 seconds at 20 users, then it stops. The
+         spike never runs, and the test passes. The fix is cumulative ends: 120, 180, 300.
+      2. After the fix, the spike stage fails the other check: from 20 to 400 users at 10 per second takes
+         380 / 10 = **38 seconds** inside a 60-second stage. It is a 38-second ramp followed by 22 seconds at the
+         peak, not "a spike of one minute", and the recovery ramp down takes 38 seconds too. The fix depends on the question
+         - if a burst is what the promotion causes, the spawn rate goes up (say 200 per second, the ramp under 2
+         seconds); if the real traffic climbs over a minute, the plan was a ramp and should be named one.
+      3. The *generator* must hold 400 users. The reviewer asks whether one machine can; if not, the spike is a test of
+         the load generator.
+
+      Nothing was run yet. Two defects that would have produced "all green" results were found in a list of three
+      dictionaries. That is the argument for plans as data.
+
+      **After the run** the same team reads the history by phase. The windowed `Requests/s` column shows the peak arriving
+      a few seconds late and the percentiles staying high after the users have left - they say so in the report, and quote
+      requests per second from the growth of the running total, with the percentiles marked as 10-second window values.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: How the exercises are tested
+    body: |
+      - `tests/locust/test_lc_shape_stages.py` checks your plan functions as plain Python: which stage `tick` picks at the
+        boundaries (a stage ends *before* its end second), cumulative end times from `from_steps`, ramp seconds in both
+        directions, and `stage_problems` on the real slow-ramp plan, a plan written with lengths, a plan with a dead stage
+        and a sound plan.
+      - `tests/locust/test_lc_shape_locustfile.py` runs **your locustfile with real Locust** in a subprocess against the
+        practice API. It checks that the run ended by itself (well under the 60 seconds that `-t` was given - which Locust
+        ignores), that the history's user counts climbed 1, 3, 5 and nothing else, that every user logged in once, and that
+        nothing failed. A shape that never returns `None` makes the test time out and fail with a message that says so.
+      - `tests/locust/test_lc_shape_history.py` runs your `phases()`, `peak_users()` and `missed_targets()` on the **real
+        history rows** of the spike run and the slow-ramp run (in `support/lc_shape_fixture.py`, captured on 21 November
+        2026) and on small tables for the edge cases.
+
+      None of the tests check absolute response times or request counts: they depend on the machine. They check which user
+      counts appeared and in which order, how the counts relate, and that the run ended when the plan said.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/locust/test_lc_shape_stages.py tests/locust/test_lc_shape_history.py
+      .venv/bin/python -m pytest tests/locust/test_lc_shape_locustfile.py   # about 12 seconds: it runs Locust
+      ```
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: Common mistakes
+    body: |
+      - **Stage lengths where end times belong.** `60, 60, 60` stops the test after the first 60 seconds. Check
+        that the end times increase.
+      - **A spawn rate that cannot reach the target in the stage.** 10 users at 1 per second in a 3-second stage ran at 4
+        users; the log never said "All users spawned: 10". Compare `|Δusers| / spawn_rate` with the stage length.
+      - **A spike with a slow spawn rate.** It is a ramp. The test's name promises a burst that never happened.
+      - **Expecting `-u`, `-r` or `-t` to work with a shape.** They are ignored (with a warning in the log, which nobody
+        reads). `-t 5m` does not cap a shape - a shape that keeps returning tuples ran past `-t 5s` until the harness killed it.
+      - **No `return None`.** The test never ends. In CI this is a job that times out after an hour, and a generator that
+        keeps loading the target meanwhile.
+      - **Reading the windowed columns for a short phase.** `Requests/s` said 192.3 two seconds after the users had
+        dropped to 2. Use the growth of `Total Request Count` for rates, and say that percentiles are a 10-second window.
+      - **Returning a new float every tick.** A tuple that differs on every tick (a user count computed as a float with a
+        fraction, a spawn rate recomputed with noise) makes the runner call `start()` once a second. Return whole user
+        counts and stable spawn rates.
+      - **Forgetting `super().__init__()`** in a shape that defines `__init__`: no `start_time`, so `get_run_time()` fails.
+      - **A shape that waits forever.** `get_current_user_count() == stage["users"]` never becomes true if a user dies in
+        `on_start`. Give the wait a timeout and fail loudly.
+      - **Two shape classes in the locust files.** Locust picks one, silently. Put each profile in its own file and name it
+        on the command line, or mark a shared base `abstract = True`.
+      - **Calling a spike "healthy" because the error rate was zero.** The queueing API above absorbed the spike with no
+        errors and tripled the latency. Judge a spike by errors, latency during the burst, and how long it takes to return
+        to the baseline.
+      - **Judging a ceiling without checking the generator.** If Locust's machine is the bottleneck, the flat line in the
+        results is the generator's.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: Trade-offs
+    body: |
+      - **A stage list versus a formula in `tick()`.** A list can be read, generated and checked before the run. A formula
+        (a sine wave, a daily curve) is shorter and smoother but only the run shows what it did. Keep the formula's inputs in
+        named constants, and log what it returned.
+      - **Fixed stage clocks versus waiting for the users.** Fixed clocks give a test of a known length; waiting gives
+        a stage that is always `hold` seconds at its target. Choose by what you must be able to promise: the end time, or
+        the time at the load.
+      - **One-second resolution.** `tick()` runs about once a second, so stage boundaries are good to a second. That is
+        fine for a 60-second step and not for a 3-second burst - use a spawn rate high enough that the jump is far inside
+        a tick.
+      - **Combined files versus one file.** Separate user and shape files let one user model serve many profiles; one
+        file is easier to hand to a colleague. Either way the shape's name should say the profile.
+      - **History CSV versus the final JSON.** The history gives a time series with a window; the JSON gives exact
+        totals with no time axis. A report that needs both says which number came from which.
+      - **Spike on one machine versus a spike on many.** A single Locust process has a ceiling of its own; if the burst
+        needs more users than one generator sustains, the run must be distributed - the next lessons.
+      - **Soak and the real world.** Locust can hold the load; it does not watch memory or disk on the target. A soak
+        without server-side monitoring cannot find a leak.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-lcshape-tick, perf-lcshape-profiles, perf-lcshape-ramp-reading]
+    title: Summary
+    body: |
+      - A class that inherits `LoadTestShape` and defines `tick()` takes over the load. `tick()` runs about once a second
+        and returns `(users, spawn_rate)`, optionally with a list of User classes, or `None` to end the test.
+      - An unchanged tuple does nothing; a changed one starts or stops users at `spawn_rate` per second.
+      - With a shape, `-u -r -t` are ignored with a warning. The shape ends the test; a shape that never returns `None`
+        never ends, and `-t` will not help.
+      - A profile is a list of stages `{"duration": end second, "users": n, "spawn_rate": r}`. **`duration` is an end time
+        since the start, not a length.**
+      - Step = equal climbs to find the breakpoint. Spike = high spawn rate, baseline before and after. Soak = one long,
+        moderate stage plus server-side monitoring.
+      - A ramp takes `|b - a| / spawn_rate` seconds. If that is longer than the stage, the next stage replaces it and the
+        target is never reached. Check the plan before the run; read the log for `All users spawned`.
+      - `get_current_user_count()` lets a stage start its clock when its users are running; give it a timeout.
+      - Read a run by phase: group history rows by `User Count`, take the growth of `Total Request Count` for the rate.
+        `Requests/s` and the percentile columns are a 10-second window.
+      - Keep user and shape in separate files (`-f users.py,shape.py`); mark a reusable base shape `abstract = True`.
+
+exercises:
+  - id: stop-mcq
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: recall
+    title: How a shape ends a test
+    prompt: A `LoadTestShape` is running a headless test. What makes Locust stop it?
+    options:
+      - id: none
+        text: '`tick()` returns `None`'
+        feedback: Correct - "(or None to stop the test)". It is the only thing that ends a shape test.
+      - id: run-time
+        text: The `-t 10m` on the command line
+        feedback: With a shape, `-t` is ignored (Locust logs a warning), and the timer is armed only after the shape has finished.
+      - id: zero-users
+        text: '`tick()` returns `(0, 1)`'
+        feedback: That is a valid tuple - the runner stops all users, but the test keeps running and `tick()` keeps being called.
+      - id: last-stage
+        text: Running out of stages in a list - Locust counts them
+        feedback: Locust knows nothing about your list. Your code has to notice the end and return None.
+    correct: [none]
+    hints:
+      - What does the documentation say tick() may return?
+    solution: |
+      `None` is the only exit. A tuple, even `(0, 1)`, means "keep going".
+
+  - id: rate-mcq
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: recall
+    title: How often tick runs
+    prompt: |
+      A spike stage is meant to start at second 60 exactly. What can you rely on, from the documentation?
+    options:
+      - id: second
+        text: '`tick()` is called approximately once per second, so the stage starts within about a second of 60'
+        feedback: Correct - "Locust will call the tick() method approximately once per second." Stage boundaries have one-second resolution.
+      - id: millisecond
+        text: The stage starts at 60.000 s - `get_run_time()` is exact
+        feedback: The clock is precise, but you only act on it when tick() is called.
+      - id: every-request
+        text: '`tick()` is called before every request'
+        feedback: It runs on its own once-a-second loop and has nothing to do with requests.
+      - id: change-only
+        text: '`tick()` is called only when the user count changes'
+        feedback: It is called every second whatever it returns; the runner compares the tuple with the last one.
+    correct: [second]
+    hints:
+      - Look for the word "approximately" in the definition of tick().
+    solution: |
+      About once a second. Design bursts so that the jump is far inside one tick (a high spawn rate).
+
+  - id: options-mcq
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: application
+    title: The command line you copied
+    prompt: |
+      A colleague runs the step-load locustfile with `locust -f steps.py --headless -u 50 -r 5 -t 10m`. The `StepShape`
+      stages add up to 9 seconds. What happens?
+    options:
+      - id: ignored
+        text: Locust warns that `--users`, `--spawn-rate` and `--run-time` will be ignored, and the shape's stages decide; the test ends after about 9 seconds
+        feedback: Correct - this is the warning in the real run above, and the run lasted 10 seconds, not 60.
+      - id: cap
+        text: The test runs 10 minutes, with the shape's user counts capped at 50
+        feedback: Neither a cap nor a time limit applies - the options are ignored unless the shape sets `use_common_options`.
+      - id: error
+        text: Locust refuses to start because the options conflict with the shape
+        feedback: It starts; it only logs a warning.
+      - id: spawn
+        text: The shape's spawn rates are replaced by 5 per second
+        feedback: The shape's own spawn rates are used.
+    correct: [ignored]
+    hints:
+      - Read the WARNING lines of the real run.
+    solution: |
+      The three options are ignored with a warning, so the shape alone decides the users and the length.
+
+  - id: forever-mcq
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: analysis
+    title: The job that never finished
+    prompt: |
+      A nightly CI job runs `locust -f users.py,spike.py --headless -t 30m` and times out after 6 hours. In `spike.py` the
+      last line of `tick()` is `return self.stages[-1]["users"], self.stages[-1]["spawn_rate"]`. What is the cause and
+      the fix?
+    options:
+      - id: no-none
+        text: After the last stage `tick()` still returns a tuple, so the shape never ends and `-t` does not apply; return `None` after the last stage
+        feedback: Correct - the lesson's real run of a shape that always returns a tuple was still going after 15 seconds with `-t 5s`.
+      - id: runner
+        text: The CI runner is slow; raise `-t` to 60m
+        feedback: '`-t` is not used at all with a shape.'
+      - id: spawn
+        text: The spawn rate is too low; raise it
+        feedback: A slow ramp does not keep a test alive after the stages; the missing None does.
+      - id: workers
+        text: Locust needs `--exit-code-on-error` to quit
+        feedback: That option sets the exit code; it does not end a test.
+    correct: [no-none]
+    hints:
+      - What is the only way a shape ends the test?
+    solution: |
+      Return `None` once `run_time` is past the last stage's end. Confirm by reading the log: there is no "Shape test
+      stopping" line.
+
+  - id: cumulative-mcq
+    type: mcq
+    concept: perf-lcshape-profiles
+    skill: application
+    title: Three minutes of three stages
+    prompt: |
+      A plan has three stages meant to last 60 seconds each: `"duration": 60` in all of them, with 10, 20 and 30 users. What
+      does the standard `tick()` loop do?
+    options:
+      - id: first-only
+        text: 10 users for 60 seconds, then the test stops - stages two and three can never be reached
+        feedback: Correct - `duration` is the end second since the start, so the other two stages "end" at second 60 as well.
+      - id: three-minutes
+        text: 10, 20 then 30 users for 60 seconds each
+        feedback: That needs end times 60, 120 and 180.
+      - id: last-only
+        text: 30 users for 60 seconds
+        feedback: The loop returns the first stage whose end is after the run time, so the first stage wins.
+      - id: error
+        text: Locust reports an error for the repeated duration
+        feedback: Locust never sees the list. Only a plan check can notice the problem.
+    correct: [first-only]
+    hints:
+      - Is "duration" a length or an end time in the lesson's stage layout?
+    solution: |
+      `duration` is cumulative. Use 60, 120, 180. A `stage_problems` check reports stages two and three as `not-increasing`.
+
+  - id: spawn-mcq
+    type: mcq
+    concept: perf-lcshape-ramp-reading
+    skill: application
+    title: 40 users at 2 per second
+    prompt: |
+      A stage lasts 10 seconds and asks for 40 users at a spawn rate of 2 per second, starting from 0 users. The next stage
+      asks for 10 users. About how many users are running when the next stage starts, and how would you know from the log?
+    options:
+      - id: twenty
+        text: 'About 20 - the ramp needs 40 / 2 = 20 seconds, so the next stage replaces it half-way; there is no "All users spawned: 40" line'
+        feedback: 'Correct - this is the slowramp run: the target was replaced before it was reached and the log never said all users had spawned.'
+      - id: forty
+        text: 40 - Locust waits for the ramp before the next stage
+        feedback: The slowramp run did not wait; the next stage's tuple replaced the ramp.
+      - id: ten
+        text: 10 - the next stage's target applies at once
+        feedback: The next stage then ramps from the current count (about 20) down to 10 at its own rate.
+      - id: zero
+        text: 0 - a ramp that cannot finish in time is cancelled
+        feedback: Users already started keep running.
+    correct: [twenty]
+    hints:
+      - How long does a ramp from 0 to 40 take at 2 users per second?
+    solution: |
+      20 seconds of ramp against a 10-second stage: about 20 users. The log of a finished ramp contains
+      `All users spawned`; this one does not.
+
+  - id: patient-mcq
+    type: mcq
+    concept: perf-lcshape-ramp-reading
+    skill: application
+    title: What get_current_user_count is for
+    prompt: Which problem does `get_current_user_count()` solve in a shape?
+    options:
+      - id: wait
+        text: It lets a stage start its hold timer only when its target user count is actually running, so a slow ramp does not eat the stage
+        feedback: Correct - the documentation says it can "prevent advancing to subsequent steps until the desired number of users has been reached".
+      - id: limit
+        text: It limits the number of users to what the machine can run
+        feedback: It only reports the count; it limits nothing.
+      - id: rate
+        text: It measures requests per second
+        feedback: It counts users, not requests.
+      - id: classes
+        text: It chooses which User classes run in a tick
+        feedback: That is the third element of the tick tuple.
+    correct: [wait]
+    hints:
+      - Think of the slow ramp that was replaced after three seconds.
+    solution: |
+      It reports the running users, so a shape can wait for the target. The price: the total length of the test is no
+      longer known in advance, and the wait needs a timeout.
+
+  - id: window-mcq
+    type: mcq
+    concept: perf-lcshape-ramp-reading
+    skill: analysis
+    title: The rate that lagged
+    prompt: |
+      In a spike run the `Requests/s` column of the history CSV says 192.3 at second 19, but the users dropped from 24 to 2
+      at second 17 and the growth of `Total Request Count` at second 19 is 27. Which number describes second 19?
+    options:
+      - id: delta
+        text: 27 - the growth of the running total; `Requests/s` is a 10-second sliding window that still contains the spike
+        feedback: Correct - the history rows carry "the current (10 seconds sliding window) stats".
+      - id: column
+        text: 192.3 - the column is the rate in that second
+        feedback: It is an average over about the last ten seconds, most of which were the spike.
+      - id: mean
+        text: Neither - Locust cannot tell a per-second rate
+        feedback: 'It can: the difference between two consecutive running totals is exact.'
+      - id: both
+        text: Both - the load really was still 192 for 2 seconds after the users left
+        feedback: With 2 users at 0.05 s of wait there cannot be 192 requests per second; the requests that second were 27.
+    correct: [delta]
+    hints:
+      - How wide is the window of the history columns?
+    solution: |
+      Use the growth of `Total Request Count` for the rate in a short phase; label percentile and `Requests/s` columns as
+      10-second window values.
+
+  - id: abstract-mcq
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: application
+    title: A base shape for the whole team
+    prompt: |
+      You write `class BaseStages(LoadTestShape)` with a `tick()` that reads `self.stages`, and import it into `spike.py`
+      and `step.py`, which each subclass it with their own `stages`. Locust may pick `BaseStages` as the shape. What do you add?
+    options:
+      - id: abstract
+        text: '`abstract = True` on `BaseStages`, so it is not picked as the Shape when imported'
+        feedback: Correct - the documentation says a custom base shape needs the abstract attribute set to True.
+      - id: use-common
+        text: '`use_common_options = True` on `BaseStages`'
+        feedback: That makes a shape read `-u`, `-r` and `-t`; it does not hide a base class.
+      - id: nothing
+        text: Nothing - Locust only picks a class whose name ends with Shape
+        feedback: There is no naming rule; Locust looks for LoadTestShape subclasses.
+      - id: del
+        text: '`del BaseStages` after the import'
+        feedback: That deletes the name your subclass needs.
+    correct: [abstract]
+    hints:
+      - The documentation has a short example of a "MyBaseShape".
+    solution: |
+      `abstract = True` on the base class; the subclasses leave it unset.
+
+  - id: files-mcq
+    type: mcq
+    concept: perf-lcshape-profiles
+    skill: application
+    title: One user model, three profiles
+    prompt: |
+      `users.py` defines the `Dashboard` user. `step.py`, `spike.py` and `soak.py` each hold one shape. How do you run the spike
+      against the same users?
+    options:
+      - id: comma
+        text: '`locust -f users.py,spike.py --headless`'
+        feedback: Correct - `-f` accepts several comma-separated files, as in the documentation''s `locust -f locustfile.py,low_load.py`.
+      - id: import
+        text: '`locust -f spike.py --headless` after adding `import users` to it'
+        feedback: Importing does not make Locust treat `Dashboard` as a user to run, unless the class is in the namespace; the documented route is the file list.
+      - id: two-f
+        text: '`locust -f users.py -f spike.py`'
+        feedback: The option takes one comma-separated value; a repeated `-f` is not the documented way.
+      - id: u
+        text: '`locust -f users.py -u spike.py`'
+        feedback: '`-u` is the user count.'
+    correct: [comma]
+    hints:
+      - Look at the "Combining Users with different load profiles" section.
+    solution: |
+      List both files after one `-f`, separated by a comma.
+
+  - id: user-classes-mcq
+    type: mcq
+    concept: perf-lcshape-profiles
+    skill: recall
+    title: The third element of the tuple
+    prompt: A `tick()` returns `(50, 10, [WebUser])`. What does the third element do?
+    options:
+      - id: only
+        text: It restricts the users spawned in that tick to the `WebUser` class
+        feedback: Correct - "Adding the element user_classes to the return value gives you more detailed control".
+      - id: weight
+        text: It sets the task weight of `WebUser`
+        feedback: Weights belong to tasks on the User class.
+      - id: host
+        text: It sets the host for 50 users
+        feedback: The host is a User or command-line setting.
+      - id: nothing
+        text: Nothing - a tuple longer than 2 is an error
+        feedback: Two or three elements are valid.
+    correct: [only]
+    hints:
+      - The API reference says "None or a List of userclasses".
+    solution: |
+      The list restricts which User classes run; `None` (or a two-element tuple) means all of them.
+
+  - id: shape-order
+    type: order
+    concept: perf-lcshape-tick
+    skill: application
+    title: Adding a shape to a test
+    prompt: Put the steps of adding a step-load shape to an existing locustfile in order.
+    items:
+      - id: question
+        text: Write the question the profile answers (where does p95 pass the requirement?)
+      - id: plan
+        text: Write the stages as data, with end times, users and spawn rates
+      - id: check
+        text: Check the plan - end times increasing, every ramp shorter than its stage
+      - id: shape
+        text: Write the tick() loop that returns None after the last stage, in its own file
+      - id: run
+        text: Run headless with --csv and the file list, without -u -r -t
+      - id: verify
+        text: Read the log and history - did every stage's users appear, in order?
+      - id: report
+        text: Report each phase from the growth of the running total
+    hints:
+      - You can check a plan before you spend a test run on it.
+    solution: |
+      Question, plan, plan check, shape, run, verify the plan ran, then report by phase.
+
+  - id: shape-debug
+    type: debug
+    concept: perf-lcshape-profiles
+    skill: analysis
+    title: Four defects in one spike shape
+    prompt: |
+      This shape is meant to hold 10 users for 60 seconds, spike to 200 for 60 seconds and recover for 60 seconds, then stop.
+      Click every line that is a defect.
+    language: python
+    code: |
+      class SpikeShape(LoadTestShape):
+          stages = [
+              {"duration": 60, "users": 10, "spawn_rate": 10},
+              {"duration": 60, "users": 200, "spawn_rate": 1},
+              {"duration": 60, "users": 10, "spawn_rate": 10},
+          ]
+
+          def tick(self):
+              run_time = time.time()
+              for stage in self.stages:
+                  if run_time < stage["duration"]:
+                      return stage["users"], stage["spawn_rate"]
+              return stage["users"], stage["spawn_rate"]
+    correctLines: [4, 5, 9, 13]
+    lineNotes:
+      - line: 3
+        note: Fine - 10 users at 10 per second needs 1 second, and 60 is the end of the first stage.
+      - line: 12
+        note: Fine - the first stage whose end is after the run time wins.
+      - line: 4
+        note: Two defects. The end time 60 is not after the first stage's end, so the stage can never run (use 120). And 200 users at 1 per second is a 200-second ramp - not a spike.
+      - line: 5
+        note: The recovery stage must end after the spike - 180 - and ramping down 190 users at 10 per second takes 19 seconds, so lengthen it or raise the rate.
+      - line: 9
+        note: '`time.time()` is the epoch, far above every stage end. The shape''s own clock is `self.get_run_time()`.'
+      - line: 13
+        note: After the last stage the test never ends. Return `None`.
+    hints:
+      - Look at the three durations together.
+      - Which function gives the shape's own clock?
+      - What does the loop return when it falls off the end?
+    solution: |
+      Line 4: end time 120 and a spawn rate that gets to 200 inside a second or two (for example 200). Line 5: end time 180
+      (and check the ramp down). Line 9: `self.get_run_time()`. Line 13: `return None`.
+
+  - id: ramp-short
+    type: short
+    concept: perf-lcshape-ramp-reading
+    skill: analysis
+    title: Why the peak was 4
+    prompt: |
+      A shape's first stage asks for 10 users at 1 per second and ends at second 3; the second asks for 4 users. The run's
+      history shows user counts 0, 1, 2, 3, 4, 4, 4, 2, 2, 2 and the log has no "All users spawned" line for 10. Explain
+      what happened, what the test really measured, and two ways to fix the plan.
+    modelAnswer: |
+      The first stage needs 10 / 1 = 10 seconds to ramp but lasts 3, so after 3 seconds the second stage's tuple replaced
+      the ramp (3 users running at the time, then the second stage's 4 users). The peak was 4, not 10: the test measured a
+      load of 4 users and still "passed". The log showed it: no `All users spawned: 10`.
+
+      Fixes: (1) make the plan fit - raise the spawn rate to 4 or more so the ramp fits the stage, or lengthen the stage to
+      at least 10 seconds; check it with a ramp-seconds check before the run. (2) Write the shape with
+      `get_current_user_count()` so each stage's hold starts when its users are running (and give the wait a timeout).
+    rubric:
+      - Says the ramp needs 10 seconds and the stage lasts 3, so the next stage replaced it.
+      - Says what was measured - a peak of 4 users, not the planned 10 - and that the test passed anyway.
+      - Names the evidence - the missing "All users spawned" line, or the history's user counts.
+      - Gives two fixes - a plan that fits, or a shape that waits for its users.
+    hints:
+      - How long does 10 users at 1 per second take?
+    solution: |
+      The ramp could not finish; the next stage replaced it. Fix the plan or wait for the users.
+
+  - id: payday-testdesign
+    type: testdesign
+    concept: perf-lcshape-profiles
+    skill: application
+    title: A payday spike test
+    prompt: |
+      SandPay merchants all open the settlement dashboard when salaries land at 09:00. A normal morning has about 30
+      merchants online; the burst brings about ten times that for a few minutes. Design the Locust shape test: the profile
+      as stages, what you check about the plan before the run, what you record during it, and how you judge the result.
+    modelAnswer: |
+      **Profile (a spike, hypothetical numbers):** baseline 30 users for 2 minutes (ends 120), jump to 300 users (ends 300,
+      3 minutes at the peak), recovery to 30 users for 5 minutes (ends 600). The spawn rate for the jump is high - 270 more
+      users at 100 per second takes 2.7 seconds, well inside one 30 second window. The recovery spawn rate is moderate.
+      End times are cumulative: 120, 300, 600. The shape returns `None` after 600.
+
+      **Plan check before the run:** end times increase; every ramp (270 / 100 = 2.7 s) is much shorter than its stage;
+      the generator can hold 300 users (check its CPU in a smaller trial); users and shape are in separate files; the
+      target is a production-like environment I have written permission to load.
+
+      **During the run:** the log (a `All users spawned: 300` line for the spike), `--csv` history, `--json-file`
+      totals, and the target's own metrics (CPU, queue depth, database connections).
+
+      **Judging:** per phase from the growth of `Total Request Count` (requests per second at 30, 300, 30 users), error rate
+      per phase, latency during the burst against the requirement, and **how long after the burst the latency returns to
+      baseline**. Percentile and `Requests/s` columns are a 10-second window, so I read the recovery from the target's own
+      metrics and from a run with long stages, not from the first ten seconds after the drop. Evidence kept: the stage
+      list, the log, the history CSV, the JSON and the target's dashboards.
+    rubric:
+      - Gives cumulative end times and a high spawn rate for the jump, with the ramp time computed.
+      - Checks the plan before the run - increasing ends, ramps that fit, generator capacity.
+      - Records the log, the history CSV, the JSON totals and the target's metrics.
+      - Judges errors, latency during the burst and time to recover, per phase.
+      - Notes the window effect on Requests/s and percentiles.
+    hints:
+      - What makes a spike a spike and not a ramp?
+      - Which columns of the history can you trust for a short phase?
+    solution: |
+      Baseline, high-spawn-rate jump, baseline; cumulative ends; a plan check; the log and history as evidence; per-phase
+      numbers from the running total; recovery time as the key result.
+
+  - id: shape-interview
+    type: interview
+    concept: perf-lcshape-tick
+    skill: analysis
+    title: 'Interview: how do you model a traffic spike in Locust?'
+    prompt: |
+      "We expect a sudden burst of traffic after a marketing email. How would you model that in Locust, and how would you
+      know the test did what you intended?"
+    modelAnswer: |
+      A spike is a shape, not a `-u -r -t` run. I write a `LoadTestShape` whose `tick()` - called about once a second -
+      follows a list of stages: a baseline, a jump to a multiple of the baseline with a high spawn rate so the burst builds
+      in a second or two, and a return to the baseline so I can see recovery. `duration` is the cumulative end time; the
+      shape returns `None` after the last stage, which is what ends the test, because with a shape `-u -r -t` are ignored.
+
+      To know the test did what I intended: I check the plan before the run - end times increasing, and for each stage
+      `|users - previous| / spawn_rate` shorter than the stage, since a ramp that cannot finish is replaced by the next
+      stage and the peak is lower than planned. In the run I look for the `All users spawned` line for the peak, and in the
+      history CSV for the user counts of the plan in order. I read each phase from the growth of the running request
+      total, not from `Requests/s` or the percentile columns, which are a 10-second window and smear a short spike. I judge
+      errors, latency during the burst and time to recover, and I check the load generator is not the bottleneck.
+    rubric:
+      - Uses a LoadTestShape with stages, a high spawn rate for the jump and a baseline before and after.
+      - Knows that tick() returning None ends the test and that -u -r -t are ignored.
+      - Checks that the ramp fits the stage, and verifies the peak in the log and history.
+      - Reads phases from the running total and knows the 10-second window.
+      - Judges errors, latency during the burst and recovery, and the generator's capacity.
+    followUps:
+      - What would you change to model a slow climb instead of a spike?
+      - How do you stop a stage from losing time to a slow ramp?
+      - What breaks if the shape never returns None?
+    hints:
+      - Start with what a spike is made of - a baseline, a jump, a return.
+    solution: |
+      A LoadTestShape with stages and a high spawn rate, a plan check, proof from the log and history, per-phase numbers,
+      and recovery time as the result.
+
+  - id: stages-code
+    type: coding
+    concept: perf-lcshape-profiles
+    skill: application
+    title: Stage plans as plain functions
+    prompt: |
+      Implement `locust/lc_shape_stages.py` (plain Python, no Locust import): `tick(stages, run_time)`, which returns the
+      `(users, spawn_rate)` of the stage running now or `None` after the last one; `from_steps(...)`, which builds a
+      step-load plan with cumulative end times; `ramp_seconds(from_users, to_users, spawn_rate)`; and `stage_problems(stages)`,
+      which returns `(index, "not-increasing" | "ramp-too-slow")` for every stage that cannot work, judging each stage from
+      the previous *live* stage's end and users, starting from 0 users at second 0.
+    project: perf
+    files:
+      - exercises/locust/lc_shape_stages.py
+    test: tests/locust/test_lc_shape_stages.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_shape_stages.py
+    modelAnswer: |
+      ```python
+      def tick(stages, run_time):
+          for stage in stages:
+              if run_time < stage["duration"]:
+                  return stage["users"], stage["spawn_rate"]
+          return None
+
+      def ramp_seconds(from_users, to_users, spawn_rate):
+          if spawn_rate <= 0:
+              raise ValueError("spawn_rate must be positive")
+          return abs(to_users - from_users) / spawn_rate
+
+      def stage_problems(stages):
+          problems, previous_end, previous_users = [], 0.0, 0
+          for index, stage in enumerate(stages):
+              length = stage["duration"] - previous_end
+              if length <= 0:
+                  problems.append((index, "not-increasing"))
+                  continue                                  # a dead stage does not move the baseline
+              if ramp_seconds(previous_users, stage["users"], stage["spawn_rate"]) > length:
+                  problems.append((index, "ramp-too-slow"))
+              previous_end, previous_users = stage["duration"], stage["users"]
+          return problems
+      ```
+
+      `from_steps` is a list comprehension: stage `i` ends at `(i + 1) * step_seconds` and has `first_users + i * step_users`
+      users. The details the tests check: a stage ends *before* its end second (`<`), a ramp exactly as long as its stage is
+      fine, and a stage that is not increasing is skipped when the next stages are judged.
+    rubric:
+      - Every test in tests/locust/test_lc_shape_stages.py passes.
+      - tick() uses strictly less than the end second and returns None after the last stage.
+      - stage_problems judges each ramp against the stage length and ignores dead stages when moving the baseline.
+      - ramp_seconds works downwards too and refuses a spawn rate that is not positive.
+    hints:
+      - '`run_time < stage["duration"]` - strictly less.'
+      - The ramp from 10 to 4 users also takes time.
+      - After a "not-increasing" stage, `continue` without updating the previous end and users.
+    solution: |
+      A first-match loop for `tick`, a comprehension for `from_steps`, `abs(b - a) / rate` for the ramp, and a walk over the stages
+      that keeps the previous live stage's end and users.
+
+  - id: shape-code
+    type: coding
+    concept: perf-lcshape-tick
+    skill: application
+    title: A step-load shape that ends itself
+    prompt: |
+      Complete `StepShape.tick` in `locust/lc_shape_locustfile.py`. The test must hold 1 user for 3 seconds, then 3 users for
+      3 seconds, then 5 users for 3 seconds (all at 10 users per second) and stop on its own, with no `-u`, `-r` or `-t`. The
+      test runs your file with real Locust against the practice API, reads the history CSV, and checks that the user count
+      climbed 1, 3, 5, that every user logged in once and that the run ended long before the 60 seconds `-t` was given.
+    project: perf
+    files:
+      - exercises/locust/lc_shape_locustfile.py
+    test: tests/locust/test_lc_shape_locustfile.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_shape_locustfile.py
+    modelAnswer: |
+      See "The code: a step-load shape in a locustfile". The part the tests check:
+
+      ```python
+      def tick(self):
+          run_time = self.get_run_time()
+          for stage in self.stages:
+              if run_time < stage["duration"]:
+                  return stage["users"], stage["spawn_rate"]
+          return None
+      ```
+
+      - `self.get_run_time()` is the clock; the stage list holds end times (3, 6, 9).
+      - `return None` after the last stage is what ends the run in about 10 seconds - without it the test times out.
+      - Five logins mean no user was restarted between stages: the same tuple is not returned again with a different
+        count, and the count only grows.
+    rubric:
+      - Every test in tests/locust/test_lc_shape_locustfile.py passes.
+      - tick() uses get_run_time() and cumulative end times, and returns None after the last stage.
+      - The test ends by itself - no -t is needed.
+      - You can explain why -u -r -t were ignored in this run.
+    hints:
+      - The stages are already listed on the class.
+      - The first stage whose end time is after the run time is the one running now.
+      - Falling off the end of the loop must return None explicitly.
+    solution: |
+      Loop over `self.stages`, return the first stage's `(users, spawn_rate)` whose end is after `self.get_run_time()`, and
+      return `None` after the loop.
+
+  - id: history-code
+    type: coding
+    concept: perf-lcshape-ramp-reading
+    skill: analysis
+    title: Read a run by phase
+    prompt: |
+      Implement `locust/lc_shape_history.py` on the rows of a Locust `_stats_history.csv` (dicts with `"User Count"` and
+      `"Total Request Count"` as strings): `phases(rows)` groups consecutive rows with the same user count and returns
+      `{"users", "seconds", "requests", "rps"}` with the requests taken from the growth of the running total;
+      `peak_users(rows)`; and `missed_targets(rows, targets)`, the plan's user counts that never appeared. The tests run on
+      the real history of a spike run and a slow-ramp run.
+    project: perf
+    files:
+      - exercises/locust/lc_shape_history.py
+    test: tests/locust/test_lc_shape_history.py
+    command: .venv/bin/python -m pytest tests/locust/test_lc_shape_history.py
+    modelAnswer: |
+      ```python
+      def phases(rows):
+          result, previous_total = [], 0
+          for row in rows:
+              users, total = int(row["User Count"]), int(row["Total Request Count"])
+              if result and result[-1]["users"] == users:
+                  result[-1]["seconds"] += 1
+                  result[-1]["requests"] += total - previous_total
+              else:
+                  result.append({"users": users, "seconds": 1, "requests": total - previous_total})
+              previous_total = total
+          for phase in result:
+              phase["rps"] = round(phase["requests"] / phase["seconds"], 1)
+          return result
+
+      def missed_targets(rows, targets):
+          seen = {int(row["User Count"]) for row in rows}
+          return sorted(t for t in set(targets) if t not in seen)
+      ```
+
+      The spike run gives 26.7, 193.1 and 26.9 requests per second; `missed_targets(slow_ramp, [10, 4, 2])` is `[10]` - the
+      stage whose users were never reached. A user count that comes back later is a **new** phase, not a merge.
+    rubric:
+      - Every test in tests/locust/test_lc_shape_history.py passes.
+      - The rate comes from the growth of Total Request Count, not from a Requests/s column.
+      - Consecutive rows are grouped; a repeated user count later is a separate phase.
+      - missed_targets is sorted and ignores duplicates in the plan.
+    hints:
+      - Keep the previous row's total; the first row grows from 0.
+      - Group only while the user count equals the last phase's.
+      - '`set()` removes duplicate targets; `sorted()` orders them.'
+    solution: |
+      Walk the rows once with the previous total, merge a row into the last phase when the user count is the same,
+      and compute `rps` at the end. `missed_targets` is a set difference.
+
+placement:
+  - id: place-tick
+    type: mcq
+    concept: perf-lcshape-tick
+    skill: application
+    title: A shape in CI
+    prompt: |
+      A headless run uses a `LoadTestShape` and `-t 5m`. The stages total 3 minutes and `tick()` returns `None` after them.
+      How long does the run last?
+    options:
+      - id: three
+        text: About 3 minutes - the shape ends the test and `-t` is ignored
+        feedback: Correct - with a shape, `-t` is ignored with a warning and the stages' end ends the run.
+      - id: five
+        text: 5 minutes - `-t` extends the test
+        feedback: '`-t` has no effect on a shape that does not read it.'
+      - id: min
+        text: Whichever is shorter, 3 or 5 minutes, because both rules apply
+        feedback: Only the shape's rule applies.
+      - id: forever
+        text: It never ends - tick() is called forever
+        feedback: Returning None stops the test.
+    correct: [three]
+    solution: |
+      The shape decides: `None` after the last stage ends the run; `-t` is ignored.
+
+  - id: place-profile
+    type: mcq
+    concept: perf-lcshape-profiles
+    skill: application
+    title: Which profile answers the question
+    prompt: |
+      You must find out whether response times degrade after a normal load has run for eight hours. Which profile?
+    options:
+      - id: soak
+        text: A soak - one long stage at a moderate user count, with server-side monitoring
+        feedback: Correct - drift and leaks need time at a normal load.
+      - id: spike
+        text: A spike - a short burst well above normal
+        feedback: A spike tests the reaction to a sudden burst, not slow degradation.
+      - id: step
+        text: A step load with a new step every minute
+        feedback: A step load finds the breakpoint; it does not hold a normal load for hours.
+      - id: ramp
+        text: A single fast ramp to the maximum user count
+        feedback: That is a stress or capacity probe.
+    correct: [soak]
+    solution: |
+      Soak: moderate count, long duration, and monitoring on the server side to catch leaks.
+
+  - id: place-ramp
+    type: mcq
+    concept: perf-lcshape-ramp-reading
+    skill: analysis
+    title: The stage that did not reach its users
+    prompt: |
+      A stage asks for 30 users at a spawn rate of 3 per second and lasts 6 seconds; the next stage asks for 5 users. About
+      how many users will the first stage have started when the second replaces it?
+    options:
+      - id: eighteen
+        text: About 18 - the ramp needs 30 / 3 = 10 seconds and only 6 are available
+        feedback: Correct - 3 users per second for 6 seconds, so the target of 30 is never reached.
+      - id: thirty
+        text: 30 - Locust waits for the ramp
+        feedback: The next stage replaced the ramp in the real slow-ramp run.
+      - id: six
+        text: 6 - one user per second of the stage
+        feedback: The rate is 3 users per second, not 1.
+      - id: five
+        text: 5 - the next stage's target applies from the start
+        feedback: The next stage starts only after this one ends.
+    correct: [eighteen]
+    solution: |
+      Users started = spawn rate x stage length = 3 x 6 = 18 (about; ticks and start-up add noise).
+
+recall:
+  - id: recall-tick
+    concept: perf-lcshape-tick
+    prompt: What does tick() return, and how often is it called?
+    answer: '(user_count, spawn_rate), optionally with a list of User classes as a third element, or None to stop the test. About once per second.'
+  - id: recall-options
+    concept: perf-lcshape-tick
+    prompt: What happens to -u, -r and -t when a LoadTestShape is present?
+    answer: Locust logs a warning and ignores them (unless the shape sets use_common_options). The shape decides the users and the length; a shape that never returns None never ends.
+  - id: recall-stage
+    concept: perf-lcshape-profiles
+    prompt: 'What is "duration" in a stage {"duration": 120, "users": 20, "spawn_rate": 5}?'
+    answer: The end of the stage in seconds since the test started (cumulative), not its length. Writing lengths makes later stages unreachable.
+  - id: recall-profiles
+    concept: perf-lcshape-profiles
+    prompt: Step, spike, soak - what does each profile ask?
+    answer: Step - at what user count does it degrade? Spike - how does it take a sudden burst and recover (high spawn rate)? Soak - does it degrade over hours at a normal load?
+  - id: recall-ramp
+    concept: perf-lcshape-ramp-reading
+    prompt: How long does a ramp from a to b users take, and what if the stage is shorter?
+    answer: '|b - a| / spawn_rate seconds. If the stage is shorter, the next stage replaces the ramp and the target is never reached - check the plan and look for "All users spawned".'
+  - id: recall-wait
+    concept: perf-lcshape-ramp-reading
+    prompt: How can a stage start its clock only when its users are running?
+    answer: Compare get_current_user_count() with the stage's users and start the hold timer when they match (with a timeout). The total length of the test is then no longer fixed.
+  - id: recall-window
+    concept: perf-lcshape-ramp-reading
+    prompt: Why not read a short spike's rate from the Requests/s column of the history CSV?
+    answer: Requests/s and the percentile columns are a 10-second sliding window, so they lag and smear. Use the growth of Total Request Count per phase for the rate.
+
+next:
+  - locust-events-and-custom-clients
+  - locust-distributed-and-ci
+  - reading-load-test-results

@@ -1,0 +1,1363 @@
+id: testing-mass-assignment-and-data-exposure
+title: Testing mass assignment and excessive data exposure
+subject: security-testing
+module: api-security
+level: intermediate
+status: published
+estimatedMinutes: 150
+summary: Test the two halves of API3:2023, Broken Object Property Level Authorization - the properties a client can write that it never should (mass assignment) and the properties the server sends that the client never should see (excessive data exposure). Probe PATCH /api/profile with harmless same-value requests and a control, scan responses for secrets without printing them, compare each response with the API contract, and write the two fixes - an allow-list for input and a response model for output - against a deliberately vulnerable SandPay portal, with probes that find the flaw and stay quiet once it is fixed.
+tags:
+  [
+    mass assignment,
+    autobinding,
+    object injection,
+    excessive data exposure,
+    broken object property level authorization,
+    API3:2023,
+    BOPLA,
+    CWE-915,
+    CWE-213,
+    allow-list,
+    block-list,
+    DTO,
+    data transfer object,
+    response model,
+    schema validation,
+    sensitive data,
+    privilege escalation,
+    PATCH,
+    JSON,
+    API contract,
+    OWASP API Security Top 10,
+    API security,
+    security testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/security/.venv` with pytest 9.2.0 and requests 2.34.2, on Linux. Every output
+    marked as run here was printed by the code shown, on 21 November 2026, against the practice portal on `127.0.0.1`.
+    The probes' answers do not depend on timing; the tests assert on status codes, property names and paths only.
+  - **Practice target:** `practice/security/support/sandpay_vuln.py`, the **deliberately vulnerable** SandPay merchant
+    portal. This lesson uses two of its flaws: `mass-assignment` (`PATCH /api/profile` binds `display_name`, `role` and
+    `merchant_id`) and `data-exposure` (`GET /api/merchants/<id>` returns `api_secret` and the full IBAN).
+    `make_app({"mass-assignment", "data-exposure"})` closes both. The portal binds to loopback only. SandPay, its
+    users, `sk_test_shop_a_practice` and the IBAN-shaped value `XX00 SAND 0000 0001` are fictional.
+  - **Ethics:** test only systems you own or have **written permission** to test, inside the agreed scope. A probe that
+    writes to an account (a role, an owner id, a price) changes real data, so on a real system send the value the
+    account already has, use a test account, and say in the rules of engagement which write tests you will run.
+    Practice runs only against the local portal.
+  - **Sources (read in full text on 21 November 2026):** OWASP
+    [API3:2023 Broken Object Property Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/)
+    (its source is in the [API-Security repository](https://github.com/OWASP/API-Security/blob/master/editions/2023/en/0xa3-broken-object-property-level-authorization.md));
+    the OWASP [Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html);
+    [CWE-915](https://cwe.mitre.org/data/definitions/915.html) and
+    [CWE-213](https://cwe.mitre.org/data/definitions/213.html), the two weakness entries API3:2023 lists. Their
+    wording is quoted where it is quoted.
+  - **Not run here:** the Spring, Mongoose, Laravel and other framework snippets in the cheat sheet are described from
+    the cheat sheet, not run. GraphQL field-level exposure is mentioned from API3:2023 and not run. I did not read a
+    WSTG test page for mass assignment, so this lesson cites none - check the release you cite in a report.
+  - **Not repeated here:** who may read or change a whole object (broken object level authorization) -
+    [Testing access control and IDOR](#/lesson/testing-access-control-idor); the full risk list -
+    [The OWASP API Security Top 10](#/lesson/owasp-api-security-top-10); secrets and personal data stored or sent
+    without protection - [Testing cryptography and data exposure](#/lesson/testing-cryptography-and-data-exposure);
+    the developer's view of the same list - [OWASP Top 10 for developers](#/lesson/owasp-top-10-for-developers).
+
+prerequisites:
+  - security-testing-fundamentals
+  - http-security-for-testers
+  - owasp-api-security-top-10
+  - testing-access-control-idor
+
+concepts:
+  - id: sec-mass-assignment-write
+    name: Mass assignment - properties the client can write
+    summary: Mass assignment happens when the API binds the client's JSON straight onto an object, so the client can set properties the server should decide - a role, an owner, a price, a blocked flag. A tester finds the writable object properties from the responses and the documentation, sends each privileged property with the value the account already has, and uses a control field to prove the request works. The fix is an allow-list of editable fields (or a DTO) that rejects everything else.
+  - id: sec-excessive-data-exposure-read
+    name: Excessive data exposure - properties the client can read
+    summary: Excessive data exposure happens when an endpoint returns the whole stored object and trusts the front end to hide the rest, so secrets, hashes and full account numbers cross the wire to anyone who calls the API. A tester compares each response with the documented contract and scans every value for secret-looking keys and data shapes, reporting paths and never printing the secret. The fix is a response model that cherry-picks the properties the endpoint needs.
+  - id: sec-property-level-method
+    name: Testing property-level authorization with controls
+    summary: Both halves have the same shape - the question is not "may this user reach the object" but "may this user read or change this property of it". A trustworthy test has a baseline, a control that proves the endpoint works, a probe that changes nothing, a re-read that proves nothing changed, and a negative control against the fixed build. A 200 answer alone proves nothing, because many servers silently ignore properties they do not know.
+
+objectives:
+  - Explain mass assignment and excessive data exposure as the write and read halves of API3:2023, and tell them apart from broken object level authorization.
+  - Probe an endpoint for mass assignment with same-value requests and a control, and read the status code and the response correctly, including a silent 200.
+  - Scan a JSON response for secrets by key name and by data shape, and compare it with the contract, without ever printing the secret value.
+  - Write the two fixes - an allow-list that rejects unknown fields and a response model that returns only what the endpoint needs.
+  - Explain why a block-list is not a fix and why a front end that hides a field is not a control.
+  - Design a test plan for property-level authorization on a profile, an order and a merchant endpoint with expected results and evidence.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: The idea in plain language
+    body: |
+      Think of a paper form at a bank counter. At the top the clerk has already filled in boxes you are not meant to
+      touch - "Account type", "Credit limit", "Approved by". Below them are the boxes meant for you: your phone number
+      and your nickname. A careful clerk takes only your two boxes and types them in. A careless clerk takes **the
+      whole sheet back from you and files it as it is**. Now you can cross out "Credit limit: 500" and write
+      "50000". Nobody checked, because the system assumed that the sheet would come back the way it left.
+
+      That is **mass assignment**: the API takes the JSON it receives and binds *every* property onto the stored
+      object. The profile screen only ever shows a "display name" box, so the developers never thought about
+      `role` - but the API does not know what the screen looks like. A tester who adds `"role": "admin"` to the
+      request is crossing out the credit limit.
+
+      The same clerk makes the opposite mistake at the other end of the counter. You ask "what is my phone number?"
+      and the clerk **photocopies your whole file** - including the internal risk score, the password hash and the
+      staff notes - and slides it over, trusting that you will only read the top line. That is **excessive data
+      exposure**: the endpoint returns the whole stored object and relies on the front end to display only some of
+      it. The front end hides the field; the network does not.
+
+      Both mistakes have one cure, and it is the same on both sides of the counter: **name the properties on purpose**.
+      On the way in, list the boxes you accept. On the way out, list the boxes you return. Anything not on the list
+      does not travel.
+
+      In the OWASP API Security Top 10 these two used to be separate entries (API3:2019 Excessive Data Exposure and
+      API6:2019 Mass Assignment). In 2023 they became one: **API3:2023, Broken Object Property Level Authorization**.
+      The word "property" is the whole point - it is about the *fields* inside an object you are allowed to
+      reach.
+
+  - id: what
+    kind: what
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: What the terms mean
+    body: |
+      **API3:2023 Broken Object Property Level Authorization.** OWASP says an API endpoint is vulnerable if:
+
+      - it "exposes properties of an object that are considered sensitive and should not be read by the user"
+        (previously named *Excessive Data Exposure*), or
+      - it "allows a user to change, add/or delete the value of a sensitive object's property which the user should
+        not be able to access" (previously named *Mass Assignment*).
+
+      The two halves, side by side:
+
+      | | Mass assignment (write) | Excessive data exposure (read) |
+      | --- | --- | --- |
+      | Direction | request body in | response body out |
+      | The mistake | client input is bound onto the object as it is | the whole object is serialised and sent |
+      | What the attacker does | adds or changes a property: `role`, `merchant_id`, `blocked`, a price | calls the endpoint and reads the extra properties |
+      | Typical impact | privilege escalation, taking over another account's data, tampering with a price or a status | leaked secrets, hashes, full account numbers, internal flags |
+      | The fix | allow-list the editable fields, or bind to a DTO | a response model that cherry-picks the fields |
+      | CWE | [CWE-915](https://cwe.mitre.org/data/definitions/915.html), improperly controlled modification of dynamically-determined object attributes | [CWE-213](https://cwe.mitre.org/data/definitions/213.html), exposure of sensitive information due to incompatible policies |
+
+      **Names for mass assignment.** The Mass Assignment Cheat Sheet lists the alternative names: "Mass Assignment: Ruby
+      on Rails, NodeJS. Autobinding: Spring MVC, ASP NET MVC. Object injection: PHP." They are one weakness. When you
+      read a report that says "autobinding" or "object injection", it is this.
+
+      **Object level versus property level.** Broken *object* level authorization (BOLA, the IDOR lesson) is "may this
+      user touch **this payment**?". Property level is the next question down: "the user may touch this payment - may
+      they set its `amount_minor`, or read its internal `risk_score`?" An endpoint can be perfect at the first
+      question and broken at the second. The practice portal is: `PATCH /api/profile` only ever edits the caller's
+      own user, so object level is fine, and yet the caller can set their own `role`.
+
+      **Allow-list versus block-list.** An **allow-list** names what is accepted; everything else is refused. A
+      **block-list** names what is refused; everything else is accepted. The cheat sheet's advice is plain: "Do not
+      rely on a block-list as the sole protection: a new or overlooked sensitive field remains bindable."
+
+      **DTO (data transfer object).** A small class that holds *only* the fields a request may carry, so the request
+      is bound to the DTO and never to the database object. The cheat sheet's example is a
+      `UserRegistrationFormDTO` with the comment "isAdmin field is not present". The **response model** is the same
+      idea going out.
+
+  - id: why
+    kind: why
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read]
+    title: Why testers must look for it
+    body: |
+      Nothing in the user interface shows either flaw. The profile page has one box; the merchant page shows a name and
+      a masked IBAN. Every functional test passes. The flaws exist only in the gap between **what the screen
+      uses** and **what the API accepts and returns** - which is exactly the part a UI-driven test never exercises.
+
+      Three reasons to test it deliberately:
+
+      1. **The impact can be total.** OWASP's rating for API3:2023 is "Exploitability Easy", "Prevalence Common",
+         "Detectability Easy". Its impact text says that unauthorized access to object properties "may result in data
+         disclosure, data loss, or data corruption" and, "under certain circumstances", "privilege escalation or
+         partial/full account takeover". Setting `role` is the textbook case.
+      2. **It is easy to introduce and easy to miss in review.** One generic call - bind the request to the model,
+         serialise the model to the response - is the *shortest* code. The Cheat Sheet's example is a controller that
+         takes a `User` object straight from the form. A property added to the database table next year becomes
+         bindable and readable on the same day, with no change to the endpoint.
+      3. **It has happened to well-known systems.** The cheat sheet's case study: "In 2012, GitHub was hacked using mass
+         assignment. A user was able to upload his public key to any organization and thus make any subsequent changes
+         in their repositories." (Read as told by the cheat sheet; I did not check GitHub's own post.)
+
+      OWASP's own attack scenarios show the write side in business terms. A host approves a booking with
+      `{"approved": true, "comment": "..."}`; replaying it with `"total_stay_price": "$1,000,000"` added makes the
+      guest pay more. A blocked video's description is edited with `{"description": "..."}`; adding
+      `"blocked": false` unblocks it. Neither request needed a vulnerability scanner - only the idea that **the body
+      may carry more than the screen sends**.
+
+  - id: write-internals
+    kind: internals
+    concepts: [sec-mass-assignment-write, sec-property-level-method]
+    title: How mass assignment works, and how to find the writable properties
+    body: |
+      **The mechanism.** The portal's profile handler, simplified, does this (the real code is in
+      `support/sandpay_vuln.py`):
+
+      ```python
+      allowed = {"display_name", "role", "merchant_id"}        # FLAW: more than the screen sends
+      for key in set(data) & allowed:
+          update users set <key> = <value> where id = <the caller>
+      ```
+
+      The screen sends `{"display_name": "..."}`. The handler does not check who is asking for `role`; it only
+      checks that `role` is a column it knows. In frameworks the same thing hides one level up: the code reads
+      `User(**request.json)` or `Model.update(req.body)` and every column is bindable.
+
+      **Finding the properties to try.** You do not need the source. Collect candidate names from:
+
+      1. **Responses.** The object you read back is the best list - `GET /api/me` returns `email`, `merchant_id`,
+         `role` and `display_name`. Every one of them is a candidate for a write. (The OWASP text says to inspect
+         "API responses" - detecting exposure is "easy", and finding writable properties "requires more effort",
+         with fuzzing as a technique for hidden ones.)
+      2. **Documentation and schemas.** An OpenAPI document lists the request and the response models; properties
+         present in the response model and absent from the request model are the ones to try.
+      3. **Other endpoints.** An admin screen or a different role's request often shows fields the normal user never
+         sees: `is_admin`, `approved`, `blocked`, `price`, `owner_id`, `status`.
+      4. **Naming conventions.** `role`, `is_admin`, `admin`, `verified`, `balance`, `credit`, `tenant_id`,
+         `owner_id`, `created_at`, `id`.
+
+      **Reading the answer correctly.** This is where most people are wrong, and the portal is built to show it:
+
+      | Request | Vulnerable portal | Fixed portal | What it tells you |
+      | --- | --- | --- | --- |
+      | `{"role": "merchant"}` (the value you have) | `200`, role in the body | `400` `fields not allowed: ['role']` | `role` is bound |
+      | `{"is_admin": true}` (not a column) | `200`, body **unchanged** | `400` | a 200 does **not** prove the property was set - this server silently ignores unknown keys |
+      | `{"display_name": "Alice"}` (the control) | `200` | `200` | the endpoint works for this caller |
+
+      Look at the second row. On the vulnerable portal an unknown field is *accepted with a 200 and ignored*. If a probe
+      reported "accepted" for every 200 it would report `is_admin` as a finding - a **false positive**. The honest
+      evidence for "this property is bound" is a response that **shows the property with the value you sent** (or a
+      later read that shows it), not a status code alone. That is why the exercise counts a field as accepted only
+      when the answer is `200` *and* the property is in the body with the sent value.
+
+      **Side-effect analysis.** OWASP notes that "side-effect analysis may be required if the target property is not
+      returned in the API response". A write-only property such as `blocked` or `total_stay_price` is invisible in the
+      answer; you then have to look elsewhere - a later read of the object, another endpoint, an email, the amount
+      on an invoice - to see whether it was applied.
+
+      **The write you must not make.** Setting your `role` to `admin` is the proof the attacker wants and the change
+      you must **not** leave behind on a system that is not yours. The safe test sends the value the account
+      *already has*: if the server accepts `role: "merchant"` from a merchant, it would accept `role: "admin"` -
+      the binding is the finding, and nothing changed. This is the technique the lesson's probe uses, and it
+      is a judgement call to flag in the rules of engagement: it proves that the property is bound, not that the
+      server has no *other* check on the value (a rule such as "only admins may *raise* a role"). If the engagement
+      allows a real write on a test account, do that on the test account and report both.
+
+  - id: read-internals
+    kind: internals
+    concepts: [sec-excessive-data-exposure-read, sec-property-level-method]
+    title: How excessive data exposure works, and how to find it
+    body: |
+      **The mechanism.** The merchant endpoint reads the row and returns it:
+
+      ```python
+      row = query("SELECT * FROM merchants WHERE id = ?", mid)
+      return json(dict(row))          # FLAW: every column, including api_secret and the full IBAN
+      ```
+
+      `SELECT *` plus "serialise the row" is the shortest way to write the endpoint, and it is the OWASP "generic
+      method" warning: "Avoid using generic methods such as `to_json()` and `to_string()`. Instead, cherry-pick
+      specific object properties you specifically want to return." The page only shows the name and the last four
+      digits of the IBAN, so the leak is invisible - until someone opens the browser's network tab or calls the API
+      directly.
+
+      **Finding it.** Read the whole response, not the part the screen shows. Two complementary checks:
+
+      1. **By contract.** Compare the keys of the response with the documented model. Anything extra is a finding
+         candidate even if it looks harmless - an undocumented property is a decision nobody made. (The portal's
+         documented merchant model is `id`, `name`, `payout_iban_last4`.)
+      2. **By content.** Scan keys for names that hold secrets (`secret`, `password`, `hash`, `token`, `key`,
+         `private`) and values for data shapes (a full IBAN, a long hex string, a card number, an email that
+         belongs to someone else). The content scan catches what the contract check cannot: a property nobody
+         documented *and* nobody expected.
+
+      **Do it on every shape.** The leak is often not in the main object but in a nested one (`owner.password_hash`),
+      in a list item (`items[3].internal_note`), in a related-object expansion (`?expand=customer`), in an error
+      message, or in a different endpoint that returns the same object in a different wrapper. Walk lists and nested
+      objects; report the **path**.
+
+      **Do not print the secret.** A test report is a document that gets pasted into tickets and chat. The finding is
+      "`$.api_secret` is returned" - the *key name and path*, not `sk_...`. The lesson's scanner returns a path and a
+      reason and **never the value**, and a test asserts that. If you must prove the value is real, show a redacted
+      form (the first and last characters), and rotate the credential: **once a secret has appeared in an API
+      response, treat it as exposed.**
+
+      **GraphQL.** OWASP notes that for protocols such as GraphQL "it may require crafted requests to specify which
+      properties should be returned" - the client chooses the fields, so exposure shows up as a field the schema lets
+      anyone ask for (the dating-app scenario in API3:2023: `fullName` and `recentLocation`). Not run here.
+
+  - id: when
+    kind: when
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: When to test it, and what it does not replace
+    body: |
+      **Test it on:**
+
+      - every endpoint that **creates or updates** an object from JSON (`POST`, `PUT`, `PATCH`) - profile, order,
+        payment, settings, organisation, API key;
+      - every endpoint that **returns** an object with more columns than the screen shows - merchant, user, order,
+        invoice, "list" endpoints that return full rows;
+      - after **any schema change**: a new column is a new bindable and readable property.
+
+      **Where it belongs in an assessment.** After you have mapped the endpoints
+      ([The OWASP API Security Top 10](#/lesson/owasp-api-security-top-10), reconnaissance) and while you test
+      authorization ([Testing access control and IDOR](#/lesson/testing-access-control-idor)). Run the object level
+      check first - "may I reach this object?" - then the property level one - "may I change or read *this field* of
+      it?".
+
+      **What it does not replace.**
+
+      - **Object level authorization.** An allow-list of fields does not decide *whose* record is edited. The cheat
+        sheet says so directly: DTOs and field allow-lists "restrict writable properties; they do not replace
+        authorization for the requested object and operation."
+      - **Input validation.** An allowed field still needs a type, a length and a range check - `display_name` is
+        allowed, a 10 MB string is not.
+      - **Business rules.** A legitimate field can still be abused (a refund amount, a discount) - see the next lesson
+        on business logic.
+      - **Field-level authorization.** Sometimes a field is editable by *some* roles (an admin may set `role`). The
+        allow-list then depends on the caller's role - a second dimension the test must cover.
+
+  - id: visual-write
+    kind: visual
+    concepts: [sec-mass-assignment-write, sec-property-level-method]
+    title: The mass assignment probe, step by step
+    body: |
+      ```mermaid
+      sequenceDiagram
+        participant T as Tester (alice, a merchant)
+        participant P as SandPay portal
+        T->>P: GET /api/me
+        P-->>T: 200 role merchant, merchant_id m_100 (baseline and candidate list)
+        T->>P: PATCH /api/profile with display_name Alice (control)
+        P-->>T: 200 (the endpoint works for this caller)
+        T->>P: PATCH /api/profile with role merchant (the value alice has)
+        P-->>T: vulnerable 200 with role in the body
+        T->>P: PATCH /api/profile with merchant_id m_100 (the value alice has)
+        P-->>T: vulnerable 200 with merchant_id in the body
+        T->>P: GET /api/me again
+        P-->>T: 200 identical to the first answer (the probe changed nothing)
+        Note over P: The fixed portal answers 400 "fields not allowed" to both privileged fields and 200 to the control
+      ```
+
+      Notice the **control** in the second exchange and the **re-read** in the last. Without the control, a `400` on
+      `role` could mean "PATCH is broken for everyone". Without the re-read you cannot claim that the probe was
+      harmless. And notice what is *not* in the picture: no `role: admin`. The proof that the property is bound is
+      the server's willingness to accept it, and the account is left exactly as it was found.
+
+  - id: visual-read
+    kind: visual
+    concepts: [sec-excessive-data-exposure-read, sec-property-level-method]
+    title: Two checks on every response
+    body: |
+      ```mermaid
+      flowchart TD
+        R["Response body (JSON)"] --> C{"Every top-level key in the documented contract?"}
+        C -- "no" --> F1["Finding candidate: extra property, report its path"]
+        C -- "yes" --> S
+        F1 --> S{"Any key named like a secret, or a value shaped like one?"}
+        S -- "yes" --> F2["Finding: sensitive property, report path and reason, never the value"]
+        S -- "no" --> N["Walk nested objects and list items with the same two checks"]
+        F2 --> N
+        N --> D["Done: clean only if both checks pass at every depth"]
+      ```
+
+      The two checks are independent. A response can pass the contract check (every key is documented) and still fail the
+      content check, because the *documentation* was wrong and listed the secret. And a response can fail the contract check with a
+      perfectly harmless key. Reporting both gives the developer the whole picture, and the contract check is the
+      one that can run on every build automatically.
+
+  - id: raw-exchanges
+    kind: code
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: The raw exchanges, vulnerable and fixed
+    collapsed: true
+    body: |
+      This is what a manual test sees. It was printed on 21 November 2026 by a script that calls the
+      loopback portal as `alice@shop-a.example` (merchant `m_100`) - first with both flaws present, then with
+      `make_app({"mass-assignment", "data-exposure"})`. Bodies are exactly as the portal sent them.
+
+      ```text
+      ===== VULNERABLE
+      GET /api/me 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      PATCH {display_name, role=merchant} 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      PATCH {is_admin} 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      GET /api/merchants/m_100 200 {"id": "m_100", "name": "Shop A", "api_secret": "sk_test_shop_a_practice", "payout_iban": "XX00 SAND 0000 0001"}
+      ===== FIXED
+      GET /api/me 200 {"email": "alice@shop-a.example", "merchant_id": "m_100", "role": "merchant", "display_name": "Alice"}
+      PATCH {display_name, role=merchant} 400 {"error": "fields not allowed: ['role']"}
+      PATCH {is_admin} 400 {"error": "fields not allowed: ['is_admin']"}
+      GET /api/merchants/m_100 200 {"id": "m_100", "name": "Shop A", "payout_iban_last4": "0001"}
+      ```
+
+      Read it line by line:
+
+      - **`PATCH {display_name, role=merchant}` - `200` vulnerable, `400` fixed.** The vulnerable portal accepted `role`
+        next to a legitimate field. The fixed one refuses the *whole request* and names the field: it rejects rather
+        than silently dropping (see the mistakes section for why that matters).
+      - **`PATCH {is_admin}` - `200` on the vulnerable portal, and the body did not change.** `is_admin` is not a column,
+        so this portal ignored it. A `200` is therefore **not proof of binding**. This one row is why a probe must
+        look at the body, not only at the status.
+      - **`GET /api/merchants/m_100`.** The vulnerable body carries `api_secret` and the full IBAN-shaped
+        `payout_iban`. The fixed body carries three properties - `id`, `name` and `payout_iban_last4`.
+
+      **What the escalation would look like** (run once on a fresh vulnerable portal, in this lesson only - never on a
+      system you do not own):
+
+      ```text
+      ESCALATE 200 {"email": "alice@shop-a.example", "merchant_id": "m_200", "role": "admin", "display_name": "Alice"}
+      then GET m_200 200 ['api_secret', 'id', 'name', 'payout_iban']
+      then payments ids ['pay_2001', 'pay_2002']
+      ```
+
+      One request changed alice's `role` to `admin` and her `merchant_id` to Shop B's. Afterwards she can read Shop B's
+      merchant object (secret included) and Shop B's payments. The two flaws chain: mass assignment is the way in,
+      data exposure is what is behind the door. The safe probe never does this - it proves the binding with
+      same-value requests.
+
+  - id: probes-code
+    kind: code
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: The probes and the fixes in Python
+    collapsed: true
+    body: |
+      The three files in `practice/security/exercises/api/` are what you write in the exercises below. These are the
+      reference solutions, shortened.
+
+      **1. The mass assignment probe (`mass_probe.py`).**
+
+      ```python
+      PRIVILEGED = ("role", "merchant_id")
+      CONTROL = "display_name"
+
+      def probe_mass_assignment(base_url, token, timeout=5):
+          before = read_profile(base_url, token, timeout)          # raises RuntimeError unless 200
+          result = MassAssignmentResult()
+
+          def patch(name):                                         # same value the caller already has
+              return requests.patch(base_url + "/api/profile", json={name: before[name]},
+                                    headers=_auth(token), timeout=timeout)
+
+          control = patch(CONTROL)
+          result.control_ok = control.status_code == 200
+          if not result.control_ok:
+              raise RuntimeError("control PATCH failed: no verdict possible")
+
+          for name in PRIVILEGED:
+              resp = patch(name)
+              if resp.status_code == 200 and resp.json().get(name) == before[name]:
+                  result.accepted.append(name)
+              else:
+                  result.refused[name] = resp.status_code
+
+          if read_profile(base_url, token, timeout) != before:
+              raise RuntimeError("the probe changed the profile")
+          result.vulnerable = bool(result.accepted)
+          return result
+      ```
+
+      **2. The exposure scanner (`mass_exposure.py`).**
+
+      ```python
+      SENSITIVE_KEY = re.compile(r"(secret|password|passwd|hash|token|api_?key|private)", re.I)
+
+      def find_sensitive(value, path="$"):
+          found = []
+          if isinstance(value, dict):
+              for key, item in value.items():
+                  child = f"{path}.{key}"
+                  if SENSITIVE_KEY.search(key):
+                      found.append(Exposure(child, "sensitive key name"))   # the value is never read
+                  else:
+                      found.extend(find_sensitive(item, child))
+          elif isinstance(value, list):
+              for index, item in enumerate(value):
+                  found.extend(find_sensitive(item, f"{path}[{index}]"))
+          elif isinstance(value, str) and FULL_IBAN.match(value.strip()):
+              found.append(Exposure(path, "full IBAN"))
+          return found
+      ```
+
+      **3. The two fixes (`mass_fix.py`).**
+
+      ```python
+      EDITABLE = {"display_name": str}
+
+      def apply_profile_update(user, payload):
+          unknown = sorted(set(payload) - set(EDITABLE))
+          if unknown:
+              raise ValueError(f"fields not allowed: {unknown}")      # reject, do not silently drop
+          updated = dict(user)                                         # a copy, never the original
+          ...validate type, blank and length, then updated[name] = value.strip()
+          return updated
+
+      def merchant_view(row):
+          iban = row["payout_iban"].replace(" ", "")
+          return {"id": row["id"], "name": row["name"], "payout_iban_last4": iban[-4:]}
+      ```
+
+      **Real output.** The probe and the scanner run against both builds, printed on 21 November 2026:
+
+      ```text
+      ===== VULNERABLE
+      MassAssignmentResult(vulnerable=True, control_ok=True, accepted=['role', 'merchant_id'], refused={}, evidence='PATCH /api/profile accepted role, merchant_id')
+      [Exposure(path='$.api_secret', reason='not in the contract'), Exposure(path='$.payout_iban', reason='not in the contract')]
+      ===== FIXED
+      MassAssignmentResult(vulnerable=False, control_ok=True, accepted=[], refused={'role': 400, 'merchant_id': 400}, evidence="PATCH /api/profile refused {'role': 400, 'merchant_id': 400}")
+      []
+      ```
+
+      The exposure list shows the *paths* only - no secret appears in it. (`check_merchant_exposure` lists a property
+      once, as a contract breach, even when it is also a secret; the content scan fills in anything the contract
+      did not catch.)
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: Why the important lines are written that way
+    body: |
+      | Line | Why |
+      | --- | --- |
+      | `before = read_profile(...)` raising `RuntimeError` unless `200` | The baseline. If the token does not work, "no mass assignment found" would only mean "I was never signed in". The probe refuses to give a verdict. |
+      | `json={name: before[name]}` | The **same-value** request. It proves the property is bound without changing the account, so the probe is safe to run and safe to repeat. |
+      | Each privileged property in its **own** request | If you send `role` and `merchant_id` together, a single `400` hides which one was refused - and the fixed portal refuses the whole request when any field is not allowed. One field per request gives one answer per field. |
+      | `control = patch(CONTROL)` and the `RuntimeError` | The control. A `400` for `role` is only meaningful if a legitimate field gets a `200` from the same endpoint for the same caller. |
+      | `resp.status_code == 200 and resp.json().get(name) == before[name]` | The accepted rule. A `200` alone is not enough because a server may ignore unknown fields; the property must be **in the answer**. |
+      | `if read_profile(...) != before: raise` | The harmlessness check. A probe that changes data is not a probe. A failure here means the probe's rule "send only what the caller already has" was broken. |
+      | `if SENSITIVE_KEY.search(key): ...append(...)` without recursing | A flagged key's **value** is never read, copied or printed, and nothing inside a secret object needs reporting separately. |
+      | `Exposure(path, reason)` with no value field | The type has nowhere to put a secret. A test asserts the secret string is not in `repr(exposure)`. |
+      | `sorted(set(payload) - set(EDITABLE))` | A set difference is the allow-list. Sorting makes the error message stable, so a test (and a developer) can rely on it. |
+      | `updated = dict(user)` | The function returns a copy and a rejected request leaves the original untouched. A half-applied update is the sort of bug a later test would catch only by luck. |
+      | `merchant_view(row)` builds a new dict key by key | A response model **cherry-picks**. A new column added to `merchants` next year does not appear in the response, because nobody listed it. |
+
+  - id: steps
+    kind: steps
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: A property-level test, step by step
+    body: |
+      1. **Get permission and scope in writing.** Include the statement about write tests: which endpoints, which test
+         accounts, and whether you may send values the account does not already have.
+      2. **Map the objects.** For each endpoint that takes or returns an object, write down the object, the roles that
+         call it, and the **documented** property list (OpenAPI, the front end's types, a colleague).
+      3. **Baseline.** Call the endpoint with a valid token and confirm `200`; without a token confirm `401`.
+      4. **Read side.** Read every response in full. Compare the keys with the documented list (contract check), then
+         scan keys and values (content check) - at every depth, in lists, and with any `expand` or `include` option.
+         Note paths, never values.
+      5. **Write side - candidates.** Build the candidate list from the response, the documentation, other roles'
+         requests and naming conventions.
+      6. **Write side - control.** Send a legitimate field with its current value and confirm `200`.
+      7. **Write side - probe.** Send each candidate **alone**, with the value the account already has. Record the
+         status code and whether the property appears in the answer.
+      8. **Re-read.** Call the read endpoint again and confirm nothing changed. If a write-only property cannot be
+         observed, look for its side effect elsewhere.
+      9. **Prove impact with the least change.** If the rules of engagement allow it, show the *effect* on a test
+         account (for example, that a role change would open an admin endpoint) - do not change a real
+         account's role.
+      10. **Negative control.** Run the same probes against a build where the flaw is fixed (or after the fix) and
+          confirm they report nothing. A probe that fires everywhere is noise.
+      11. **Report.** For each finding: endpoint, direction (read or write), property **path**, evidence (status
+          code and the answer with secrets redacted), impact in one sentence, the OWASP and CWE reference, and the fix.
+      12. **Keep the test.** Turn the confirmed finding into an automated regression test - see the security regression
+          automation lesson later in this track.
+
+  - id: example
+    kind: example
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: A realistic scenario on the SandPay portal
+    body: |
+      The SandPay merchant portal ships a new "My profile" page with one editable box, the display name. The release
+      checklist says "profile page works - pass". You are asked to test the API behind it.
+
+      You sign in as `alice@shop-a.example` and read `GET /api/me`. The answer has four properties. The page shows one
+      of them in an input box. You write the other three down as candidates: `email`, `merchant_id`, `role`.
+
+      You send the control, `PATCH /api/profile` with `display_name` - `200`. You send `role` with the value Alice
+      already has - `200`, and `role` is in the body. You send `merchant_id` the same way - `200`. You read `/api/me`
+      again: unchanged. Your report says the portal binds **two** properties the user must never control. You do
+      **not** say "alice can become admin" as if you had done it - you say the binding is accepted and, under the
+      rules of engagement, you show the effect on a test account: `role` changed to `admin` on `test-merchant@...`,
+      and the admin endpoint then answered.
+
+      Then you open the merchant page's API: `GET /api/merchants/m_100`. The screen shows the name and the last four IBAN
+      digits. The body has `api_secret` and a full `payout_iban`. The contract check lists both as outside the
+      documented model (`id`, `name`, `payout_iban_last4`); the content check agrees. Your report lists the paths
+      `$.api_secret` and `$.payout_iban` and says **rotate the key**, because it has been served to every merchant
+      user's browser.
+
+      A developer asks, "we hide those fields in the page - why is it a problem?" The answer is the one sentence of
+      this lesson: **the front end hides the field, the network does not.** Anyone with the token can call the API
+      without the page.
+
+      The fix is two small changes: an allow-list on the profile handler (the portal's fixed build answers
+      `400 fields not allowed: ['role']`) and a response model for the merchant (the fixed build returns exactly
+      `id`, `name` and `payout_iban_last4`). You re-run both probes: no findings. You add them to the regression suite.
+
+  - id: tests
+    kind: tests
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: Test cases with expected results and evidence
+    body: |
+      | # | Case | Steps | Expected (secure) | Evidence |
+      | --- | --- | --- | --- | --- |
+      | 1 | Baseline | call the endpoint with no token, then with a valid one | `401`, then `200` | both exchanges |
+      | 2 | Control | PATCH an editable field with its current value | `200` | the request and the answer |
+      | 3 | Privileged field, same value | PATCH `role` alone with the caller's own role | `400` (or `403`); never `200` with the property in the body | status code and body |
+      | 4 | Owner field, same value | PATCH `merchant_id` alone with the caller's own value | refused | status code and body |
+      | 5 | Unknown field | PATCH `is_admin: true` | refused (`400`) - or, if the API ignores unknown fields by design, a `200` whose body is unchanged and a later read that is unchanged | the answer and a re-read |
+      | 6 | No side effect | re-read the object after cases 2 - 5 | identical to the baseline read | the two reads |
+      | 7 | Nested and bulk | PATCH with the property inside a nested object, in an array item, or in a `PUT` of the whole object | refused the same way | the requests |
+      | 8 | Other roles | repeat 3 - 4 as another role (an admin may set `role`; a merchant may not) | each role gets exactly its own allow-list | one row per role |
+      | 9 | Contract check | compare every response's keys with the documented model | no extra top-level property | the extra paths |
+      | 10 | Content check | scan keys and values at every depth, including lists and nested objects | no secret-named key, no full account number | paths and reasons, never values |
+      | 11 | Other shapes of the same object | list endpoint, `expand` or `include` options, the error body | same properties as the single read | one response per shape |
+      | 12 | Negative control | run cases 3 - 5 and 9 - 10 against a build with the flaw fixed | no findings | the same probes, quiet |
+
+      Case 5 has two acceptable answers on purpose. A server that **rejects** unknown fields is stricter and easier to
+      test; one that **ignores** them is allowed by many designs. What is *not* acceptable is a `200` that changes
+      something. Decide the rule with the team *before* you test, and write it in the plan.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: Common mistakes and a debugging method
+    body: |
+      - **Treating a 200 as proof.** The portal answers `200` to `{"is_admin": true}` and changes nothing. A probe that
+        counts every 200 reports a vulnerability that does not exist, and the developer stops trusting your reports.
+        Look for the property **in the answer or in a re-read**.
+      - **Testing only with a real write.** Setting `role` to `admin` on a live account is an incident, not a test. Use
+        same-value requests, or a dedicated test account named in the rules of engagement.
+      - **Leaving the change behind.** A probe that edits `display_name` or `merchant_id` and does not restore it
+        corrupts the account for the next test. Re-read, compare, and restore.
+      - **Sending all properties in one request.** One `400` says nothing about *which* property was refused, and a
+        server that rejects the whole request hides the fields that would have been accepted alone.
+      - **Skipping the control.** Without a legitimate field getting a `200`, a refusal of `role` may only mean the
+        endpoint is down or the token expired.
+      - **Believing the front end.** "The page does not show it" is not a control. Read the API's answer and send the
+        API's request.
+      - **Fixing with a block-list.** `if key in {"role"}: skip` closes the one field you tested and leaves
+        `merchant_id`, `is_admin`, and next year's new column wide open. The cheat sheet: "a new or overlooked sensitive
+        field remains bindable." Use an allow-list.
+      - **Silently dropping unknown fields in the fix.** It hides the attack from the logs and from the client, which gets
+        a `200` and believes `role` was saved. Rejecting with a `400` that names the field makes the problem visible. (It
+        is a design choice; if you choose to ignore, log it and test it as case 5 says.)
+      - **Fixing the write and forgetting the read, or the other way round.** Both halves are API3. A new allow-list that
+        still returns the secret has fixed half the finding.
+      - **Printing the secret in the report.** The report is copied into tickets and chats. Report paths. Rotate the
+        credential: it has already been served.
+      - **Checking only the main endpoint.** The same object appears in list endpoints, `expand` options, webhooks, error
+        bodies and exports. Each one is its own response model.
+
+      **Debugging method when a probe gives a surprising answer:**
+
+      1. Was the baseline `200`? If not, fix the token first.
+      2. Did the control get `200`? If not, the endpoint (not the property) is the problem.
+      3. Print the exact request body that was sent and the exact answer body.
+      4. Is the property **in the answer**? If not, look at a re-read before you decide.
+      5. Run the same probe against the fixed build. If it still fires, the probe is wrong.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **Same-value probes prove binding, not exploitability.** A server may accept `role: merchant` from a merchant and
+        refuse `role: admin` because of a second check. The same-value probe reports a **bound property**; a real
+        escalation needs a test account and permission. Say which you proved.
+      - **Reject versus ignore.** Rejecting unknown fields is stricter and gives clear feedback, but it breaks old clients
+        that send extra fields. Ignoring is friendlier but hides mistakes. Either is defensible *if* the privileged
+        properties are never applied. Pick one and test it.
+      - **DTOs versus allow-lists.** A DTO per endpoint is explicit and type-checked but means more classes. A field
+        allow-list is smaller but lives next to the handler. The cheat sheet recommends dedicated input objects
+        "and" explicit allow-lists when binding to an object with extra properties. Either beats binding to the
+        database object.
+      - **Response models and schema validation.** OWASP suggests "a schema-based response validation mechanism as an
+        extra layer of security" that defines and enforces the data returned by every method. It catches a new column
+        that leaks - at the cost of keeping the schema in step.
+      - **A content scan is heuristic.** A key regex finds `api_secret`, not a secret stored in `notes`. A value regex finds
+        an IBAN, not every identifier worth protecting. Treat it as a net, and combine it with the contract check and
+        human review.
+      - **Contract checks need a contract.** If the documentation is missing or wrong, the contract check passes or fails for
+        the wrong reasons. A missing contract is itself worth reporting.
+      - **Automation catches regressions, not design.** A scanner in CI will notice a new property in a response; only
+        a person decides whether it should be there.
+
+  - id: summary
+    kind: summary
+    concepts: [sec-mass-assignment-write, sec-excessive-data-exposure-read, sec-property-level-method]
+    title: Summary
+    body: |
+      - API3:2023 has two halves: **mass assignment** (the client writes properties it must not) and **excessive data
+        exposure** (the client reads properties it must not). Neither is visible in the user interface.
+      - Object level authorization asks "may I touch this object?"; property level asks "may I read or change this
+        **field** of it?". Test both.
+      - Find writable candidates from responses, documentation, other roles and naming conventions; send each **alone**,
+        with the value the account **already has**, after a baseline and a **control**, then **re-read**.
+      - A `200` is not proof. Count a property as bound only when it is in the answer or in a later read.
+      - Compare each response with the **contract** and scan keys and values for secrets at every depth. Report **paths,
+        never values**, and rotate any secret that has been served.
+      - Fix with an **allow-list** (or DTO) on the way in and a **response model** on the way out. A block-list and a
+        hidden form field are not fixes.
+      - Run every probe against the fixed build too; the quiet result is what makes the loud one believable.
+
+exercises:
+  - id: ma-which-half
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: application
+    title: Which half is it?
+    prompt: |
+      You call `GET /api/orders/812` as a customer. The page shows the item and the total, but the JSON also holds
+      `"internal_margin": 0.31` and `"supplier_cost_minor": 840`. You may legitimately read order 812. How do you classify
+      the finding?
+    options:
+      - id: read-half
+        text: "API3:2023 - excessive data exposure. You may reach the object, but not these properties of it."
+        feedback: "Correct. Object level is fine (it is your order); the properties are the problem. This is the read half of API3."
+      - id: bola
+        text: "Broken object level authorization - you read an order."
+        feedback: "BOLA would be reading someone else's order. This is your own order with fields you should not see."
+      - id: mass
+        text: "Mass assignment - the API returned extra fields."
+        feedback: "Mass assignment is about what the client can write. Extra fields in a response are exposure."
+      - id: not-a-finding
+        text: "Not a finding - the page does not show them."
+        feedback: "The page is not the control. Anyone with the token can read the whole body."
+    correct: [read-half]
+    hints:
+      - Is it your order or someone else's?
+      - Is the problem what you can read or what you can write?
+    solution: |
+      It is your own order, so object level authorization works. The two margin and cost properties should not be
+      readable by a customer, so it is excessive data exposure - the read half of API3:2023.
+
+  - id: ma-200-proof
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: Is a 200 proof?
+    prompt: |
+      You PATCH `/api/profile` with `{"is_admin": true}` and get `200` with a body that is identical to the one before.
+      A re-read shows no change either. What is the correct report?
+    options:
+      - id: ignored
+        text: "No finding for this property - the server accepted the request but did not apply it. Record it as case 'ignored by design' and keep testing the real properties."
+        feedback: "Correct. A 200 with an unchanged body and an unchanged re-read means the property was not bound."
+      - id: vulnerable-200
+        text: "Mass assignment - the server answered 200."
+        feedback: "A 200 only means the request was processed. The property has to show up in the answer or a re-read."
+      - id: waf
+        text: "A WAF blocked it."
+        feedback: "A blocked request would normally be a 4xx. Nothing here suggests a WAF."
+      - id: bug-bounty
+        text: "Critical - report it immediately."
+        feedback: "There is no evidence of impact. Reporting it would be a false positive."
+    correct: [ignored]
+    hints:
+      - What would you expect to see if the property were really set?
+    solution: |
+      A property is bound when the answer or a later read shows it with the new value. An unchanged body and an unchanged
+      re-read mean the server ignored the unknown field.
+
+  - id: ma-same-value
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: application
+    title: Why send the value the account already has?
+    prompt: |
+      Your rules of engagement allow reads and "non-destructive writes" on a production-like system. Why does the probe
+      send `role: merchant` to a merchant instead of `role: admin`?
+    options:
+      - id: no-change
+        text: "A server that accepts the current value would accept any value the binding allows, and nothing is left changed. It proves the property is bound without escalating a real account."
+        feedback: "Correct. It shows the binding and leaves the account as it was. It does not prove there is no second check on the value."
+      - id: admin-blocked
+        text: "Because the server always blocks admin."
+        feedback: "Nothing says that. The point is to avoid changing a real account."
+      - id: faster
+        text: "Because it is faster."
+        feedback: "Speed is not the reason."
+      - id: both-needed
+        text: "Because the server needs both values."
+        feedback: "The server does not need two requests."
+    correct: [no-change]
+    hints:
+      - What should be true of the account after your test?
+    solution: |
+      The same-value request proves the property is bound and leaves nothing changed. The limit is that a second rule (for
+      example, only admins may raise a role) is not tested - say so in the report.
+
+  - id: ma-control
+    type: mcq
+    concept: sec-property-level-method
+    skill: analysis
+    title: What does the control prove?
+    prompt: |
+      Your probe sends `role` and gets `403`. Before that, a PATCH of `display_name` also got `403`. What is the right
+      conclusion?
+    options:
+      - id: no-verdict
+        text: "No verdict yet - the endpoint refuses this caller for any field, so the refusal of role proves nothing about property-level checks."
+        feedback: "Correct. The control failed. Fix the account, token or permission and run again."
+      - id: secure
+        text: "The API is secure - role was refused."
+        feedback: "Everything was refused, so the refusal is not specific to role."
+      - id: vulnerable
+        text: "The API is vulnerable - 403 means a bypass is possible."
+        feedback: "A 403 for every field is not a bypass."
+      - id: skip
+        text: "Skip the control and test another endpoint."
+        feedback: "A failed control is the signal to fix the setup, not to move on."
+    correct: [no-verdict]
+    hints:
+      - What would a secure server do with the control?
+    solution: |
+      A legitimate field must get a `200` for the same caller. When it does not, the test setup is wrong, and no result for the
+      other fields means anything.
+
+  - id: ma-blocklist
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: Why a block-list is not a fix
+    prompt: |
+      A developer fixes the profile endpoint by dropping the key `role` from every request body and leaving everything else
+      as it was. You retest `role` - it is refused. What do you do next?
+    options:
+      - id: other-fields
+        text: "Retest `merchant_id` and the other properties of the object, and recommend an allow-list. The block-list closes one field and leaves the rest bindable."
+        feedback: "Correct. The cheat sheet: a block-list leaves new or overlooked fields bindable."
+      - id: close
+        text: "Close the finding - the role field is fixed."
+        feedback: "The finding was property-level binding, not just role. Other properties may still be bound."
+      - id: add-more
+        text: "Ask the developer to add more names to the block-list."
+        feedback: "That repeats the mistake with a longer list. Name what is allowed instead."
+      - id: encrypt
+        text: "Recommend encrypting the request."
+        feedback: "Encryption does not change what the server binds."
+    correct: [other-fields]
+    hints:
+      - What happens when a new column is added next year?
+    solution: |
+      A block-list lists what is refused, so every other property stays bindable. Retest the other properties and recommend
+      an allow-list or a DTO.
+
+  - id: ma-silent-drop
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: Reject or drop?
+    prompt: |
+      After a fix, `PATCH /api/profile` with `{"display_name": "A", "role": "admin"}` answers `200`, sets the display name and
+      does not change the role. The client is not told. Is that acceptable?
+    options:
+      - id: acceptable-if-tested
+        text: "It does not escalate, so it can be acceptable - but it hides the attempt from the client and from logs. Check that role is never applied, prefer a 400 that names the field, and log the attempt."
+        feedback: "Correct. Ignoring is a design choice that is only safe if the privileged property is never applied; rejecting is clearer."
+      - id: always-fail
+        text: "Never acceptable - only a 400 is secure."
+        feedback: "Both designs can be secure. What matters is that the property is not applied."
+      - id: fine
+        text: "Perfectly fine and nothing to note."
+        feedback: "It is worth a note: silent drops hide attempts and mislead clients."
+      - id: critical
+        text: "Critical - the attack succeeded."
+        feedback: "The role was not changed, so the attack did not succeed."
+    correct: [acceptable-if-tested]
+    hints:
+      - Was the property applied? What does the client learn?
+    solution: |
+      The security question is whether the property is applied. Ignoring can be safe, but rejecting gives feedback and a log
+      line. Test that the role never changes either way.
+
+  - id: ma-contract
+    type: mcq
+    concept: sec-excessive-data-exposure-read
+    skill: application
+    title: What does the contract check find?
+    prompt: |
+      The OpenAPI response model for a merchant lists `id`, `name`, `payout_iban_last4`. The real body has `id`, `name`,
+      `payout_iban_last4` and `settlement_notes`. The value of `settlement_notes` looks harmless. What is your report?
+    options:
+      - id: undocumented
+        text: "An extra property that no one decided to expose. Report it as a contract breach so the team decides whether it belongs - and check what `settlement_notes` can contain."
+        feedback: "Correct. An undocumented property is a decision nobody made, harmless or not."
+      - id: ignore
+        text: "Ignore it - the value looks harmless."
+        feedback: "The value may be harmless today and sensitive tomorrow. The point is that the response left the contract."
+      - id: secret
+        text: "A leaked secret."
+        feedback: "Nothing shows a secret. It is an undocumented property."
+      - id: bola
+        text: "Broken object level authorization."
+        feedback: "Nothing suggests another merchant's data. It is a property-level question."
+    correct: [undocumented]
+    hints:
+      - Who decided that settlement_notes is part of the API?
+    solution: |
+      The contract check reports any property outside the documented model. The team decides whether it belongs; the tester
+      checks what it can contain.
+
+  - id: ma-print-secret
+    type: mcq
+    concept: sec-excessive-data-exposure-read
+    skill: application
+    title: What goes in the report?
+    prompt: |
+      You found `api_secret` in a response. How do you show it in the report?
+    options:
+      - id: path-only
+        text: "The property path, the endpoint and the status, with at most a redacted form of the value - and recommend rotating the credential, because it has been served."
+        feedback: "Correct. Reports are copied around. Rotate anything that has appeared in a response."
+      - id: full
+        text: "Paste the full value so the developer can see it."
+        feedback: "The report becomes a second leak. The path is enough."
+      - id: nothing
+        text: "Leave it out - it is a secret."
+        feedback: "The finding needs evidence. Use the path and a redacted value."
+      - id: screenshot
+        text: "A screenshot of the whole response."
+        feedback: "A screenshot contains the full value."
+    correct: [path-only]
+    hints:
+      - Who will read the report and where will it be pasted?
+    solution: |
+      Report the path and endpoint, redact any value, and recommend rotation - once served, the secret is exposed.
+
+  - id: ma-front-end
+    type: mcq
+    concept: sec-excessive-data-exposure-read
+    skill: analysis
+    title: The front end hides it
+    prompt: |
+      A developer says "we hide `api_secret` in the page, so exposing it in the API is fine". What is the best answer?
+    options:
+      - id: network
+        text: "The front end hides it from the page; the API still sends it to everyone who calls it with a token. Return only the properties the endpoint needs."
+        feedback: "Correct. The browser's network tab and any script show the whole body."
+      - id: https
+        text: "It is fine because the API uses HTTPS."
+        feedback: "HTTPS protects the transport. The user at the other end still receives the secret."
+      - id: obfuscate
+        text: "Obfuscate the value."
+        feedback: "Obfuscation does not remove the property. Do not send it."
+      - id: ok
+        text: "Agree - the page is what users see."
+        feedback: "Users and attackers call the API directly."
+    correct: [network]
+    hints:
+      - Who can call the API without the page?
+    solution: |
+      The API is a public interface for anyone with a token. A response model that omits the property is the fix.
+
+  - id: ma-order
+    type: order
+    concept: sec-property-level-method
+    skill: application
+    title: Run a mass assignment test in order
+    prompt: Put the steps of a trustworthy, harmless mass assignment test in order.
+    items:
+      - id: baseline
+        text: Call the read endpoint with a valid token and record the 200 and the object
+      - id: candidates
+        text: List candidate properties from the response, the documentation and other roles
+      - id: control
+        text: PATCH an editable field with its current value and confirm 200
+      - id: probe
+        text: PATCH each privileged candidate alone with the value the account already has
+      - id: judge
+        text: Count a property as bound only if it is in the answer or in a re-read
+      - id: reread
+        text: Re-read the object and confirm nothing changed
+      - id: negative
+        text: Run the same probes against the fixed build and confirm nothing is reported
+    hints:
+      - You need to know the endpoint works before you trust any answer.
+      - The negative control comes last.
+    solution: |
+      Baseline, candidates, control, probe (one field at a time, same values), judge on the answer, re-read to prove no change,
+      then the negative control on the fixed build.
+
+  - id: ma-debug
+    type: debug
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: Which line leaves the profile endpoint open?
+    prompt: |
+      A developer "fixed" mass assignment in this handler. Pick the line that still lets a client set almost any property.
+    language: python
+    code: |
+      BLOCKED = {"role"}
+
+      def update_profile(user, payload):
+          for key, value in payload.items():
+              if key not in BLOCKED:
+                  setattr(user, key, value)
+          return user
+    correctLines: [5]
+    hints:
+      - Which line decides what is accepted?
+      - What is accepted when the key is anything other than role?
+    lineNotes:
+      - line: 1
+        note: Naming the field you know about is the start of a block-list, not a fix.
+      - line: 4
+        note: Looping over the payload is fine; the question is what the loop does with each key.
+      - line: 6
+        note: Applying a value is right for a field that was approved. Here the approval is the missing part.
+    solution: |
+      Line 5 accepts every key except `role`. `merchant_id`, `is_admin` and any new column can still be set. The fix is an
+      allow-list - accept only `display_name`, reject the rest - plus a type and length check on the allowed field.
+
+  - id: ma-short
+    type: short
+    concept: sec-excessive-data-exposure-read
+    skill: analysis
+    title: One endpoint, two findings
+    prompt: |
+      Explain in a few sentences why `GET /api/merchants/m_100` returning `api_secret` is a finding even though the
+      merchant page never shows it, and what the fix is.
+    modelAnswer: |
+      The API is the interface, not the page. Anyone who holds a valid token can call the endpoint and read the whole
+      body, including `api_secret` and the full IBAN, with the browser's network tab or a script. Hiding a field in the
+      front end hides it from the page only. The endpoint exposes properties that the caller should not read, which
+      is API3:2023.
+
+      The fix is a response model: build the response from a short list of properties the endpoint needs (here `id`,
+      `name` and `payout_iban_last4`) instead of serialising the database row. Because the secret has already been served,
+      rotate it.
+    rubric:
+      - Says the API, not the page, is the interface and that the whole body is readable by anyone with a token.
+      - Names the finding as excessive data exposure or API3:2023.
+      - Gives the fix - a response model that cherry-picks properties - and mentions rotating the served secret.
+    hints:
+      - Who can call the endpoint without the page?
+      - What should the endpoint build the response from?
+    solution: The API returns the whole row to anyone with a token; fix it with a response model, and rotate the secret.
+
+  - id: ma-testdesign
+    type: testdesign
+    concept: sec-property-level-method
+    skill: application
+    title: Test plan for the order and refund endpoints
+    prompt: |
+      SandPay has `POST /api/orders` (customer creates an order from `items` and `shipping_address`) and
+      `GET /api/orders/<id>` (customer reads their order). The order object also holds `total_minor`, `status`,
+      `discount_minor`, `customer_id` and `internal_margin`. Design property-level security tests for both endpoints -
+      preconditions, steps, expected result and evidence for each.
+    modelAnswer: |
+      Preconditions for all: written scope covering these endpoints, two customer test accounts and one admin test account,
+      the documented request and response models, an intercepting proxy, and an agreement about write tests on the test
+      accounts.
+
+      1. **Baseline and control** - create an order with the documented body and read it back. Expected: `201`/`200`.
+         Evidence: both exchanges. This proves the endpoint works.
+      2. **Write: server-owned properties** - `POST` the documented body plus `total_minor: 1`, `status: "paid"`,
+         `discount_minor` with a large value, `customer_id` of the other test customer, one at a time. Expected: refused
+         (or ignored, with the order created using server values) - never applied. Evidence: the request, the answer,
+         and a read of the order.
+      3. **Write: unknown fields** - add `is_admin: true` and a made-up `x_test`. Expected: refused or ignored with no
+         change. Evidence: the answer and a re-read.
+      4. **Write: nested** - put `total_minor` inside an item. Expected: same as above.
+      5. **Write: other roles** - repeat 2 as the admin where the documentation says an admin may set `status`. Expected: only
+         the documented properties are accepted per role.
+      6. **Read: contract check** - compare the keys of `GET /api/orders/<id>` with the documented customer model.
+         Expected: no extra property. Evidence: the extra paths if any.
+      7. **Read: content check** - scan keys and values at every depth for `internal_margin`, secrets, other customers'
+         data. Expected: `internal_margin` absent. Evidence: paths and reasons, never values.
+      8. **Read: other shapes** - the list endpoint, any `expand` option and an error body. Expected: the same properties
+         as the single read.
+      9. **Negative control** - run 2, 3, 6 and 7 on a build with the flaws fixed. Expected: no findings.
+    rubric:
+      - Starts with a baseline and a control so that refusals mean something.
+      - Tests server-owned properties on write (total, status, discount, customer) and unknown and nested fields.
+      - Covers read properties with a contract check and a content check, and other shapes of the same object.
+      - Covers other roles and a negative control.
+      - Every case has preconditions, steps, an expected result and evidence.
+    hints:
+      - Which properties of the order should the client never control or see?
+      - What would prove the endpoint works before you test the refusals?
+    solution: |
+      Baseline and control; one server-owned property per request on write (and unknown and nested fields); the contract and
+      content checks on read, on every shape of the order; per-role checks; a negative control on the fixed build.
+
+  - id: ma-interview
+    type: interview
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: 'Interview: how do you test for mass assignment?'
+    prompt: '"Walk me through how you would test an API for mass assignment and excessive data exposure."'
+    modelAnswer: |
+      They are the two halves of API3:2023, broken object property level authorization: what the client can write and
+      what it can read. I start with a baseline - the endpoint answers a valid token and refuses no token - and I read
+      the response in full, because the response is the best list of candidate properties.
+
+      For the write side I add a control (an editable field with its current value gets a 200), then send each privileged
+      candidate - role, owner id, status, price - alone, with the value the account already has, so the test is harmless.
+      I do not trust a 200: I count a property as bound only when it is in the answer or in a later read, because many
+      servers ignore unknown fields. I re-read the object to show nothing changed, and if the rules of engagement allow it
+      I show the real effect on a test account.
+
+      For the read side I compare each response with the documented model and scan keys and values for secrets and data
+      shapes, at every depth and in list, expand and error shapes. I report paths, never values, and recommend rotating
+      anything that was served.
+
+      The fix is an allow-list or DTO on the way in and a response model on the way out - never a block-list, and
+      never "the front end hides it". Every probe also runs against the fixed build, and then it becomes a regression test.
+    rubric:
+      - Names both halves and links them to API3:2023.
+      - Describes the write test with a baseline, a control, one property at a time, same values, and judging by the answer or a re-read rather than the status alone.
+      - Describes the read test with a contract check and a content check, reporting paths and not values.
+      - Gives the fixes (allow-list or DTO, response model) and mentions a negative control or regression test.
+    followUps:
+      - How would you test a GraphQL API for the read half?
+      - What do you do if the API ignores unknown fields by design?
+      - How is this different from testing for IDOR?
+    hints:
+      - Structure it as baseline, write test, read test, fix, regression.
+    solution: Baseline and control, one property at a time with same values, judge on the answer or a re-read, contract and content checks on read, allow-list and response model as the fix, negative control and regression test.
+
+  - id: probe-code
+    type: coding
+    concept: sec-mass-assignment-write
+    skill: application
+    title: Write the mass assignment probe
+    prompt: |
+      In `practice/security/exercises/api/mass_probe.py`, implement `read_profile` and `probe_mass_assignment`. The tests run the
+      probe against the loopback portal: it must report both privileged fields on `make_app()` and nothing on
+      `make_app({"mass-assignment"})` (with the status codes of the refusals), leave the profile exactly as it found it, and refuse a
+      verdict when the token does not work or the control PATCH fails.
+    project: security
+    files: [exercises/api/mass_probe.py]
+    test: tests/api/test_mass_probe.py
+    command: .venv/bin/python -m pytest tests/api/test_mass_probe.py
+    modelAnswer: |
+      ```python
+      before = read_profile(base_url, token, timeout)           # RuntimeError unless 200
+
+      def patch(name):
+          return requests.patch(base_url + "/api/profile", json={name: before[name]},
+                                headers=_auth(token), timeout=timeout)
+
+      if patch(CONTROL).status_code != 200:
+          raise RuntimeError("control failed")
+      for name in PRIVILEGED:
+          resp = patch(name)
+          if resp.status_code == 200 and resp.json().get(name) == before[name]:
+              result.accepted.append(name)
+          else:
+              result.refused[name] = resp.status_code
+      if read_profile(base_url, token, timeout) != before:
+          raise RuntimeError("the probe changed the profile")
+      ```
+
+      A field counts as accepted only when the answer is `200` and the property is in the body with the value that was
+      sent. One field per request keeps each answer attributable.
+    rubric:
+      - Every test in tests/api/test_mass_probe.py passes.
+      - The probe reads the profile first and raises RuntimeError when that is not a 200.
+      - A control PATCH of display_name must succeed before any verdict.
+      - Each privileged field is sent alone with the value the caller already has.
+      - It re-reads the profile and reports nothing against the fixed portal.
+    hints:
+      - "Send {name: before[name]} so nothing changes."
+      - Count a field as accepted only on a 200 with the property in the body.
+      - requests.Response.json() gives you the answer body.
+    solution: Read the baseline, send the control, send each privileged field alone with its current value, count it accepted only on a 200 that shows it, re-read to prove nothing changed.
+
+  - id: exposure-code
+    type: coding
+    concept: sec-excessive-data-exposure-read
+    skill: application
+    title: Write the exposure scanner
+    prompt: |
+      In `practice/security/exercises/api/mass_exposure.py`, implement `find_sensitive`, `outside_contract` and
+      `check_merchant_exposure`. `find_sensitive` walks dicts and lists and reports secret-named keys and full-IBAN-shaped values
+      by path - never the value. `check_merchant_exposure` lists contract breaches first, then other findings, each path once, and
+      refuses a verdict when a call is not a `200`. It must report both leaks on `make_app()` and nothing on
+      `make_app({"data-exposure"})`.
+    project: security
+    files: [exercises/api/mass_exposure.py]
+    test: tests/api/test_mass_exposure.py
+    command: .venv/bin/python -m pytest tests/api/test_mass_exposure.py
+    modelAnswer: |
+      ```python
+      def find_sensitive(value, path="$"):
+          found = []
+          if isinstance(value, dict):
+              for key, item in value.items():
+                  child = f"{path}.{key}"
+                  if SENSITIVE_KEY.search(key):
+                      found.append(Exposure(child, "sensitive key name"))
+                  else:
+                      found.extend(find_sensitive(item, child))
+          elif isinstance(value, list):
+              for i, item in enumerate(value):
+                  found.extend(find_sensitive(item, f"{path}[{i}]"))
+          elif isinstance(value, str) and FULL_IBAN.match(value.strip()):
+              found.append(Exposure(path, "full IBAN"))
+          return found
+      ```
+
+      `outside_contract` is `sorted(set(body) - documented)` turned into `Exposure` objects. `check_merchant_exposure` reads
+      `/api/me`, then the merchant, and returns `breaches + [e for e in find_sensitive(body) if e.path not in flagged]`.
+    rubric:
+      - Every test in tests/api/test_mass_exposure.py passes.
+      - Paths use the $.a.b[0].c form and the result type carries no value.
+      - Both secret-named keys and full IBAN values are found, and a masked value is not.
+      - Contract breaches come first, sorted, and each path is listed once.
+      - It reports nothing against the fixed portal and raises RuntimeError when a call is not a 200.
+    hints:
+      - Do not recurse into a key that is already flagged.
+      - enumerate the list to build the [index] part of the path.
+      - Use a set of the flagged paths to avoid listing one property twice.
+    solution: Walk the JSON building paths, flag secret-named keys without reading their values and full IBAN strings, put contract breaches first, and report nothing against the fixed portal.
+
+  - id: fix-code
+    type: coding
+    concept: sec-mass-assignment-write
+    skill: application
+    title: Write the allow-list and the response model
+    prompt: |
+      In `practice/security/exercises/api/mass_fix.py`, implement `apply_profile_update` and `merchant_view`. The update must reject
+      every field outside the allow-list with a stable message, apply nothing on a rejection, never change the input, and validate the
+      allowed field. The merchant view returns exactly three properties and never the secret or the full IBAN.
+    project: security
+    files: [exercises/api/mass_fix.py]
+    test: tests/api/test_mass_fix.py
+    command: .venv/bin/python -m pytest tests/api/test_mass_fix.py
+    modelAnswer: |
+      ```python
+      def apply_profile_update(user, payload):
+          unknown = sorted(set(payload) - set(EDITABLE))
+          if unknown:
+              raise ValueError(f"fields not allowed: {unknown}")
+          updated = dict(user)
+          for name, kind in EDITABLE.items():
+              if name in payload:
+                  value = payload[name]
+                  if not isinstance(value, kind) or not value.strip() or len(value) > MAX_NAME:
+                      raise ValueError(f"{name} must be a non-blank string of at most {MAX_NAME} characters")
+                  updated[name] = value.strip()
+          return updated
+
+      def merchant_view(row):
+          iban = row["payout_iban"].replace(" ", "")
+          return {"id": row["id"], "name": row["name"], "payout_iban_last4": iban[-4:]}
+      ```
+
+      The allow-list is a set difference, so any new field is refused until someone adds it on purpose. The response model
+      builds a new dict key by key, so a new column never appears in it.
+    rubric:
+      - Every test in tests/api/test_mass_fix.py passes.
+      - Unknown fields raise ValueError with the sorted names and nothing is applied.
+      - The input dict is never modified and a copy is returned.
+      - display_name is validated for type, blankness and length, and stored stripped.
+      - merchant_view returns exactly id, name and payout_iban_last4.
+    hints:
+      - The allow-list is set(payload) - set(EDITABLE).
+      - Validate before you copy values into the new dict.
+      - Build the view key by key instead of copying the row.
+    solution: Reject keys outside the allow-list with a sorted message, validate the allowed field, return a copy, and build the merchant view key by key.
+
+placement:
+  - id: place-write
+    type: mcq
+    concept: sec-mass-assignment-write
+    skill: analysis
+    title: Is the write endpoint sound?
+    prompt: |
+      Your control PATCH (an editable field) returns `200`. Then `{"role": "merchant"}` (the caller's own role) returns `200`
+      with `role` in the body, and `{"is_admin": true}` returns `200` with an unchanged body. Verdict?
+    options:
+      - id: role-bound
+        text: "Vulnerable for role - it is bound. is_admin was ignored, which is not a finding."
+        feedback: "Correct. A property is bound when it appears in the answer; the ignored unknown field is not a finding."
+      - id: both
+        text: "Vulnerable for both role and is_admin - both returned 200."
+        feedback: "is_admin came back unchanged, so it was not applied."
+      - id: sound
+        text: "Sound - the control worked."
+        feedback: "The control only shows the endpoint works. The role result is the finding."
+    correct: [role-bound]
+    solution: The role property shows up in the answer, so it is bound. An unknown field answered with an unchanged body is ignored, not applied.
+
+  - id: place-read
+    type: mcq
+    concept: sec-excessive-data-exposure-read
+    skill: analysis
+    title: Is the response clean?
+    prompt: |
+      The documented response model has `id`, `name` and `payout_iban_last4`. The real body has those three and
+      `"owner": {"password_hash": "..."}`. No key at the top level is outside the contract except `owner`. What is the verdict?
+    options:
+      - id: finding
+        text: "A finding - `owner` is outside the contract and `$.owner.password_hash` is a secret-named key; report both paths."
+        feedback: "Correct. The contract check and the content check both fire, at different depths."
+      - id: clean
+        text: "Clean - the three documented properties are present."
+        feedback: "Extra properties are exactly what the contract check looks for."
+      - id: top-only
+        text: "Only the top level matters."
+        feedback: "Nested objects leak just as well. Walk every depth."
+    correct: [finding]
+    solution: The extra top-level property fails the contract check and the nested password_hash fails the content check.
+
+  - id: place-fix
+    type: mcq
+    concept: sec-property-level-method
+    skill: application
+    title: Which fix closes it?
+    prompt: |
+      Which change closes mass assignment on a profile endpoint?
+    options:
+      - id: allow
+        text: "Accept only the editable fields (display_name), reject everything else, and check the allowed field's type and length."
+        feedback: "Correct. An allow-list means a new column is refused until someone allows it."
+      - id: block
+        text: "Remove role from the request body before binding."
+        feedback: "A block-list closes one field and leaves the others bindable."
+      - id: hide
+        text: "Remove the role box from the page."
+        feedback: "The API still accepts the property from anyone who sends it."
+    correct: [allow]
+    solution: An allow-list (or DTO) with validation closes the whole class. Block-lists and hidden inputs only close the fields you named or showed.
+
+recall:
+  - id: recall-halves
+    concept: sec-mass-assignment-write
+    prompt: What are the two halves of API3:2023, and which direction does each go?
+    answer: Mass assignment (the client writes properties it must not - request body in) and excessive data exposure (the client reads properties it must not - response body out). Together they are Broken Object Property Level Authorization.
+  - id: recall-200
+    concept: sec-property-level-method
+    prompt: Why is a 200 not proof of mass assignment?
+    answer: Many servers accept a request and silently ignore unknown fields. Count a property as bound only when it appears in the answer or in a later read.
+  - id: recall-same-value
+    concept: sec-mass-assignment-write
+    prompt: How do you test mass assignment without changing a real account?
+    answer: After a baseline and a control, send each privileged property alone with the value the account already has, then re-read to prove nothing changed. It shows binding, not that there is no second check.
+  - id: recall-two-checks
+    concept: sec-excessive-data-exposure-read
+    prompt: What two checks do you run on every response?
+    answer: A contract check (any property outside the documented model) and a content check (secret-named keys and secret-shaped values) - at every depth, in lists, and on every shape of the object.
+  - id: recall-no-values
+    concept: sec-excessive-data-exposure-read
+    prompt: What goes in the report when you find a secret in a response?
+    answer: The endpoint, the property path and a status - never the value (at most a redacted form) - and a recommendation to rotate the credential, because it has been served.
+  - id: recall-fix
+    concept: sec-property-level-method
+    prompt: What are the two fixes, and which two things are not fixes?
+    answer: An allow-list or DTO on input and a response model that cherry-picks properties on output. A block-list and a front end that hides the field are not fixes.
+  - id: recall-bola
+    concept: sec-property-level-method
+    prompt: How does property level differ from object level authorization?
+    answer: Object level asks whether you may touch this object; property level asks whether you may read or change this field of it. An endpoint can pass the first and fail the second, and an allow-list does not replace the first.
+
+next:
+  - testing-business-logic-and-rate-limits
+  - testing-access-control-idor
+  - owasp-api-security-top-10
