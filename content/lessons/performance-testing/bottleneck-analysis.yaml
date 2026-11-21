@@ -1,0 +1,1435 @@
+id: bottleneck-analysis
+title: 'Bottleneck analysis with the USE and RED methods'
+subject: performance-testing
+module: perf-analysis
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: 'A load test tells you that the system is slow; it does not tell you why. This lesson is the method for the why. RED (rate, errors, duration) describes what a service does for its users, USE (utilization, saturation, errors) describes what each resource is going through, and the two together point at the one resource that limits throughput. You will read a step load for its knee, tell a saturated worker pool from a load generator that is the real limit and from a bounded queue that answers 503, turn a measured ceiling into a service demand with the operational laws, and use the bottleneck bound to predict what speeding up each resource would change - before anyone touches the code. Every measurement shown comes from real runs against the local SandPay practice API on 21 November 2026.'
+tags:
+  [
+    bottleneck,
+    USE method,
+    RED method,
+    four golden signals,
+    utilization,
+    saturation,
+    errors,
+    queue length,
+    step load,
+    knee,
+    throughput ceiling,
+    service demand,
+    utilization law,
+    operational laws,
+    asymptotic bounds,
+    Little's law,
+    load generator,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 with pytest 9.2.0 and Locust 2.47.0, in `practice/perf/.venv`. Every output in this lesson
+    was printed by `practice/perf/support/bn_demo.py` (which calls the reference solutions of the three exercises) on
+    Linux on 21 November 2026. Timings depend on the machine: the request rates, latencies and queue lengths below will
+    differ on yours, but the shape - where throughput stops growing, how latency then climbs, which signals move - will
+    not.
+  - **Target (loopback only, synthetic data):** `practice/perf/support/sandpay_target.py`, the shared SandPay practice
+    API, started **in its own process** (`serve_separately` in `support/bn_fixture.py`) so the load generator and the
+    target do not share one interpreter. Its worker pool is `capacity=4` and every request takes about
+    `latency_ms=20` of service time, so the pool can serve at most 4 / 0.020 = 200 requests per second. The target's
+    `GET /metrics` reports `in_flight` (requests being served) and `waiting` (requests queued for a worker) - the two
+    numbers a USE reading of the pool needs.
+  - **Load generators written for this lesson:** `support/bn_fixture.py` is a closed-loop generator on the standard library
+    (threads with one keep-alive connection each, no think time) and a `Sampler` that polls `/metrics`;
+    `support/bn_locustfile.py` is the same merchant as one Locust user. The fixture is small enough to read, which is its
+    only purpose - use Locust or JMeter for real work ([Locust fundamentals](#/lesson/locust-fundamentals)).
+  - **Synthetic data:** SandPay is a fictional payments company; `merchant-1` and its secret exist only in this practice
+    project. Never point a load test at a system you do not own or have written permission to test.
+  - **Sources, as documented on 21 November 2026:**
+    - Brendan Gregg, [The USE Method](https://www.brendangregg.com/usemethod.html) - the definitions of resource, utilization,
+      saturation and errors, the software-resource examples (thread pools), the suggested interpretations (70 %, any
+      saturation, non-zero errors) and the warning about averages. Quotations are from that page.
+    - Julie Dam, [The RED Method: How to Instrument Your Services](https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/)
+      (Grafana Labs blog, 3 August 2018), a write-up of Tom Wilkie's talk; the quotations in this lesson are Wilkie's
+      words as that article gives them. It is a secondary source for the RED Method, not Wilkie's own text.
+    - Google, *Site Reliability Engineering*, chapter 6
+      [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/), the section "The Four
+      Golden Signals".
+    - E. D. Lazowska, J. Zahorjan, G. S. Graham, K. C. Sevcik, [*Quantitative System
+      Performance*](https://homes.cs.washington.edu/~lazowska/qsp/) (Prentice-Hall, 1984; free online from the authors),
+      [chapter 3 "Fundamental Laws"](https://homes.cs.washington.edu/~lazowska/qsp/Images/Chap_03.pdf) (Table 3.2: the
+      utilization law, Little's law, the forced flow law; service demand D_k) and [chapter 5 "Bounds on
+      Performance"](https://homes.cs.washington.edu/~lazowska/qsp/Images/Chap_05.pdf), section 5.2 (asymptotic bounds). The PDFs are
+      scans with imperfect text; the formulas below are the book's, written out.
+  - **Not run here:** Prometheus, Grafana, `kube-state-metrics`, operating-system tools (`top`, `vmstat`, `iostat`) and
+    Gregg's per-OS checklists - mentioned, not run, and not quoted beyond what the pages above say. The "request path" of
+    web, application and database tiers in the worked example is **hypothetical**: its numbers are made up to show the
+    arithmetic, not measured.
+  - **Not repeated here:** percentiles and why not the mean - [Performance metrics and
+    percentiles](#/lesson/performance-metrics-and-percentiles); Little's law and workload models - [Little's law and
+    workload models](#/lesson/littles-law-and-workload-models); step loads and spikes -
+    [Types of performance testing](#/lesson/performance-testing-types); metrics, logs and traces in production -
+    [Observability for web apps](#/lesson/observability-for-web-apps) and [Logs, metrics and
+    traces](#/lesson/logs-metrics-traces).
+
+prerequisites:
+  - performance-metrics-and-percentiles
+  - littles-law-and-workload-models
+  - locust-fundamentals
+
+concepts:
+  - id: perf-bn-use-red
+    name: Reading a system with USE and RED
+    summary: 'RED looks at a service from the outside: Rate (requests per second), Errors (how many of those fail) and Duration (how long they take) - "a good proxy to how happy your customers will be" (Wilkie). USE looks at each resource from the inside: Utilization (the average time it was busy), Saturation (the extra work it cannot service, often a queue length) and Errors (a count of error events) - "For every resource, check utilization, saturation, and errors" (Gregg). The four golden signals (latency, traffic, errors, saturation) are RED plus saturation. Use RED to say what users get and USE to find which resource is why. Gregg''s reading rules: 100 % utilization is usually a bottleneck, beyond about 70 % queueing starts to hurt, any saturation can be a problem, non-zero errors deserve a look - and a long-interval average can hide bursts of 100 %. On a software resource such as a thread pool, utilization is the time threads were busy and saturation is the requests waiting for a thread - exactly what the practice target reports.'
+  - id: perf-bn-signature
+    name: The signature of a bottleneck in a step load
+    summary: 'Raise the number of concurrent clients step by step with no think time and watch three things. Throughput grows almost in proportion to the clients while a resource has spare capacity, then flattens at a ceiling; that bend is the knee. Past the knee every extra client only adds waiting, so latency grows in proportion to the clients and the share of the latency that is queueing climbs towards 1. The ceiling times the service time says how many requests are served at once (Little''s law on the service station) - about the pool size. Three look-alikes mislead: a load generator that is the limit (throughput flat, but the target idle - utilization low, no queue), a bounded queue (the target answers 503 quickly, so the mean latency can even fall while errors rise), and a policy limit such as a rate limit (429). Check the generator and the errors before blaming the largest resource.'
+  - id: perf-bn-laws
+    name: Service demand and the bottleneck bound
+    summary: 'The service demand law D = U / X gives the time one request needs at a resource from its measured utilization U (0 to 1) and the system throughput X (requests per second). The resource with the largest demand saturates first: it is the bottleneck, and throughput can never exceed 1 / D_max. With N users and think time Z, throughput is also bounded by N / (D + Z), D being the sum of the demands; the two bounds cross at N* = (D + Z) / D_max users - the knee. The consequence that matters for work planning: making any resource other than the bottleneck faster changes nothing, and making the bottleneck faster moves the limit to the next-largest demand, so a what-if on the demands predicts the gain of a fix before it is built. The bounds assume a request needs the same service at a resource however many others are present; locks, retries and caches break that, and the measurement has to confirm the prediction.'
+
+objectives:
+  - Describe a service with RED and each of its resources with USE, name what each signal measures, and state Gregg's reading rules (100 %, about 70 %, any saturation, non-zero errors, averages that hide bursts).
+  - Take a USE reading of the practice target's worker pool by sampling in_flight and waiting, and turn it into utilization, saturation and findings.
+  - Read a step load for its knee, the share of latency that is waiting and the number of requests served at once, and tell a saturated pool from a slow load generator and from a bounded queue.
+  - Compute service demands from utilization and throughput, name the bottleneck, bound the throughput and find the knee population, and predict the effect of speeding up each resource with a what-if.
+  - Plan a bottleneck investigation that changes one thing at a time and ends with a re-run that looks for the next bottleneck.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: The idea in plain language
+    body: |
+      A payments office has one counter that stamps documents, four clerks behind it, a safe that only one person can open at a
+      time, and a car park for the customers. The queue out of the door is the symptom. Which of the four is the reason?
+
+      You could ask the customers (**RED**, from the outside): "How many of you come per hour? How many leave without a stamp?
+      How long do you wait?" Their answers describe the office but do not point at anything. Or you could walk behind the
+      counter and ask each resource three questions (**USE**, from the inside): how much of the time are you busy, is there
+      work waiting for you that you cannot get to, and are you failing at anything?
+
+      - The clerks are busy about half of the time and nobody is waiting for them. Not the problem.
+      - The car park is half empty. Not the problem.
+      - The safe is open every minute of the day, and five people stand next to it. **That is the bottleneck.**
+
+      Now two things follow that sound obvious and are routinely ignored:
+
+      1. **Hiring more clerks will not shorten the queue.** The office can never finish more customers per hour than the safe
+         allows, whatever the other resources can do. Fixing the wrong resource is the most expensive mistake in performance work.
+      2. **After the safe is fixed, the queue will not vanish: it moves.** The next-busiest resource becomes the limit, a little
+         higher up. Bottleneck analysis is a loop, not a single answer.
+
+      A load test is the way to make the queue appear on purpose, in a place where you are allowed to look behind the counter.
+
+  - id: what
+    kind: what
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: Terms you need
+    body: |
+      | Term | Meaning (with the source) |
+      | --- | --- |
+      | **Bottleneck** | the resource that limits throughput; in the operational laws "the center with the largest service demand" (Lazowska et al., section 5.2) |
+      | **Resource** | in USE, "all physical server functional components (CPUs, disks, busses, ...)"; "it can be useful to consider some software resources as well" - thread pools, locks, connection pools (Gregg) |
+      | **Utilization** | "the average time that the resource was busy servicing work" (Gregg); a percent over an interval |
+      | **Saturation** | "the degree to which the resource has extra work which it can't service, often queued" (Gregg); measured as a queue length |
+      | **Errors** | "the count of error events" (Gregg) - a scalar count |
+      | **RED** | Rate "the number of requests per second", Errors "the number of those requests that are failing", Duration "the amount of time those requests take" - for every service (Wilkie, via the Grafana article) |
+      | **Four golden signals** | latency, traffic, errors and saturation (Google SRE book) - "basically the same as the RED Method, but includes saturation" (Wilkie) |
+      | **Step load** | a series of runs, each with more concurrent clients than the last; here a closed loop with no think time, so clients = requests in the system |
+      | **Knee** | the load after which more clients stop raising throughput |
+      | **Ceiling** | the highest throughput any step reached |
+      | **Wait share** | the part of the mean latency that is queueing: (mean - service time) / mean |
+      | **Service demand D_k** | "the total service requirement at that resource" for one request (Lazowska et al., chapter 3); D is the sum of all D_k |
+      | **Utilization law** | U_k = X_k S_k = X D_k (Table 3.2) |
+      | **Think time Z** | the pause between a user's requests; zero in a closed loop with no pacing |
+      | **Load generator** | the machine or process that sends the load - it is a resource too, and it can be the one that saturates |
+
+  - id: why
+    kind: why
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: Why a tester needs a method, not a hunch
+    body: |
+      A load test report that says "p95 was 380 ms against a requirement of 300 ms" is a finding, but the people who read it
+      want the next sentence: **why, and what do we change?** Without a method, that sentence is a guess, and guesses have
+      a pattern:
+
+      - **The loudest component gets blamed** - "it is always the database" - and a week is spent on an index that the
+        queue never waited for.
+      - **The loud number is a symptom, not a cause.** CPU at 95 % on the application server may be the bottleneck, or the
+        symptom of retries after the real bottleneck slowed everything down.
+      - **The tester's own tool is not examined.** A load generator that cannot send faster produces a flat throughput curve
+        that looks exactly like a saturated server. The conclusion "the API tops out at 33 requests per second" is then wrong
+        by a factor of six, and it is in the report.
+
+      Gregg's claim for the USE Method is modest but useful: "I find it solves about 80% of server issues with 5% of the
+      effort", and "there are many problem types it doesn't solve". It is meant to be used early, "to identify systemic
+      bottlenecks". For a tester, the practical value is that it turns "slow" into a **table of resources with three numbers
+      each**, which anyone can check, and which the developer receiving the report can act on without asking for a re-run.
+
+      The second reason is cost. A fix to the bottleneck pays off immediately; a fix anywhere else pays nothing at all (the
+      operational laws say why, below). A one-hour bottleneck analysis that prevents one wasted sprint is the best trade in
+      performance testing.
+
+  - id: internals-use
+    kind: internals
+    concepts: [perf-bn-use-red]
+    title: 'Under the hood: USE and RED, and how to read them'
+    body: |
+      **USE is a question list.** Gregg: "It begins by posing questions, and then seeks answers, instead of beginning with given
+      metrics (partial answers) and trying to work backwards." For each resource on the list - CPUs, memory, network
+      interfaces, storage devices, and the software resources such as thread pools and connection pools - you ask for
+      utilization, saturation and errors, and note "no data" where a metric does not exist. That also finds the blind spots of
+      your monitoring.
+
+      **A thread pool is a USE resource.** From the same page: "thread pools: utilization may be defined as the time threads
+      were busy processing work; saturation by the number of requests waiting to be serviced by the thread pool." The practice
+      target is exactly that: `in_flight / capacity` is the utilization of its pool of 4 workers, `waiting` is its
+      saturation, and a 503 from a full queue is an error event.
+
+      **Reading rules, from the same page (Gregg's suggestions, not laws):**
+
+      - Utilization: "100% utilization is usually a sign of a bottleneck (check saturation and its effect to confirm)". High
+        utilization, "eg, beyond 70%", "can begin to be a problem": a long-interval average "can hide short bursts of 100%
+        utilization", and resources that cannot be interrupted queue more often once they are busy.
+      - Saturation: "any degree of saturation can be a problem (non-zero)".
+      - Errors: "non-zero error counters are worth investigating, especially if they are still increasing while performance is
+        poor".
+      - The negative case is useful too: "low utilization, no saturation, no errors. This is more useful than it sounds -
+        narrowing down the scope of an investigation can quickly bring focus to the problem area."
+      - Averages: "A burst of high utilization can cause saturation and performance issues, even though utilization is low when
+        averaged over a long interval." Gregg's own example is a customer whose monitoring showed CPU never above 80 % while
+        five-minute averages hid seconds at 100 %.
+
+      **RED is for services.** Wilkie, as quoted in the Grafana article: "The USE Method doesn't really apply to services; it
+      applies to hardware, network disks, things like this." RED is the per-service view: how many requests, how many fail,
+      how long they take. "The RED Method is a good proxy to how happy your customers will be", and the two are "complimentary":
+      "the RED Method is about caring about your users and how happy they are, and the USE Method is about caring about your
+      machines and how happy they are."
+
+      **The four golden signals** (Google SRE book) add the missing resource view to RED: latency, traffic, errors and
+      saturation. Two of its warnings matter to a tester:
+
+      - **Failed requests distort latency.** "An HTTP 500 error triggered due to loss of connection to a database or other
+        critical backend might be served very quickly; ... factoring 500s into your overall latency might result in misleading
+        calculations. On the other hand, a slow error is even worse than a fast error!" So report the latency of successes
+        and of errors separately.
+      - **Systems degrade before 100 %.** "Many systems degrade in performance before they achieve 100% utilization, so having
+        a utilization target is essential."
+
+  - id: internals-signature
+    kind: internals
+    concepts: [perf-bn-signature]
+    title: 'Under the hood: what a bottleneck looks like from the load generator'
+    body: |
+      Take a service with a pool of `c` workers, each needing `S` seconds per request. With no think time, `n` clients keep
+      `n` requests in the system.
+
+      - **Below the knee (n <= c)** every request finds a free worker. Latency is the service time S, and throughput is
+        n / S: double the clients, double the throughput.
+      - **At the knee (n = c)** every worker is busy and nobody waits. Throughput is c / S, the ceiling.
+      - **Above the knee (n > c)** the ceiling does not move, and the n - c extra requests wait in a queue. By Little's law
+        n = X R, so with X fixed R grows in proportion to n: R = n S / c. Doubling the clients doubles the latency and
+        gives no extra throughput. A real system adds noise and a rounded corner to the knee, but not a different shape.
+
+      With `c = 4` and `S = 20 ms` the model predicts 50 requests per second per client up to 4 clients, a ceiling of 200 and a
+      latency of 20 ms x 16 / 4 = 80 ms at 16 clients. The measured run below gives 191 and 79.5 ms.
+
+      **The numbers that identify the bottleneck:**
+
+      1. **The knee**: the step after which the next step gains less than, say, 10 % throughput.
+      2. **The wait share**, (mean - S) / mean: near 0 below the knee, towards 1 above it. It needs the service time, which
+         you get from the one-client step.
+      3. **The slots**, `ceiling x S`: 191 x 0.020 is 3.8, about the pool size 4 - the ceiling "is" the pool. If the slots
+         come out as 40 for a pool you believed had 4, your model of the system is wrong, which is information too.
+
+      **Three look-alikes that send people to the wrong resource:**
+
+      - **The load generator is the limit.** The throughput curve is flat, but the target is not busy: utilization low, no
+        queue, no errors. A generator can saturate on CPU (its own work, TLS, scripting), on connections, or on the single
+        core of a one-process tool. Latency measured by that generator includes its own queueing, so even the response times
+        are inflated. The tell is that the USE table of the *target* is clear.
+      - **A bounded queue.** When the target's queue has a limit, it answers 503 quickly instead of queueing. Throughput of
+        successes stays at the ceiling, errors appear, and the **mean latency can fall** because most answers are instant
+        refusals. Count status codes and look at the latency of successes alone.
+      - **A policy limit.** A rate limit answers 429 once a client exceeds its quota. The curve flattens at the quota, not at a
+        hardware ceiling, and adding capacity changes nothing. The status codes tell you.
+
+      **The measurement itself is a resource problem.** Sampling `/metrics` every 50 ms costs requests of its own and misses
+      bursts shorter than 50 ms; a reading of `waiting` of 0.07 on average is usually a request caught between arriving and
+      starting, not a queue. The exercise therefore treats a mean queue below half a request as noise.
+
+  - id: internals-laws
+    kind: internals
+    concepts: [perf-bn-laws]
+    title: 'Under the hood: service demand and the bottleneck bound'
+    body: |
+      The laws below are from Lazowska et al., chapter 3 (Table 3.2) and chapter 5 (section 5.2), written for a request path
+      in which each request needs some service at each resource.
+
+      **Utilization law.** U_k = X_k S_k = X D_k. The utilization of resource k is the throughput through it times the
+      service time per visit - or, in terms of the whole system, the system throughput X times the **service demand** D_k, the
+      total time one request needs at k (visits x time per visit). The same law read backwards is the **service demand
+      law** this lesson's first function uses: D_k = U_k / X. A pool of c identical workers with utilization U (average busy
+      fraction of the pool) has an effective demand of S / c per request, which is why the practice target at 100 % busy and
+      about 190 requests per second has D = 1.0 / 190 = 5.3 ms, roughly 20 ms / 4.
+
+      **The bottleneck.** The text: "the center that saturates at the lowest arrival rate is the bottleneck center - the center
+      with the largest service demand." Because "U_k(N) = X(N) D_k <= 1" for every k, "each center limits the maximum possible
+      throughput that the system can achieve. Since the bottleneck center is the first to saturate, it restricts system
+      throughput most severely":
+
+      > X <= 1 / D_max
+
+      **Light load.** One user alone cycles in D + Z seconds (D is the sum of the demands, Z the think time), so N users with
+      no queueing at all achieve at most N / (D + Z). The book's asymptotic bounds for a closed workload:
+
+      > N / (N D + Z)  <=  X(N)  <=  min( 1 / D_max , N / (D + Z) )
+
+      The lower bound is the worst case, where every user queues behind all the others. The two parts of the upper bound cross
+      at
+
+      > N* = (D + Z) / D_max
+
+      the knee, in users. Below it, adding users adds throughput; above it, adding users adds waiting. With zero think time,
+      N* = D / D_max - for one resource, exactly 1 (per server).
+
+      **What-if.** Because only D_max matters for the ceiling, the effect of any change can be computed. Speed up a resource
+      that is not the bottleneck: D_max is unchanged, so the ceiling is unchanged. Speed up the bottleneck: the ceiling rises
+      until the next-largest demand becomes D_max, and then stops rising. The lesson's `what_if` function does exactly this on
+      a copy of the demands.
+
+      **The one assumption** the book states for the bounds: "that the service demand of a customer at a center does not depend
+      on how many other customers currently are in the system, or at which service centers they are located." Lock contention,
+      retries that grow with the queue, a cache that warms up, and garbage collection under pressure all break it. Treat the
+      bound as a prediction to be checked by a measurement, not as a proof.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: The investigation as a loop
+    body: |
+      ```mermaid
+      flowchart TD
+        S["Symptom with numbers: RED - rate, errors, duration"] --> G{"Is the load generator healthy?"}
+        G -- "no: fix the generator first" --> S
+        G -- "yes" --> E{"Errors or 429 / 503 in the statuses?"}
+        E -- "yes" --> P["Separate causes: limit, queue bound, real failures"]
+        E -- "no" --> U["USE per resource: utilization, saturation, errors"]
+        P --> U
+        U --> L{"Which resource is saturated?"}
+        L -- "none" --> M["Add the missing metric - a blind spot, not a clean bill"]
+        L -- "one" --> W["What-if with service demands: how much would a fix gain?"]
+        M --> U
+        W --> C["Change ONE thing"]
+        C --> R["Re-run the same step load"]
+        R --> N{"Did the knee move?"}
+        N -- "yes: look for the next bottleneck" --> U
+        N -- "no: the prediction was wrong - revisit the model" --> W
+      ```
+
+      Two boxes carry most of the discipline. **The generator check** comes first because an unhealthy generator invalidates
+      every later box. **Change ONE thing** is what makes the re-run a test of the prediction instead of a lucky mix: two
+      changes at once leave you unable to say which one moved the knee.
+
+  - id: code-use
+    kind: code
+    concepts: [perf-bn-use-red]
+    title: 'The code: a USE reading of the worker pool'
+    body: |
+      The solution of the first exercise (`practice/perf/solutions/analysis/bn_use.py`, docstrings shortened). The samples
+      come from `GET /metrics` polled every 50 ms during a level (`Sampler` in `support/bn_fixture.py`):
+
+      ```python
+      USE_BUSY = 0.70       # Gregg: "beyond 70%" can begin to be a problem
+      QUEUE_NOISE = 0.5     # the queue is sampled: a mean below half a request is noise
+
+
+      def utilization(samples, capacity):
+          if not samples:
+              return 0.0
+          return round(sum(s["in_flight"] for s in samples) / len(samples) / capacity, 3)
+
+
+      def saturation(samples):
+          if not samples:
+              return 0.0
+          return round(sum(s["waiting"] for s in samples) / len(samples), 2)
+
+
+      def use_findings(util, sat, errors):
+          findings = []
+          if errors > 0:
+              findings.append("errors")
+          if sat >= QUEUE_NOISE:
+              findings.append("saturated")
+          if util >= USE_BUSY:
+              findings.append("high-utilization")
+          return findings
+
+
+      def limiting(resources):
+          candidates = []
+          for name, r in resources.items():
+              findings = use_findings(r["utilization"], r["saturation"], r["errors"])
+              if "saturated" in findings or "high-utilization" in findings:
+                  candidates.append((-r["saturation"], -r["utilization"], name))
+          return min(candidates)[2] if candidates else None
+      ```
+
+      `limiting` takes a table of resources and returns the name that is most likely to limit throughput: the longest queue,
+      then the highest utilization, then the name that sorts first. A resource with only errors is a finding, not a bottleneck,
+      and an all-idle table gives `None` - "low utilization, no saturation, no errors" is an answer.
+
+  - id: code-knee
+    kind: code
+    concepts: [perf-bn-signature]
+    title: 'The code: reading a step load'
+    body: |
+      The solution of the second exercise (`practice/perf/solutions/analysis/bn_knee.py`). A step is the dict one level of the
+      probe returns (`run_level` in `support/bn_fixture.py` runs `clients` threads, each sending `requests_each` GET
+      requests back to back on its own keep-alive connection):
+
+      ```python
+      def find_knee(steps, min_gain=0.10):
+          ordered = sorted(steps, key=lambda s: s["clients"])
+          for current, following in zip(ordered, ordered[1:]):
+              if following["throughput"] < current["throughput"] * (1 + min_gain):
+                  return current["clients"]
+          return None
+
+
+      def wait_share(step, service_ms):
+          return round(max(0.0, (step["mean_ms"] - service_ms) / step["mean_ms"]), 3)
+
+
+      def implied_slots(steps, service_ms):
+          ceiling = max(s["throughput"] for s in steps)
+          return round(ceiling * service_ms / 1000, 1)
+      ```
+
+      `find_knee` returns the client count whose *next* step no longer paid. It returns `None` when every step still gained at
+      least `min_gain`: you never reached the ceiling, so the test has not found the bottleneck yet - raise the load, do not
+      invent a knee. The threshold is a parameter because "no longer pays" is a judgement; 10 % is a reasonable default for steps
+      that double the load.
+
+  - id: code-laws
+    kind: code
+    concepts: [perf-bn-laws]
+    title: 'The code: demands, the bound and the what-if'
+    body: |
+      The solution of the third exercise (`practice/perf/solutions/analysis/bn_laws.py`). Everything is per request, in
+      seconds; `demands` maps a resource name to D_k:
+
+      ```python
+      def demand(utilization, throughput):
+          return utilization / throughput
+
+
+      def bottleneck(demands):
+          top = max(demands.values())
+          return min(name for name, d in demands.items() if d == top)
+
+
+      def max_throughput(demands):
+          return 1 / max(demands.values())
+
+
+      def knee_population(demands, think_s):
+          return (sum(demands.values()) + think_s) / max(demands.values())
+
+
+      def throughput_bounds(demands, think_s, n):
+          total = sum(demands.values())
+          lower = n / (n * total + think_s)
+          upper = min(1 / max(demands.values()), n / (total + think_s))
+          return lower, upper
+
+
+      def what_if(demands, name, factor):
+          changed = {**demands, name: demands[name] * factor}
+          return bottleneck(changed), max_throughput(changed)
+      ```
+
+      `what_if` builds a changed copy and never edits its input, so a report can try several fixes against the same table.
+      `factor` is a multiplier on the demand: 0.5 means "twice as fast".
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: The lines that matter
+    body: |
+      - **`sum(s["in_flight"] ...) / len(samples) / capacity`** - the mean number of busy workers over the capacity. A maximum
+        would be 1.0 in almost any run longer than a second, because some sample catches all four workers busy; the mean is
+        the "average time the resource was busy".
+      - **`sum(s["waiting"] ...) / len(samples)`** - a mean, not a sum. A sum grows with how long you sampled, which is not a
+        queue length.
+      - **`if sat >= QUEUE_NOISE`** - Gregg says "any degree of saturation can be a problem (non-zero)". On a *sampled* queue
+        a mean of 0.07 is a request caught between arriving and starting, so the code asks for half a request. Say so in a report.
+      - **`if util >= USE_BUSY`** - 70 %, from the page's interpretation of utilization; it is a place to look, not a verdict.
+      - **`if errors > 0`** - first in the list because errors are "usually quicker and easier to interpret", and they come
+        before utilization and saturation in Gregg's flowchart.
+      - **`candidates.append((-r["saturation"], -r["utilization"], name))`** - `min` of the negated numbers is the longest
+        queue, then the busiest resource, then the first name. A tuple does the tie-break without a second loop.
+      - **`following["throughput"] < current["throughput"] * (1 + min_gain)`** - compares with the *next* step, so the knee is
+        the last step that was still worth taking.
+      - **`(step["mean_ms"] - service_ms) / step["mean_ms"]`** - the share of the response time that is waiting. The service
+        time comes from the one-client step, where nobody waits.
+      - **`ceiling * service_ms / 1000`** - Little's law for the service station: requests served at once = throughput x service
+        time. The factor 1000 converts milliseconds to seconds.
+      - **`utilization / throughput`** - the utilization law read backwards. It is only as good as the utilization: a pool
+        measured at 40 % gives a demand 2.5 times too small for its busy time.
+      - **`1 / max(demands.values())`** - the bottleneck bound. Nothing else in the dictionary can change this number.
+      - **`{**demands, name: demands[name] * factor}`** - a new dict. Editing the input would make a second what-if start from
+        the first one's answer.
+
+  - id: when
+    kind: when
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: When to use which tool
+    body: |
+      | Situation | Reach for | Why |
+      | --- | --- | --- |
+      | A report must say what users experience, or an SLO is checked | **RED** | rate, errors and duration per service are what the requirement is written in |
+      | "Which resource is the reason?" | **USE** | a checklist across resources finds the saturated one and, as important, rules the others out |
+      | A single service needs a short dashboard and alert list | **Four golden signals** | RED plus saturation; "if you can only measure four metrics of your user-facing system, focus on these four" |
+      | You have a load test and no server-side metrics | **Step load and the knee** | the generator-side signature (flat throughput, latency growing with clients, wait share rising) still shows a limit |
+      | A fix is proposed | **Operational laws, what-if** | predicts the gain from measured demands before code is written |
+      | Throughput is flat and the server is quiet | **Check the load generator** | the cheapest explanation is the one that invalidates the test |
+      | Errors rise with load | **Status codes first** | a bounded queue (503), a rate limit (429) and real failures (500) have different owners |
+      | A request waits on something other than a pool - a lock, a downstream service | **Latency breakdown, tracing** | USE is "most effective for resources that suffer performance degradation under high utilization or saturation"; other waits need other methods |
+
+  - id: steps
+    kind: steps
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: A bottleneck investigation, step by step
+    body: |
+      1. **Write the symptom in RED terms with numbers.** "At 300 users the p95 of `POST /v1/payments` is 380 ms against 300 ms,
+         errors 0.1 %, 140 requests per second." Not "it is slow".
+      2. **Check the generator.** CPU of the load machine, connections, the tool's own warnings. If it is above about 70 % or the
+         tool reports it is behind, fix that first (more generators, a lighter script) and measure again.
+      3. **Read the status codes.** Separate 429 (policy), 503 (queue bound), 5xx (failures) and slow successes. Report the
+         latency of successes and of errors separately.
+      4. **Run a step load with no think time** (or at your workload's pacing) and find the knee: the throughput ceiling, the wait
+         share, the slots. This names the *level* at which the system saturates.
+      5. **Build the USE table.** One row per resource on the request path - load balancer, application workers, database
+         connections, CPU, memory, disk, network, queues. Three numbers each, "no data" where there is none, sampled during the
+         plateau and over short intervals, not as a long average.
+      6. **Name the limiting resource** from the table: the longest queue, then the busiest. Write down what would have to be
+         true for it to be wrong.
+      7. **Compute the demands and run the what-if.** D_k = U_k / X for each resource; the bottleneck bound; the gain of the fix and
+         where the limit moves next.
+      8. **Change one thing**, the one the what-if says pays most.
+      9. **Re-run the same step load.** Did the knee move to the predicted place? If yes, repeat from step 5 to find the next
+         bottleneck; if no, the model (or the measurement) was wrong and the fix is not a fix.
+      10. **Report** before and after with the same tool, the same data and the same environment, plus the next bottleneck.
+
+  - id: example
+    kind: example
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: 'Worked example: the practice target, measured'
+    body: |
+      Everything below is the output of `PERF_TARGET=solutions .venv/bin/python support/bn_demo.py`, run on 21 November 2026
+      against the practice target with `capacity=4` and `latency_ms=20`. The generator is a closed loop with no think time, and
+      the target runs in its own process.
+
+      **1. The step load.** Each level is a number of clients sending 20 requests each:
+
+      ```text
+      == 1. step load: closed loop, no think time, 20 requests per client
+      clients   req/s  mean ms  p95 ms  wait share
+            1    45.9     21.7    22.2       0.078
+            2    91.3     21.9    22.2       0.087
+            4   177.7     22.5    23.5       0.111
+            8   191.7     40.9    62.4       0.511
+           16   191.2     79.5   146.8       0.748
+      knee: 4 | slots implied by the ceiling: 3.8
+      target /metrics after the run: {'in_flight': 0, 'max_in_flight': 4, 'waiting': 0}
+      ```
+
+      Up to 4 clients the throughput doubles with the clients (46, 91, 178) and the latency stays at the service time. From 4 to
+      8 clients it gains 8 %, from 8 to 16 nothing: the ceiling is about 191 requests per second. The latency then follows the
+      model of the internals: 40.9 ms at 8 clients (20 x 8 / 4 = 40) and 79.5 at 16 (80). At 16 clients three quarters of every
+      response is waiting. The ceiling times the service time, 191.7 x 0.020, is 3.8 slots - the pool size, which the target's own
+      `max_in_flight` of 4 confirms. That is the step-load signature, read without looking inside the server.
+
+      **2. The USE table of the pool**, sampled every 50 ms during each level:
+
+      ```text
+      == 2. USE of the worker pool, sampled from /metrics every 50 ms during each level
+      clients   util  queue errors  findings
+            2  0.472    0.0      0  []
+            4    0.9    0.0      0  ['high-utilization']
+            8  0.941   3.47      0  ['saturated', 'high-utilization']
+           16  0.947   11.0      0  ['saturated', 'high-utilization']
+      ```
+
+      The two views agree. At 2 clients the pool is about half busy (2 of 4) and nothing waits: the negative case, "more useful
+      than it sounds". At 4 it is busy but nobody queues (a candidate, not yet a bottleneck). At 8 and 16 there is a queue of
+      3.5 and 11 requests: **saturated**. The utilization never reads exactly 1.0 because the samples include the gaps between
+      one request ending and the next starting, which is also why a USE reading is an estimate.
+
+      **3. The impostor: a generator that is the limit.** The same 16 clients, but each burns 30 ms of CPU between requests (a
+      stand-in for a heavy script, TLS, or a tool that is short of cores):
+
+      ```text
+      == 3. the same 16 clients, but each burns 30 ms of CPU between requests
+      throughput 33.2 req/s, mean 146.9 ms | target util 0.25, queue 0.0, errors 0 -> []
+      ```
+
+      Throughput is flat at 33 requests per second and the mean latency is 147 ms. Looked at from the generator alone this is
+      "the API tops out at 33 and responds in 147 ms". The target's USE table says otherwise: 25 % utilization, no queue, no
+      errors - **clear**. The 16 clients share one core (one process, one interpreter lock), so each of the 33 requests per
+      second costs 30 ms of the core. The latency the generator measured includes the time its own threads waited for the core.
+      Nothing about the API was slow.
+
+      **4. The impostor: a bounded queue.** The target is started with `queue_limit=4`, so it refuses what does not fit, and 24
+      clients push:
+
+      ```text
+      == 4. a bounded queue: queue_limit=4, 24 clients
+      statuses {'200': 85, '503': 275} | mean 11.7 ms, p95 40.8 ms | util 0.75, queue 1.55 -> ['errors', 'saturated', 'high-utilization']
+      ```
+
+      Three quarters of the answers are `503`, and the mean latency, 11.7 ms, is **lower than the 20 ms service time**, because a
+      refusal costs almost nothing. A report that quoted this mean would say the system is fast under load. The golden-signals
+      advice applies: separate the latency of successes from the latency of errors, and count the errors. The USE findings now
+      start with `errors`.
+
+      **5. Demand from the measurement.**
+
+      ```text
+      == 5. operational laws on the measured ceiling
+      D = U / X = 1.0 / 191.7 = 5.22 ms per request (20 ms / 4 workers = 5 ms)
+      ceiling 1 / D = 192 req/s
+      ```
+
+      The pool is one resource of four identical workers, so its demand per request is 20 ms / 4 = 5 ms; the measurement gives 5.2.
+      The bound `1 / D` reproduces the ceiling, 192 requests per second, which the step load found by running it. With more than
+      one resource the law is how you find out *which* one is the limit without running a test per resource.
+
+      **6. A what-if on a hypothetical path.** *The demands below are made up to show the arithmetic; nothing here was measured.* A
+      request needs 4 ms at the web tier, 12 ms at the application tier and 25 ms at the database:
+
+      ```text
+      == 6. a hypothetical path (made-up demands in seconds)
+      bottleneck: db | ceiling: 40.0 req/s
+        demand of web x 0.5: bottleneck db, ceiling 40.0 req/s
+        demand of db x 0.4: bottleneck app, ceiling 83.3 req/s
+        demand of app x 0.5: bottleneck db, ceiling 40.0 req/s
+      limiting(): db connections
+      ```
+
+      Halving the web or the application demand changes nothing: the ceiling stays at 40 requests per second, set by the 25 ms at
+      the database. Cutting the database demand to 10 ms raises the ceiling to 83 and **moves the bottleneck to the application
+      tier**, whose 12 ms is now the largest. A fix that makes the database 2.5 times faster therefore buys a factor of 2.1,
+      not 2.5, and the next ticket is already written. The last line is `limiting()` on a USE table of the same kind: the
+      database connections (queue 11.5) are named, not the busier-looking application threads (82 %).
+
+      **7. The same two loads in Locust 2.47.0**, to show the signature does not depend on the home-made generator:
+
+      ```text
+      == 7. the same two loads in Locust 2.47.0 (6 s each)
+      users requests   req/s  avg ms  p95 ms failures
+          2      453    81.4    24.2      25        0
+         16     1060   189.6    82.2      86        0
+      ```
+
+      At 2 users Locust reaches 81 requests per second (a little under the 91 of the probe: Locust does more work per request),
+      and at 16 users 190 - the same ceiling - with the average at 82 ms against 24. Locust's p95 comes from its response-time
+      histogram, rounded to whole milliseconds. The tool changed; the knee and the ceiling did not.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: How the exercises are tested
+    body: |
+      - `tests/analysis/test_bn_use.py` checks your `utilization`, `saturation`, `use_findings` and `limiting` on small tables
+        (including the 70 % line, a queue of 0.49 versus 0.5, a tie-break and an errors-only table), and then against the
+        **real practice target** in its own process: a light load is clear, a heavy load is saturated, a generator that burns CPU
+        does **not** make the target a bottleneck, and a full queue shows up as errors.
+      - `tests/analysis/test_bn_knee.py` runs `find_knee`, `wait_share` and `implied_slots` on a real step load captured on 21
+        November 2026 (in the test file), checks that the order of the steps and the gain threshold behave, and then runs a fresh
+        step load against the target and checks that the knee is at the pool size (4 or 8, because the 8-client step is a bit
+        noisy), the wait share is small at one client and large at 16, and the slots are between 3.0 and 4.6.
+      - `tests/analysis/test_bn_laws.py` checks the laws on a hypothetical path with exact arithmetic (`pytest.approx`),
+        including the two what-ifs that matter - a non-bottleneck changes nothing, the bottleneck moves - and that `what_if`
+        leaves its input alone.
+
+      None of the tests check an absolute response time or request rate, because they depend on the machine. They check which
+      signals are present, how the numbers relate, and which resource is named.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/analysis/test_bn_laws.py                                  # instant
+      .venv/bin/python -m pytest tests/analysis/test_bn_use.py tests/analysis/test_bn_knee.py    # about 15 seconds: they start the target
+      PERF_TARGET=solutions .venv/bin/python support/bn_demo.py                                  # the lesson's output
+      ```
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: Common mistakes
+    body: |
+      1. **Reading a long average.** CPU "never above 80 %" over five minutes can hide seconds at 100 %. Sample at the scale of
+         the queue: one second or less, during the plateau of the run.
+      2. **Blaming the server before checking the generator.** Flat throughput, a clear USE table on the target and a loaded load
+         generator means the test, not the API, is at its limit. Fix the test and measure again.
+      3. **Improving a resource that is not the bottleneck.** The ceiling is 1 / D_max; nothing else moves it. Run the what-if
+         first.
+      4. **Stopping at the first saturated resource.** Fix it and the next one limits you. State the next bottleneck in the report,
+         and re-run.
+      5. **Quoting the mean latency of a run with errors.** Fast refusals pull it down. Report successes and errors separately,
+         with percentiles ([metrics and percentiles](#/lesson/performance-metrics-and-percentiles)).
+      6. **Treating "no queue" as "no problem".** A resource at 100 % with no queue is the knee, not slack: one more client queues.
+         A resource at 60 % can still be the limit if the average hides bursts.
+      7. **Changing two things between runs.** A new index and a bigger pool together mean you cannot say which moved the knee.
+      8. **Forgetting that the bounds assume constant demand.** With lock contention, retries that grow under load or a cache that
+         is cold in the first minute, the measured ceiling will be lower than 1 / D_max. Believe the measurement; use the bound to
+         ask why.
+      9. **Taking a hypothetical for a measurement.** A what-if on made-up demands is arithmetic. It says what *would* happen if the
+         demands were these; it needs a measurement of the real demands before it supports a decision.
+      10. **Measuring a shared environment.** Someone else's batch job saturates the database and your USE table blames your
+          application. Use an environment you control, or record what else was running
+          ([test environments and data](#/lesson/performance-test-environments-and-data)).
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: Trade-offs
+    body: |
+      | Choice | Good | Cost |
+      | --- | --- | --- |
+      | **USE** | complete across resources; finds blind spots; cheap to start | built for hardware and pools; memory utilization and "memory errors" are awkward (Wilkie's complaint); says nothing about a slow lock or a slow dependency |
+      | **RED** | consistent per service; matches what users and SLOs see | tells you *that* a service is slow, not *which resource* is the reason |
+      | **Golden signals** | RED plus saturation in four numbers | saturation still needs a per-resource definition and a utilization target |
+      | **Step-load knee, black box** | works with no access to the server; finds the level of saturation | does not say which resource; fooled by the generator, queue bounds and rate limits |
+      | **Operational laws** | predict the gain of a fix from two measured numbers per resource | assume constant demand and a single class of work; give a bound, not a forecast |
+      | **Sampling every 50 ms** | sees queues that an average hides | its own overhead; misses shorter bursts; a noise floor is needed |
+      | **A separate process for the target** | the generator's CPU is not taken from the target | one more thing to start; closer to production, which is the point |
+
+  - id: summary
+    kind: summary
+    concepts: [perf-bn-use-red, perf-bn-signature, perf-bn-laws]
+    title: Summary
+    body: |
+      - **RED** (rate, errors, duration) says what a service gives its users; **USE** (utilization, saturation, errors) says what
+        each resource is going through; the four golden signals are RED plus saturation. Use RED for the symptom and USE for the
+        cause.
+      - Gregg's rules: 100 % utilization usually means a bottleneck, beyond about 70 % queueing starts, any saturation can matter,
+        non-zero errors deserve a look, and a long average hides bursts. A thread pool is a USE resource: utilization is busy
+        workers, saturation is requests waiting.
+      - In a step load with no think time, the **knee** is where throughput stops growing. Above it latency grows in proportion to
+        the clients and the **wait share** climbs; **ceiling x service time** is the number of requests served at once.
+      - **Check the generator and the status codes first.** A generator that is the limit leaves the target's USE table clear; a
+        bounded queue answers fast 503s and can lower the mean latency; a rate limit gives 429.
+      - **Service demand** D = U / X. The bottleneck is the largest D, throughput is at most 1 / D_max, and the knee population is
+        N* = (D + Z) / D_max. Speeding up a non-bottleneck changes nothing; speeding up the bottleneck moves the limit to the next
+        resource - compute it with a what-if before building the fix.
+      - Change one thing, re-run the same load, and look for the next bottleneck. The bounds assume constant demand: the measurement
+        has the last word.
+
+exercises:
+  - id: saturation-mcq
+    type: mcq
+    concept: perf-bn-use-red
+    skill: recall
+    title: What saturation means
+    prompt: In the USE Method, what is the **saturation** of a resource?
+    options:
+      - id: queue
+        text: The degree to which it has extra work it cannot service - often measured as a queue length
+        feedback: Correct. "the degree to which the resource has extra work which it can't service, often queued."
+      - id: busy
+        text: The average time it was busy servicing work
+        feedback: That is utilization. A resource can be 100 % utilized with no saturation until one more request arrives.
+      - id: failures
+        text: The count of failed operations
+        feedback: That is errors, the third letter.
+      - id: peak
+        text: The highest utilization seen in the run
+        feedback: A peak of utilization is still utilization, and a maximum over many samples is almost always 100 %.
+    correct: [queue]
+    hints:
+      - Which of the three letters is about work that is waiting?
+    solution: |
+      Saturation is work waiting that the resource cannot get to - for a pool, the number of requests queued for a worker.
+
+  - id: use-red-mcq
+    type: mcq
+    concept: perf-bn-use-red
+    skill: recall
+    title: USE or RED
+    prompt: A team has a service-level objective on the 95th percentile of an API and now wants to know which of its resources is the reason it is missed. Which methods answer which question?
+    options:
+      - id: red-then-use
+        text: RED describes the service against the objective (rate, errors, duration); USE per resource finds the reason
+        feedback: Correct. RED is the view of "how happy your customers are", USE the view of "how happy your machines are" - complementary.
+      - id: use-only
+        text: USE alone - utilization of the service is the user experience
+        feedback: USE is about resources. It does not give you the duration of requests that an objective is written in.
+      - id: red-only
+        text: RED alone - the duration signal names the slow resource
+        feedback: Duration says that requests are slow, not which resource makes them slow.
+      - id: neither
+        text: Neither - they are monitoring methods and do not apply to load tests
+        feedback: A load test is where you can read both on purpose, at a known load.
+    correct: [red-then-use]
+    hints:
+      - One method looks from the outside, the other from the inside.
+    solution: |
+      RED for the symptom in the objective's terms, USE per resource for the cause.
+
+  - id: knee-mcq
+    type: mcq
+    concept: perf-bn-signature
+    skill: application
+    title: Flat throughput, rising latency
+    prompt: |
+      In a step load with no think time, going from 8 to 16 clients leaves throughput at 191 requests per second and takes the mean latency from 41 ms to 80 ms. What does that most likely mean?
+    options:
+      - id: queue
+        text: A resource is saturated - the extra clients are only waiting in a queue
+        feedback: Correct. With the ceiling fixed, Little's law makes latency grow in proportion to the clients - 41 to 80 for twice the clients.
+      - id: faster
+        text: The system got faster per request
+        feedback: Per-request service time is unchanged; the extra time is queueing.
+      - id: generator
+        text: It cannot be told from a generator problem, so nothing can be concluded
+        feedback: 'It can be told: read the target''s utilization and queue. A generator-limited run leaves the target quiet.'
+      - id: noise
+        text: Measurement noise - latency doubles at random in a closed loop
+        feedback: A doubling that matches the doubling of the clients is the model, not noise.
+    correct: [queue]
+    hints:
+      - n = X R. What happens to R when n doubles and X stays put?
+    solution: |
+      The pool is saturated: with X fixed, R is proportional to n. Confirm with the target's queue length.
+
+  - id: idle-target-mcq
+    type: mcq
+    concept: perf-bn-signature
+    skill: analysis
+    title: The quiet server
+    prompt: |
+      A run with 16 clients reaches 33 requests per second with a mean latency of 147 ms. The target's USE table says: utilization 25 %, queue 0, errors 0. A colleague proposes adding workers. What is the right reply?
+    options:
+      - id: generator
+        text: The target is clear, so the limit is probably the load generator - check its CPU and connections before changing the target
+        feedback: Correct. A flat curve with a quiet target is the signature of a generator that cannot send faster.
+      - id: add
+        text: Agree - low utilization shows the workers are wasted, so more of them will help
+        feedback: Adding workers to a target that is 25 % utilized and has no queue changes nothing; the limit is elsewhere.
+      - id: remove
+        text: Agree to remove workers - they are idle
+        feedback: Idle workers are a consequence of the generator, not a finding about the target.
+      - id: network
+        text: It must be the network - latency is high
+        feedback: Possible in general, but nothing here points to it; the first check is the generator, which is on the path of every measurement.
+    correct: [generator]
+    hints:
+      - Where does a flat throughput curve come from if the target has spare capacity?
+    solution: |
+      Check the generator: its CPU, connections and tool warnings. The target's table is clear.
+
+  - id: fast-errors-mcq
+    type: mcq
+    concept: perf-bn-signature
+    skill: analysis
+    title: A latency that went down
+    prompt: |
+      A heavier run has a mean latency of 11.7 ms - lower than the 20 ms service time - and 275 of 360 responses are 503. What do you report?
+    options:
+      - id: separate
+        text: The queue is bounded and refusing most requests; report errors and the latency of successes separately - the mean mixes instant refusals with real answers
+        feedback: Correct. "A slow error is even worse than a fast error" and "factoring 500s into your overall latency might result in misleading calculations."
+      - id: faster
+        text: The system is faster under load - report 11.7 ms
+        feedback: Three quarters of those answers are refusals that cost almost nothing.
+      - id: ignore
+        text: Drop the 503 responses from the data and report the rest as the result of the run
+        feedback: Dropping them hides the finding - the system is refusing 76 % of the requests.
+      - id: retry
+        text: Re-run with fewer clients until the mean is above 20 ms
+        feedback: Choosing the run to fit an expected number is not a measurement.
+    correct: [separate]
+    hints:
+      - What does a 503 cost compared with a real answer?
+    solution: |
+      Report the error rate and the latency of the successful requests separately; the queue bound is the finding.
+
+  - id: bound-mcq
+    type: mcq
+    concept: perf-bn-laws
+    skill: application
+    title: The ceiling of a request path
+    prompt: |
+      *Hypothetical numbers.* A request needs 4 ms at the web tier, 12 ms at the application tier and 25 ms at the database. What is the highest throughput the path can reach?
+    options:
+      - id: forty
+        text: 40 requests per second - set by the database, 1 / 0.025
+        feedback: Correct. The largest demand saturates first, and X <= 1 / D_max.
+      - id: eighty
+        text: About 83 requests per second - 1 / 0.012, set by the application tier
+        feedback: The application tier would limit the path only if the database were faster.
+      - id: twentyfour
+        text: About 24 requests per second - 1 / (0.004 + 0.012 + 0.025) summed over the tiers
+        feedback: The sum is 41 ms, which bounds one request's latency, not the throughput of a pipeline. 1 / 0.041 is the throughput of one user with no overlap.
+      - id: two
+        text: 250 requests per second - 1 / 0.004, set by the web tier
+        feedback: The web tier has the smallest demand; it is the last to saturate.
+    correct: [forty]
+    hints:
+      - Which resource saturates first?
+    solution: |
+      1 / 0.025 = 40 requests per second.
+
+  - id: what-if-mcq
+    type: mcq
+    concept: perf-bn-laws
+    skill: analysis
+    title: A fix that pays less than it promises
+    prompt: |
+      *Same hypothetical path.* The team makes the database 2.5 times faster (its demand falls to 10 ms). What does the ceiling become, and what is the next bottleneck?
+    options:
+      - id: app
+        text: About 83 requests per second, and the application tier (12 ms) becomes the bottleneck
+        feedback: Correct. The ceiling rises by a factor of 2.1, not 2.5, because the application tier's 12 ms is now the largest demand.
+      - id: hundred
+        text: 100 requests per second - 1 / 0.010, since the database is still the bottleneck
+        feedback: At 10 ms the database is no longer the largest demand - the application tier's 12 ms is.
+      - id: same
+        text: 40 requests per second - nothing changes until all tiers are faster
+        feedback: Speeding up the bottleneck does raise the ceiling, up to the next-largest demand.
+      - id: web
+        text: About 250 requests per second - the web tier becomes the limit
+        feedback: The web tier (4 ms) is smaller than the application tier (12 ms).
+    correct: [app]
+    hints:
+      - After the change, which demand is the largest?
+    solution: |
+      The largest demand is now 12 ms (application): ceiling 1 / 0.012 = 83 requests per second.
+
+  - id: avg-mcq
+    type: mcq
+    concept: perf-bn-use-red
+    skill: analysis
+    title: Utilization that looks fine
+    prompt: |
+      Monitoring shows the connection pool at 55 % utilization averaged over five minutes, yet users see seconds-long stalls every few minutes. What does the USE guidance suggest?
+    options:
+      - id: burst
+        text: Look at saturation and a finer interval - a long average can hide short bursts of 100 % utilization
+        feedback: Correct. "A burst of high utilization can cause saturation and performance issues, even though utilization is low when averaged over a long interval."
+      - id: fine
+        text: The pool is healthy - 55 % is below the 70 % line
+        feedback: The 70 % line is for a utilization measured at a scale that does not hide bursts.
+      - id: shrink
+        text: Shrink the pool - it is half empty
+        feedback: A smaller pool would saturate sooner.
+      - id: cpu
+        text: Switch to CPU metrics - connection pools are not resources
+        feedback: Gregg lists thread pools and similar software resources as USE resources.
+    correct: [burst]
+    hints:
+      - What does a five-minute average of a one-second burst look like?
+    solution: |
+      Check saturation (queue of waiters) and use a much shorter sampling interval.
+
+  - id: slots-mcq
+    type: mcq
+    concept: perf-bn-signature
+    skill: application
+    title: How many at once
+    prompt: |
+      A step load stops growing at 400 requests per second and the one-client step shows a mean of 50 ms. About how many requests does the system serve at once at the ceiling?
+    options:
+      - id: twenty
+        text: About 20 - 400 x 0.050
+        feedback: Correct. Throughput x time in service, Little's law applied to the service station.
+      - id: eight
+        text: About 8 - 400 / 50
+        feedback: That divides the units the wrong way; 400 requests per second times 0.05 seconds is 20.
+      - id: four
+        text: 4 - it is always the number of cores
+        feedback: The number is whatever the data says; it is a property of the system, not a constant.
+      - id: fifty
+        text: 50 - the service time in milliseconds
+        feedback: 50 ms is how long each takes, not how many are served together.
+    correct: [twenty]
+    hints:
+      - Throughput times time per request.
+    solution: |
+      400 x 0.050 = 20 requests in service at once; compare with the size of the pool you expect.
+
+  - id: knee-pop-mcq
+    type: mcq
+    concept: perf-bn-laws
+    skill: application
+    title: The knee in users
+    prompt: |
+      *Hypothetical.* The sum of the demands is 41 ms, the largest is 25 ms and users think for 1 second between requests. At roughly how many users does the throughput stop growing?
+    options:
+      - id: forty
+        text: About 42 users - (0.041 + 1.0) / 0.025
+        feedback: Correct. N* = (D + Z) / D_max = 1.041 / 0.025 = 41.6.
+      - id: one
+        text: 1 user - the bottleneck allows only one request at a time
+        feedback: That would be with zero think time and a single resource.
+      - id: forty-one
+        text: 41 users - D in milliseconds
+        feedback: The numbers coincide here only by accident; the formula needs the think time and the largest demand.
+      - id: hundred
+        text: 100 users - 1 / 0.01
+        feedback: The formula uses the largest demand, 0.025, not an invented 0.01.
+    correct: [forty]
+    hints:
+      - N* = (D + Z) / D_max.
+    solution: |
+      (0.041 + 1.0) / 0.025 = 41.6, so about 42 users.
+
+  - id: one-change-mcq
+    type: mcq
+    concept: perf-bn-laws
+    skill: application
+    title: One change at a time
+    prompt: |
+      The analysis names the database pool as the bottleneck. A developer wants to add an index and double the pool at once, "to be sure". Why re-run after each change instead?
+    options:
+      - id: attribute
+        text: With one change per run you can say which one moved the knee, and compare it with the what-if's prediction
+        feedback: Correct. Two changes at once leave you unable to attribute the gain or to see that one of them did nothing.
+      - id: cheaper
+        text: Because every load test run is cheap
+        feedback: It is not - and that is the argument for predicting with a what-if first.
+      - id: rule
+        text: Because the operational laws are only valid for one change
+        feedback: The laws are not limited to one change; the discipline is about attribution.
+      - id: never
+        text: Re-running is unnecessary - the what-if is exact
+        feedback: The what-if assumes constant demand; the re-run is what confirms it.
+    correct: [attribute]
+    hints:
+      - What can you conclude from a run in which two things changed?
+    solution: |
+      One change per run lets you attribute the effect and test the prediction.
+
+  - id: investigation-order
+    type: order
+    concept: perf-bn-signature
+    skill: application
+    title: A bottleneck hunt, in order
+    prompt: Put the steps of a bottleneck investigation in order.
+    items:
+      - id: symptom
+        text: Write the symptom with RED numbers (rate, errors, duration)
+      - id: generator
+        text: Check the load generator and the status codes
+      - id: step
+        text: Run a step load and find the knee, the ceiling and the wait share
+      - id: use
+        text: Build the USE table and name the limiting resource
+      - id: whatif
+        text: Compute demands and run the what-if for the candidate fixes
+      - id: change
+        text: Change one thing
+      - id: rerun
+        text: Re-run the same step load and look for the next bottleneck
+    hints:
+      - The generator check invalidates everything after it if it fails.
+    solution: |
+      Symptom, generator and status codes, step load, USE table, what-if, one change, re-run.
+
+  - id: use-debug
+    type: debug
+    concept: perf-bn-use-red
+    skill: analysis
+    title: Four defects in a USE reading
+    prompt: |
+      This function should turn samples of `{"in_flight": n, "waiting": m}` from the practice target into USE findings. Click every line that is a defect.
+    language: python
+    code: |
+      def use_row(samples, capacity, errors):
+          util = max(s["in_flight"] for s in samples) / capacity
+          sat = sum(s["waiting"] for s in samples)
+          findings = []
+          if util == 1.0:
+              findings.append("high-utilization")
+          if sat > 0:
+              findings.append("saturated")
+          if errors:
+              findings.append("errors")
+          return findings
+    correctLines: [2, 3, 5, 7]
+    lineNotes:
+      - line: 2
+        note: A maximum over many samples reaches 1.0 in almost any run, loaded or not. Utilization is the mean of the busy fraction.
+      - line: 3
+        note: A sum grows with how long you sampled. A queue length is the mean (or a percentile) of the waiting counts.
+      - line: 5
+        note: Only exactly 1.0 counts. Gregg's rule is a place to start looking from about 70 %, and a mean of busy workers is rarely exactly 1.0.
+      - line: 7
+        note: Any non-zero sampled mean fires on a request caught between arriving and starting. The lesson's code asks for at least half a request on average.
+      - line: 9
+        note: Fine - a non-zero error count is worth investigating.
+      - line: 4
+        note: Fine.
+    hints:
+      - Which statistic of the samples is utilization?
+      - Does the saturation value depend on how many samples you took?
+      - Is the sampled queue ever exactly zero on a loaded pool?
+    solution: |
+      Line 2: use the mean of in_flight over the samples. Line 3: use the mean of waiting. Line 5: compare with a threshold such as 0.70. Line 7: compare with a small floor (0.5) so sampling noise is not a finding.
+
+  - id: quiet-short
+    type: short
+    concept: perf-bn-signature
+    skill: analysis
+    title: Why "add workers" is the wrong answer
+    prompt: |
+      A step load shows 33 requests per second at 16 clients and at 32 clients, with a mean latency of 147 ms at 16 and 300 ms at 32. The target's USE table at 32 clients reads utilization 28 %, queue 0.0, errors 0. A teammate says "the API is saturated, add workers". Explain what is wrong, what you would check next, and how you would prove your explanation.
+    modelAnswer: |
+      The target is clear - 28 % utilization, no queue, no errors - so it is not saturated, and more workers would change
+      nothing. Flat throughput with a quiet target is the signature of a load generator that cannot send faster, and the
+      generator's own queueing inflates the latency it measures (147 ms at 16 clients, 300 ms at 32, while the target does 20 ms
+      of work per request). Next check the generator machine's CPU, its connection count and the tool's warnings.
+
+      To prove it, move the same script to a second generator machine or lighten the script, and run the same step load again:
+      if the ceiling rises and the target's utilization rises with it, the generator was the limit.
+    rubric:
+      - Reads the USE table of the target as clear and says that adding workers would not help.
+      - Names the load generator as the likely limit and notes that it inflates the measured latency.
+      - Names what to check - the generator's CPU, connections and tool warnings.
+      - Gives a proof - a second generator or a lighter script, with the ceiling and the target's utilization rising together.
+    hints:
+      - What does a quiet target say about where the limit is?
+    solution: |
+      The target is clear, so the generator is the likely limit; check its CPU and connections and prove it by moving or lightening the load script.
+
+  - id: payments-testdesign
+    type: testdesign
+    concept: perf-bn-laws
+    skill: application
+    title: A bottleneck investigation for the settlement API
+    prompt: |
+      SandPay's `POST /v1/payments` has p95 380 ms against a 300 ms requirement at 300 concurrent users in the test environment (a hypothetical situation). Design the investigation: what you measure first, how you tell the generator, the queue bounds and the real limit apart, what table you build, what you compute before changing anything, and how you confirm the fix.
+    modelAnswer: |
+      **Symptom (RED):** record rate, error rate by status code (429, 503, 5xx) and duration percentiles of successes and errors separately for the 300-user run. Note the requirement and the environment.
+
+      **Rule out the test:** generator CPU, connections and tool warnings; if above about 70 %, add a generator or lighten the script and repeat. Check that the data, the environment and the version are the ones the requirement is written for.
+
+      **Find the level:** a step load (for example 50, 100, 200, 300, 400 users) at the workload's pacing; the knee, the ceiling, the wait share, and ceiling x service time as a consistency check.
+
+      **Build the USE table** for every resource on the path - load balancer, application workers, database connections, database CPU and I/O, memory, network, the payment-provider sandbox - sampled each second during the plateau, with "no data" where a metric is missing (a blind spot to close). Name the limiting resource by the longest queue, then the highest utilization; say what would make that wrong.
+
+      **Predict:** D_k = U_k / X for each resource; the bottleneck bound 1 / D_max and the what-if for each candidate fix (a bigger pool, an index, a cache). Choose the fix whose predicted gain is largest per effort, and write the expected new knee.
+
+      **Confirm:** change one thing, re-run the same step load, compare the knee and the p95 with the prediction, and look for the next bottleneck. If the knee did not move, the demand was not constant (locks, retries) - revisit the model.
+    rubric:
+      - Starts with the symptom in RED terms and separates successes from errors.
+      - Checks the load generator and status codes before blaming a resource.
+      - Uses a step load to find the knee and a USE table across resources to name the limiting one.
+      - Computes demands and a what-if before changing anything, and changes one thing at a time.
+      - Re-runs the same load and looks for the next bottleneck.
+    hints:
+      - What would you check before you trust the curve at all?
+    solution: |
+      Symptom with RED, generator and status codes, step load, USE table, demands and what-if, one change, re-run for the next bottleneck.
+
+  - id: bottleneck-interview
+    type: interview
+    concept: perf-bn-signature
+    skill: analysis
+    title: 'Interview: throughput is flat and latency is climbing - now what?'
+    prompt: |
+      "In a load test the throughput stops growing at some number of users and the response times keep climbing. How do you find out what the bottleneck is?"
+    modelAnswer: |
+      I first check that the flat line is the system's and not the test's: the load generator's CPU and connections, the tool's warnings and the status codes - 429 means a rate limit, 503 a bounded queue, 5xx real failures. A generator at its limit leaves the target quiet, and fast refusals can even make the mean latency fall, so I report successes and errors separately.
+
+      Then I describe the symptom with RED and go resource by resource with USE: for each of the load balancer, the application workers, the database connections, CPU, memory, disk, network and the queues, I read utilization, saturation and errors, sampled every second or so during the plateau, because a long average hides bursts. The resource with a queue - or, with none, the one near 100 % - is the candidate. A thread or connection pool counts: busy workers are utilization, waiting requests are saturation.
+
+      Before I change anything I compute the service demand of each resource, D = U / X, and apply the bottleneck bound: throughput cannot exceed 1 / D_max, so a fix elsewhere pays nothing, and a fix to the bottleneck pays until the next-largest demand takes over. That gives me the expected gain and the next bottleneck. I then change one thing, re-run the same step load, and check that the knee moved where I predicted; if it did not, the demand was not constant - locks or retries - and I revisit the model.
+    rubric:
+      - Checks the load generator and the status codes before blaming the system.
+      - Uses USE per resource, with a short sampling interval, and counts pools as resources.
+      - Knows the bottleneck is the largest service demand and that throughput is at most 1 / D_max.
+      - Predicts the effect of a fix, changes one thing and re-runs to confirm.
+      - Expects the next bottleneck and mentions the assumption of constant demand.
+    followUps:
+      - How would you tell a slow load generator from a saturated server?
+      - What would you do if the USE table showed no saturated resource at all?
+      - Why can the mean latency go down while the system is failing?
+    hints:
+      - Start with whether the flat line belongs to the system or to the test.
+    solution: |
+      Rule out the generator and the status codes, USE per resource at a fine interval, demands and the bottleneck bound, change one thing and re-run.
+
+  - id: use-code
+    type: coding
+    concept: perf-bn-use-red
+    skill: application
+    title: A USE reading of the worker pool
+    prompt: |
+      Implement `analysis/bn_use.py`: `utilization(samples, capacity)` (mean busy fraction), `saturation(samples)` (mean queue
+      length), `use_findings(util, sat, errors)` (a list in the order errors, saturated, high-utilization, with the 70 % line and
+      a queue noise floor of half a request) and `limiting(resources)` (the name of the resource that limits throughput, or
+      `None`). The tests run on small tables and against the real practice target, including a load generator that burns CPU
+      and a target whose queue is bounded.
+    project: perf
+    files:
+      - exercises/analysis/bn_use.py
+    test: tests/analysis/test_bn_use.py
+    command: .venv/bin/python -m pytest tests/analysis/test_bn_use.py
+    modelAnswer: |
+      ```python
+      def utilization(samples, capacity):
+          if not samples:
+              return 0.0
+          return round(sum(s["in_flight"] for s in samples) / len(samples) / capacity, 3)
+
+      def saturation(samples):
+          if not samples:
+              return 0.0
+          return round(sum(s["waiting"] for s in samples) / len(samples), 2)
+
+      def use_findings(util, sat, errors):
+          findings = []
+          if errors > 0:
+              findings.append("errors")
+          if sat >= 0.5:
+              findings.append("saturated")
+          if util >= 0.70:
+              findings.append("high-utilization")
+          return findings
+
+      def limiting(resources):
+          candidates = []
+          for name, r in resources.items():
+              findings = use_findings(r["utilization"], r["saturation"], r["errors"])
+              if "saturated" in findings or "high-utilization" in findings:
+                  candidates.append((-r["saturation"], -r["utilization"], name))
+          return min(candidates)[2] if candidates else None
+      ```
+
+      A tuple of negated numbers and the name makes `min` pick the longest queue, then the highest utilization, then the first
+      name. The generator test passes because the target's table stays clear however slow the clients are.
+    rubric:
+      - Every test in tests/analysis/test_bn_use.py passes.
+      - Utilization and saturation are means over the samples, and an empty list gives 0.0.
+      - Findings are in the order errors, saturated, high-utilization, with 0.70 and 0.5 as thresholds.
+      - limiting() ignores a resource that has only errors and returns None when nothing is busy or saturated.
+    hints:
+      - Utilization is the mean of in_flight over the capacity.
+      - A threshold of exactly 0.70 counts; a queue of exactly 0.5 counts.
+      - Negate the numbers you want the largest of, then use min().
+    solution: |
+      Means over the samples, three threshold checks in the order errors, saturated, high-utilization, and a min() over (-queue, -utilization, name) for the candidates.
+
+  - id: knee-code
+    type: coding
+    concept: perf-bn-signature
+    skill: analysis
+    title: Read a step load
+    prompt: |
+      Implement `analysis/bn_knee.py` on the steps a level run returns (dicts with `clients`, `throughput` and `mean_ms`):
+      `find_knee(steps, min_gain=0.10)` (the client count whose next step gains less than `min_gain`, or `None`),
+      `wait_share(step, service_ms)` (the part of the mean latency that is waiting) and `implied_slots(steps, service_ms)` (the
+      highest throughput times the service time). The tests use a real step load captured on 21 November 2026 and a fresh run
+      against the practice target.
+    project: perf
+    files:
+      - exercises/analysis/bn_knee.py
+    test: tests/analysis/test_bn_knee.py
+    command: .venv/bin/python -m pytest tests/analysis/test_bn_knee.py
+    modelAnswer: |
+      ```python
+      def find_knee(steps, min_gain=0.10):
+          ordered = sorted(steps, key=lambda s: s["clients"])
+          for current, following in zip(ordered, ordered[1:]):
+              if following["throughput"] < current["throughput"] * (1 + min_gain):
+                  return current["clients"]
+          return None
+
+      def wait_share(step, service_ms):
+          return round(max(0.0, (step["mean_ms"] - service_ms) / step["mean_ms"]), 3)
+
+      def implied_slots(steps, service_ms):
+          ceiling = max(s["throughput"] for s in steps)
+          return round(ceiling * service_ms / 1000, 1)
+      ```
+
+      On the captured steps the knee is 4 clients, the wait share at 16 clients is 0.748, and the ceiling of 191.5 requests per
+      second times 20 ms gives 3.8 slots - the pool of 4.
+    rubric:
+      - Every test in tests/analysis/test_bn_knee.py passes.
+      - The steps are sorted by clients, and the knee is the last step that still paid (the next one gained less than min_gain).
+      - find_knee returns None when no step saturated or there is a single step.
+      - wait_share never goes below 0, and implied_slots uses the highest throughput.
+    hints:
+      - Sort first - the steps may arrive in any order.
+      - Compare each step with the one after it.
+      - Throughput is per second and the service time in milliseconds.
+    solution: |
+      Sort by clients, return the first step whose successor gains less than min_gain; wait share is (mean - service) / mean floored at 0; slots are the best throughput x service seconds.
+
+  - id: laws-code
+    type: coding
+    concept: perf-bn-laws
+    skill: application
+    title: Service demands, the bound and the what-if
+    prompt: |
+      Implement `analysis/bn_laws.py` (seconds per request): `demand(utilization, throughput)`, `bottleneck(demands)`,
+      `max_throughput(demands)`, `knee_population(demands, think_s)`, `throughput_bounds(demands, think_s, n)` (a lower and an
+      upper bound) and `what_if(demands, name, factor)`, which returns the new bottleneck and ceiling without changing its
+      input. The tests use a hypothetical request path and the practice target's measured ceiling.
+    project: perf
+    files:
+      - exercises/analysis/bn_laws.py
+    test: tests/analysis/test_bn_laws.py
+    command: .venv/bin/python -m pytest tests/analysis/test_bn_laws.py
+    modelAnswer: |
+      ```python
+      def demand(utilization, throughput):
+          return utilization / throughput
+
+      def bottleneck(demands):
+          top = max(demands.values())
+          return min(name for name, d in demands.items() if d == top)
+
+      def max_throughput(demands):
+          return 1 / max(demands.values())
+
+      def knee_population(demands, think_s):
+          return (sum(demands.values()) + think_s) / max(demands.values())
+
+      def throughput_bounds(demands, think_s, n):
+          total = sum(demands.values())
+          return n / (n * total + think_s), min(1 / max(demands.values()), n / (total + think_s))
+
+      def what_if(demands, name, factor):
+          changed = {**demands, name: demands[name] * factor}
+          return bottleneck(changed), max_throughput(changed)
+      ```
+
+      For the hypothetical path (4, 12 and 25 ms) the ceiling is 40 requests per second; halving the web demand leaves it
+      unchanged, and cutting the database demand to 10 ms moves the bottleneck to the application tier at 83 requests per second.
+    rubric:
+      - Every test in tests/analysis/test_bn_laws.py passes.
+      - The bottleneck is the largest demand, ties going to the first name, and the ceiling is 1 / D_max.
+      - The knee population and the throughput bounds follow N* = (D + Z) / D_max and X between N / (N D + Z) and min(1 / D_max, N / (D + Z)).
+      - what_if works on a copy and reuses bottleneck and max_throughput.
+    hints:
+      - D is the sum of the demands in the knee and the bounds.
+      - Python's min() over names gives the alphabetical tie-break.
+      - 'Build the changed dict with {**demands, name: ...}.'
+    solution: |
+      One-line formulas for the demand law, the ceiling and the knee; the bounds from the book's two expressions; what_if as a changed copy fed to bottleneck and max_throughput.
+
+placement:
+  - id: place-use-red
+    type: mcq
+    concept: perf-bn-use-red
+    skill: application
+    title: Which signal is which
+    prompt: |
+      A report says: "the database connection pool is 100 % utilized and 12 requests are waiting for a connection." Which USE letters are those, and what do they suggest?
+    options:
+      - id: us
+        text: Utilization (100 %) and saturation (12 waiting) - the pool is a likely bottleneck
+        feedback: Correct. Busy workers are utilization, requests waiting for one are saturation, and the two together are the classic bottleneck signature.
+      - id: ue
+        text: Utilization and errors - the pool is failing
+        feedback: Nothing in the report is an error count.
+      - id: ss
+        text: Saturation twice - both numbers measure the queue
+        feedback: Utilization is how busy the pool is; saturation is the work waiting beyond it.
+      - id: none
+        text: Neither - a connection pool is not a USE resource
+        feedback: Gregg's page lists thread pools and similar software resources.
+    correct: [us]
+    solution: |
+      100 % busy is utilization, 12 waiting is saturation: a likely bottleneck.
+
+  - id: place-signature
+    type: mcq
+    concept: perf-bn-signature
+    skill: application
+    title: Reading a step load
+    prompt: |
+      A step load (no think time) gives 100, 200, 390, 410 and 405 requests per second at 1, 2, 4, 8 and 16 clients, with the mean latency staying near 10 ms until 4 clients and then growing. Where is the knee?
+    options:
+      - id: four
+        text: At 4 clients - the next step gains about 5 %, less than the 10 % bar
+        feedback: Correct. The ceiling is about 400 requests per second, and from 4 clients on the extra clients only wait.
+      - id: one
+        text: At 1 client - throughput is highest per client there
+        feedback: Throughput per client is the same up to the knee; the question is where the total stops growing.
+      - id: sixteen
+        text: At 16 clients - the last step
+        feedback: The last step did not gain anything; the knee is where it stopped paying.
+      - id: eight
+        text: At 8 clients - the highest throughput
+        feedback: The highest throughput is a ceiling reached earlier; the knee is the last step after which the next one does not pay.
+    correct: [four]
+    solution: |
+      From 4 to 8 clients throughput grows by about 5 % (390 to 410): the knee is at 4.
+
+  - id: place-laws
+    type: mcq
+    concept: perf-bn-laws
+    skill: analysis
+    title: Which fix pays
+    prompt: |
+      A request needs 10 ms at the application tier and 30 ms at the database. Which change raises the throughput ceiling most?
+    options:
+      - id: db
+        text: Halving the database demand (to 15 ms) - the ceiling rises from about 33 to 67 requests per second
+        feedback: Correct. The database is the bottleneck; at 15 ms the ceiling is 1 / 0.015.
+      - id: app
+        text: Halving the application demand (to 5 ms)
+        feedback: The ceiling stays at 1 / 0.030 - the largest demand is unchanged.
+      - id: both
+        text: Both are equal - the sum of the demands is what matters
+        feedback: The sum bounds the latency of a single request; the ceiling depends on the largest demand.
+      - id: neither
+        text: Neither - throughput does not depend on service demand
+        feedback: 'It does: X <= 1 / D_max.'
+    correct: [db]
+    solution: |
+      Only the bottleneck's demand sets the ceiling: halving the database demand doubles it (33 to 67 requests per second).
+
+recall:
+  - id: recall-use
+    concept: perf-bn-use-red
+    prompt: What does the USE Method ask for every resource?
+    answer: Utilization (the average time it was busy), saturation (extra work it cannot service, often a queue length) and errors (a count of error events).
+  - id: recall-red
+    concept: perf-bn-use-red
+    prompt: What are RED and the four golden signals?
+    answer: RED = Rate, Errors, Duration, per service. Golden signals = latency, traffic, errors and saturation (RED plus saturation).
+  - id: recall-rules
+    concept: perf-bn-use-red
+    prompt: What are Gregg's reading rules for USE?
+    answer: 100 % utilization usually means a bottleneck; beyond about 70 % queueing starts to hurt; any saturation can be a problem; non-zero errors deserve a look; a long-interval average can hide bursts.
+  - id: recall-knee
+    concept: perf-bn-signature
+    prompt: What does a bottleneck look like in a step load with no think time?
+    answer: Throughput grows with the clients up to a knee, then flattens at a ceiling; above the knee latency grows in proportion to the clients and the wait share climbs towards 1.
+  - id: recall-impostors
+    concept: perf-bn-signature
+    prompt: Name three look-alikes of a saturated server.
+    answer: A load generator that is the limit (flat curve, target quiet), a bounded queue (fast 503s, mean latency can fall) and a policy limit (429).
+  - id: recall-demand
+    concept: perf-bn-laws
+    prompt: How do you get a service demand, and what does it give you?
+    answer: D = U / X (utilization over throughput). The largest D is the bottleneck, throughput is at most 1 / D_max, and the knee population is N* = (D + Z) / D_max.
+  - id: recall-whatif
+    concept: perf-bn-laws
+    prompt: What happens if you speed up a resource that is not the bottleneck, and if you speed up the bottleneck?
+    answer: Nothing changes for a non-bottleneck. Speeding up the bottleneck raises the ceiling until the next-largest demand becomes the limit - so the bottleneck moves.
+
+next:
+  - backend-and-database-performance
+  - reading-load-test-results
+  - performance-testing-in-ci-cd

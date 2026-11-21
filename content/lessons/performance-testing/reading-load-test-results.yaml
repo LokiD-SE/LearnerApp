@@ -1,0 +1,1338 @@
+id: reading-load-test-results
+title: Reading load test results honestly
+subject: performance-testing
+module: perf-analysis
+level: intermediate
+status: published
+estimatedMinutes: 150
+summary: A load test report is one number per metric, and one number can hide most of what happened. This lesson reads a run the way a careful tester does - percentiles window by window instead of one figure for the whole run, a warm-up separated from the steady state, the requests a stalled closed-loop generator never sent (coordinated omission) found in the start times and corrected with the HdrHistogram rule, and repeated runs compared against their own spread before anyone says "regression". You write the three analysers in Python and run them on real JMeter and Locust runs against local SandPay practice services.
+tags:
+  [
+    results analysis,
+    percentiles over time,
+    time windows,
+    warm-up,
+    steady state,
+    coordinated omission,
+    closed model,
+    open model,
+    expected interval,
+    HdrHistogram,
+    wrk2,
+    constant throughput timer,
+    run-to-run variance,
+    noisy runs,
+    repeat runs,
+    regression verdict,
+    load generator CPU,
+    JTL,
+    Locust,
+    JMeter,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/perf/.venv` with Locust 2.47.0 and pytest; Apache JMeter 5.6.3
+    (non-GUI mode) on OpenJDK 17, on one Linux machine. Every run shown was made on 21 November 2026 and captured
+    by `practice/perf/support/rd_capture.py` into `support/rd_data/`; the tables below are printed by the
+    solution code on those files. **Timings, counts and throughput change with the machine and the run**; the way
+    of reading them does not.
+  - **Synthetic services:** SandPay is a fictional payments company. The two runs against
+    `support/rd_fixture.py` use a quote service whose slow moments are driven by a request counter, so they tell
+    the same story on any machine: a **cold start** (the first 60 requests carry extra time that shrinks to zero,
+    300 ms on the first) and a **stall** (when request 80 arrives the whole service freezes for 1.5 s). Real
+    systems warm up and stall for reasons such as cold caches, empty connection pools, garbage collection or a
+    failover; none of those causes is demonstrated here, only their effect on the numbers. The noisy-run data
+    comes from five-run batches of the practice API (`support/sandpay_target.py`, 20 ms service time and 26 ms
+    service time, capacity 4) driven by eight Locust users.
+  - **JMeter, from the user manual as documented on 21 November 2026:**
+    [Component reference - Constant Throughput Timer, Precise Throughput Timer, Open Model Thread
+    Group](https://jmeter.apache.org/usermanual/component_reference.html) (the timer text "the throughput will
+    be lower if the server is not capable of handling it", the note that an Open Model Thread Group "would be a
+    better choice for generating the desired load profile", and that thread group being marked experimental);
+    [Listeners - results file format](https://jmeter.apache.org/usermanual/listeners.html) (`timeStamp` and
+    `elapsed` in milliseconds). That `timeStamp` is when the sample STARTED was checked on the stall run itself:
+    the four stalled samples carry start times between 3.82 s and 3.97 s after the first sample and elapsed
+    times of about 1.4-1.5 s, and the next sample starts at 5.33 s.
+  - **Locust 2.47.0:** [Writing a locustfile - wait_time](https://docs.locust.io/en/stable/writing-a-locustfile.html)
+    (`constant_throughput` "ensures the task runs (at most) X times per second"; "Wait time can only constrain
+    the throughput, not launch new Users"); [Distributed load
+    generation](https://docs.locust.io/en/stable/running-distributed.html) ("If Locust is getting close to running
+    out of CPU resources, it will log a warning"); the installed source `locust/runners.py`
+    (`CPU_WARNING_THRESHOLD = 90`) and `locust/event.py` (`cpu_warning`). **The Locust documentation pages and
+    source files read for this lesson do not mention coordinated omission**, so the lesson makes no claim about
+    what Locust does about it beyond how its users wait.
+  - **Coordinated omission:** Gil Tene, [wrk2 README](https://github.com/giltene/wrk2) (the section on the
+    constant-throughput model, quoted as "Coordinated Omission" effect, and the 1.4 s disruption example);
+    [HdrHistogram README](https://github.com/HdrHistogram/HdrHistogram) (`recordValueWithExpectedInterval`, the
+    100-second pause example) and the source `AbstractHistogram.java`
+    (`recordSingleValueWithExpectedInterval`: the loop `for (missingValue = value - expectedInterval;
+    missingValue >= expectedInterval; missingValue -= expectedInterval)`), all read on 21 November 2026.
+  - **Not run here:** k6, Gatling, wrk2 itself and a real production service. Statements about them come from the
+    documents above or are left out.
+
+prerequisites:
+  - performance-metrics-and-percentiles
+  - performance-testing-types
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-read-timeline
+    name: Percentiles over time and the warm-up
+    summary: A whole-run percentile averages different phases into one number; cutting the run into time windows shows the warm-up, the steady state and any stall, and a summary of the steady state is a different (and honest) number from a summary of everything.
+  - id: perf-read-omission
+    name: Coordinated omission
+    summary: A closed-loop generator stops sending while the server stalls, so the slow moment is recorded as a few slow samples and most of the damage is never measured; it shows as a hole in the start times and is corrected by adding the samples the schedule implies.
+  - id: perf-read-noise
+    name: Noisy runs and honest comparisons
+    summary: Identical runs differ; a verdict about a change needs several runs per side, a margin larger than the spread, and a load generator that was not itself the bottleneck.
+
+objectives:
+  - Cut a JTL into time windows with per-window samples, errors, p50, p95 and throughput, keep empty windows, and explain what a whole-run percentile hides.
+  - Find where a warm-up ends with a stated rule, and report the steady state separately from the warm-up with both numbers shown.
+  - Explain closed and open workload models and why a stalled closed-loop generator under-reports slow responses (coordinated omission).
+  - Find the hole a stall leaves in the start times, count the requests the schedule implies, and apply the HdrHistogram expected-interval correction with the right per-stream interval.
+  - Say what a Constant Throughput Timer does and does not protect against, and what an open model changes.
+  - Compare repeated runs by their spread and a margin, give a verdict (regression, improvement, no difference, inconclusive), and recognise a run whose load generator was overloaded.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: The idea in plain language
+    body: |
+      A SandPay engineer runs a load test on a new quote service and the report says **"p95 = 167 ms, p99 = 302
+      ms"**. The service is meant to answer in about 30 ms. Is it slow?
+
+      Look at the same run second by second. In the first second the median response was **292 ms**. By the third
+      second it was **32 ms**, and it stayed at 32 ms for the remaining five seconds. The service was not slow; it
+      was **cold** for the first two seconds, and the whole-run percentile mixed two different services into one
+      number. Reading the run honestly means asking *when* each number happened.
+
+      Now a second run. The service froze for a second and a half in the middle, yet the report shows **p95 = 14
+      ms** and nothing alarming - only a p99 of 1.4 s. The reason is sneaky: the load generator's threads each
+      send a request, wait for the answer and only then send the next one. While the server was frozen, all four
+      threads sat waiting, so the generator **stopped sending** - and the 25 or so requests that real, independent
+      users would have sent during those 1.5 s are simply **missing from the data**. The tool was "coordinating"
+      with the server to leave out exactly the measurements that would have looked worst. This is **coordinated
+      omission**, and you find it by looking for the hole in the timeline.
+
+      A third trap is quieter. You run a test before and after a change and get p95 values of 29 and 36 ms. Is that
+      a regression? Only if you know how much p95 moves when *nothing* changes. Run each build five times and the
+      answer is easy; compare one run with one run and it is a coin toss.
+
+      This lesson is about reading results as a skeptic: by time window, with the warm-up separated, with holes
+      in the timeline checked, and with every comparison made against the noise.
+
+  - id: what
+    kind: what
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: What is in a result, and what is not
+    body: |
+      A load test produces **samples**: one row per request with a start time, an elapsed time and a success flag
+      (a JMeter JTL row; a Locust request event). A **report** is a summary computed from them. Three things the
+      summary does not show unless you ask:
+
+      - **Time.** A percentile of the whole run treats second 1 and second 60 as interchangeable. A run has
+        phases: **warm-up** (caches fill, pools open, code gets compiled, the load ramps), the **steady state**
+        you meant to measure, and sometimes **disturbances** (a stall, a failover, a restart). The steady state
+        is a judgement you make with a stated rule, not something the tool knows.
+      - **What was never sent.** A sample exists only if the generator sent the request. A generator that waits
+        for each answer before sending again is a **closed model**: the load it offers depends on how fast the
+        server answers. In an **open model** requests arrive on a schedule whatever the server does, which is
+        closer to independent users arriving at a shop. When a closed generator meets a stall, the samples that
+        would have been slow never exist. That is **coordinated omission** (Gil Tene's term).
+      - **Variation.** The same build tested twice gives two different numbers. A single run is one draw from a
+        distribution; a *comparison* of builds needs to know how wide that distribution is.
+
+      One more input matters before you trust any of it: whether the **load generator itself** had enough CPU.
+      Locust logs a warning when its CPU use crosses 90 %; a test run with an overloaded generator is measuring
+      the generator.
+
+      In this lesson the same practice services are used throughout, so you can see the three effects with real
+      JMeter and Locust output. The analysers you write are plain Python on JTL rows - no tool imports - so you
+      can check any tool's report against the raw samples.
+
+  - id: why
+    kind: why
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Why honest reading matters
+    body: |
+      **Wrong decisions in both directions.** The cold-start run above would have been rejected ("p95 167 ms, the
+      target is 50") although the service met its target for 6 of 8 seconds. The stalled run would have been
+      approved ("p95 14 ms") although for 1.5 seconds every customer waited. A report is a decision input; one
+      that is wrong in the optimistic direction is worse than one that is noisy.
+
+      **Production disagrees with the lab.** The classic complaint - "load test p99 was 80 ms but customers saw
+      timeouts" - often has one of these causes: the lab number came from a run that included or excluded a
+      warm-up in the wrong way, the generator stopped offering load during stalls, or the run was a single sample
+      from a noisy distribution.
+
+      **Gates need a defensible number.** If a CI job fails a build when p95 grows by 10 %, the job must know the
+      run-to-run spread (otherwise it fails at random), the steady state (otherwise it measures start-up), and the
+      generator's health (otherwise it measures the CI machine). Those are the three halves of this lesson.
+
+      **It is the tester's accountability.** Reporting "p95 = 33 ms in the steady state from second 3, 167 ms
+      including the 3-second warm-up, 592 of 676 samples" lets a reader decide for themselves. Reporting just
+      "p95 = 167 ms" or "p95 = 33 ms" asks them to trust a choice you did not show.
+
+  - id: timeline-internals
+    kind: internals
+    concepts: [perf-read-timeline]
+    title: Internals - windows and the steady state
+    body: |
+      ### Windows
+
+      Cut the run into consecutive windows of fixed length (1 s here) counting from the **earliest** start time.
+      A JTL `timeStamp` is the **start** of the sample in milliseconds, so a sample belongs to window
+      `floor((timeStamp - first) / window_ms)`. Per window keep the number of samples, the failed ones (counted
+      apart, never mixed into response times), and the percentiles of the **successful** samples.
+
+      Three details decide whether the table is honest:
+
+      - **Keep empty windows.** A window with no samples is the most important row in a stall; dropping it makes
+        the timeline look continuous. The analyser returns one row per window from 0 to the last occupied one.
+      - **Choose the window for the question.** One second shows a ramp or a 1.5-second stall; one minute smooths
+        a 3-second warm-up into nothing. A window needs enough samples for its percentile to mean something: a
+        p95 over 16 samples is one sample's value.
+      - **The last window is partial.** The run ends part-way through a window, so its sample count and rate are
+        lower. Do not read that as a drop in throughput.
+
+      ### The steady state needs a rule
+
+      "The run settled after about 3 seconds" is an eyeball. A rule can be checked and repeated. The one used here:
+
+      1. Take the p50 of each window in the **last half** of the run and use their median as the reference level.
+      2. The steady state begins at the first window that starts **three consecutive windows** whose p50 is within
+         25 % of the reference.
+      3. If no such run exists (or there is no reference), the run **never settled** - which is itself a finding,
+         not something to hide by picking a start time.
+
+      Median-of-the-late-half is a deliberate choice: it ignores the warm-up even when the warm-up is long, and
+      it fails loudly when the whole run drifts. Other rules are fine (slope of the p50 close to zero, a fixed
+      ramp length from the plan); the requirement is that the rule is **stated in the report** and not tuned
+      after seeing the result.
+
+      ### Report both
+
+      Do not delete the warm-up: **summarise the steady state for the number you compare, and show the whole-run
+      number with the warm-up window beside it.** The warm-up is information too (a 300 ms first response after a
+      deploy is something a customer will see).
+
+  - id: omission-internals
+    kind: internals
+    concepts: [perf-read-omission]
+    title: Internals - coordinated omission
+    body: |
+      ### The closed loop
+
+      A JMeter thread group of 4 threads, or 4 Locust users, runs a loop: send, wait for the response, wait a
+      think time, repeat. The number of requests in flight can never exceed the number of threads, and **the next
+      request is sent only after the previous answer**. When the server is slow the generator offers less load.
+      The Little's-law view is the same: with N users and a response time R, throughput falls as R grows.
+
+      Now the server stalls for 1.5 s. Each of the 4 threads has one request stuck in it. Nothing new is sent for
+      1.5 s. The result file gets **4 slow samples** (about 1.5 s each). Independent users would have kept arriving
+      every 50 ms, so about 30 requests would have waited, with waits from 1.5 s down to nearly zero. The result
+      file knows nothing about them.
+
+      The wrk2 README says it this way: with the usual measurement model "most of the high latency artifacts
+      exhibited by the measured server will be ignored", because "each connection will only begin to send a
+      request after receiving a response, high latency responses result in the load generator coordinating with
+      the server to avoid measurement during high latency periods".
+
+      ### A constant-throughput timer does not fix it
+
+      A JMeter Constant Throughput Timer inserts pauses to keep the rate near a target. The manual says the
+      throughput "will be lower if the server is not capable of handling it". When threads are all blocked in a
+      stalled request there is nobody to send, so the schedule slips. In the run below the plan was 20 requests per
+      second for 10 s (200 requests) and the file has 174.
+
+      ### Finding it in the data
+
+      The hole is visible in the **start times**. If the plan leaves 50 ms between requests, a gap of 1354 ms between
+      two consecutive starts means about `1354 // 50 - 1 = 26` requests were not sent. The check is cheap:
+
+      1. Sort samples by start time.
+      2. Report every gap larger than a multiple of the planned interval (5x is a safe default; a few small gaps
+         exist at start-up and after a stall).
+      3. Compare the count of samples with the plan (rate x duration).
+
+      ### Correcting the percentiles: the HdrHistogram rule
+
+      HdrHistogram's `recordValueWithExpectedInterval` repairs the *recorded distribution* when you know the
+      interval at which samples should have been taken: for every recorded value larger than the interval it adds
+      the values "linearly decreasing in steps of expectedInterval" - `value - interval`, `value - 2 x interval`,
+      ... while the added value is still at least the interval. The loop in the source is
+      `missingValue = value - interval; missingValue >= interval; missingValue -= interval`. Example from the
+      README's idea: a 1500 ms sample with a 500 ms interval records 1500, 1000 and 500, because requests that
+      should have started 500 ms and 1000 ms after the slow one's start would have waited 1000 ms and 500 ms.
+
+      **The interval is per stream.** The correction models one measuring stream - one thread sending one request
+      after another. With 4 threads sharing 20 requests per second, each thread should send every 200 ms (4 x 50),
+      not every 50. Using 50 adds about 110 implied samples to this run, five times more than the roughly 26 the
+      hole shows; using 200 adds 23. Getting the interval wrong changes the answer by a lot, so state it.
+
+      ### What a correction is
+
+      An estimate, under the assumption that the missing users would have been just as unlucky as the ones you
+      measured (their arrivals do not depend on the server's state). Report the **measured** numbers and the
+      **corrected** ones, say which interval you used, and prefer a test that does not omit in the first place -
+      an open-model generator (JMeter's Open Model Thread Group, documented as experimental; wrk2's
+      constant-throughput design) - when the question is "what do independent users experience during a stall?".
+
+  - id: noise-internals
+    kind: internals
+    concepts: [perf-read-noise]
+    title: Internals - noise, spread and a verdict
+    body: |
+      ### Run-to-run spread
+
+      Five Locust runs of the same build and the same load gave these p95 values (ms): **29, 27, 29, 28, 29**. The
+      range is 2 ms on a median of 29, a **relative spread** of `(max - min) / median = 0.07`. A second batch of
+      the same build gave **27, 29, 29, 27, 28** (also 0.07). That is the noise on this quiet machine; on a
+      shared CI runner it is usually larger, so measure it where the gate will run.
+
+      ### A verdict rule
+
+      Compare lists of per-run numbers, not single runs. The rule used in this lesson:
+
+      | situation | verdict |
+      | --- | --- |
+      | fewer than 3 runs on either side | inconclusive |
+      | medians differ by no more than the margin (10 %) | no difference |
+      | median up by more than the margin **and** every candidate run slower than every baseline run | regression |
+      | median down by more than the margin **and** every candidate run faster than every baseline run | improvement |
+      | big median shift but the runs overlap | inconclusive |
+
+      The margin is a decision about what matters (a 3 % change is not worth a release), and it must be larger
+      than the spread you measured. The "no overlap" condition is a cheap guard against a few outliers moving the
+      median. For serious statistics you would use a proper test and more runs; the point here is to refuse a
+      verdict you cannot support, and "inconclusive - run more" is a legitimate result.
+
+      On the real data: baseline 29, 27, 29, 28, 29 against a candidate with a 26 ms service time (30 % slower than
+      20 ms) gave p95 of 35-36 ms, a median change of +24 %, no overlap: **regression**. Baseline against a second
+      batch of the same build: median change -3 %: **no difference**.
+
+      ### Is the generator the bottleneck?
+
+      A load test measures the system formed by the generator **and** the target. If the generator runs out of CPU
+      it sends fewer requests and times them late. Locust compares the machine's CPU use with a threshold of 90 %
+      (`CPU_WARNING_THRESHOLD`) and fires a `cpu_warning` event; its documentation says it will "log a warning".
+      Treat that warning as invalidating the run, or at least as a reason to add worker processes (see the
+      distributed lesson). With JMeter, watch the generator's CPU yourself; the same rule applies. Also look for
+      the other sign: throughput that stops rising when you add users while the target is idle.
+
+  - id: when
+    kind: when
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: When to use each check
+    body: |
+      - **Windowed view** - always, for any run longer than a minute or two, and the first thing to look at when
+        a whole-run percentile surprises you. Cheap: one pass over the JTL.
+      - **Steady-state summary** - whenever the number goes into a comparison, a gate or an SLO check. Show the
+        warm-up number next to it.
+      - **Gap check for omission** - for every closed-model run that has a planned rate or a known think time,
+        and always after a run that shows a stall, an error burst or a throughput dip. No plan means no schedule
+        to compare with; then the throughput-over-time window is your only clue.
+      - **Expected-interval correction** - when you cannot rerun with an open model and need to say how bad a
+        stall was for independent users. Show measured and corrected side by side.
+      - **Spread and verdict** - any time you say "faster", "slower" or "regression". Run each side at least
+        three times (five is better) in the same environment, in alternating order if the machine is shared.
+      - **Generator health** - every run. It is one log line or one monitor sample.
+
+      Do **not** use the correction to "fix" a run you do not understand. If there is a stall, first find out why
+      (server log, GC log, a lock, a failover); the corrected percentile is a statement about the impact, not
+      an explanation.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: How the three checks fit together
+    body: |
+      ```mermaid
+      flowchart TD
+        R["Raw samples: start time, elapsed, success"] --> G["Generator healthy? CPU below 90 percent"]
+        G --> W["Windows: samples, errors, p50, p95, rate per second"]
+        W --> H["Holes? Empty windows, gaps in start times, fewer samples than planned"]
+        H -- "yes" --> C["Correct with the expected interval, report measured and corrected"]
+        H -- "no" --> S["Steady state: stated rule, first stable run of windows"]
+        C --> S
+        S --> N["Repeat runs: spread, margin, verdict"]
+        N --> P["Report: steady and whole-run numbers, plan, samples, definitions"]
+      ```
+
+      ```mermaid
+      sequenceDiagram
+        participant T as Thread
+        participant S as Service
+        T->>S: request 80 at 3.8 s
+        Note over S: frozen for 1.5 s
+        S-->>T: answer at 5.3 s (elapsed 1.5 s)
+        Note over T: no request sent in between
+        T->>S: next request at 5.3 s
+        Note over T,S: the plan expected about 30 more requests in that gap
+      ```
+
+      The flowchart is the order of reading; the sequence shows why a stall leaves four samples instead of thirty.
+
+  - id: code-timeline
+    kind: code
+    concepts: [perf-read-timeline]
+    title: Windows and the steady state in Python
+    body: |
+      The reference solution of `analysis/rd_timeline.py`, trimmed to the functions (the exercise has the full
+      docstring):
+
+      ```python
+      import math
+      import statistics
+
+
+      def percentile(values, pct):
+          data = sorted(values)
+          if not data:
+              raise ValueError("no values")
+          return data[max(1, math.ceil(len(data) * pct / 100)) - 1]
+
+
+      def _ok(rows):
+          return [int(r["elapsed"]) for r in rows if r["success"] == "true"]
+
+
+      def windows(rows, seconds=1.0):
+          if not rows:
+              return []
+          first = min(int(r["timeStamp"]) for r in rows)
+          width = seconds * 1000
+          buckets: dict[int, list] = {}
+          for r in rows:
+              buckets.setdefault(int((int(r["timeStamp"]) - first) // width), []).append(r)
+          out = []
+          for k in range(max(buckets) + 1):
+              group = buckets.get(k, [])
+              good = _ok(group)
+              out.append({"start": k * seconds, "samples": len(group), "errors": len(group) - len(good),
+                          "p50": percentile(good, 50) if good else None,
+                          "p95": percentile(good, 95) if good else None, "rps": len(group) / seconds})
+          return out
+
+
+      def steady_start(wins, tolerance=0.25, run=3):
+          tail = [w["p50"] for w in wins[len(wins) // 2:] if w["p50"] is not None]
+          if not tail:
+              return None
+          ref = statistics.median(tail)
+          ok = [w["p50"] is not None and abs(w["p50"] - ref) <= tolerance * ref for w in wins]
+          for i in range(len(wins) - run + 1):
+              if all(ok[i:i + run]):
+                  return wins[i]["start"]
+          return None
+      ```
+
+      Driver, run on the captured cold-start run (`support/rd_data/warmup.csv`, real JMeter JTL columns, 21
+      November 2026):
+
+      ```python
+      from rd_fixture import read_rows
+      from rd_timeline import steady_start, steady_summary, windows
+
+      rows = read_rows("warmup.csv")
+      wins = windows(rows)
+      print(f"{'sec':>3} {'samples':>7} {'p50':>5} {'p95':>5}")
+      for w in wins:
+          print(f"{w['start']:>3.0f} {w['samples']:>7} {w['p50']:>5} {w['p95']:>5}")
+      start = steady_start(wins)
+      print("steady state starts at second", start)
+      print("whole run  :", steady_summary(rows, 0))
+      print("steady only:", steady_summary(rows, start))
+      ```
+
+      ```text
+      sec samples   p50   p95
+        0      16   292   366
+        1      16   213   252
+        2      52    41   162
+        3     120    32    33
+        4     120    32    33
+        5     120    32    33
+        6     124    32    33
+        7     108    32    32
+      steady state starts at second 3.0
+      whole run  : {'samples': 676, 'errors': 0, 'p50': 32, 'p95': 167, 'p99': 302}
+      steady only: {'samples': 592, 'errors': 0, 'p50': 32, 'p95': 33, 'p99': 33}
+      ```
+
+      Run on 21 November 2026, JMeter 5.6.3, 4 threads for 8 s against the cold-start service (30 ms base). Read
+      it carefully: the **median is 32 ms in both summaries** - the warm-up is invisible in the p50 and
+      shouts in the p95 and p99. Whole-run p95 is 167 ms, steady p95 is 33 ms, and the steady state still holds
+      592 of 676 samples (88 %).
+
+  - id: code-omission
+    kind: code
+    concepts: [perf-read-omission]
+    title: Finding the hole and correcting for it
+    body: |
+      The reference solution of `analysis/rd_omission.py` (functions only):
+
+      ```python
+      def fill_expected_interval(values, interval_ms):
+          out = []
+          for v in values:
+              out.append(v)
+              if interval_ms <= 0:
+                  continue
+              missing = v - interval_ms
+              while missing >= interval_ms:
+                  out.append(missing)
+                  missing -= interval_ms
+          return out
+
+
+      def find_gaps(rows, interval_ms, factor=5.0):
+          starts = sorted(int(r["timeStamp"]) for r in rows)
+          gaps = []
+          for before, after in zip(starts, starts[1:]):
+              gap = after - before
+              if gap > factor * interval_ms:
+                  gaps.append({"after_s": round((before - starts[0]) / 1000, 1), "gap_ms": gap,
+                               "missing": int(gap // interval_ms) - 1})
+          return gaps
+
+
+      def corrected_percentiles(rows, stream_interval_ms):
+          good = [int(r["elapsed"]) for r in rows if r["success"] == "true"]
+          return {"measured": _three(good),
+                  "corrected": _three(fill_expected_interval(good, stream_interval_ms))}
+      ```
+
+      (`_three` returns p50, p95 and p99 by nearest rank.) Driver on the captured stalled run
+      (`support/rd_data/stall.csv`: JMeter, 4 threads, a Constant Throughput Timer at 1200 samples per minute,
+      the service frozen for 1.5 s when request 80 arrived):
+
+      ```python
+      from rd_fixture import read_rows
+      from rd_omission import corrected_percentiles, find_gaps
+
+      rows = read_rows("stall.csv")
+      print("samples sent:", len(rows), "- the plan was 20 per second for 10 s = 200")
+      print("slowest elapsed (ms):", sorted(int(r["elapsed"]) for r in rows)[-5:])
+      print("gaps in the start times:", find_gaps(rows, 50))
+      for name, p in corrected_percentiles(rows, 200).items():
+          print(f"{name:>9}: {p}")
+      ```
+
+      ```text
+      samples sent: 174 - the plan was 20 per second for 10 s = 200
+      slowest elapsed (ms): [52, 1352, 1403, 1453, 1503]
+      gaps in the start times: [{'after_s': 4.0, 'gap_ms': 1354, 'missing': 26}]
+       measured: {'p50': 13, 'p95': 14, 'p99': 1453}
+      corrected: {'p50': 13, 'p95': 1053, 'p99': 1453}
+      ```
+
+      Run on 21 November 2026. **Four** samples carry the stall; the measured p95 is 14 ms, 75 times below the
+      corrected 1053 ms. The gap check finds the hole (1354 ms between two starts, about 26 requests) without
+      knowing anything about the server, and the sample count (174 of 200) agrees. With the interval wrongly
+      set to 50 ms the same correction would give p95 = 1253 ms - a 19 % difference from using the per-thread
+      interval, which is why the lesson states it.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Line by line - the choices that matter
+    body: |
+      **`windows`**
+
+      - '`first = min(...)` - windows count from the earliest start, not the first row in the file (rows are not'
+        guaranteed to be in order, and a test covers that).
+      - '`buckets.setdefault(k, [])` plus `range(max(buckets) + 1)` - the loop runs over every window number, not'
+        over the keys that exist; **that is what keeps the empty windows**. Iterating `sorted(buckets)` instead is
+        the bug in the debug exercise below.
+      - '`good = _ok(group)` and `len(group) - len(good)` - errors are counted but never enter a percentile.'
+      - '`percentile(good, 50) if good else None` - an all-error window has no response time; `None` is honest, `0`'
+        is a lie.
+
+      **`steady_start`**
+
+      - '`wins[len(wins) // 2:]` - the reference level comes from the late half of the run.'
+      - '`abs(...) <= tolerance * ref` - the comparison is inclusive, so a window exactly 25 % above counts. A test'
+        pins that edge; without it two implementations disagree on a run that sits on the boundary.
+      - '`for i in range(len(wins) - run + 1)` and `all(ok[i:i + run])` - three **consecutive** good windows, not'
+        three anywhere. One lucky window in the middle of the warm-up must not end it.
+      - '`return None` - no settled run is a result.'
+
+      **`fill_expected_interval`**
+
+      - '`missing >= interval_ms` - the same boundary as HdrHistogram''s loop. For a value of 100 and an interval of'
+        30 it adds 70 and 40, and stops before 10.
+      - Originals are kept in order with their added values right after them; the percentile functions sort
+        anyway, but the order makes tests readable.
+      - '`interval_ms <= 0` - no known interval, nothing to infer; the correction is a no-op.'
+
+      **`find_gaps`**
+
+      - Consecutive **start** times, not end times: a response that took long does not make the start-to-start
+        gap longer unless the generator waited for it - and that waiting is precisely what the gap detects.
+      - '`int(gap // interval_ms) - 1` - the number of whole intervals that fit in the gap, minus the one request'
+        that ended it.
+
+      **`verdict`** (in `rd_compare.py`)
+
+      - The `abs(change) <= margin` test comes before the direction tests, so a change inside the margin is "no
+        difference" even when the ranges do not overlap. Ordering the checks differently changes answers.
+      - '`min(candidate) > max(baseline)` is strict: equal values overlap.'
+
+  - id: steps
+    kind: steps
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Steps - reading a run
+    body: |
+      1. **Check the generator.** CPU below the tool's threshold for the whole run; the tool printed no warning.
+         If it did, repeat with more generator capacity before reading anything else.
+      2. **Keep the raw samples** (JTL, or Locust's request events) and note the plan: users or rate, duration,
+         think time, ramp.
+      3. **Cut into windows** (1 s for short runs, 5-10 s for long ones). Print samples, errors, p50, p95 and the
+         rate per window. Keep empty windows.
+      4. **Look for holes.** Empty or low-rate windows, gaps in the start times, fewer samples than the plan
+         implies, a throughput dip with no error rise.
+      5. **If there is a hole, find the cause** (server logs, GC, locks, failover) and decide: rerun with an open
+         model, or report the measured and the expected-interval corrected numbers with the interval stated.
+      6. **Find the steady state with a stated rule.** Summarise it. Show the whole-run and warm-up numbers too.
+      7. **Repeat** for any comparison: at least three runs per side, same environment, alternating order.
+      8. **Compare with a verdict rule** and a margin chosen before you look. "Inconclusive" is allowed.
+      9. **Report:** tool and version, plan, window size, steady-state rule, sample counts, interval used for any
+         correction, spread, margin, verdict.
+
+  - id: example
+    kind: example
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Worked example - the checkout quote after a release
+    body: |
+      *Hypothetical, to show the order of reasoning; the figures are invented for the story and are not
+      measurements.*
+
+      SandPay's team releases a change to the fee-quote service. The nightly job posts "p95 41 ms, target 50 ms"
+      and the build is green. A tester opens the JTL anyway.
+
+      1. **Generator.** The job's log has no CPU warning. Fine.
+      2. **Windows.** Each 10-second window of a 10-minute run shows a p95 near 30 ms - except minute 7, where
+         there are 6 windows with 0 samples. The whole run is "green" because those 60 seconds contribute nothing.
+      3. **Holes.** The gap check at the planned interval finds one gap of 58 seconds. The sample count is 8 %
+         lower than rate times duration. The generator was a closed-loop plan: it stopped sending.
+      4. **Cause.** The server log shows the quote service restarted its database pool at minute 7.
+      5. **Correction.** The tester reports measured p95 (30 ms) and, with the per-thread interval stated, the
+         expected-interval corrected p95 (the stall now dominates the tail), and asks for a rerun with an open
+         model to confirm.
+      6. **Comparison.** Three runs of the old build and three of the new give p95 within 4 % of each other
+         outside the stall - no regression in normal operation; the issue is the pool restart.
+
+      The green dashboard and the honest report disagree about the same file. The difference was three checks that
+      took less than an hour.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: How the exercises are tested
+    body: |
+      Three files under `practice/perf/tests/analysis/` check your three modules. Each has hand-made rows with the
+      answer worked out in a comment, then real data:
+
+      - '`test_rd_timeline.py` - nearest-rank percentile; windows with empty windows, errors apart, two-second'
+        windows, unsorted rows; `steady_start` with and without a settled run, the inclusive 25 % edge, a longer
+        run length; `steady_summary`; then the captured cold-start run (a clear warm-up, steady start between
+        seconds 2 and 4, steady p95 and p99 far below the whole-run ones) and **one fresh JMeter run** against the
+        cold-start service with generous margins.
+      - '`test_rd_omission.py` - the HdrHistogram examples (100 with interval 30 adds 70 and 40); order kept;'
+        `find_gaps` on hand rows, factor and sorting; `corrected_percentiles` with an error row that must not count;
+        the captured stalled run (174 samples, one gap of 1.0-2.0 s hiding 20-30 requests, 23 implied samples at the
+        per-thread interval) and one fresh paced run.
+      - '`test_rd_compare.py` - `spread`, each of the four verdicts, too few runs, the margin, the CPU rule (exactly'
+        90 is not above 90), and the captured five-run batches: the same build twice is "no difference" and the
+        slower service is a "regression".
+
+      The tests check **behaviour and shape, never absolute response times**: fresh runs assert that the first
+      window is several times slower than the last full one, not that it is 292 ms.
+
+      Run them as the CI does: `PERF_TARGET=solutions .venv/bin/python -m pytest tests/analysis -q` passes (91
+      tests); against the unsolved exercises each file fails.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Common mistakes
+    body: |
+      - **Reporting one number for the whole run.** It mixes warm-up, steady state and disturbances. Show windows
+        and a steady-state summary.
+      - **Dropping empty windows** (or smoothing them with a long window). The stall disappears from the picture.
+      - **Choosing the steady-state start by eye after seeing the result.** Fix the rule first and put it in the
+        report; "never settled" is allowed.
+      - **Discarding the warm-up silently.** Customers meet it after every deploy. Report it.
+      - **Treating a closed-loop run with a stall as complete data.** Compare the sample count with rate times
+        duration and look at the start times.
+      - **Believing a Constant Throughput Timer makes the load open.** It paces threads; blocked threads send
+        nothing, and the timer's own manual says throughput will be lower if the server cannot keep up.
+      - **Using the global interval for the expected-interval correction.** The correction models one stream: the
+        per-thread interval is threads x the global interval. In the example the wrong interval adds 110 implied
+        samples instead of 23.
+      - **Presenting the corrected figure as measured.** It is an estimate under an assumption. Show both.
+      - **Comparing one run with one run.** Spread is unknown; repeat each side and use a margin.
+      - **Ignoring the generator.** A Locust CPU warning, or throughput that will not rise with more users while
+        the target idles, means you measured the generator.
+      - **Averaging p95 values from several agents or windows.** Percentiles do not average; merge the raw samples
+        (the distributed lesson shows the merge).
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Trade-offs
+    body: |
+      - **Window length:** short windows show brief events but have few samples per percentile; long windows are
+        stable but erase 2-3 second disturbances. Start with 1 s on short runs and 5-10 s on long ones, and keep
+        the raw data to re-cut.
+      - **Steady-state rule:** a tight tolerance is strict but may call a noisy run "never settled"; a loose one
+        lets the tail of the warm-up in. State the choice.
+      - **Closed versus open model:** a closed model is simple and matches systems with a fixed pool of users or
+        connections; an open model matches independent arrivals and exposes stalls but needs more care (queues
+        can grow without limit, the generator needs capacity for the backlog). JMeter's Open Model Thread Group is
+        documented as experimental in the manual read for this lesson.
+      - **Correct or rerun:** the expected-interval correction is cheap and explainable but rests on an
+        assumption; a rerun with an open model measures what you want and costs a test slot.
+      - **Number of repeat runs:** three is the minimum for a verdict rule like this one; five gives a spread you
+        can believe; more is better but costs environment time. Say how many you used.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-read-timeline, perf-read-omission, perf-read-noise]
+    title: Summary
+    body: |
+      - A whole-run percentile hides phases. Cut the JTL into windows (samples, errors, p50, p95, rate), keep the
+        empty ones, and read the timeline before the totals. In the cold-start run the p50 was 32 ms in both views
+        while p95 was 167 ms versus 33 ms.
+      - Find the steady state with a rule you state in advance (here: the first three consecutive windows within
+        25 % of the median p50 of the run's late half). Report steady and whole-run numbers together.
+      - A closed-loop generator stops sending during a stall, so the slow moment is under-recorded
+        (coordinated omission). The hole shows in the start times: 174 samples of a planned 200, one 1354 ms gap.
+      - The HdrHistogram correction adds `value - k x interval` samples while they are at least one interval; use the
+        **per-stream** interval. Measured p95 was 14 ms, corrected 1053 ms. Report both, and prefer an open model
+        when you can rerun.
+      - A Constant Throughput Timer does not make a test open.
+      - Compare builds with repeated runs, a spread and a margin: no difference, regression, improvement or
+        inconclusive. Five runs of the same build gave a 7 % spread; a 30 % slower service stood out.
+      - Check the generator first: Locust's CPU warning (90 %) invalidates the run.
+
+exercises:
+  - id: rd-whole-run-p95
+    type: mcq
+    concept: perf-read-timeline
+    skill: analysis
+    title: The p95 that describes nobody
+    prompt: |
+      A 3-minute run reports p95 = 160 ms for the quote service. The windowed table shows p95 of 360, 250 and 160 ms
+      in the first three seconds and 33 ms in every later second. Which statement is best supported?
+    options:
+      - id: warm
+        text: The service was cold for about the first 3 seconds and ran at about 33 ms afterwards; the whole-run number mixes both, so report the steady state and the warm-up separately.
+        feedback: Correct - the windowed view separates the phases; the summary should show both numbers and the rule used to split them.
+      - id: slow
+        text: The service is slow, with p95 around 160 ms; the later seconds are lucky.
+        feedback: 175 consecutive seconds at 33 ms are not luck. The 160 comes from the first few seconds weighing into the whole-run percentile.
+      - id: discard
+        text: The first 3 seconds should be deleted from the file and not mentioned.
+        feedback: Never delete data silently. The warm-up is something real customers meet after a deploy; report it next to the steady-state figure.
+      - id: median
+        text: Use the average response time instead, because it is not affected by the first seconds.
+        feedback: The mean is affected by every sample, including the slow first ones, and it describes almost nobody. A windowed percentile table is the right tool.
+    correct: [warm]
+    hints:
+      - Which window do the 360, 250 and 160 ms belong to?
+    solution: |
+      Cold start, then steady state. Report both with the rule that separates them, instead of the blended p95.
+
+  - id: rd-window-size
+    type: mcq
+    concept: perf-read-timeline
+    skill: application
+    title: Choosing a window
+    prompt: |
+      You are looking for a 2-second stall and a 3-second warm-up in a 20-minute run that sends about 50 requests
+      per second. Which window length is the most sensible starting point?
+    options:
+      - id: one
+        text: 1 second - about 50 samples per window, short enough to show both events.
+        feedback: Correct - enough samples for a median and a p95 to mean something, and short enough that a 2-second stall covers two windows.
+      - id: sixty
+        text: 60 seconds - the more samples per window the better.
+        feedback: A 60-second window averages a 2-second stall and a 3-second warm-up into nothing.
+      - id: single
+        text: One window per request - the finest possible view.
+        feedback: A percentile over one sample is just that sample; the table becomes the raw data again.
+      - id: whole
+        text: One window for the whole run - the tool's summary row.
+        feedback: That is the number the lesson warns against.
+    correct: [one]
+    hints:
+      - The window must be shorter than the events and long enough for a percentile.
+    solution: |
+      About 1 s here: roughly 50 samples per window, short enough to show a 2-second event. Keep the raw samples so you
+      can re-cut with another window.
+
+  - id: rd-steady-rule
+    type: mcq
+    concept: perf-read-timeline
+    skill: application
+    title: A steady-state rule
+    prompt: |
+      Which way of choosing where the steady state starts is the most defensible?
+    options:
+      - id: rule
+        text: A rule fixed before looking, such as "first run of three consecutive windows whose p50 is within 25 % of the median p50 of the run's last half", stated in the report; and "never settled" if none exists.
+        feedback: Correct - it can be repeated by someone else, it uses only the late half as reference, and it can fail loudly.
+      - id: eye
+        text: Whichever second makes the p95 meet the target.
+        feedback: Tuning the cut to the answer turns the analysis into a conclusion looking for evidence.
+      - id: fixed
+        text: Always discard the first 10 seconds of every run.
+        feedback: A fixed cut ignores the actual run - too much for a 3-second warm-up, too little for a 60-second one - though a ramp length taken from the test plan can be a good start if it is stated.
+      - id: first
+        text: The very first window - the run is steady from the start by definition.
+        feedback: The cold-start run was not.
+    correct: [rule]
+    hints:
+      - Who else must be able to reproduce your choice?
+    solution: |
+      Fix a checkable rule in advance, state it, and accept "never settled" as a finding.
+
+  - id: rd-what-is-co
+    type: mcq
+    concept: perf-read-omission
+    skill: recall
+    title: What coordinated omission is
+    prompt: Which description of coordinated omission is correct?
+    options:
+      - id: right
+        text: A generator that waits for each response before sending the next stops offering load while the server stalls, so the slow responses that independent users would have seen are never measured.
+        feedback: Correct - the generator and the server coordinate, without meaning to, to leave out the measurements that would look worst.
+      - id: network
+        text: The load generator drops packets when the network is congested.
+        feedback: That is packet loss. Omission here is about requests that were never sent because the sender was waiting.
+      - id: errors
+        text: Error responses are left out of the response time percentiles.
+        feedback: Excluding failures from response times is a separate (and correct) practice; it is not what the term means.
+      - id: sample
+        text: The tool samples only some of the requests to save memory.
+        feedback: Sampling is a different distortion. Coordinated omission comes from the closed-loop sending behaviour.
+    correct: [right]
+    hints:
+      - Who decides when the next request is sent?
+    solution: |
+      Closed-loop senders stop sending during a stall, so the slow period is under-recorded.
+
+  - id: rd-spot-co
+    type: mcq
+    concept: perf-read-omission
+    skill: application
+    title: Spotting it in a JTL
+    prompt: |
+      A 10-second run was planned at 20 requests per second. The JTL has 174 rows, p95 = 14 ms, and one row with
+      elapsed 1503 ms. Which check would most directly show whether a stall was hidden?
+    options:
+      - id: gaps
+        text: Sort the rows by start time and look for gaps between consecutive starts much larger than the planned 50 ms, and compare 174 with the planned 200.
+        feedback: Correct - the hole in the timeline and the shortfall against the plan are the fingerprints of omission.
+      - id: mean
+        text: Compare the average response time with the p95.
+        feedback: Both numbers are computed from the samples that exist; neither can show the ones that were never sent.
+      - id: errors
+        text: Count the failed rows.
+        feedback: The stalled requests succeeded (they were just slow); the error count would be zero.
+      - id: max
+        text: Read the maximum elapsed time.
+        feedback: The max (1503 ms) shows one slow request, not how many were missing.
+    correct: [gaps]
+    hints:
+      - What would a stall do to the number of requests and to the spacing of their start times?
+    solution: |
+      Look at start-time gaps and at the sample count against the plan.
+
+  - id: rd-ctt
+    type: mcq
+    concept: perf-read-omission
+    skill: analysis
+    title: Does a constant-throughput timer prevent it?
+    prompt: |
+      A tester says "we use a JMeter Constant Throughput Timer, so our test is open-model and immune to coordinated
+      omission". The run with a 1.5-second stall had 174 samples against a plan of 200. Evaluate the claim.
+    options:
+      - id: no
+        text: Wrong - the timer only paces threads that are free to send; when all threads are blocked in a stalled request nothing is sent, the schedule slips, and the manual itself says throughput will be lower if the server cannot handle the target.
+        feedback: Correct - the run shows it (174 of 200, one 1354 ms gap in the start times).
+      - id: yes
+        text: Right - the timer sends requests at fixed times regardless of the server.
+        feedback: It inserts pauses before each sample; it does not create requests. The documentation says the throughput will be lower if the server cannot keep up.
+      - id: partly
+        text: Right for p99 but wrong for p50.
+        feedback: The stall hides slow samples, which affects the tail; but the timer does not make any percentile immune.
+      - id: threads
+        text: Right as long as there are at least 100 threads.
+        feedback: More threads delay the effect (more requests are stuck, so a stall costs more samples) but they do not change the closed-loop nature.
+    correct: [no]
+    hints:
+      - Who sends the request if every thread is waiting for an answer?
+    solution: |
+      The timer paces; it does not make the load open. A stall still leaves a hole, as the 174-of-200 run shows.
+
+  - id: rd-hdr-calc
+    type: mcq
+    concept: perf-read-omission
+    skill: application
+    title: The expected-interval correction by hand
+    prompt: |
+      A thread should send one request every 200 ms. One of its samples took 1000 ms. Using the HdrHistogram
+      expected-interval rule (add `value - k x interval` while the added value is at least the interval), which
+      values does the corrected data contain for that sample?
+    options:
+      - id: four
+        text: 1000, 800, 600, 400 and 200.
+        feedback: Correct - 1000 is recorded; 800, 600, 400 and 200 are added; the next candidate is 0, below the interval, so it stops.
+      - id: one
+        text: 1000 only.
+        feedback: That is the uncorrected data. The rule adds the values the missing requests would have measured.
+      - id: five
+        text: 1000, 800, 600, 400, 200 and 0.
+        feedback: The loop stops while the added value is at least the interval; 0 is below 200.
+      - id: five-fifty
+        text: 1000, 950, 900, 850, ... down to 50.
+        feedback: That would use a 50 ms interval; the question gives 200 ms for this one stream.
+    correct: [four]
+    hints:
+      - Subtract 200 repeatedly from 1000 and stop when the result drops below 200.
+    solution: |
+      800, 600, 400 and 200 are added to the recorded 1000.
+
+  - id: rd-correction-honest
+    type: mcq
+    concept: perf-read-omission
+    skill: analysis
+    title: How to report a corrected percentile
+    prompt: |
+      The stalled run has measured p95 = 14 ms and corrected p95 = 1053 ms (per-thread interval 200 ms). What do you
+      put in the report?
+    options:
+      - id: both
+        text: Both numbers, labelled, with the interval used and the assumption that the missing users would have been as unlucky as the measured ones; and a note that a rerun with an open model would measure it directly.
+        feedback: Correct - the corrected figure is an estimate; the reader needs the method and the measured number to judge it.
+      - id: corrected
+        text: Only 1053 ms - the measured number is wrong.
+        feedback: The measured number is correct for the requests that were sent; it is incomplete, not wrong. Presenting an estimate as a measurement hides the assumption.
+      - id: measured
+        text: Only 14 ms - corrections are speculation.
+        feedback: That reports a number you know under-represents a 1.5-second stall.
+      - id: average
+        text: The average of the two.
+        feedback: Averaging a measurement with an estimate gives a number that is neither.
+    correct: [both]
+    hints:
+      - What would a reviewer need in order to reproduce your correction?
+    solution: |
+      Report measured and corrected with the interval and the assumption; prefer an open-model rerun when possible.
+
+  - id: rd-noise-verdict
+    type: mcq
+    concept: perf-read-noise
+    skill: application
+    title: Is it a regression?
+    prompt: |
+      Baseline p95 over five runs: 29, 27, 29, 28, 29 ms. Candidate over five runs: 35, 36, 36, 36, 36 ms. Margin 10 %.
+      By the rule in the lesson, what is the verdict?
+    options:
+      - id: regression
+        text: Regression - the median rose from 29 to 36 (+24 %, more than the margin) and every candidate run is slower than every baseline run.
+        feedback: Correct - both conditions hold.
+      - id: nodiff
+        text: No difference - 7 ms is small.
+        feedback: 7 ms on a median of 29 is 24 %, far above the 10 % margin and far above the 7 % spread the baseline shows on its own.
+      - id: inconclusive
+        text: Inconclusive - five runs are never enough.
+        feedback: The rule needs at least three per side; five with no overlap and a large shift gives a verdict.
+      - id: improvement
+        text: Improvement - the candidate is more consistent (36, 36, 36).
+        feedback: Consistency is not speed. A higher p95 is slower.
+    correct: [regression]
+    hints:
+      - Check the margin and the overlap condition separately.
+    solution: |
+      Median change +24 % with no overlap: regression.
+
+  - id: rd-generator-cpu
+    type: mcq
+    concept: perf-read-noise
+    skill: analysis
+    title: The generator's CPU warning
+    prompt: |
+      A Locust run logs a CPU warning (usage above 90 %). Throughput is 40 % below what the same plan achieved last
+      week and p95 is higher. A developer says "the service got slower". What do you do?
+    options:
+      - id: invalid
+        text: Treat the run as suspect - the generator may be the bottleneck; rerun with more generator capacity (more worker processes or a bigger machine) before comparing with last week.
+        feedback: Correct - the warning is exactly the documented signal that the load generator may be the limit.
+      - id: accept
+        text: Accept the numbers; a warning is only informational.
+        feedback: A generator short of CPU sends late and times late, which looks like a slow service.
+      - id: lower
+        text: Raise the CPU warning threshold so it stops appearing.
+        feedback: That hides the symptom, not the cause.
+      - id: avg
+        text: Average the run with last week's run.
+        feedback: Mixing a suspect run with a good one makes both uninterpretable.
+    correct: [invalid]
+    hints:
+      - What does the load test measure when the generator is saturated?
+    solution: |
+      Rerun with enough generator capacity before drawing any conclusion.
+
+  - id: rd-order-reading
+    type: order
+    concept: perf-read-timeline
+    skill: application
+    title: Reading a run
+    prompt: Put the steps for reading a load test run in a sensible order.
+    items:
+      - id: gen
+        text: Check the load generator's CPU and warnings
+      - id: raw
+        text: Keep the raw samples and the plan (users or rate, duration)
+      - id: win
+        text: Cut into windows with samples, errors, p50, p95 and rate
+      - id: holes
+        text: Look for empty windows, start-time gaps and a sample count below the plan
+      - id: steady
+        text: Find the steady state with a stated rule and summarise it
+      - id: repeat
+        text: Repeat the run and compare with a spread, a margin and a verdict
+      - id: report
+        text: Report numbers with the plan, rule, intervals and sample counts
+    hints:
+      - Trust the measurement first, then the data, then the shape, then the comparison.
+    solution: |
+      Generator health, raw data and plan, windows, holes, steady state, repeats and verdict, then the report.
+
+  - id: rd-debug-windows
+    type: debug
+    concept: perf-read-timeline
+    skill: analysis
+    title: A timeline function that hides the stall
+    prompt: |
+      This function builds the per-window table. On a run with a 3-second stall the table shows windows 0, 1 and 5
+      next to each other and nobody notices. Which line is the defect?
+    language: python
+    code: |
+      def windows(rows, seconds=1.0):
+          first = min(int(r["timeStamp"]) for r in rows)
+          buckets = {}
+          for r in rows:
+              k = int((int(r["timeStamp"]) - first) // (seconds * 1000))
+              buckets.setdefault(k, []).append(int(r["elapsed"]))
+          return [
+              {"start": k * seconds, "samples": len(v), "max": max(v)}
+              for k, v in sorted(buckets.items())
+          ]
+    correctLines: [9]
+    lineNotes:
+      - line: 2
+        note: Counting from the earliest start is right; it does not depend on the row order.
+      - line: 5
+        note: The integer division puts each sample into its window; that is correct.
+      - line: 8
+        note: Reading the window's maximum is fine for a table; a percentile would need the nearest-rank rule and a guard for empty windows.
+    hints:
+      - Which windows does the loop visit?
+    solution: |
+      Line 9 iterates only the windows that contain samples, so empty windows vanish. Loop over `range(max(buckets) + 1)`
+      and emit a row with `samples: 0` (and `None` for the percentiles) for the missing ones.
+
+  - id: rd-short-warmup
+    type: short
+    concept: perf-read-timeline
+    skill: analysis
+    title: Why not just throw the warm-up away?
+    prompt: |
+      A colleague proposes "discard the first minute of every load test and report the rest". Give two situations where
+      that is a bad idea and say what you would do instead.
+    modelAnswer: |
+      A fixed cut is arbitrary: if the system settles in 5 seconds it throws away 55 seconds of good data, and if
+      it takes three minutes to settle (a large cache, a slow ramp) the minute is not enough and the report still
+      contains warm-up. Also the warm-up is something customers meet after every deploy or autoscaling event, so a
+      report that never shows it can approve a release whose first minutes are bad. I would find the steady state
+      with a stated rule (for example the first three consecutive windows near the late-run median), report the
+      steady-state numbers for the comparison, and show the whole-run and warm-up numbers next to them; if the run
+      never settles, say so.
+    rubric:
+      - Says a fixed cut is arbitrary (discards good data or leaves warm-up in).
+      - Says the warm-up is real customer experience and should be reported.
+      - Proposes a stated, checkable rule for the steady state.
+      - Reports steady and whole-run figures together, or says the run never settled.
+    hints:
+      - What if the system settles in 5 seconds? What if it takes 3 minutes?
+    solution: |
+      A fixed cut is arbitrary and hides the warm-up. Use a stated rule and report both numbers.
+
+  - id: rd-testdesign-analyser
+    type: testdesign
+    concept: perf-read-omission
+    skill: application
+    title: Test a results analyser before a gate uses it
+    prompt: |
+      A CI step will fail the build if the steady-state p95 exceeds 300 ms or if the run looks like it omitted
+      requests. Design test cases for the analyser before it goes live.
+    modelAnswer: |
+      Preconditions: hand-written JTLs and one real JTL from each of a cold-start run and a stalled run.
+
+      1. **Windows keep empty windows** - rows with a 3-second hole. Expected: three rows with 0 samples and `None`
+         percentiles. Evidence: the table in the test output.
+      2. **Errors apart** - fast failed rows in a window. Expected: they raise the error count and do not lower the
+         response time percentiles. Evidence: assertions on both.
+      3. **Steady start** - a hand-made warm-up then flat run. Expected: the documented start; a run that never
+         settles returns "no steady state" and the gate fails rather than passes. Evidence: exit code and message.
+      4. **Boundary** - a window exactly 25 % above the reference and p95 exactly 300 ms. Expected: the documented
+         inclusive or exclusive behaviour on both sides. Evidence: assertions.
+      5. **Gap detection** - a 1.5 s hole at a 50 ms plan. Expected: one gap with about 29 missing requests; small
+         start-up gaps ignored. Evidence: the gap record.
+      6. **Shortfall** - fewer samples than rate x duration. Expected: the gate reports omitted requests even when the
+         p95 is fine. Evidence: message with both counts.
+      7. **Correction interval** - 4 threads sharing 20 per second. Expected: the per-thread 200 ms is used, not 50.
+         Evidence: the count of implied samples (23 on the captured run).
+      8. **Empty or truncated file** - no rows, or a cut-off last line. Expected: fail loudly. Evidence: non-zero exit.
+    rubric:
+      - Each case has preconditions, input, expected result and evidence.
+      - Covers empty windows, errors kept out of response times and a run that never settles.
+      - Covers gap detection and the shortfall against the plan.
+      - Covers the per-stream interval of the correction.
+      - Covers empty or broken input failing the build rather than passing.
+    hints:
+      - Which inputs would make a broken gate pass silently?
+    solution: |
+      Empty windows, errors, steady-state boundaries, gaps and shortfall, the correct interval, and broken input that must
+      fail the build.
+
+  - id: rd-interview-numbers
+    type: interview
+    concept: perf-read-noise
+    skill: analysis
+    title: 'Interview: the lab number and the production complaint'
+    prompt: |
+      "Our load test said p99 was 80 ms, but customers report timeouts after releases. How would you find out what
+      the test missed?"
+    modelAnswer: |
+      I would not start by rerunning at higher load. I would first look at what the existing run says over time:
+      cut the JTL into one-second windows with samples, errors and percentiles, keeping empty windows, and check
+      whether the 80 ms is a whole-run figure that blends a warm-up or a stall. After a release the first minutes
+      matter, so I would report the warm-up window next to the steady state. Then I would check for coordinated
+      omission: with a closed-loop generator a stall leaves a few slow samples instead of many, so I would compare
+      the sample count with rate times duration and look for gaps in the start times; if there are holes I would
+      correct with the expected-interval rule using the per-thread interval and say it is an estimate, and I would
+      rerun with an open-model generator. I would also check the generator's CPU and repeat the run several times
+      to know the spread before comparing it with production. Finally I would compare the test conditions with
+      production (data volume, cache state after a deploy, connection pool size) because a perfect analysis of the
+      wrong experiment is still wrong.
+    rubric:
+      - Looks at the run over time and at the warm-up before changing the load.
+      - Explains coordinated omission and how to detect it in the data.
+      - Mentions the correction with the interval stated, or an open-model rerun.
+      - Mentions generator health and run-to-run spread.
+      - Compares test conditions with production.
+    followUps:
+      - Why is the p99 of one 8-second run not much use?
+      - How would you tell a stall from a ramp in a JTL?
+      - What would you ask the developers to log?
+    hints:
+      - Start with what the existing data can already tell you.
+    solution: |
+      Windows and warm-up, then omission (sample count and start-time gaps), the correction or an open-model rerun,
+      generator health and spread, and the differences between test and production.
+
+  - id: rd-timeline-code
+    type: coding
+    concept: perf-read-timeline
+    skill: application
+    title: Windows, warm-up and the steady state
+    prompt: |
+      Implement `percentile`, `windows`, `steady_start` and `steady_summary` in `exercises/analysis/rd_timeline.py`. The
+      tests use hand-made rows, the JTL of a real JMeter run of the cold-start service and one fresh JMeter run (JMeter
+      must be installed: `scripts/get-jmeter.sh`).
+    project: perf
+    files: [exercises/analysis/rd_timeline.py]
+    test: tests/analysis/test_rd_timeline.py
+    command: .venv/bin/python -m pytest tests/analysis/test_rd_timeline.py
+    modelAnswer: |
+      See "Windows and the steady state in Python". Key points: windows are numbered from the earliest start and the
+      loop runs over every window number so empty ones stay; failures are counted but never enter a percentile;
+      the reference level is the median p50 of the late half; the steady state starts at the first run of three
+      consecutive windows within the tolerance, or `None`.
+    rubric:
+      - Every test in tests/analysis/test_rd_timeline.py passes.
+      - Keeps empty windows and gives them None percentiles.
+      - Keeps failed samples out of the percentiles and counts them apart.
+      - Uses a stated rule for the steady state and returns None when nothing settles.
+    hints:
+      - Start with `percentile`; it is two lines after sorting.
+      - Loop over `range(max(buckets) + 1)`, not over the keys of the dict.
+      - '`abs(p50 - ref) <= tolerance * ref` is inclusive.'
+    solution: |
+      Four small functions; the care goes into empty windows, errors and the steady-state rule.
+
+  - id: rd-omission-code
+    type: coding
+    concept: perf-read-omission
+    skill: application
+    title: Finding and correcting coordinated omission
+    prompt: |
+      Implement `percentile`, `fill_expected_interval`, `find_gaps` and `corrected_percentiles` in
+      `exercises/analysis/rd_omission.py`. The tests use the HdrHistogram examples, hand-made rows, the JTL of a real
+      paced JMeter run with a 1.5-second stall, and one fresh run.
+    project: perf
+    files: [exercises/analysis/rd_omission.py]
+    test: tests/analysis/test_rd_omission.py
+    command: .venv/bin/python -m pytest tests/analysis/test_rd_omission.py
+    modelAnswer: |
+      See "Finding the hole and correcting for it". `fill_expected_interval` adds `value - k x interval` while the added
+      value is at least the interval; `find_gaps` looks at gaps between consecutive start times larger than factor x
+      interval; `corrected_percentiles` takes successes only and uses the per-stream interval.
+    rubric:
+      - Every test in tests/analysis/test_rd_omission.py passes.
+      - The correction stops before a value smaller than the interval (100 with interval 30 adds 70 and 40).
+      - find_gaps works on unsorted rows and ignores gaps under factor x interval.
+      - Can explain why the correction takes the per-thread interval (200 ms for 4 threads at 20 per second).
+    hints:
+      - 'The inner loop is `missing = value - interval`, then `while missing >= interval` add it and subtract the interval again.'
+      - Sort the start times before looking at neighbours.
+      - Only successful samples enter the percentiles.
+    solution: |
+      The HdrHistogram loop, a gap finder over sorted start times, and percentiles before and after the fill.
+
+  - id: rd-compare-code
+    type: coding
+    concept: perf-read-noise
+    skill: application
+    title: A verdict you can defend
+    prompt: |
+      Implement `spread`, `verdict` and `generator_overloaded` in `exercises/analysis/rd_compare.py`. The tests cover each
+      verdict, too few runs, the margin, the CPU rule and real five-run batches of the practice API.
+    project: perf
+    files: [exercises/analysis/rd_compare.py]
+    test: tests/analysis/test_rd_compare.py
+    command: .venv/bin/python -m pytest tests/analysis/test_rd_compare.py
+    modelAnswer: |
+      See the verdict table under "Internals - noise, spread and a verdict": fewer than three runs is inconclusive; a median
+      change within the margin is no difference; beyond the margin it needs non-overlapping runs to be a
+      regression or an improvement; otherwise inconclusive. The generator check is `any(c > threshold ...)`.
+    rubric:
+      - Every test in tests/analysis/test_rd_compare.py passes.
+      - Checks the margin before the direction and requires non-overlapping runs for a verdict.
+      - Returns inconclusive for fewer than three runs on either side.
+      - Treats exactly the threshold as not overloaded.
+    hints:
+      - Compute the medians first and the relative change from the baseline.
+      - Use strict comparisons for overlap - equal values overlap.
+    solution: |
+      Median change against a margin, with a non-overlap guard and a minimum number of runs.
+
+placement:
+  - id: rd-place-window
+    type: mcq
+    concept: perf-read-timeline
+    skill: application
+    title: A single number for a 10-minute run
+    prompt: A 10-minute run reports p95 = 120 ms, and its first 2 minutes were 4x slower than the rest. What is the right way to report it?
+    options:
+      - id: both
+        text: Show the windowed view, summarise the steady state, and report the warm-up and whole-run numbers beside it.
+        feedback: Correct - the phases are information.
+      - id: single
+        text: Report the 120 ms; it is what the tool says.
+        feedback: It blends two different regimes.
+      - id: drop
+        text: Delete the first 2 minutes and report the rest without comment.
+        feedback: Silent deletion hides what customers meet after a deploy.
+    correct: [both]
+    hints:
+      - What would a reader need to decide for themselves?
+    solution: |
+      Windows, a stated steady-state rule and both numbers.
+
+  - id: rd-place-omission
+    type: mcq
+    concept: perf-read-omission
+    skill: application
+    title: Few samples during the incident
+    prompt: A test planned for 100 requests per second shows 61 requests per second in the minute when the database failed over, with a p99 that looks fine. What does that suggest?
+    options:
+      - id: co
+        text: The closed-loop generator stopped sending while the server was stuck, so the slow responses are under-represented; check the start-time gaps and use an open model or the expected-interval correction.
+        feedback: Correct - the dip in the rate is the fingerprint.
+      - id: fine
+        text: The system is fine; fewer requests means less load.
+        feedback: The load was meant to be 100 per second; it fell because the generator was waiting.
+      - id: net
+        text: The network dropped the missing requests.
+        feedback: Nothing suggests loss; the requests were never sent.
+    correct: [co]
+    hints:
+      - What does a closed-loop sender do while it waits for an answer?
+    solution: |
+      Coordinated omission: the rate dip is the clue.
+
+  - id: rd-place-compare
+    type: mcq
+    concept: perf-read-noise
+    skill: application
+    title: One run against one run
+    prompt: Last night's run had p95 = 52 ms and tonight's has 57 ms. The team wants to open a regression ticket. What is the best next step?
+    options:
+      - id: repeat
+        text: Run each build several times in the same environment, compare the medians and ranges against a margin, and only then decide.
+        feedback: Correct - one run per side does not say how much the number moves on its own.
+      - id: ticket
+        text: Open the ticket; 5 ms is a regression.
+        feedback: Without the spread you cannot tell a regression from noise.
+      - id: ignore
+        text: Ignore it; 5 ms is nothing.
+        feedback: It might be a real 10 % regression; the repeat runs will tell.
+    correct: [repeat]
+    hints:
+      - How much does p95 move when nothing changes?
+    solution: |
+      Repeat the runs and use a spread and margin.
+
+recall:
+  - id: rd-recall-windows
+    concept: perf-read-timeline
+    prompt: Why cut a load test into time windows, and what must you keep?
+    answer: A whole-run percentile blends warm-up, steady state and disturbances. Per-window samples, errors, p50, p95 and rate show them; keep empty windows because a stall is a window with no samples.
+  - id: rd-recall-steady
+    concept: perf-read-timeline
+    prompt: How does the lesson find the start of the steady state?
+    answer: Reference = median of the window p50s in the run's last half; the steady state starts at the first window beginning three consecutive windows within 25 % of it; no such run means the run never settled. The rule is stated in the report.
+  - id: rd-recall-co
+    concept: perf-read-omission
+    prompt: What is coordinated omission?
+    answer: A closed-loop generator sends the next request only after the last answer, so during a stall it stops sending and the slow responses independent users would have seen are never recorded.
+  - id: rd-recall-gap
+    concept: perf-read-omission
+    prompt: How do you detect omission in a JTL?
+    answer: Sort by start time and look for gaps much larger than the planned interval (missing ~ gap // interval - 1); compare the sample count with rate x duration.
+  - id: rd-recall-hdr
+    concept: perf-read-omission
+    prompt: What does HdrHistogram's expected-interval correction do?
+    answer: For each recorded value above the interval it adds value - interval, value - 2 x interval ... while the added value is at least the interval. Use the per-stream (per-thread) interval; report measured and corrected.
+  - id: rd-recall-verdict
+    concept: perf-read-noise
+    prompt: What does it take to call a regression?
+    answer: At least 3 runs per side, a median change above the margin, and every candidate run slower than every baseline run; a change within the margin is no difference; a big shift with overlap is inconclusive.
+  - id: rd-recall-cpu
+    concept: perf-read-noise
+    prompt: What does Locust's CPU warning mean for the result?
+    answer: Locust warns when CPU use passes 90 %; the generator may be the bottleneck, so the run is suspect until repeated with more capacity (workers or a bigger machine).
+
+next:
+  - bottleneck-analysis
+  - performance-testing-in-ci-cd
+  - locust-distributed-and-ci

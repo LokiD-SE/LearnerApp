@@ -1,0 +1,1559 @@
+id: backend-and-database-performance
+title: 'Backend and database performance for testers'
+subject: performance-testing
+module: perf-analysis
+level: advanced
+status: published
+estimatedMinutes: 150
+summary: 'A load test tells you that the API is slow; it does not tell you why. This lesson teaches the three database-side causes a tester meets most often and how to prove each one from what the test shows. Queries per request (the N+1 problem) turn one page into a hundred round trips; a missing or unusable index turns a lookup into a scan that grows with the table; and a bounded connection pool puts a queue in front of the database whose waiting time is invisible in the database itself. A cache then removes lookups, but only as many as its hit ratio says. Everything is run for real on a small SandPay database in SQLite (query counts, query plans, a FIFO connection pool under 32 closed-loop clients, an LRU cache under skewed traffic), and every number is tied back to Little''s law and to the sources quoted.'
+tags:
+  [
+    database performance,
+    N+1 queries,
+    round trips,
+    eager loading,
+    JOIN,
+    index,
+    EXPLAIN,
+    query plan,
+    full table scan,
+    composite index,
+    covering index,
+    connection pool,
+    pool sizing,
+    Little's law,
+    HikariCP,
+    cache,
+    hit ratio,
+    LRU,
+    bottleneck,
+    load testing,
+    performance testing,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 with its standard-library `sqlite3` module (SQLite 3.45.1) and pytest 9.2.0, in
+    `practice/perf/.venv`. Every output in this lesson was produced on Linux on 21 November 2026 by
+    `practice/perf/support/db_demo.py` (the demonstration script of this lesson) and by the exercise solutions.
+  - **SQLite stands in for a database server.** It is in the Python standard library, so everything here runs without
+    installing anything and without a network. What carries over to PostgreSQL or MySQL is the shape of each problem -
+    queries per request, scan versus index search, a bounded pool with a queue in front of it, a cache with a hit
+    ratio. What does not carry over: absolute times and the exact wording of the plan lines. PostgreSQL's own wording is
+    quoted from its documentation and labelled "from the docs, not run here".
+  - **Data (synthetic, seeded):** `support/db_fixture.py` builds an in-memory SandPay database - `merchants` and
+    `payments` tables, filled from a seeded random generator, so every run builds the same rows. SandPay is a fictional
+    payments company; no real data is involved.
+  - **Simulated, and labelled as simulated:** an in-process SQLite call costs microseconds, whereas a query to a database
+    server costs a network round trip. The N+1 run therefore sleeps 1 ms per query (`CountingConn(round_trip_ms=1.0)`) to
+    stand in for that round trip. The 1 ms is an assumption, not a measurement; the query counts are exact. The
+    connection pool is a small model (`ConnectionPool`, a FIFO queue with direct hand-over) and the "queries" it runs are
+    20 ms sleeps - it is a model of a pool, not a real driver's pool.
+  - **What varies:** every time printed (milliseconds, requests per second) depends on the machine and changes from run
+    to run. What does not vary: query counts, plan lines, hit ratios (seeded) and the relations between the pool rows
+    (served requests grow with the pool until the clients, not the pool, are the limit).
+  - **Sources, as documented on 21 November 2026:**
+    - SQLite, [EXPLAIN QUERY PLAN](https://sqlite.org/eqp.html) (what `SCAN` and `SEARCH` mean) and
+      [The SQLite Query Optimizer Overview](https://sqlite.org/queryplanner.html) (full table scan, lookup by index).
+    - PostgreSQL documentation, [Introduction to indexes](https://www.postgresql.org/docs/current/indexes-intro.html)
+      and [Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html) - quoted, not run here.
+    - Ruby on Rails Guides, [Active Record Query Interface, "Eager Loading Associations"](https://guides.rubyonrails.org/active_record_querying.html)
+      for the wording of the N + 1 queries problem - quoted as one framework's description of a problem that exists in
+      every ORM; the Rails code is not run here.
+    - HikariCP wiki, [About Pool Sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) - the
+      formula it quotes from the PostgreSQL project, and its advice on small pools. Quoted, not run here; it describes a
+      Java pool and the measurements it cites were made by its authors, not here.
+    - Little's law - used as in [Little's law and workload models](#/lesson/littles-law-and-workload-models).
+  - **Not run here:** PostgreSQL, MySQL, any real connection-pool library (HikariCP, pgbouncer), Redis or another real
+    cache, the Oracle video that the HikariCP page links, and every ORM. Statements about them are quotes from their
+    documentation and are labelled.
+  - **Not repeated here:** how to model a workload and use Little's law -
+    [Little's law and workload models](#/lesson/littles-law-and-workload-models); reading plans and designing indexes for
+    PostgreSQL in depth - [Postgres indexes and query plans](#/lesson/postgres-indexes-and-query-plans); HTTP caching and
+    web performance - [Web performance and caching](#/lesson/web-performance-and-caching); the test data a database needs
+    - [Test environments and test data](#/lesson/performance-test-environments-and-data).
+
+prerequisites:
+  - littles-law-and-workload-models
+  - performance-metrics-and-percentiles
+  - performance-test-environments-and-data
+  - relational-modelling-and-sql
+
+concepts:
+  - id: perf-db-roundtrips
+    name: Queries per request and the N+1 problem
+    summary: 'Every query is a round trip to the database, so the time a request spends on the database is roughly queries x (round trip + work). An endpoint that runs one query for a list and then one more per row (N+1) sends 1 + N queries: the page of 100 payments costs 101 round trips, and the cost grows with the page size, not with the data. The signature in a load test is a response time that tracks the size of the result, and a query log that shows the same statement repeated with different ids. The fix is to ask the database for the whole answer - a JOIN, or one batched query with IN and GROUP BY - and the proof is a query count per request that no longer depends on N. ORMs hide the loop, so count queries instead of reading code.'
+  - id: perf-db-indexes
+    name: Indexes, query plans and what a scan costs
+    summary: 'Without a usable index a filter is a full-table scan: the database reads every row to find the few that match, and the time grows with the table, so a query that is instant on a test database of thousands of rows is slow on production''s millions. EXPLAIN shows the plan - in SQLite SCAN means a full scan and SEARCH means only a subset of rows is visited. An index turns the scan into a search, but only when the query can use it: a function wrapped around the column defeats it, and in a composite index the equality columns must come before the range column. Indexes are not free - every insert must update each one - so the test is the plan plus the write cost, not "add an index".'
+  - id: perf-db-pool-cache
+    name: Connection pools, queues and caches
+    summary: 'A connection pool is a bounded set of servers with a queue of requests in front of it. By Little''s law the connections in use equal throughput x hold time, so a pool of P connections serves at most P / hold requests per second; past that the extra load only waits, response time grows in proportion to the number of waiting clients while throughput stays flat, and a request that waits too long fails with a pool timeout. The database itself can look idle while this happens, because the waiting is in the application. A larger pool is not the cure - the HikariCP guidance is a small pool near (cores x 2) + effective spindles. A cache in front of the database removes lookups in proportion to its hit ratio, which depends on how skewed the traffic is as much as on the cache size.'
+
+objectives:
+  - Count the queries a request sends, recognise the N+1 pattern from a query log, and rewrite it as one JOIN or one batched query whose count no longer depends on the number of rows.
+  - Read an EXPLAIN plan for a full scan versus an index search, choose the columns and the column order of an index for an equality-plus-range filter, and name two ways a query can fail to use an index.
+  - Use Little's law to find the throughput ceiling of a connection pool and the pool size a target throughput needs, and explain why the response time of a saturated pool grows linearly with the number of clients.
+  - Estimate the load that reaches the database behind a cache from its hit ratio, and explain why skewed traffic caches better than uniform traffic.
+  - Turn a slow load-test result into a database-side hypothesis - queries per request, plan, pool wait or hit ratio - and say which measurement would confirm or reject it.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: The idea in plain language
+    body: |
+      A load test is like timing a visitor in a library. It tells you the visitor needed 40 seconds to get a list of 100
+      books. It does not tell you *why*. Four different things in the library produce the same 40 seconds:
+
+      1. **One trip per book.** The visitor asks the librarian for the list, then walks to the shelf for the first title,
+         comes back for the second, and so on - 101 trips. The shelves are fine; the *number of trips* is the problem.
+         (**N+1 queries.**)
+      2. **No catalogue.** For each title the librarian walks every shelf in the building, because nothing says where the
+         book is. A small library is fine. The big library is not. (**A missing index: a full scan.**)
+      3. **One desk, a queue.** There are 4 librarians. Visitors queue for a free one. The librarians are not tired and
+         the shelves are quiet - the 40 seconds are spent standing in line. (**A connection pool.**)
+      4. **A trolley of popular books.** If a few titles account for most requests, a trolley by the door removes most
+         of the trips - and if every title is equally likely, the trolley barely helps. (**A cache and its hit ratio.**)
+
+      Each cause leaves a different fingerprint: the number of queries per request, the plan of one query, the time spent
+      waiting for a connection, the hit ratio. A tester who can read those four fingerprints turns "the API is slow" into
+      "this endpoint sends 101 queries per request" - a defect a developer can fix in an afternoon.
+
+      The tester's job is **not** to tune the database. It is to find which of the four it is, with evidence from the
+      test, and to hand over a report that cannot be argued with.
+
+  - id: what
+    kind: what
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Terms you need
+    body: |
+      | Term | Meaning |
+      | --- | --- |
+      | **Round trip** | one request to the database and its answer. Each query pays a round trip on top of the work the database does |
+      | **N+1 queries** | Rails Guides: "Retrieving a list of records N (where N is a number greater that 1) in a single query can sometimes trigger N extra queries; one for each record." Their example: "1 (to find 10 books) + 10 (one per each book to load the author) = 11 queries in total." |
+      | **Eager loading / JOIN / batch** | asking for the related rows together with the first query (a JOIN), or all at once in one extra query (`IN (...)` with `GROUP BY`), instead of one query per row |
+      | **Full-table scan** | SQLite documentation: "the entire content of the table must be read and examined in order to find the one row of interest" |
+      | **Index** | a separate structure kept in order, so the database can find rows by binary search; SQLite: lookup time "proportional to logN rather than being proportional to N as in a full table scan" |
+      | **Query plan (`EXPLAIN`)** | the database's description of how it will run a query. SQLite: lines that begin with "SCAN" (a full-table scan) or "SEARCH" ("only a subset of the table rows are visited") |
+      | **Selectivity** | how small a share of the table a filter keeps. An index helps when the filter keeps few rows |
+      | **Composite index** | an index on several columns, in a given order; the order decides which filters can use it |
+      | **Covering index** | an index that holds every column the query needs, so the table itself is not read (SQLite plan: `USING COVERING INDEX`) |
+      | **Connection pool** | a fixed set of open database connections that requests borrow and return. Size = how many queries can run at once |
+      | **Hold time** | how long a request keeps a connection: the time its queries and its transaction take |
+      | **Pool wait / timeout** | time a request spends queued for a free connection; if it exceeds the acquire timeout the request fails |
+      | **Hit ratio** | the share of lookups a cache answers itself: hits / lookups. The database sees only the misses |
+      | **LRU** | least recently used: when a cache is full it drops the entry that was used longest ago |
+
+  - id: why
+    kind: why
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Why it matters - what a load test shows, and what it hides
+    body: |
+      A load test sees the system from outside: response times, throughput, errors. The database causes of slowness look
+      alike from there, so the first skill is to separate them with a *second* measurement taken at the same time. Here
+      is what each cause looks like, and what to look at to tell them apart:
+
+      | What the load test shows | Likely database-side cause | The confirming measurement |
+      | --- | --- | --- |
+      | Response time grows with the **size of the page or result** (50 rows fast, 500 rows 10 times slower) | N+1: a query per row | queries per request in a query log: does it equal 1 + N? |
+      | Response time grows with the **size of the table** as the test data grows; even one-row lookups are slow | a full-table scan on a filter | `EXPLAIN` of the slow statement: SCAN, not SEARCH |
+      | **Throughput stops growing** when you add users, response time grows linearly with users, **database CPU is low** | a pool too small for the hold time: requests queue in the application | pool metrics: connections in use = pool size, requests waiting > 0 |
+      | The same, but errors appear as "timeout acquiring a connection" | pool exhaustion: the wait exceeds the acquire timeout | count of pool timeouts; the hold time of the slowest queries |
+      | **Database CPU is high**, throughput flat | the database itself is saturated: scans, missing indexes, too many connections | the database's top statements by total time; plans |
+      | Fast at first, then slower as the cache fills or empties | a cold cache, or a hit ratio that changes with traffic | cache hit ratio over time; database load per second |
+
+      Two things make these causes easy to miss:
+
+      - **A small test database hides them.** A scan over 4,000 rows is quick; the same query over 40 million rows is not.
+        An N+1 over a page of 10 is acceptable; over a page of 100 it is not. If the load-test data is not production-like
+        in volume and shape ([Test environments and test data](#/lesson/performance-test-environments-and-data)), the test
+        passes and production fails.
+      - **The slowness can be invisible on the database.** A queue in the application's pool does not show in the
+        database's CPU or in its slow-query log - every statement ran quickly. The waiting is in front of the database.
+
+      This lesson builds a small SandPay database and reproduces each cause on purpose, so that you recognise it when you
+      meet it in a real system. Where the test ends and the investigation begins is the subject of
+      [Bottleneck analysis with the USE and RED methods](#/lesson/bottleneck-analysis); this lesson is the part that is
+      specific to databases.
+
+  - id: internals-roundtrips
+    kind: internals
+    concepts: [perf-db-roundtrips]
+    title: How N+1 happens, and what it costs
+    body: |
+      The endpoint "latest payments, with the merchant's name" is written, innocently, as a loop:
+
+      1. one query for the 100 newest payments;
+      2. for each payment, one query for its merchant's name.
+
+      That is 1 + 100 = 101 queries. Nothing in the code looks wrong - it reads naturally - and with an ORM the second
+      query is hidden behind `payment.merchant.name`. The Rails Guides describe exactly this: "This code looks fine at the
+      first sight, but the problem lies within the total number of queries executed."
+
+      **The cost model.** Each query costs a round trip plus the database's work for it. When the database is on another
+      machine, the round trip (network, driver, parsing) is often larger than the work for a lookup by key. With a round
+      trip of *r* and 1 + N queries, the database part of the request is about *(1 + N) x r*. It grows with N, the page
+      size - not with the amount of data. That is why the symptom is "slow when the page is big", and why it hides on
+      small test pages.
+
+      **The proof is a count, not a timing.** A timing varies with the machine; a query count does not. In the run below,
+      the code is given a connection that counts every `execute` call (`CountingConn`). The simulated 1 ms per query
+      stands in for a network round trip - it is an assumption; the counts are exact.
+
+      **The fixes**, from the framework documentation's vocabulary:
+
+      - **A JOIN** - one query returns each payment together with its merchant. The count is 1, whatever N is.
+      - **A batched query** - collect the ids, then one query with `WHERE id IN (...)` (and `GROUP BY` for totals). The
+        count is 2 (or 1 if the ids were known beforehand), whatever N is. Rails Guides name this `preload`: "Active Record
+        loads each specified association using one query per association."
+      - **Eager loading in the ORM** - the same two ideas behind a method name (`includes`, `select_related` and similar).
+
+      **What the fixes cost.** A JOIN repeats the parent columns on every child row, so a JOIN of a payment with ten line
+      items returns ten rows per payment; a very long `IN (...)` list hits driver and database limits and defeats plan
+      caching, so ids are sent in chunks. A fix that makes one query much slower than any single old one can still win -
+      the proof is the count and the total time, not the worst single statement.
+
+      **Where N+1 hides.** In list endpoints, in serializers that touch a related object per row, in "convenience" getters,
+      in a GraphQL resolver that runs per field (not run here). The common thread: the query count depends on the number of
+      rows returned. A load test that varies the page size, and a query log, expose it.
+
+  - id: internals-indexes
+    kind: internals
+    concepts: [perf-db-indexes]
+    title: Plans, scans and indexes
+    body: |
+      A query says *what* rows to find, not *how*. The database chooses the how, and `EXPLAIN` shows the choice. In
+      SQLite: "For each table read by the query, the output of EXPLAIN QUERY PLAN includes a record for which the value in
+      the 'detail' column begins with either 'SCAN' or 'SEARCH'. 'SCAN' is used for a full-table scan, including cases
+      where SQLite iterates through all records in a table in an order defined by an index. 'SEARCH' indicates that only a
+      subset of the table rows are visited."
+
+      PostgreSQL says the same in its own words (from the docs, not run here): scan nodes are "sequential scans, index scans,
+      and bitmap index scans", and "it is this number that the planner seeks to minimize" - the planner estimates a cost for
+      each possible plan and picks the cheapest. So the planner may choose a sequential scan even when an index exists, if
+      it estimates that most of the table matches. **The habit is the same in every database: look for the scan first.**
+
+      **Why a scan hurts at scale.** SQLite's optimizer overview: with a full scan "the entire content of the table must be
+      read and examined in order to find the one row of interest. With a table of only 7 rows, a full table scan is
+      acceptable, but if the table contained 7 million rows, a full table scan might read megabytes of content in order to
+      find a single 8-byte number." An index lets the database "find the correct row using a binary search": the time is
+      "proportional to logN rather than ... to N".
+
+      **An index is only used when the query can use it.** Three rules that decide most real cases:
+
+      1. **A function on the column hides it.** `WHERE CAST(merchant_id AS TEXT) = ?` or `WHERE merchant_id + 0 = ?` asks
+         for something the index (sorted by `merchant_id`) cannot answer directly, so the plan stays a SCAN.
+      2. **Order the columns of a composite index: equality columns first, then the range column.** For
+         `WHERE merchant_id = ? AND created_day >= ?` an index on `(merchant_id, created_day)` narrows on both. An index on
+         `(created_day, merchant_id)` narrows on the range only, and the database checks `merchant_id` row by row inside it.
+      3. **A covering index avoids reading the table.** If every column the query needs is in the index, the plan says
+         `USING COVERING INDEX`. Note that a SCAN can use an index too (to read in order or to read the narrower
+         structure) - it is still a full scan of that index.
+
+      **Indexes are not free.** PostgreSQL documentation (from the docs, not run here): "After an index is created, the
+      system has to keep it synchronized with the table. This adds overhead to data manipulation operations." A real
+      measurement of that cost follows. It is the reason "add an index to everything" is not an answer, and why a load
+      test of a write-heavy endpoint can get *slower* after an index is added.
+
+      **Selectivity.** An index pays when the filter keeps a small share of the table. A filter on a column with three
+      values (a `status`) keeps a third of the rows, and the planner is right to ignore the index.
+
+      **What the tester contributes.** Not the index design - the evidence: the slow statement, its plan on a
+      production-sized table, and the effect of the proposed index on that plan *and* on the writes. Whether a fix is
+      right is the developer's and DBA's decision.
+
+  - id: internals-pool
+    kind: internals
+    concepts: [perf-db-pool-cache]
+    title: Pools, queues and caches
+    body: |
+      **A pool is a queue with P servers.** An application does not open a connection per request - opening is slow and
+      the database can only serve so many at once. It keeps a **pool** of P connections; a request takes one, runs its
+      queries and releases it. If all P are taken, the request waits in line.
+
+      From Little's law (connections in use = throughput x time each is held) two consequences follow:
+
+      - **The ceiling.** If every request holds a connection for `hold` seconds, the pool serves at most
+        `P / hold` requests per second. P = 4 and hold = 20 ms: at most 4 / 0.020 = **200 requests per second**.
+      - **The queue above the ceiling.** Offer more than that and the surplus waits. With C clients that each send their
+        next request as soon as the last one finishes, about `C - P` are always waiting, and each waits for `(C - P) / P`
+        holds. For C = 32, P = 4, hold = 20 ms: (32 - 4) / 4 x 20 ms = **140 ms** of waiting on top of the 20 ms of work.
+        Response time rises *in proportion to the number of clients*, throughput stays at the ceiling - the "hockey
+        stick" of a saturated system, here located in a pool.
+
+      **The database looks idle.** During that wait the database is serving only P queries at a time and each is fast.
+      Its CPU is low and its slow-query log is empty. The queue is in the application. You find it only by measuring
+      the pool (in use, waiting, wait time, timeouts) - or by the pattern: throughput flat, latency linear in users,
+      database CPU low.
+
+      **A timeout turns a queue into errors.** A pool has an acquire timeout. When the wait exceeds it, the request fails
+      instead of waiting. The run below shows the effect: 40 clients and a pool of 4 with a 100 ms timeout fail roughly half of
+      their attempts, without a single slow query.
+
+      **Hold time includes the slow parts.** The hold time is not "one query": it is the time from taking the connection to
+      returning it - several queries, any work done while holding it, a whole transaction. A slow query, or application
+      code that calls another service while holding a connection, raises the hold time, and the ceiling `P / hold`
+      falls with it. This is how one slow dependency collapses a whole service.
+
+      **A bigger pool is not the cure.** The HikariCP page: "You want a small pool, saturated with threads waiting for
+      connections." It quotes the PostgreSQL project's starting point - "for optimal throughput the number of active
+      connections should be somewhere near ((core_count * 2) + effective_spindle_count)" - and says that reducing the pool
+      "decreased the response times of the application from ~100ms to ~2ms" in one demonstration (the authors' figures,
+      from a video they link; not reproduced here). The reasoning: the database can only work on about as many queries at
+      once as it has cores and disks; more connections than that only add context switching. So the pool should be
+      sized from the database's capacity - and load tests are how to check it: "If you run load tests, you will probably
+      see TPS rates starting to fall, and front-end response times starting to climb, as you push the connection pool much
+      past" the starting point.
+
+      **One request, several connections.** If one request holds a connection and asks for a second, the pool can deadlock
+      when all connections are held by requests waiting for another. The same page gives the minimum size that makes that
+      impossible: `pool size = Tn x (Cm - 1) + 1` for `Tn` threads that each hold up to `Cm` connections at once. The better
+      fix is to hold one connection at a time.
+
+      **A cache removes lookups in proportion to its hit ratio.** The database sees only the misses: `requests x (1 - hit
+      ratio)`. The hit ratio depends on **the traffic as much as on the size of the cache**. If a few merchants get most
+      of the traffic (skew), a small cache holds the popular ones and hits often; if every merchant is equally likely,
+      a cache needs to hold nearly everything. The run below shows both. Two consequences for a tester: a cache makes a
+      load test of the database meaningless unless the hit ratio matches production's, and a *cold* cache at the start of a
+      run is a different system from a warm one ([Test environments and test data](#/lesson/performance-test-environments-and-data)
+      calls this the warm-up).
+
+  - id: visual
+    kind: visual
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Where a request waits
+    body: |
+      ```mermaid
+      flowchart LR
+        C["load generator: 32 clients"] --> A["application threads"]
+        A --> K{"cache: hit?"}
+        K -- "hit: no database work" --> R["response"]
+        K -- "miss" --> Q["pool queue: waits for a free connection"]
+        Q --> P["pool: P connections"]
+        P --> D["database: parse, plan, scan or index search"]
+        D --> P
+        P --> R
+      ```
+
+      Each box is a place where time goes, and each has its own measurement: the **cache** (hit ratio), the **pool
+      queue** (wait time, queue length), the **pool** (connections in use), the **database** (queries per request, plan,
+      CPU). A load test measures only the whole path - the sum of all of them - so the work of this lesson is to add the
+      other measurements, one box at a time.
+
+      ```mermaid
+      flowchart TD
+        S["slow endpoint under load"] --> Q1{"queries per request depend on result size?"}
+        Q1 -- "yes" --> N["N+1: JOIN or one batched query"]
+        Q1 -- "no" --> Q2{"slow statement shows SCAN on a big table?"}
+        Q2 -- "yes" --> I["index or rewrite so it can be used - check write cost"]
+        Q2 -- "no" --> Q3{"connections in use = pool size and requests waiting?"}
+        Q3 -- "yes" --> W["pool: shorten hold time first, then size from database capacity"]
+        Q3 -- "no" --> Q4{"database CPU high?"}
+        Q4 -- "yes" --> B["database saturated: top statements, plans, connection count"]
+        Q4 -- "no" --> O["look elsewhere: application CPU, other services, network"]
+      ```
+
+      The order of the questions is the order of cheapness: a query log answers the first in a minute, a plan the
+      second in five, pool metrics the third in ten. Only when all four are "no" is the database not the problem.
+
+  - id: code-roundtrips
+    kind: code
+    concepts: [perf-db-roundtrips]
+    title: 'The code: count the queries, then send one'
+    body: |
+      The solution of the first exercise (`practice/perf/solutions/analysis/db_queries.py`) and the run that proves it.
+      `CountingConn` (in `support/db_fixture.py`) offers only `execute`, records each statement, and can sleep once per
+      query to *simulate* a network round trip:
+
+      ```python
+      def latest_payments_n_plus_one(conn, limit):
+          payments = conn.execute(
+              "SELECT id, merchant_id, amount_cents FROM payments ORDER BY id DESC LIMIT ?", (limit,)
+          ).fetchall()
+          rows = []
+          for payment_id, merchant_id, amount in payments:
+              name = conn.execute("SELECT name FROM merchants WHERE id = ?", (merchant_id,)).fetchone()[0]
+              rows.append((payment_id, name, amount))
+          return rows
+
+
+      def latest_payments(conn, limit):
+          return conn.execute(
+              "SELECT p.id, m.name, p.amount_cents FROM payments p JOIN merchants m ON m.id = p.merchant_id "
+              "ORDER BY p.id DESC LIMIT ?",
+              (limit,),
+          ).fetchall()
+
+
+      def totals_for(conn, merchant_ids):
+          ids = list(merchant_ids)
+          if not ids:
+              return {}
+          placeholders = ", ".join("?" for _ in ids)
+          rows = conn.execute(
+              f"SELECT merchant_id, count(*), sum(amount_cents) FROM payments "
+              f"WHERE status = 'captured' AND merchant_id IN ({placeholders}) GROUP BY merchant_id",
+              ids,
+          ).fetchall()
+          found = {merchant_id: (count, total) for merchant_id, count, total in rows}
+          return {merchant_id: found.get(merchant_id, (0, 0)) for merchant_id in ids}
+      ```
+
+      Run with `.venv/bin/python support/db_demo.py n_plus_one` on 21 November 2026:
+
+      ```text
+      N+1   rows=100 queries=101 time= 110.4 ms (1 ms simulated per query)
+      JOIN  rows=100 queries=  1 time=   1.4 ms (1 ms simulated per query)
+      same rows: True
+         SELECT id, merchant_id, amount_cents FROM payments ORDER BY id DESC LIMIT ?
+         SELECT name FROM merchants WHERE id = ?
+         SELECT name FROM merchants WHERE id = ?
+         SELECT name FROM merchants WHERE id = ?
+      ```
+
+      The last four lines are the query log of a page of **3** payments: one list query, then the same statement
+      repeated with different ids - the fingerprint of N+1. The 101 and 1 are exact; the milliseconds are the machine's, and
+      the 1 ms per query is the stated assumption (so 101 queries cost about 101 ms of simulated round trips, and the
+      one-query version about 1 ms plus its own work).
+
+  - id: code-plans
+    kind: code
+    concepts: [perf-db-indexes]
+    title: 'The code: read the plan, add the index, check the price'
+    body: |
+      The solution of the second exercise (`practice/perf/solutions/analysis/db_plans.py`):
+
+      ```python
+      import re
+
+      _PATH = re.compile(r"^(SCAN|SEARCH)\s+(?:TABLE\s+)?(\S+)(?:\s+AS\s+\S+)?(.*)$")
+      _INDEX = re.compile(r"USING (?:COVERING )?INDEX (\S+)")
+
+
+      def explain(conn, sql, params=()):
+          return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+
+
+      def access_paths(conn, sql, params=()):
+          paths = []
+          for detail in explain(conn, sql, params):
+              match = _PATH.match(detail)
+              if not match:
+                  continue
+              kind, table, rest = match.groups()
+              index = _INDEX.search(rest)
+              paths.append((kind, table, index.group(1) if index else None))
+          return paths
+
+
+      def full_scans(conn, sql, params=()):
+          return [table for kind, table, _ in access_paths(conn, sql, params) if kind == "SCAN"]
+
+
+      def index_ddl(table, equality, range_columns=()):
+          columns = [*equality, *range_columns]
+          return f"CREATE INDEX idx_{table}_{'_'.join(columns)} ON {table} ({', '.join(columns)})"
+      ```
+
+      Run with `.venv/bin/python support/db_demo.py plans` on 21 November 2026, on a `payments` table of 200,000 rows and
+      2,000 merchants (about 100 payments per merchant). Each "mean per query" is the average of 200 lookups for
+      different merchants:
+
+      ```text
+      rows in payments: 200000
+      plan without index: ['SCAN payments']
+      mean per query without index: 9.634 ms
+      plan with index:    ['SEARCH payments USING INDEX idx_payments_merchant (merchant_id=?)']
+      mean per query with index:    0.157 ms
+      range query, index (created_day, merchant_id): ['SEARCH payments USING COVERING INDEX idx_a (created_day>?)']
+      range query, index (merchant_id, created_day): ['SEARCH payments USING COVERING INDEX idx_b (merchant_id=? AND created_day>?)']
+      covering query: ['SEARCH payments USING COVERING INDEX idx_b (merchant_id=?)']
+      function on the column: ['SCAN payments USING COVERING INDEX idx_b']
+      cast on the column: ['SCAN payments USING COVERING INDEX idx_b']
+      insert 100000 rows, no index :     136 ms
+      insert 100000 rows, 1 index  :     240 ms
+      insert 100000 rows, 3 indexes:     454 ms
+      ```
+
+      How to read it:
+
+      - **SCAN to SEARCH** - the plan changes from `SCAN payments` to `SEARCH payments USING INDEX ... (merchant_id=?)`, and
+        the mean per query on this machine falls from about 9.6 ms to about 0.16 ms. The ratio (not the milliseconds) is what
+        carries to other machines, and it grows with the table: the scan reads all 200,000 rows, the search about 100.
+      - **Column order** - with the range column first, the plan's search condition mentions only `created_day>?`; with the
+        equality column first it says `merchant_id=? AND created_day>?`. Same columns, same query, a narrower search.
+      - **A function on the column** - both `merchant_id + 0 = ?` and `CAST(merchant_id AS TEXT) = ?` print `SCAN`. The
+        index `idx_b` exists (it leads with `merchant_id`) and the plan still reads all of it: it is "a full-table scan,
+        including cases where SQLite iterates through all records ... in an order defined by an index".
+      - **The price** - inserting the same 100,000 rows took about 136 ms with no index, 240 ms with one and 454 ms with
+        three. Each index must be updated by every insert. The absolute times belong to this machine; that each index adds a
+        similar slice does not.
+
+  - id: code-pool
+    kind: code
+    concepts: [perf-db-pool-cache]
+    title: 'The code: a pool under closed-loop load, and a cache under skewed traffic'
+    body: |
+      The third exercise (`practice/perf/solutions/analysis/db_pool.py`) holds the arithmetic and a deterministic pool
+      simulation:
+
+      ```python
+      import heapq
+      import math
+      from collections import OrderedDict
+
+
+      def max_throughput(pool_size, hold_s):
+          if pool_size < 1 or hold_s <= 0:
+              raise ValueError("pool_size must be at least 1 and hold_s positive")
+          return pool_size / hold_s
+
+
+      def pool_size_for(throughput_per_s, hold_s, utilisation=0.8):
+          if throughput_per_s < 0 or hold_s <= 0 or not 0 < utilisation <= 1:
+              raise ValueError("throughput >= 0, hold_s > 0, 0 < utilisation <= 1")
+          # round() first: float noise just above 1 must not turn 1 connection into 2
+          return max(1, math.ceil(round(throughput_per_s * hold_s / utilisation, 9)))
+
+
+      def simulate_pool(arrival_times, hold_s, pool_size):
+          free_at = [0.0] * pool_size
+          heapq.heapify(free_at)
+          waits = []
+          for arrival in arrival_times:
+              earliest = heapq.heappop(free_at)
+              start = max(arrival, earliest)
+              waits.append(start - arrival)
+              heapq.heappush(free_at, start + hold_s)
+          return waits
+      ```
+
+      The real runs. `run_closed_clients` (in `support/db_fixture.py`) starts 32 threads; each loops "take a connection from
+      the pool, hold it 20 ms (a stand-in for a query), release it", with no think time. Run with
+      `.venv/bin/python support/db_demo.py pool` on 21 November 2026, 1.5 seconds per row:
+
+      ```text
+      32 clients, each holds a connection 20 ms per request, no think time, 1.5 s per row
+      pool  served  req/s  wait mean ms  wait p95 ms  total p95 ms  upper bound req/s
+         1     106     49         531.7        629.6         649.7            50
+         2     178     98         277.0        306.8         327.0           100
+         4     324    197         135.1        143.1         163.3           200
+         8     624    395          59.2         61.2          81.4           400
+        16    1200    787          20.1         20.9          41.1           800
+        32    2400   1584           0.0          0.0          20.5          1600
+        64    2400   1586           0.0          0.0          20.4          1600
+      pool 4, 40 clients, acquire timeout 100 ms: served=316 timeouts=300 (49% of requests)
+      ```
+
+      Check the table against the formulas, because that is the point of having them:
+
+      - **The ceiling holds.** For each pool of 16 or fewer, throughput is within about 2% of `P / 0.020` (49 vs 50, 98
+        vs 100, 197 vs 200, 395 vs 400, 787 vs 800). A pool of 2 serves half of what a pool of 4 serves.
+      - **The wait matches the queue.** For P = 4: (32 - 4) / 4 x 20 ms = 140 ms predicted, 135 ms measured. For P = 8:
+        (32 - 8) / 8 x 20 = 60 ms predicted, 59 ms measured.
+      - **Past the clients, more pool does nothing.** Pools of 32 and 64 give the same throughput (1584 and 1586 requests
+        per second): there are only 32 clients, so there is nothing to wait for and the extra connections stay idle. The
+        total p95 (about 20 ms) is the 20 ms of work.
+      - **The timeouts.** 40 clients, a pool of 4 and a 100 ms acquire timeout: 300 of 616 attempts (49%) fail. No query was
+        slow; the queue was longer than the patience. That count varies a little from run to run.
+
+      Now the cache, run with `.venv/bin/python support/db_demo.py cache`: 50,000 lookups over 1,000 merchants, once with
+      skewed traffic (merchant of rank *k* is chosen with weight 1/*k*, seeded) and once uniform, in an LRU cache of the
+      given capacity:
+
+      ```text
+      capacity  hit ratio (skewed)  hit ratio (uniform)
+            10               21.2%                 1.0%
+            50               46.3%                 5.0%
+           100               57.8%                10.2%
+           250               73.6%                25.1%
+          1000               98.0%                98.0%
+      100 entries: 57.8% hits, so the database sees 42.2% of the lookups: 1000 requests/s -> 422 queries/s
+      ```
+
+      With skewed traffic, a cache of 100 entries (10% of the merchants) answers 57.8% of the lookups; with uniform traffic
+      the same cache answers about 10%. At 1,000 entries every merchant fits and only each merchant's first lookup misses
+      (1,000 of 50,000 = 2%). The last line is arithmetic on the measured ratio: `requests x (1 - hit ratio)`. "Skewed" here
+      is an invented distribution for the demonstration - real traffic has to be measured, as in
+      [Workload modelling from production](#/lesson/workload-modelling-from-production).
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: The lines that matter
+    body: |
+      - **`CountingConn` offers only `execute`** - one call, one query, one round trip. If the code under test needs a
+        cursor or `executemany`, it is a different cost model and the counter would need to say so.
+      - **`for ... in payments: conn.execute(... WHERE id = ?)`** - the N+1: a query inside a loop whose length is the result
+        size. Spot it by the *placement* of `execute`, not by its text.
+      - **`JOIN merchants m ON m.id = p.merchant_id`** - the database finds each merchant itself. One round trip.
+      - **`", ".join("?" for _ in ids)` and `IN ({placeholders})`** - one placeholder per id. The ids go in as parameters,
+        never into the SQL text: it avoids injection, and lets the database reuse the statement.
+      - **`found.get(merchant_id, (0, 0))`** - `GROUP BY` returns no row for a merchant with no captured payments, so the
+        absence must be turned into zero in code. A report that silently drops those merchants is a correctness bug that
+        performance work can introduce.
+      - **`EXPLAIN QUERY PLAN ` + sql** - the plan of the query with its parameters; SQLite returns `(id, parent, notused,
+        detail)`, and `row[3]` is the text. Plan the statement the application *really* sends, with realistic values.
+      - **`line.startswith("SCAN")`** (the `_PATH` pattern) - SCAN is a full scan even when it names an index.
+      - **`[*equality, *range_columns]`** - the order is the whole idea of the composite index: equality columns, then the
+        range column.
+      - **`P / hold`** (`max_throughput`) - Little's law rearranged: connections in use = throughput x hold, so
+        throughput = connections / hold.
+      - **`math.ceil(round(x, 9))`** - round up, because 4.2 connections means 5, but strip float noise first.
+      - **`heapq.heappop(free_at)`** - the connection that frees earliest takes the next request; `max(arrival, earliest)`
+        is when its work starts; the difference is the wait.
+      - **`ticket.wait(timeout)`** in `ConnectionPool.acquire` - the request queues in FIFO order; on timeout it removes
+        itself from the queue. The hand-over in `release` gives the connection directly to the longest waiter, so nobody
+        can jump the queue (a plain `queue.Queue` lets the releasing thread take the connection back first, which starves
+        some clients and distorts the tail).
+      - **`1 - hit_ratio`** - the database only sees the misses.
+
+  - id: when
+    kind: when
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: When to look at the database, and when not to
+    body: |
+      **Look at the database when:**
+
+      - the response time depends on the **size of the result** (page size), or on the **size of the table** (the same test
+        with more data is slower);
+      - throughput is flat while users grow, **and** the application server's CPU is not the limit;
+      - the errors say "timeout" or "cannot get a connection";
+      - the slowest transactions in the test correspond to one endpoint with a list or report in it.
+
+      **Do not start with the database when:**
+
+      - the **load generator** is the limit (its CPU is saturated, or the number of clients is too small to reach the target
+        - see [Little's law and workload models](#/lesson/littles-law-and-workload-models));
+      - the application CPU is saturated and the database is quiet;
+      - the time is in a **dependency** - a payment provider's sandbox, another service - and not in the database;
+      - the front end is slow while the API is fast ([Frontend performance testing](#/lesson/frontend-performance-testing)).
+
+      **Do not "fix" it from the test alone:** the load test says *where in the path* time goes only if you add the second
+      measurement. Without a query log, a plan or pool metrics you have a hypothesis, and the report should say so.
+
+      **Who does what.** The tester finds, proves and reports - query count, plan, pool wait, hit ratio, the conditions
+      (data volume, load level). The developer or DBA decides the fix (JOIN, index, pool size, cache). The tester then repeats
+      the *same* test on the same data to check the fix - and checks that the fix did not move the problem (a fixed N+1
+      often exposes the pool next).
+
+  - id: steps
+    kind: steps
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Finding the database cause of a slow endpoint, step by step
+    body: |
+      1. **Reproduce it with production-like data.** Row counts, value distributions and the number of merchants like
+         production's; the same warm-up as the real run. A small database hides scans and N+1.
+      2. **Vary one thing and watch the curve.** Run the endpoint at a fixed load with page sizes 10, 50, 100. Run it with
+         two table sizes. Run it with more users. The way the response time bends points at the cause (page size: N+1; table
+         size: scan; users: pool or CPU).
+      3. **Count queries per request.** Turn on the database's statement log, or the ORM's, for a short run. Divide
+         statements by requests. Is it a constant? Does it equal 1 + N?
+      4. **List the top statements by total time.** Total time = executions x mean time. A cheap statement that runs 100
+         times per request outranks one slow statement that runs once.
+      5. **Explain the suspects.** Run `EXPLAIN` on the statement with realistic parameters on production-sized data. SCAN
+         on a big table? A function on the column? A composite index in the wrong order?
+      6. **Read the pool.** Connections in use, waiting requests, wait time, timeouts, and the hold time of the longest
+         holders. In use = pool size with requests waiting means the pool is the queue.
+      7. **Check the cache.** Hit ratio over the run, and whether the test's traffic is as skewed as production's.
+      8. **Write the hypothesis with its evidence** - "101 queries per request at page size 100, 11 at page size 10" - and
+         the measurement that would reject it. Hand it over.
+      9. **Re-test the fix on the same data and load**, report the same metrics, and look for the next limit.
+
+  - id: example
+    kind: example
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: 'Worked example: a settlement page that gets slower with every merchant'
+    body: |
+      *This example is hypothetical; the numbers are invented to show the reasoning, not measured.*
+
+      The SandPay merchant dashboard has a settlement page. A load test at 40 virtual users shows: median 180 ms with 10
+      merchants in the account group, 1.6 s with 100. The CPU of the application server is 25%, the database's CPU is 15%.
+      Throughput is 20 requests per second and does not rise when more users are added.
+
+      1. **The curve.** Response time grows roughly in proportion to the number of merchants, so the first suspect is a
+         query per merchant (N+1). The low CPUs on both machines say neither is saturated: the time is spent waiting.
+      2. **The count.** The statement log for 60 seconds shows 1,240 statements for 20 requests - 62 per request on a page
+         of 10 merchants. The next run at 100 merchants shows 12,040 for 20 requests - 602 per request. The queries per
+         request grow with the number of merchants (about 6 per merchant plus 2). That is the N+1; the loop is in a serializer that totals each
+         merchant's captured payments (the `totals_for` situation of this lesson's first exercise).
+      3. **Why throughput is flat.** Each request holds a connection for the whole loop: hundreds of queries. By Little's
+         law, if the pool has 10 connections and a request holds one for 0.5 s, the ceiling is 10 / 0.5 = 20 requests per
+         second - exactly the plateau. So the N+1 is also the *cause of the pool ceiling*: the hold time is long because
+         the queries are many.
+      4. **The report.** "At 100 merchants the page sends about 600 statements per request, the same statement with a
+         different merchant id; at 10 merchants about 62. The hold time of a connection is about 0.5 s, so a pool of 10 caps
+         throughput at about 20 requests per second, which is the plateau we measured. Proposed check: one `GROUP BY`
+         query for all merchants of the group. Expected: statements per request constant; hold time falls; ceiling rises.
+         Not claimed: that the pool size is wrong - it is a symptom here."
+      5. **After the fix**, the same test: 2 statements per request at any page size, hold time 12 ms, the page at 100
+         merchants in 90 ms. The test is repeated at higher user counts to find the next limit; the plateau has moved from
+         the pool to the database CPU, which is where it should be.
+
+      What the example does not say: that adding pool connections would have helped. It would have raised the plateau a
+      little and put 5 times the load on a database that was doing 600 pointless queries per request.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: How the exercises are tested
+    body: |
+      - `tests/analysis/test_db_queries.py` gives your functions a `CountingConn` and counts: `latest_payments` must return
+        the same rows as the given N+1 version with exactly **1** query for any limit; `totals_for` must match a
+        query-per-merchant answer with **1** query for 40 ids, **0** for an empty list, must treat a merchant with no
+        captured payments as `(0, 0)`, and must pass the ids as parameters (the SQL text must not contain them).
+      - `tests/analysis/test_db_plans.py` builds a 20,000-row database and checks what your functions say about **real
+        plans**: a filter without an index is a `SCAN`; after the index you build it is a `SEARCH` that names your index; an
+        equality-first index narrows on both columns and a range-first one does not; a function on the column stays a scan;
+        a scan that walks an index is still a scan.
+      - `tests/analysis/test_db_pool.py` checks the arithmetic (the ceiling, rounding up, the PostgreSQL starting point)
+        and your `simulate_pool` on cases that can be computed by hand: a pool that is big enough never waits, one connection
+        at twice the rate gives waits 0, 0.5, 1.0, 1.5 ..., a burst is served in waves; and your LRU on a tiny sequence
+        you can trace.
+
+      None of them checks a time. They check counts, plan text, and exact arithmetic, because milliseconds depend on the
+      machine and the lesson's claims do not.
+
+      ```bash
+      cd practice/perf
+      .venv/bin/python -m pytest tests/analysis
+      PERF_TARGET=solutions .venv/bin/python -m pytest tests/analysis   # the reference solutions
+      ```
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Common mistakes
+    body: |
+      - **Testing on a tiny database.** Scans and N+1 are invisible on 4,000 rows and a page of 10. Match production's
+        volume and shape, or say plainly that the result does not cover it.
+      - **Judging a query by its text.** The plan decides the cost, and the plan depends on the data and the parameters.
+        `WHERE merchant_id = ?` is a scan or a search depending on an index you cannot see in the SQL.
+      - **"Add an index" as the answer to everything.** An index that the query cannot use (a function on the column, the
+        wrong column order) does nothing; one it can use makes writes slower, and a low-selectivity index is ignored.
+      - **Fixing N+1 and not counting afterwards.** The proof is queries per request that no longer depends on N. A JOIN
+        written the wrong way can still send N queries somewhere else.
+      - **Raising the pool size when requests queue.** A bigger pool puts more concurrent work on a database that is
+        already the limit, and hides a long hold time. First shorten the hold time; size the pool from the database's
+        capacity, and check it with a load test.
+      - **Reading the database's CPU as proof it is fine.** A queue in the application's pool leaves the database idle.
+        Look at the pool, not only at the database.
+      - **Comparing a cold run with a warm one.** The cache and the pool start empty; the first minutes are a different
+        system. Report the steady state ([Test environments and test data](#/lesson/performance-test-environments-and-data)).
+      - **Believing a cache hit ratio from another system.** It depends on the traffic's skew and the cache size. Measure
+        it under a realistic workload, or load-test the database with the cache disabled and say so.
+      - **Reporting a timing as the finding.** "It took 9.6 ms" belongs to one machine. "It is a SCAN of the payments table"
+        is true on every machine.
+      - **Fixing a performance problem and breaking correctness.** The batched totals query drops merchants without
+        payments unless you add them back; test the output, not only the speed.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Trade-offs
+    body: |
+      | Choice | Gain | Cost |
+      | --- | --- | --- |
+      | **JOIN** instead of N+1 | one round trip; the database optimises the whole | parent columns repeat on each child row; a big result row set |
+      | **Batched `IN (...)`** instead of N+1 | 2 queries, simple rows | a limit on the list length; send ids in chunks; plan caching suffers for long lists |
+      | **Another index** | faster reads for the queries that can use it | slower inserts and updates, more disk and memory; useless if the query cannot use it |
+      | **Covering index** | the table is not read at all | a wide index; more write cost |
+      | **Bigger pool** | more concurrent queries, shorter queue (until the database is the limit) | more load and context switching on the database; hides a long hold time |
+      | **Smaller pool** | the database works at its best concurrency; queue sits in the app, where it is cheap | requests wait; needs a sensible acquire timeout |
+      | **Acquire timeout** | a failing request frees the thread; bounded latency | errors instead of slow responses - good for the system, visible to the user |
+      | **Cache** | fewer database lookups, lower latency on hits | stale data, invalidation, a cold start, and a database that is never tested at full load |
+      | **Production-sized test data** | scans, plans and pools behave as in production | slow, big and costly to prepare and reset |
+      | **Counting queries** instead of timing | exact, machine-independent evidence | needs access to a log or a counting hook; says nothing about the cost of a single query |
+
+  - id: summary
+    kind: summary
+    concepts: [perf-db-roundtrips, perf-db-indexes, perf-db-pool-cache]
+    title: Summary
+    body: |
+      - A load test says the API is slow; it does not say where. Add a second measurement for each box in the path: queries
+        per request, the plan of the slow statement, the pool's wait, the cache's hit ratio.
+      - **N+1**: one query for the list and one per row. The cost is `(1 + N) x round trip`; the symptom is time that grows
+        with the page size; the proof is a query count that depends on N; the fix is a JOIN or one batched query. The 101
+        queries of the run became 1.
+      - **Indexes and plans**: a filter without a usable index is a full-table scan whose cost grows with the table. SCAN
+        versus SEARCH is the first thing to read in a plan. A function on the column and a wrong column order defeat an index;
+        every index slows writes (136 ms, 240 ms, 454 ms for 100,000 inserts with 0, 1 and 3 indexes on this machine).
+      - **Pools**: a pool of P connections held `hold` seconds each serves at most `P / hold` requests per second; above that
+        the extra clients queue (about `(C - P) / P x hold` of waiting each), throughput is flat and the database looks idle.
+        Shorten the hold time first; size the pool from the database's capacity, not from the number of users. A timeout
+        turns the queue into errors.
+      - **Caches** remove `hit ratio` of the lookups; skewed traffic caches well (57.8% with 10% of the keys), uniform
+        traffic does not (10.2%).
+      - Test with production-like data, vary the page size, the table size and the users, and write down the hypothesis, its
+        evidence and the measurement that would reject it.
+
+exercises:
+  - id: nplus1-mcq
+    type: mcq
+    concept: perf-db-roundtrips
+    skill: recall
+    title: What N+1 means
+    prompt: An endpoint returns 100 payments and shows each payment's merchant name. It sends one query for the payments and one per payment for the merchant. How many queries does one request send?
+    options:
+      - id: n101
+        text: 101 - one for the list and one for each of the 100 payments
+        feedback: Correct. That is 1 + N, and it grows with the page size.
+      - id: n100
+        text: 100 - the list query is not counted
+        feedback: The list query is a query too. The pattern is called N+1 because of that extra one.
+      - id: n2
+        text: 2 - the database caches the merchant lookups
+        feedback: Nothing makes the loop collapse; each execute is its own round trip.
+      - id: n1
+        text: 1 - the database joins the tables by itself
+        feedback: A JOIN is the fix, but it has to be written; the loop sends separate queries.
+    correct: [n101]
+    hints:
+      - Count the queries in the loop, then add the first one.
+    solution: |
+      1 + 100 = 101 queries. With a JOIN it is 1, whatever the page size.
+
+  - id: signature-mcq
+    type: mcq
+    concept: perf-db-roundtrips
+    skill: analysis
+    title: The fingerprint of N+1 in a load test
+    prompt: |
+      A list endpoint takes 90 ms with a page size of 10 and 800 ms with a page size of 100. The database CPU is low. Which
+      measurement most directly confirms an N+1?
+    options:
+      - id: count
+        text: Queries per request at each page size - does it grow with the page size, as 1 + N?
+        feedback: Correct - a count that follows the page size is the N+1 fingerprint, and it does not depend on the machine.
+      - id: cpu
+        text: The application server's CPU percentage
+        feedback: It may be moderate in both runs; it does not show how many queries each request sent.
+      - id: p99
+        text: The 99th percentile at page size 100
+        feedback: It describes the slowness more precisely, not its cause.
+      - id: size
+        text: The database file size on disk
+        feedback: Unrelated to how many queries a request sends.
+    correct: [count]
+    hints:
+      - What does the time scale with - and what in the code scales the same way?
+    solution: |
+      Statements per request (from the query log) at page sizes 10 and 100. If it is about 1 + N, the loop is the cause.
+
+  - id: scan-mcq
+    type: mcq
+    concept: perf-db-indexes
+    skill: recall
+    title: SCAN or SEARCH
+    prompt: In SQLite's EXPLAIN QUERY PLAN, what does a line beginning with SCAN mean?
+    options:
+      - id: full
+        text: A full-table scan - every row is visited (even if it walks an index in order)
+        feedback: Correct. "SCAN is used for a full-table scan, including cases where SQLite iterates through all records in a table in an order defined by an index."
+      - id: subset
+        text: Only a subset of the rows is visited
+        feedback: That is what SEARCH means.
+      - id: cached
+        text: The result comes from the cache
+        feedback: A plan line describes access to a table, not a cache.
+      - id: join
+        text: The query is a JOIN
+        feedback: Joins show up as several SCAN/SEARCH lines, one per table, but a SCAN is about how a table is read.
+    correct: [full]
+    hints:
+      - The SQLite documentation contrasts SCAN with SEARCH.
+    solution: |
+      SCAN is a full-table scan; SEARCH visits only a subset of the rows.
+
+  - id: function-mcq
+    type: mcq
+    concept: perf-db-indexes
+    skill: application
+    title: Why the index is not used
+    prompt: |
+      There is an index on payments(merchant_id). The query `SELECT id FROM payments WHERE CAST(merchant_id AS TEXT) = ?`
+      still shows `SCAN payments`. Why?
+    options:
+      - id: func
+        text: The condition applies a function to the column, so the index, sorted by merchant_id, cannot answer it directly
+        feedback: Correct. Compare the column itself (WHERE merchant_id = ?) or index the expression, where the database supports it.
+      - id: small
+        text: The index is too small to be used
+        feedback: The size of the index is not the reason; the form of the condition is.
+      - id: write
+        text: Indexes are only used for INSERT statements
+        feedback: Indexes serve reads (and are updated by writes).
+      - id: cold
+        text: The index has not warmed up yet
+        feedback: A cold cache slows the first reads; it does not change the plan.
+    correct: [func]
+    hints:
+      - What is the index sorted by?
+    solution: |
+      The function hides the column from the index. Write the condition on the bare column.
+
+  - id: order-mcq
+    type: mcq
+    concept: perf-db-indexes
+    skill: application
+    title: Column order in a composite index
+    prompt: |
+      The query is `WHERE merchant_id = ? AND created_day >= ?`. Which index narrows the search on both conditions?
+    options:
+      - id: eq-first
+        text: (merchant_id, created_day) - equality column first, then the range column
+        feedback: Correct. The plan reads `merchant_id=? AND created_day>?`.
+      - id: range-first
+        text: (created_day, merchant_id) - the range column first
+        feedback: In the run, this plan narrowed on `created_day>?` only; merchant_id is checked row by row.
+      - id: either
+        text: Either order gives the same plan
+        feedback: The two plans printed in the lesson differ.
+      - id: none
+        text: No composite index can help; two single-column indexes are required
+        feedback: A composite index with the equality column first handles this query in one search.
+    correct: [eq-first]
+    hints:
+      - Which column does the index have to find exactly before it can walk a range?
+    solution: |
+      Equality columns first, then the range column: (merchant_id, created_day).
+
+  - id: write-mcq
+    type: mcq
+    concept: perf-db-indexes
+    skill: analysis
+    title: The price of an index
+    prompt: |
+      A team adds three indexes to speed up reports. The load test of the payment-creation endpoint then gets slower. Which
+      explanation fits what the lesson measured?
+    options:
+      - id: maint
+        text: Every insert must also update each index; in the run, 100,000 inserts took about 136 ms with no index and about 454 ms with three
+        feedback: Correct. Reads gain and writes pay; the plan and the write cost both belong in the report.
+      - id: lock
+        text: Indexes make the database slower to read
+        feedback: A usable index makes the reads it serves faster.
+      - id: pool
+        text: Adding indexes always shrinks the connection pool
+        feedback: The pool size is a configuration; indexes do not change it.
+      - id: none
+        text: It cannot be the indexes - they only affect SELECT statements
+        feedback: Indexes are maintained on every insert, update and delete.
+    correct: [maint]
+    hints:
+      - What does the database have to do for an index on every INSERT?
+    solution: |
+      Each index is a structure that every insert must update; the cost is real and measurable.
+
+  - id: ceiling-mcq
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: application
+    title: The ceiling of a pool
+    prompt: |
+      A pool has 10 connections and every request holds a connection for 50 ms. What is the most requests per second it can
+      serve?
+    options:
+      - id: c200
+        text: 200 - 10 / 0.050
+        feedback: Correct. Connections in use = throughput x hold, so throughput = connections / hold.
+      - id: c500
+        text: 500 - 10 x 50
+        feedback: Multiplying counts the milliseconds, not the rate. The hold time is 0.050 s.
+      - id: c20
+        text: 20 - 1 / 0.050
+        feedback: That is the rate of one connection; there are ten.
+      - id: c10
+        text: 10 - one request per connection per second
+        feedback: A connection that is held 50 ms can serve 20 requests per second, not one.
+    correct: [c200]
+    hints:
+      - One connection serves 1 / hold requests per second.
+    solution: |
+      10 connections x (1 / 0.050 s) = 200 requests per second.
+
+  - id: queue-mcq
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: analysis
+    title: Flat throughput, low database CPU
+    prompt: |
+      Adding virtual users does not increase throughput, response time rises in proportion to the number of users, and the
+      database's CPU is at 15%. What is the most likely place where requests are waiting?
+    options:
+      - id: pool
+        text: In front of the database, for a free connection in the application's pool
+        feedback: Correct. The ceiling P / hold is reached; the extra requests queue, and the database sits idle.
+      - id: db
+        text: Inside the database, because its CPU is saturated
+        feedback: At 15% it is not saturated.
+      - id: gen
+        text: Nowhere - throughput is just random
+        feedback: A plateau with response times growing linearly is the signature of a queue.
+      - id: disk
+        text: In the browser
+        feedback: Load generators do not run a browser here, and a browser would not cause a server-side plateau.
+    correct: [pool]
+    hints:
+      - Where can requests queue without making the database busy?
+    solution: |
+      In the connection pool's wait queue; confirm with the pool metrics (in use = size, requests waiting).
+
+  - id: bigpool-mcq
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: analysis
+    title: Should the pool be bigger?
+    prompt: |
+      Requests queue for connections and the database CPU is already near 90%. A developer proposes doubling the pool. What
+      is the best response, according to the HikariCP guidance quoted in the lesson?
+    options:
+      - id: small
+        text: Do not; the database can only work on about (cores x 2) + spindles queries at once, so more connections add contention - shorten the hold time and check the size with a load test
+        feedback: Correct. "You want a small pool, saturated with threads waiting for connections."
+      - id: yes
+        text: Do; more connections always mean more throughput
+        feedback: Past the database's capacity, more connections add context switching and the throughput falls.
+      - id: unlimited
+        text: Remove the pool and open a connection per request
+        feedback: Opening connections is slow, and the database cannot serve them all at once.
+      - id: ignore
+        text: Ignore the queue; it is normal for requests to wait
+        feedback: A queue is a symptom of a limit; it still has to be explained.
+    correct: [small]
+    hints:
+      - What does the database do with more concurrent queries than it has cores?
+    solution: |
+      Keep the pool small, shorten the hold time (fewer or faster queries), and test the size under load.
+
+  - id: cache-mcq
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: application
+    title: Load behind a cache
+    prompt: |
+      1,000 requests per second hit a cache with a 70% hit ratio. How many lookups per second reach the database?
+    options:
+      - id: c300
+        text: 300 - the misses, 1000 x (1 - 0.70)
+        feedback: Correct. The database sees only the misses.
+      - id: c700
+        text: 700 - the hits
+        feedback: Hits are answered by the cache and never reach the database.
+      - id: c1000
+        text: 1000 - the cache does not change the database load
+        feedback: A cache exists to remove lookups.
+      - id: c30
+        text: 30 - 1000 x 0.03
+        feedback: That would be a 97% hit ratio.
+    correct: [c300]
+    hints:
+      - Which share of the requests does the cache not answer?
+    solution: |
+      1000 x (1 - 0.70) = 300 lookups per second.
+
+  - id: skew-mcq
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: analysis
+    title: Why the same cache hits less
+    prompt: |
+      In the lesson's run an LRU cache of 100 entries over 1,000 merchants hit 57.8% of the time with one traffic pattern and
+      10.2% with another. What explains the difference?
+    options:
+      - id: skew
+        text: In the first, a few merchants receive most of the lookups (skew), so a small cache holds the popular ones; in the second every merchant is equally likely
+        feedback: Correct. The hit ratio depends on the traffic's distribution as much as on the cache size.
+      - id: bug
+        text: One of the runs had a bug in the cache
+        feedback: Both runs use the same cache code and the same capacity.
+      - id: size
+        text: The second run had a smaller cache
+        feedback: Both used 100 entries.
+      - id: time
+        text: The second run was slower, so entries expired
+        feedback: There is no expiry in this cache; the hit ratio was computed from the sequence of keys, not from timings.
+    correct: [skew]
+    hints:
+      - What differs between the two key sequences?
+    solution: |
+      Skewed versus uniform key popularity.
+
+  - id: pool-order
+    type: order
+    concept: perf-db-pool-cache
+    skill: application
+    title: Diagnosing a flat throughput plateau
+    prompt: Put the steps of finding the cause of a throughput plateau with low database CPU in order.
+    items:
+      - id: repro
+        text: Reproduce the plateau with production-like data and a steady load
+      - id: curve
+        text: Vary the number of users and watch response time and throughput
+      - id: pool
+        text: Read the pool - connections in use, waiting requests, wait time, timeouts
+      - id: hold
+        text: Find what makes the hold time long - the top statements by total time and the queries per request
+      - id: hypothesis
+        text: Write the hypothesis with its evidence and the measurement that would reject it
+      - id: retest
+        text: Re-test the fix on the same data and load, and look for the next limit
+    hints:
+      - Reproduce, measure the pool, find why connections are held long, then hand over and re-test.
+    solution: |
+      Reproduce, vary the users, read the pool, find what makes the hold time long, write the hypothesis with its evidence,
+      re-test the fix.
+
+  - id: report-debug
+    type: debug
+    concept: perf-db-roundtrips
+    skill: analysis
+    title: Three defects in a settlement report
+    prompt: |
+      This function should return `(merchant_id, captured_total_cents)` for each merchant in the list, with 0 for a merchant
+      that has no captured payments, using as few queries as possible. Click every line that is a defect.
+    language: python
+    code: |
+      def settlement_report(conn, merchant_ids):
+          report = []
+          for merchant_id in merchant_ids:
+              row = conn.execute(
+                  f"SELECT sum(amount_cents) FROM payments WHERE merchant_id = {merchant_id}"
+              ).fetchone()
+              report.append((merchant_id, row[0]))
+          return report
+    correctLines: [4, 5, 7]
+    lineNotes:
+      - line: 3
+        note: The loop itself is fine; the defect is the query that runs inside it (line 4).
+      - line: 4
+        note: One query per merchant - an N+1 shape. One batched query (IN with GROUP BY) sends 1, whatever the length of the list.
+      - line: 5
+        note: The id is formatted into the SQL text - injection risk, and a different statement per id. Use one placeholder per id and pass the ids as parameters.
+      - line: 7
+        note: sum() over no rows is NULL, so row[0] is None for a merchant with no payments, and the status is not filtered either. The report must show 0 and count only captured payments.
+      - line: 8
+        note: Fine - it returns the report.
+    hints:
+      - Where is the query placed relative to the loop?
+      - How are the ids put into the SQL?
+      - What does sum() return when there are no rows?
+    solution: |
+      Lines 4 and 5 (a query per id, with the id in the SQL text) and line 7 (None instead of 0, and no captured filter). The
+      fix is one query with a placeholder per id, `GROUP BY merchant_id`, and `found.get(id, (0, 0))` in code.
+
+  - id: scan-short
+    type: short
+    concept: perf-db-indexes
+    skill: analysis
+    title: Fast in test, slow in production
+    prompt: |
+      A lookup `WHERE merchant_id = ?` returns in 2 ms on the test database (5,000 payments) and takes 400 ms on production
+      (many millions). The code is identical. Explain what is probably happening, how you would prove it, and what you would
+      change about the test.
+    modelAnswer: |
+      Most likely a full-table scan: with no usable index the database reads every row, so the time grows with the table -
+      trivial at 5,000 rows, large at millions ("if the table contained 7 million rows, a full table scan might read megabytes
+      of content in order to find a single 8-byte number"). To prove it: run EXPLAIN on that statement, with a real parameter,
+      against production-sized data (or a copy of it), and look for SCAN / Seq Scan versus SEARCH / Index Scan; also confirm
+      the index exists and that the condition does not put a function on the column. I would also run the lookup at two table
+      sizes and show the time rising with the size. For the test: use production-like data volume and distribution, so the
+      plan in the test environment is the plan in production, and add a plan check for the critical statements.
+    rubric:
+      - Names a full-table scan whose cost grows with the table as the likely cause.
+      - Proves it with EXPLAIN on production-sized data and a real parameter - SCAN versus SEARCH.
+      - Checks that the index exists and that the condition does not wrap the column in a function.
+      - Changes the test to production-like data volume and distribution, with a plan check for critical statements.
+    hints:
+      - What grows with the table, and not with the number of rows returned?
+      - What does EXPLAIN show for the two cases?
+    solution: |
+      A scan that grows with the table. Prove it with EXPLAIN on production-sized data; fix the test by using production-like
+      volume.
+
+  - id: orders-testdesign
+    type: testdesign
+    concept: perf-db-pool-cache
+    skill: application
+    title: A load test that finds the database limit
+    prompt: |
+      SandPay's merchant dashboard lists recent orders and shows totals. Design the load test and the extra measurements that
+      would tell you whether the first limit you hit is N+1 queries, a missing index, the connection pool or the database
+      itself. State the data, the load profile, what you record on the database and the pool, and how you decide.
+    modelAnswer: |
+      **Data:** production-like volumes - the same row counts, the same spread of orders per merchant (a few merchants with
+      many orders), indexes as in production, warm database. **Load profile:** a step load to find where the curve bends
+      (see Load shapes in Locust), plus a fixed-load run at page sizes 10, 50 and 100 and a run with the table at two sizes.
+      **Record on the load side:** response time percentiles, throughput and errors per step. **Record on the database and the
+      pool, at the same time:** statements per request (statement log for a short window), the top statements by total time, the
+      plan of each suspect, pool connections in use / waiting / wait time / timeouts, database CPU, cache hit ratio.
+      **Decide:** statements per request that grow with page size mean N+1; a SCAN on a large table in the top statements means
+      an index or a rewrite; connections in use equal to the pool size with waiting requests and a low database CPU mean a pool
+      limit, usually caused by a long hold time; high database CPU with flat throughput means the database itself. Report the
+      hypothesis with the evidence and the measurement that would reject it, then re-test the fix on the same data.
+    rubric:
+      - Uses production-like data - volume, spread of orders per merchant, indexes, warm database.
+      - Varies the page size, the table size and the users, not only one load level.
+      - Records queries per request, top statements, plans, pool in use and waiting, database CPU and hit ratio alongside the response times.
+      - Maps each observation to a cause - N+1, scan, pool, database - and says what would reject it.
+      - Re-tests the fix on the same data and load.
+    hints:
+      - One load-side measurement is not enough to separate the four causes.
+    solution: |
+      Production-like data; a step load plus page-size and table-size runs; record statements per request, top statements,
+      plans, pool in use / waiting, database CPU and hit ratio alongside the response times; decide from those.
+
+  - id: db-interview
+    type: interview
+    concept: perf-db-roundtrips
+    skill: analysis
+    title: 'Interview: the API is slow under load - how do you tell whether it is the database?'
+    prompt: |
+      "A payments API gets slow when we load-test it. How would you work out whether the database is responsible, and what is
+      wrong?"
+    modelAnswer: |
+      I would not guess from the response times alone - they only say the whole path is slow. I add a measurement for each
+      place time can go. First, queries per request from the statement log, at different page sizes: if it grows as 1 + N,
+      it is an N+1, and the fix is a JOIN or one batched query. Second, the top statements by total time and their plans on
+      production-sized data: a SCAN on a big table means a missing or unusable index - a function on the column, or a
+      composite index in the wrong order - and I would also weigh the write cost of the new index. Third, the connection pool:
+      if throughput is flat, response time grows with the users and the database CPU is low, requests are queuing for
+      connections; by Little's law the pool can serve at most pool size divided by hold time, so I would look at why the hold
+      time is long before suggesting a bigger pool, and size the pool from the database's capacity. Fourth, the cache hit
+      ratio, because a cache changes what the database sees. I would check the test data is production-like, otherwise scans and
+      N+1 do not show up, and I would report the hypothesis with its evidence and the measurement that would reject it, then
+      repeat the same test after the fix.
+    rubric:
+      - Separates the causes - queries per request, plan, pool, cache - rather than blaming "the database" in general.
+      - Uses counts and plans as evidence, not only timings.
+      - Applies Little's law to the pool and does not simply raise the pool size.
+      - Insists on production-like data, and re-tests the fix.
+      - Presents a hypothesis with the measurement that would reject it.
+    followUps:
+      - How would you prove an N+1 from a load test alone?
+      - Why can the database CPU be low while the system is database-limited?
+      - What can go wrong after you add an index?
+    hints:
+      - Name the measurements you would add to the load test.
+    solution: |
+      Queries per request, plans of the top statements, pool metrics and cache hit ratio, on production-like data, each with a
+      stated way to reject it; Little's law for the pool; re-test after the fix.
+
+  - id: queries-code
+    type: coding
+    concept: perf-db-roundtrips
+    skill: application
+    title: One query instead of N+1
+    prompt: |
+      Implement `latest_payments` and `totals_for` in `analysis/db_queries.py`. `latest_payments(conn, limit)` returns the
+      same `(payment id, merchant name, amount_cents)` rows as the given `latest_payments_n_plus_one`, newest first, with
+      exactly one query. `totals_for(conn, merchant_ids)` returns `{merchant_id: (captured payments, their total cents)}` for
+      every id, with one query for the whole list (and none for an empty list), `(0, 0)` for a merchant without captured
+      payments, and the ids passed as parameters, never inside the SQL text.
+    project: perf
+    files:
+      - exercises/analysis/db_queries.py
+    test: tests/analysis/test_db_queries.py
+    command: .venv/bin/python -m pytest tests/analysis/test_db_queries.py
+    modelAnswer: |
+      ```python
+      def latest_payments(conn, limit):
+          return conn.execute(
+              "SELECT p.id, m.name, p.amount_cents FROM payments p JOIN merchants m ON m.id = p.merchant_id "
+              "ORDER BY p.id DESC LIMIT ?",
+              (limit,),
+          ).fetchall()
+
+
+      def totals_for(conn, merchant_ids):
+          ids = list(merchant_ids)
+          if not ids:
+              return {}
+          placeholders = ", ".join("?" for _ in ids)
+          rows = conn.execute(
+              f"SELECT merchant_id, count(*), sum(amount_cents) FROM payments "
+              f"WHERE status = 'captured' AND merchant_id IN ({placeholders}) GROUP BY merchant_id",
+              ids,
+          ).fetchall()
+          found = {merchant_id: (count, total) for merchant_id, count, total in rows}
+          return {merchant_id: found.get(merchant_id, (0, 0)) for merchant_id in ids}
+      ```
+
+      The tests count queries with `CountingConn`: `1` for the JOIN at any limit, `1` for the batched totals at any list length, `0` for an empty
+      list. The placeholders are built from the count of ids (the SQL text must not contain the ids), and the absent
+      merchants are filled in with `(0, 0)` in code, because `GROUP BY` returns no row for them.
+    rubric:
+      - Every test in tests/analysis/test_db_queries.py passes.
+      - latest_payments uses a JOIN and sends exactly one query whatever the limit.
+      - totals_for sends one query for any list, none for an empty list, and uses placeholders and parameters.
+      - Merchants without captured payments appear as (0, 0).
+    hints:
+      - The JOIN condition is m.id = p.merchant_id.
+      - One placeholder per id, built from the number of ids, and the ids as the parameter list.
+      - GROUP BY returns no row for a merchant that has no matching payments.
+    solution: |
+      A JOIN with ORDER BY and LIMIT; an IN list built from placeholders with GROUP BY, then fill the missing ids with (0, 0).
+
+  - id: plans-code
+    type: coding
+    concept: perf-db-indexes
+    skill: application
+    title: Read plans and choose the index
+    prompt: |
+      Implement `explain`, `access_paths`, `full_scans` and `index_ddl` in `analysis/db_plans.py`. `explain` returns the
+      `detail` strings of `EXPLAIN QUERY PLAN`; `access_paths` returns `(kind, table, index)` for every SCAN or SEARCH line
+      (index is the name after `INDEX`, else `None`; skip other lines); `full_scans` returns the tables read with a SCAN
+      (even a scan that walks an index); `index_ddl` builds the `CREATE INDEX` statement with the equality columns first and
+      then the range columns, named `idx_<table>_<columns joined by _>`.
+    project: perf
+    files:
+      - exercises/analysis/db_plans.py
+    test: tests/analysis/test_db_plans.py
+    command: .venv/bin/python -m pytest tests/analysis/test_db_plans.py
+    modelAnswer: |
+      ```python
+      import re
+
+      _PATH = re.compile(r"^(SCAN|SEARCH)\s+(?:TABLE\s+)?(\S+)(?:\s+AS\s+\S+)?(.*)$")
+      _INDEX = re.compile(r"USING (?:COVERING )?INDEX (\S+)")
+
+
+      def explain(conn, sql, params=()):
+          return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+
+
+      def access_paths(conn, sql, params=()):
+          paths = []
+          for detail in explain(conn, sql, params):
+              match = _PATH.match(detail)
+              if not match:
+                  continue
+              kind, table, rest = match.groups()
+              index = _INDEX.search(rest)
+              paths.append((kind, table, index.group(1) if index else None))
+          return paths
+
+
+      def full_scans(conn, sql, params=()):
+          return [table for kind, table, _ in access_paths(conn, sql, params) if kind == "SCAN"]
+
+
+      def index_ddl(table, equality, range_columns=()):
+          columns = [*equality, *range_columns]
+          return f"CREATE INDEX idx_{table}_{'_'.join(columns)} ON {table} ({', '.join(columns)})"
+      ```
+
+      The tests run your functions against real plans of a 20,000-row table: a SCAN before the index, a SEARCH naming your
+      index after it, the narrower search from the equality-first order, and a SCAN that stays when a function wraps the
+      column.
+    rubric:
+      - Every test in tests/analysis/test_db_plans.py passes.
+      - access_paths skips lines that are not SCAN or SEARCH and reads the index name after INDEX or COVERING INDEX.
+      - full_scans counts a scan that walks an index as a scan.
+      - index_ddl puts the equality columns before the range columns and names the index as specified.
+    hints:
+      - The detail text is the fourth column of each EXPLAIN QUERY PLAN row.
+      - 'A line starts with SCAN or SEARCH; the table name follows, and "USING INDEX x" or "USING COVERING INDEX x" may come after it.'
+      - A scan that names an index is still a SCAN.
+    solution: |
+      Keep row[3]; parse SCAN/SEARCH with a regular expression and an index pattern; filter SCAN for full_scans; equality
+      columns first in the DDL.
+
+  - id: pool-code
+    type: coding
+    concept: perf-db-pool-cache
+    skill: application
+    title: Pool and cache arithmetic
+    prompt: |
+      Implement `max_throughput`, `pool_size_for`, `starting_pool_size`, `simulate_pool`, `lru_hit_ratio` and `database_load`
+      in `analysis/db_pool.py`. The pool ceiling is `pool_size / hold_s`; the size for a throughput rounds
+      `throughput x hold / utilisation` up (and is at least 1); `simulate_pool` returns each request's wait for a connection
+      with FIFO service; `lru_hit_ratio` simulates an LRU cache; `database_load` is the misses per second.
+    project: perf
+    files:
+      - exercises/analysis/db_pool.py
+    test: tests/analysis/test_db_pool.py
+    command: .venv/bin/python -m pytest tests/analysis/test_db_pool.py
+    modelAnswer: |
+      ```python
+      import heapq
+      import math
+      from collections import OrderedDict
+
+
+      def max_throughput(pool_size, hold_s):
+          if pool_size < 1 or hold_s <= 0:
+              raise ValueError("pool_size must be at least 1 and hold_s positive")
+          return pool_size / hold_s
+
+
+      def pool_size_for(throughput_per_s, hold_s, utilisation=0.8):
+          if throughput_per_s < 0 or hold_s <= 0 or not 0 < utilisation <= 1:
+              raise ValueError("throughput >= 0, hold_s > 0, 0 < utilisation <= 1")
+          return max(1, math.ceil(round(throughput_per_s * hold_s / utilisation, 9)))
+
+
+      def starting_pool_size(cores, effective_spindles=0):
+          return cores * 2 + effective_spindles
+
+
+      def simulate_pool(arrival_times, hold_s, pool_size):
+          free_at = [0.0] * pool_size
+          heapq.heapify(free_at)
+          waits = []
+          for arrival in arrival_times:
+              earliest = heapq.heappop(free_at)
+              start = max(arrival, earliest)
+              waits.append(start - arrival)
+              heapq.heappush(free_at, start + hold_s)
+          return waits
+
+
+      def lru_hit_ratio(keys, capacity):
+          keys = list(keys)
+          if not keys:
+              return 0.0
+          cache, hits = OrderedDict(), 0
+          for key in keys:
+              if key in cache:
+                  hits += 1
+                  cache.move_to_end(key)
+              else:
+                  cache[key] = True
+                  if len(cache) > capacity:
+                      cache.popitem(last=False)
+          return hits / len(keys)
+
+
+      def database_load(requests_per_s, hit_ratio):
+          if not 0 <= hit_ratio <= 1:
+              raise ValueError("hit_ratio must be between 0 and 1")
+          return requests_per_s * (1 - hit_ratio)
+      ```
+
+      The details the tests check: rounding the float noise away before `ceil` (7 x 0.1 / 0.7 comes out a hair above 1), a hit
+      that makes a key the newest, a loop one entry longer than the cache never hitting under LRU, and a burst being served
+      in waves of `pool_size`.
+    rubric:
+      - Every test in tests/analysis/test_db_pool.py passes.
+      - max_throughput is pool_size / hold_s and rejects nonsense input.
+      - pool_size_for rounds up, is at least 1, and is not fooled by floating-point noise.
+      - simulate_pool serves requests FIFO with a heap of connection free-times.
+      - lru_hit_ratio moves a hit to the most-recent end and evicts the least recently used entry.
+    hints:
+      - A pool of P connections serves P / hold requests per second.
+      - Keep a heap of the times at which the connections become free; the next request takes the earliest.
+      - 'OrderedDict has move_to_end and popitem(last=False).'
+    solution: |
+      Division for the ceiling; ceil of round(x, 9) for the size; a heap for the pool; an OrderedDict for the LRU; a
+      multiplication by the miss ratio.
+
+placement:
+  - id: place-nplus1
+    type: mcq
+    concept: perf-db-roundtrips
+    skill: application
+    title: Count the queries
+    prompt: |
+      A page lists 25 invoices, and for each one the code reads its customer, then the customer's country. Each read is a
+      separate query. How many queries does the page send?
+    options:
+      - id: q51
+        text: 51 - one for the list, then two queries for each of the 25 invoices
+        feedback: Correct. 1 + 25 x 2 = 51, and it grows with the number of invoices.
+      - id: q50
+        text: 50 - two for each invoice; the list query is not counted
+        feedback: The list query is a query too.
+      - id: q26
+        text: 26 - the list and one per invoice
+        feedback: That counts one lookup per invoice; this code does two (the customer, then the country).
+      - id: q2
+        text: 2 - the database batches the reads
+        feedback: Nothing batches separate execute calls.
+    correct: [q51]
+    solution: |
+      1 + 25 x 2 = 51 queries.
+
+  - id: place-plan
+    type: mcq
+    concept: perf-db-indexes
+    skill: application
+    title: Which plan is the problem
+    prompt: |
+      A query on a table of 30 million rows shows `SCAN payments`; the same query on a test table of 3,000 rows is also `SCAN
+      payments` and finishes instantly. What is the correct conclusion?
+    options:
+      - id: scan
+        text: Both are full scans; the test hides the problem because the cost grows with the table
+        feedback: Correct. The plan is the same, the cost is not.
+      - id: fine
+        text: It is fine - the test passed
+        feedback: The test table is too small to show the cost of a scan.
+      - id: index
+        text: The index on the test table is better
+        feedback: Both plans say SCAN; neither uses an index.
+      - id: cache
+        text: The test table is cached and the production table is not
+        feedback: That might add to the difference, but the plan line already shows what the database does with both.
+    correct: [scan]
+    solution: |
+      The same scan, tiny cost on 3,000 rows and large cost on 30 million.
+
+  - id: place-pool
+    type: mcq
+    concept: perf-db-pool-cache
+    skill: application
+    title: What a pool allows
+    prompt: |
+      A pool of 8 connections; each request holds one for 40 ms. A test offers 300 requests per second. What happens?
+    options:
+      - id: queue
+        text: The pool serves at most 8 / 0.040 = 200 per second; the rest queue, so throughput plateaus near 200 and response time grows
+        feedback: Correct.
+      - id: all
+        text: All 300 are served, because requests overlap
+        feedback: Overlap is limited to 8 at a time.
+      - id: half
+        text: Throughput falls to 100 because connections are wasted
+        feedback: Connections serve at their ceiling; they are not wasted by queueing.
+      - id: err
+        text: Every request fails at once
+        feedback: Requests queue; they fail only when an acquire timeout is exceeded.
+    correct: [queue]
+    solution: |
+      The ceiling is 200 requests per second; the excess waits.
+
+recall:
+  - id: recall-nplus1
+    concept: perf-db-roundtrips
+    prompt: What is the N+1 problem, how do you prove it, and how do you fix it?
+    answer: One query for a list plus one per row, so 1 + N round trips that grow with the page size. Prove it with queries per request from a statement log at different page sizes. Fix it with a JOIN or one batched IN / GROUP BY query so the count no longer depends on N.
+  - id: recall-scan
+    concept: perf-db-indexes
+    prompt: In SQLite, what do SCAN and SEARCH mean in a query plan?
+    answer: SCAN is a full-table scan, even when it walks an index in order; SEARCH visits only a subset of the rows. Look for the scan first on any database (PostgreSQL says Seq Scan versus Index Scan).
+  - id: recall-defeat
+    concept: perf-db-indexes
+    prompt: Name two reasons an existing index is not used.
+    answer: A function on the column in the condition (CAST, arithmetic), and a composite index whose column order does not match the filter (equality columns must come before the range column). Also low selectivity, where the planner prefers a scan.
+  - id: recall-price
+    concept: perf-db-indexes
+    prompt: What does an index cost?
+    answer: Every insert, update and delete must keep each index in step with the table - the lesson's run took about 136, 240 and 454 ms for 100,000 inserts with 0, 1 and 3 indexes - plus disk and memory.
+  - id: recall-ceiling
+    concept: perf-db-pool-cache
+    prompt: What is the throughput ceiling of a connection pool?
+    answer: pool size / hold time, from Little's law (connections in use = throughput x hold time). Above it, requests queue; with C clients each waits about (C - P) / P holds.
+  - id: recall-idle
+    concept: perf-db-pool-cache
+    prompt: Why can the database look idle when it is the limit of the system?
+    answer: The queue is in the application's connection pool, in front of the database. The database serves only as many queries as the pool allows, each quickly, so its CPU and slow-query log look fine. Measure the pool - in use, waiting, wait time, timeouts.
+  - id: recall-cache
+    concept: perf-db-pool-cache
+    prompt: How much load does a cache leave on the database, and what drives the hit ratio?
+    answer: requests x (1 - hit ratio). The hit ratio depends on the traffic's skew and the cache size - in the run, 100 entries gave 57.8% for skewed traffic and 10.2% for uniform.
+
+next:
+  - bottleneck-analysis
+  - frontend-performance-testing
+  - performance-testing-payment-systems
