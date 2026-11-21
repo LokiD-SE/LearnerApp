@@ -1,0 +1,1295 @@
+id: load-testing-tools-compared
+title: JMeter, Locust and other tools compared
+subject: performance-testing
+module: perf-analysis
+level: intermediate
+status: published
+estimatedMinutes: 150
+summary: Choosing a load testing tool is a decision about people, protocols and load model - and about what the tool itself costs to run - not about which logo is best. This lesson runs one SandPay checkout scenario in JMeter and in Locust (HttpUser and FastHttpUser) against the same local API, then compares what the docs promise with what was measured - the script, the closed and open load models each tool offers, whether the two tools' result numbers can be put side by side (they use different percentile rules), and what each generator cost in CPU and memory. k6 and Gatling are covered from their own documentation, not run here. You write a result normaliser, the Locust twin of the JMeter plan, and a generator-sizing calculator.
+tags:
+  [
+    JMeter,
+    Locust,
+    k6,
+    Gatling,
+    tool comparison,
+    tool selection,
+    closed model,
+    open model,
+    virtual users,
+    threads,
+    greenlets,
+    FastHttpUser,
+    percentile rules,
+    response time bucketing,
+    load generator cost,
+    CPU per request,
+    memory per user,
+    generator sizing,
+    pilot,
+    JTL,
+  ]
+
+environment: |
+  - **Runtime:** Python 3.12.3 in `practice/perf/.venv` with Locust 2.47.0 and pytest; Apache JMeter 5.6.3
+    (non-GUI mode) on OpenJDK 17.0.21.1; one Linux machine with 14 CPUs and about 31 GB of memory. Every run shown
+    was made on 21 November 2026 by `practice/perf/support/tc_capture.py` into `support/tc_data/`; the tables are
+    printed by `support/tc_demo.py` from those files. The machine was **shared with other work** (the one-minute load
+    average just before a run was between 2 and 6.4), so **absolute numbers are indicative only**: each figure is the
+    middle of three runs and the lesson shows the range. How to read the numbers matters; the numbers will differ on
+    your machine.
+  - **One scenario, one API.** SandPay is a fictional payments company; the target is the local practice API
+    (`support/sandpay_target.py`, 10 ms service time, room for 64 requests at once). The scenario signs a merchant in
+    once, then loops *list five payments, create a payment with its own Idempotency-Key, read it back, think*. It is
+    not a benchmark: a different scenario (big responses, TLS, many assertions, scripted logic) would change every
+    number, and the order of the tools could change with it. **k6, Gatling and wrk-style tools were not run.**
+  - **How cost was measured:** each tool ran inside a small wrapper process that reports what the operating system
+    recorded for it (Python `resource.getrusage(RUSAGE_CHILDREN)`: user and system CPU seconds, summed over all the
+    tool's threads, and the peak resident memory; Linux reports that in kilobytes, checked here against `psutil`). The
+    practice API ran in a different process and is not counted.
+  - **JMeter, as documented on 21 November 2026:** [Home page](https://jmeter.apache.org/) (the list of protocols;
+    "JMeter is not a browser"; "CLI mode"; the HTML report); [Getting started](https://jmeter.apache.org/usermanual/get-started.html)
+    ("GUI mode should only be used for creating the test script, CLI mode (NON GUI) must be used for load testing";
+    Java 8 or higher; the `HEAP` default, confirmed on Linux in the installed `bin/jmeter` script:
+    `-Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m`); [Elements of a test plan](https://jmeter.apache.org/usermanual/test_plan.html)
+    (a thread group's threads "execute the test plan in its entirety and completely independently"; "A timer will cause
+    JMeter to delay a certain amount of time before each sampler which is in its scope");
+    [Best practices, 16.7](https://jmeter.apache.org/usermanual/best-practices.html) (reducing resource requirements);
+    [Component reference](https://jmeter.apache.org/usermanual/component_reference.html) (Test Action "allows pauses to be
+    included without needing to generate a sample"; the Open Model Thread Group "is experimental").
+  - **Locust 2.47.0:** [What is Locust?](https://docs.locust.io/en/stable/what-is-locust.html) ("Locust runs every user
+    inside its own greenlet"; tests in "regular Python code"; "version control your tests as regular code (as opposed to
+    some other tools that use XML or binary formats)"); [Writing a locustfile](https://docs.locust.io/en/stable/writing-a-locustfile.html)
+    (`wait_time` functions; "Wait time can only constrain the throughput, not launch new Users"; "Wait time is applied
+    after task execution"); [Increase performance with a more efficient HTTP client](https://docs.locust.io/en/stable/increase-performance.html)
+    (the FastHttpUser figures, quoted below as the docs' own claim for their machine);
+    [Testing other systems/protocols](https://docs.locust.io/en/stable/testing-other-systems.html) ("Locust only comes with
+    built-in support for HTTP/HTTPS"). The percentile rounding and rule were read in the installed source `locust/stats.py`
+    (`bucket_response_time`, `calculate_response_time_percentile`) and `locust/runners.py` (every request is logged, then
+    errors are logged).
+  - **k6, from the documentation and not run here:** [Grafana k6](https://grafana.com/docs/k6/latest/),
+    [Open and closed models](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/),
+    [Thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/). **Gatling, from the documentation and not run
+    here:** [Gatling documentation](https://docs.gatling.io/), [Injection](https://docs.gatling.io/concepts/injection/).
+    Statements such as k6 being "optimized for minimal resource consumption" are the vendors' claims; this lesson did
+    not test them.
+
+prerequisites:
+  - jmeter-thread-groups-and-timers
+  - locust-fundamentals
+  - reading-load-test-results
+  - littles-law-and-workload-models
+
+concepts:
+  - id: perf-tc-models
+    name: Virtual users, load models and scripting
+    summary: Each tool turns a script into virtual users differently (a JMeter thread, a Locust greenlet, a k6 VU), offers closed and sometimes open load models, and places pauses differently - a JMeter timer runs before the sampler it covers, a Locust wait runs after the task.
+  - id: perf-tc-results
+    name: Comparing results and generator cost fairly
+    summary: Two tools' numbers describe the same system only if the scenario is the same and the definitions match; the tools round and rank differently, add their own overhead, and cost very different amounts of CPU and memory to run, which decides how many generators a target rate needs.
+  - id: perf-tc-choose
+    name: Choosing a tool
+    summary: Pick by hard requirements first (protocols, who writes and maintains the scripts, the load model, CI and reporting), then by cost at your scale, and settle it with a short pilot of your own scenario instead of a vendor benchmark.
+
+objectives:
+  - Describe a virtual user in JMeter, Locust, k6 and Gatling, and say which tools offer a closed model, an open model, or both, citing the documentation.
+  - Explain why a JMeter timer and a Locust wait_time do not pause at the same place, and place a pause so the two scenarios match.
+  - Normalise a JTL and a Locust result into one per-request summary and check that two runs describe the same scenario by their request mix.
+  - State the two percentile rules (nearest rank on exact values, Locust's bucketed rule) and Locust's rounding, and what a reported p95 can really mean.
+  - Measure what a load generator costs (start-up, CPU per request, memory per user) from repeated runs and turn it into the number of generator cores a target rate needs.
+  - Choose a tool from hard requirements, document the decision, and run a pilot that would change it.
+
+sections:
+  - id: intuition
+    kind: intuition
+    concepts: [perf-tc-models, perf-tc-results, perf-tc-choose]
+    title: The idea in plain language
+    body: |
+      A SandPay team has run JMeter for years. A new engineer writes the same checkout test in Locust in an afternoon -
+      **35 lines of Python against a 129-line JMeter plan** - runs both against the same practice API with the same
+      10 virtual users, and reports: "the payment list has p95 = 24 ms in Locust and 19 ms in JMeter. Locust is
+      slower." Is it?
+
+      The API did not change between the two runs. What changed is **who is holding the stopwatch**. Each tool
+      measures from inside its own process, and a Python HTTP client takes a few milliseconds of its own for every
+      call. Part of the gap is the tool, not the system. And the tools also *round* and *rank* differently before
+      they show you a percentile.
+
+      Then comes the bill. A one-second test cost JMeter **7.2 CPU-seconds** - the Java virtual machine starting up -
+      and Locust **0.9**. Once running, the same traffic cost JMeter about 3.2 CPU-seconds per thousand requests and
+      Locust's `HttpUser` about 2.0; its `FastHttpUser` about 0.7. At a few hundred requests a second nobody notices.
+      At a few thousand, the choice of tool decides how many machines you rent.
+
+      So choosing a tool is not "which one is best". It is three smaller questions. *Can it do what we need* - the
+      protocols, the load model. *Can our people use it* - the script format, the language. *What does it cost to run
+      at our size* - and, before any of those, *are we comparing like with like?* This lesson answers each with a run
+      you can repeat, and with the vendors' own words where we did not run the tool.
+
+  - id: what
+    kind: what
+    concepts: [perf-tc-models, perf-tc-choose]
+    title: What a load tool is made of, and four of them
+    body: |
+      Every load tool has the same four parts:
+
+      - **A script** that says what one virtual user does (its requests, its data, its pauses).
+      - **A load model** that says how virtual users arrive and how many run at once.
+      - **A generator**, the engine that sends the traffic and times each request.
+      - **Results**: raw samples and a summary.
+
+      What differs is how each part is built. This table only repeats what each tool's own documentation says (the
+      k6 and Gatling columns were **not run here**):
+
+      | | JMeter 5.6.3 | Locust 2.47.0 | k6 | Gatling |
+      | --- | --- | --- | --- | --- |
+      | Script | A test plan, a tree of elements saved as XML (`.jmx`), normally built in the GUI; scripted samplers in Groovy | "Regular Python code" | JavaScript (the docs' examples) | Code in the Java, Kotlin, Scala or JavaScript/TypeScript SDKs; a browser recorder; a no-code GUI in Enterprise Edition |
+      | A virtual user is | A thread of a Thread Group | A greenlet (a lightweight coroutine) | A VU | A user injected by the injection profile |
+      | Load models | Thread groups; timers; an Open Model Thread Group (marked experimental) | Users loop with a `wait_time`; custom load shapes | Closed (`constant-vus`) and open (arrival-rate executors) | `injectClosed` and `injectOpen` |
+      | Protocols (docs) | HTTP(S), SOAP/REST, FTP, JDBC, LDAP, JMS, mail, TCP, native commands, Java objects | HTTP/HTTPS built in; others by wrapping a client library | HTTP in the docs' examples; extensions add protocols | Guides for gRPC, MQTT, WebSocket and Kafka |
+      | Runs headless in CI | CLI mode and an HTML report | `--headless` | Thresholds make a test finish "with a failed status" | Run from Maven or Gradle; the docs home lists CI integrations (GitHub Actions, GitLab CI, Jenkins) |
+
+      None of this makes one column the winner. A team that needs to load a JMS queue and a database finds both
+      on JMeter's own list; a team that wants every test in its Python repository finds that in Locust's; a team of
+      JavaScript developers will find k6's scripts familiar. The next sections show where the columns *behave*
+      differently, which a feature list hides.
+
+  - id: why
+    kind: why
+    concepts: [perf-tc-results, perf-tc-choose]
+    title: Why compare tools at all
+    body: |
+      - **A tool is hard to leave once the suite exists.** Hundreds of plans or locustfiles, CI jobs and dashboards
+        hang off it. A day spent on a pilot costs less than a year with the wrong tool.
+      - **Numbers do not travel between tools.** A p95 from a JMeter run and a p95 from a Locust run are two measurements of
+        two different pieces of software. When a team migrates, the first thing it sees is a "regression" that is
+        really a different stopwatch. Knowing why lets you recalibrate once instead of arguing for a month.
+      - **The generator is part of the experiment.** If the tool saturates its machine, the load is lower than you
+        planned and the response times are inflated (see "Reading load test results honestly"). The cost of a tool at
+        your target rate is a requirement, not a footnote.
+      - **Vendor comparisons are written by vendors.** The honest alternative is a small test of your own scenario on
+        your own hardware, the way this lesson does one.
+
+  - id: models-internals
+    kind: internals
+    concepts: [perf-tc-models]
+    title: Internals - virtual users, closed and open models, and where the pause goes
+    body: |
+      **A virtual user is a thread, a greenlet or a VU.** JMeter's manual says a thread group's threads "execute the
+      test plan in its entirety and completely independently of other test threads". Locust "runs every user inside its
+      own greenlet", which is why one Locust process can hold thousands of users, and why a library that blocks the
+      whole process (its I/O in C code that gevent cannot patch) limits it, in the docs' words, to "a single User per
+      worker process". The difference matters for cost, shown below.
+
+      **Closed and open models.** In a *closed* model a virtual user starts its next iteration only after the last one
+      finished, so a slow server lowers the load. In an *open* model users arrive on a schedule whatever the server is
+      doing. The k6 documentation says it plainly: "in the closed model, VU iterations start only when the last
+      iteration finishes. In the open model, on the other hand, VUs arrive independently of iteration completion", and
+      adds that this slowing-down effect is "in some testing literature ... known as coordinated omission" (the topic of
+      the previous lesson). What each tool offers, from its documentation:
+
+      - **JMeter:** a Thread Group is closed. The Constant Throughput Timer paces threads, but "the throughput will be
+        lower if the server is not capable of handling it". The Open Model Thread Group generates users "according to
+        the schedule", and "is experimental, and it might change in the future releases".
+      - **Locust:** every user loops through its tasks, so the model is closed per user. `wait_time` functions pace it:
+        "Wait time can only constrain the throughput, not launch new Users to reach the target." Load shapes (an earlier
+        lesson) change the number of users over time.
+      - **k6:** executors choose the model: `constant-vus` is closed; `constant-arrival-rate` and `ramping-arrival-rate`
+        are open (not run here).
+      - **Gatling:** `injectOpen` and `injectClosed` are separate methods; for the closed one, "the only way for virtual
+        users to terminate is to complete their scenario" (not run here).
+
+      **Where does the pause go?** This is a small thing that breaks comparisons. JMeter's manual: "A timer will cause
+      JMeter to delay a certain amount of time before each sampler which is in its scope." Put a Constant Timer under the
+      first sampler and every iteration *starts* with a pause - including the first. Locust's manual: "Wait time is
+      applied after task execution." Its first iteration starts at once. With a think time of 12 seconds that is a whole
+      iteration of difference at the start of a short run. The plan in this lesson avoids it with a **Test Action**
+      sampler set to "pause" at the *end* of the loop (the manual: it "allows pauses to be included without needing to
+      generate a sample"), so both tools think after each iteration, and the JMeter result file has no extra rows.
+
+  - id: results-internals
+    kind: internals
+    concepts: [perf-tc-results]
+    title: Internals - can two tools' numbers be compared?
+    body: |
+      Before you compare a number, check four things.
+
+      **1. Is it the same scenario?** Compare the *request mix*, not the totals. Two tools never send exactly the same
+      number of requests in the same time (the closed loops finish at different speeds), but the share of each request
+      in the mix should agree to a couple of percentage points. A missing sign-in or an extra request shows up at once.
+
+      **2. Which percentile rule?** JMeter's JTL holds an exact `elapsed` per request, so a percentile can be computed
+      exactly, for example by *nearest rank*: the ceil(p x n)-th smallest value. Locust does not keep every request. It
+      counts each response time in a histogram after **rounding** it (`bucket_response_time`, Locust 2.47.0 source):
+      under 100 ms to a whole millisecond, then to the nearest 10 ms below 1000, the nearest 100 ms below 10 000 and the
+      nearest 1000 ms above - "about two significant digits". A reported 150 ms can be anything from 145 up to 154.99.
+      And its percentile function walks the histogram from the slowest bucket down and stops at the first bucket
+      where `requests - seen <= int(requests x fraction)`. On ten requests that is not nearest rank:
+
+      ```text
+      p50: nearest rank 10, Locust rule 20
+      p95: nearest rank 150, Locust rule 150
+      ```
+
+      (10 ms five times, 20 ms three times, 150 ms twice.) On thousands of requests the two rules differ by one rank
+      and one rounding step - small, but you now know why a Locust p99 above 100 ms looks "rounded".
+
+      **3. What is inside the number?** Both tools time a request from inside their own process. In the captured run, for
+      the very same API: payment list p50 **14 ms** in JMeter and **16 ms** in Locust (`HttpUser`), p95 **19** and **24**;
+      payment creation p50 **23** and **25**, p95 **26** and **33**. The few milliseconds extra are the Python client's
+      own time; the lesson did not profile where it goes. The sign-in is a bigger difference: JMeter's first request took
+      **125 ms** (p50) and Locust's **25 ms**. Every JMeter thread's first call carries something that later calls do not,
+      and this lesson did not isolate what - which is itself the lesson: a tool's first request is not a clean sample.
+      Both tools also keep a failed request's time in their statistics (Locust's `runners.py` logs every request, then
+      logs the error), so a fast failure pulls a percentile down in either.
+
+      **4. Was the generator healthy?** The load is lower and the times are higher if the tool's machine is busy. Locust
+      logs a warning when its CPU gets close to the limit; with JMeter you have to look yourself. The next section puts
+      numbers on the cost.
+
+  - id: cost-internals
+    kind: internals
+    concepts: [perf-tc-results]
+    title: Internals - what a generator costs
+    body: |
+      The cost of a tool has three parts, and a single "requests per second" figure mixes them up.
+
+      **A fixed start-up cost.** JMeter is a Java program: a virtual machine starts, classes load, the just-in-time
+      compiler works on several threads. A one-second test (one user) took, as the middle of three runs:
+
+      ```text
+      scenario setup           wall s  CPU s cores peak MB requests CPU s/1000
+      startup  jmeter-default     4.4   7.19  1.62     208       10     719.10
+      startup  jmeter-512m        4.4   6.45  1.47     167       10     645.10
+      startup  locust-http        1.5   0.86  0.57      51       10      86.10
+      startup  locust-fast        1.6   0.92  0.59      50       10      91.90
+      ```
+
+      "Cores" is CPU seconds divided by wall seconds: JMeter used more than one core at once even for one user. The
+      two JMeter rows differ only in the heap setting: `jmeter-default` is JMeter's own `-Xms1g -Xmx1g`, `jmeter-512m` is
+      `-Xms256m -Xmx512m` (what `load_tools.run_jmeter` uses). Start-up does not grow with the test, so for a long
+      test it vanishes into the total and for a one-minute CI test it is most of the bill.
+
+      **A cost per request.** Subtract the start-up run from a 10-user, 10-second run and divide by the extra
+      requests (`marginal_cpu_per_1000`): JMeter **3.23** CPU-seconds per 1000 requests, Locust `HttpUser` **2.04**,
+      Locust `FastHttpUser` **0.67**. Locust's own docs say a single process "can do around 16000 requests per second
+      using FastHttpUser, and 4000 using HttpUser" in a best case on "a 2021 M1 MacBook Pro" and that it "does not
+      make individual requests faster"; here `FastHttpUser` cost about a third of `HttpUser` per request, the same
+      direction, on a different machine and a different scenario.
+
+      **A cost per virtual user.** The same traffic, from 500 users each thinking 12 seconds instead of 10 users
+      thinking 0.2 s, 25 seconds:
+
+      ```text
+      many     jmeter-default     28.5  20.99  0.74     352     3796       5.53
+      many     jmeter-512m        28.7  21.55  0.75     406     3792       5.68
+      many     locust-http        25.7   5.35  0.21      70     3524       1.52
+      many     locust-fast        25.7   3.50  0.14      64     3800       0.92
+      ```
+
+      Peak memory rose by about **0.3 to 0.5 MB per extra user** in JMeter (a thread each) and about **0.03 to 0.04 MB** in
+      Locust (a greenlet each) - roughly ten times. JMeter's peak varied between runs (363 to 406 MB with the 512 MB
+      heap) because it depends on when the garbage collector runs.
+
+      **Turning cost into a plan.** `1000 / marginal_cpu_per_1000` is the requests one core sustains: about **310** for
+      JMeter, **490** for `HttpUser`, **1494** for `FastHttpUser`. For 2000 requests per second, keeping each core at no
+      more than 70 % busy (the lesson's example headroom, not a standard), that is **10**, **6** and **2** cores of
+      generator. Locust uses one core per process (its docs: "you should run one locust process per CPU core"), JMeter
+      spreads one process over several. It is a plan to be checked with a run at that rate, not a result: it extends a
+      118 requests-per-second measurement to 2000.
+
+  - id: when
+    kind: when
+    concepts: [perf-tc-choose]
+    title: When each tool fits - and when to leave it
+    body: |
+      Start from hard requirements. Each row is a reading of the documentation quoted above, not a ranking.
+
+      | If you need... | Look first at | Why |
+      | --- | --- | --- |
+      | JMS, JDBC, LDAP, FTP, mail or raw TCP load without writing a client | JMeter | Its home page lists them as built-in protocol types. Locust "only comes with built-in support for HTTP/HTTPS". |
+      | Tests as ordinary code in the application's repository, reviewed like code | Locust, k6 or Gatling | Locust: "version control your tests as regular code (as opposed to some other tools that use XML or binary formats)". |
+      | A team that builds tests in a GUI and has little programming | JMeter | The GUI builds the test plan; but run it in CLI mode ("must be used for load testing"). |
+      | A guaranteed arrival rate whatever the server does (an open model) | k6 or Gatling, or JMeter's experimental Open Model Thread Group | The k6 and Gatling docs make the open model a first-class choice; Locust's wait functions "can only constrain the throughput". |
+      | A pass or fail verdict for a pipeline in the script itself | k6 thresholds, or a gate on any tool's results | k6: a failed threshold ends the test "with a failed status"; with JMeter or Locust you write the gate (see "Performance testing in CI/CD"). |
+      | Thousands of users from few machines | Measure it - Locust, k6 and Gatling all claim low overhead per user | A claim is not a number; the cost section shows how to get yours. |
+
+      **When to switch.** Not because another tool is fashionable. Switch when a hard requirement fails (a protocol,
+      an open model), when the generator bill at your target rate is the real constraint, or when nobody left can
+      maintain the scripts. When you do switch, run the old and the new tool on the **same scenario** first, as in this
+      lesson, and calibrate the difference before comparing any old number with a new one.
+
+  - id: visual
+    kind: visual
+    concepts: [perf-tc-models, perf-tc-results, perf-tc-choose]
+    title: How the checks and the choice fit together
+    body: |
+      ```mermaid
+      flowchart TD
+        N["Need: protocols, load model, who writes scripts, CI, scale"] --> H["Hard requirements met?"]
+        H -- "no" --> X["Drop the tool, or write a client or plugin"]
+        H -- "yes" --> P["Pilot: the same scenario in each candidate"]
+        P --> S["Same scenario? Compare the request mix, then think-time placement and data"]
+        S --> C["Cost: start-up, CPU per 1000 requests, memory per user, repeated three times"]
+        C --> R["Results: percentile rule and rounding, first request, failed requests"]
+        R --> D["Decide with the evidence and write the decision down"]
+      ```
+
+      ```mermaid
+      sequenceDiagram
+        participant J as JMeter thread
+        participant L as Locust user
+        participant A as Practice API
+        Note over J: Constant Timer under the first sampler
+        J->>J: pause before the first iteration
+        J->>A: GET list
+        L->>A: GET list at once
+        Note over L: wait_time runs after the task
+        L->>L: pause after the iteration
+      ```
+
+      The flowchart is the order of the work; the sequence is the small difference that makes two "identical"
+      scenarios start at different moments unless the pause is placed deliberately.
+
+  - id: code-scenario
+    kind: code
+    concepts: [perf-tc-models]
+    title: The same scenario in two tools
+    body: |
+      The scenario - sign in once, then loop *list five payments, create one with its own `Idempotency-Key`, read it back,
+      think for 200 ms*. Here it is as a Locust user, `support/tc_checkout_locustfile.py` (35 lines in all; the file
+      also picks `FastHttpUser` when `TC_CLIENT=fast`):
+
+      ```python
+      class Merchant(HttpUser):
+          wait_time = constant(WAIT)
+
+          def on_start(self):
+              n = next(_merchants) % 50 + 1
+              r = self.client.post("/auth/token", name="POST /auth/token",
+                                   json={"client_id": f"merchant-{n}", "client_secret": f"secret-{n}"})
+              self.auth = {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+          @task
+          def checkout(self):
+              self.client.get("/v1/payments?limit=5", name="GET /v1/payments", headers=self.auth)
+              r = self.client.post("/v1/payments", name="POST /v1/payments",
+                                   headers={**self.auth, "Idempotency-Key": str(uuid.uuid4())},
+                                   json={"amount_minor": 1250, "currency": "EUR"})
+              self.client.get(f"/v1/payments/{r.json()['id']}", name="GET /v1/payments/{id}", headers=self.auth)
+      ```
+
+      And the JMeter plan, `support/tc_checkout.jmx` (129 lines of XML; the plan was written as XML, which is what the GUI
+      saves, following the plans of earlier lessons - the GUI was not used here). Its tree, as the GUI shows it:
+
+      ```text
+      Test Plan
+      └─ Thread Group "Merchants"  (threads, ramp-up, duration from -J properties)
+         ├─ HTTP Header Manager  Content-Type, Authorization: Bearer ${token}
+         ├─ Once Only Controller "Sign in once per thread"
+         │  └─ HTTP Request POST /auth/token
+         │     └─ JSON Extractor  $.access_token -> token
+         ├─ HTTP Request GET /v1/payments?limit=5
+         ├─ HTTP Request POST /v1/payments
+         │  ├─ HTTP Header Manager  Idempotency-Key: ${__UUID()}
+         │  └─ JSON Extractor  $.id -> payment_id
+         ├─ HTTP Request GET /v1/payments/${payment_id}
+         └─ Test Action  pause ${__P(wait,200)} ms   <- the think time, at the END of the loop
+      ```
+
+      Things the tree makes visible: the sign-in needs a Once Only Controller, the token has to be *extracted* into a
+      variable (correlation), the unique key is a function call, and the pause is a sampler. In Python these are
+      `on_start`, a local variable, `uuid.uuid4()` and `wait_time`. Neither is better; they are different ways of saying
+      the same thing, and the Python one diffs and reviews like any other source file.
+
+      Run them as the capture script does (the tool's own result files are what the next section reads):
+
+      ```bash
+      jmeter -n -t support/tc_checkout.jmx -l results.jtl -Jport=8090 -Jthreads=10 -Jduration=10 -Jwait=200
+      TC_WAIT=0.2 locust -f support/tc_checkout_locustfile.py --headless -u 10 -r 10 -t 10s \
+        --host http://127.0.0.1:8090 --json-file out
+      ```
+
+  - id: code-summary
+    kind: code
+    concepts: [perf-tc-results]
+    title: One summary for two result formats
+    body: |
+      A JTL is one row per request; Locust's JSON is one histogram per request name. `exercises/analysis/tc_summary.py`
+      turns both into `{requests, failures, rps, labels: {label: {requests, failures, p50, p95}}}`. The heart of it is the
+      two percentile rules (full file: `solutions/analysis/tc_summary.py`):
+
+      ```python
+      def percentile(values, fraction):
+          ordered = sorted(values)
+          rank = max(1, math.ceil(fraction * len(ordered)))
+          return ordered[rank - 1]
+
+      def bucket(ms):
+          if ms < 100:
+              return round(ms)
+          if ms < 1000:
+              return int(round(ms, -1))
+          if ms < 10000:
+              return int(round(ms, -2))
+          return int(round(ms, -3))
+
+      def locust_percentile(histogram, requests, fraction):
+          allowed = int(requests * fraction)
+          seen = 0
+          for ms in sorted((int(k) for k in histogram), reverse=True):
+              seen += histogram[ms] if ms in histogram else histogram[str(ms)]
+              if requests - seen <= allowed:
+                  return ms
+          return 0
+      ```
+
+      `same_scenario(a, b)` compares each label's *share* of the requests. Run on the two saved result files
+      (`support/tc_data/`, the 10-user, 10-second scenario; Locust's file has `start_time` counted from zero and the JTL's
+      start times counted from the first sample, so neither holds a 13-digit clock value):
+
+      ```text
+      request                  JMeter n  p50  p95  Locust n  p50  p95
+      GET /v1/payments              390   14   19       372   16   24
+      GET /v1/payments/{id}         390   12   14       370   14   19
+      POST /auth/token               10  125  126        10   25   35
+      POST /v1/payments             390   23   26       371   25   33
+      total                        1180                1123   rps 120.3 vs 118.0
+      same_scenario: no differences | mix JMeter {'GET /v1/payments': 0.331, 'GET /v1/payments/{id}': 0.331, 'POST /auth/token': 0.008, 'POST /v1/payments': 0.331}
+      without the sign-in: ['POST /auth/token: only in the first run']
+      ```
+
+      The totals differ (1180 and 1123) and the shares do not. Locust's `HttpUser` sent about 5 % fewer requests in the
+      same ten seconds - a closed loop finishes fewer iterations when each call takes a little longer, and the client's own
+      time is part of each call.
+
+  - id: code-sizing
+    kind: code
+    concepts: [perf-tc-results]
+    title: What the generator costs, in code
+    body: |
+      `exercises/analysis/tc_sizing.py` holds the arithmetic of the cost section. A *run* is a dictionary with `users`,
+      `requests`, `wall_s`, `cpu_user_s`, `cpu_sys_s` and `rss_peak_mb`. The key ones (full file:
+      `solutions/analysis/tc_sizing.py`):
+
+      ```python
+      def cpu_seconds(run):
+          return run["cpu_user_s"] + run["cpu_sys_s"]
+
+      def marginal_cpu_per_1000(run, startup):
+          return (cpu_seconds(run) - cpu_seconds(startup)) / (run["requests"] - startup["requests"]) * 1000
+
+      def mb_per_user(small, big):
+          return (big["rss_peak_mb"] - small["rss_peak_mb"]) / (big["users"] - small["users"])
+
+      def generators_needed(target_rps, rps_per_core, max_busy=0.7):
+          return max(1, math.ceil(target_rps / (rps_per_core * max_busy)))
+      ```
+
+      Run on the captured middle runs, `support/tc_demo.py` prints:
+
+      ```text
+      jmeter-default  start-up CPU 7.19 s, marginal 3.23 CPU s per 1000 requests = 310 requests per core-second; extra memory per user 0.294 MB (10 -> 500 users); generators for 2000 rps at 70% busy: 10
+      jmeter-512m     start-up CPU 6.45 s, marginal 4.23 CPU s per 1000 requests = 236 requests per core-second; extra memory per user 0.469 MB (10 -> 500 users); generators for 2000 rps at 70% busy: 13
+      locust-http     start-up CPU 0.86 s, marginal 2.04 CPU s per 1000 requests = 490 requests per core-second; extra memory per user 0.039 MB (10 -> 500 users); generators for 2000 rps at 70% busy: 6
+      locust-fast     start-up CPU 0.92 s, marginal 0.67 CPU s per 1000 requests = 1494 requests per core-second; extra memory per user 0.026 MB (10 -> 500 users); generators for 2000 rps at 70% busy: 2
+      cheapest by CPU per 1000 requests: {'startup': 'locust-http', 'steady': 'locust-fast', 'many': 'locust-fast'}
+      ```
+
+      Read the spread before the medians: JMeter's 10-user CPU ranged from 10.3 to 11.5 seconds and the `jmeter-512m`
+      peak memory with 500 users from 363 to 406 MB. The two JMeter rows are close in CPU (11.0 and 11.3 seconds for 10
+      users) and cross over in memory (208 against 176 MB with 10 users, 352 against 406 with 500), so the heap setting
+      did not make a clear difference in these runs - "512m costs more per request" would be a wrong reading of the
+      4.23 against 3.23.
+
+  - id: line-by-line
+    kind: line-by-line
+    concepts: [perf-tc-models, perf-tc-results]
+    title: Line by line
+    body: |
+      **`wait_time = constant(WAIT)` and the Test Action.** Both think *after* the iteration, so the first request of every
+      user happens at the same moment in both tools. With a Constant Timer under the first sampler, JMeter would have waited
+      first.
+
+      **`name="GET /v1/payments/{id}"`.** The URL contains a different payment id each time. Without `name=`, Locust makes
+      one statistics row per URL, and the table has thousands of rows and no totals per request type. JMeter names its
+      sampler once, and the label is the name.
+
+      **`headers=self.auth`.** The token lives on the user, not on the session, so each request names it; JMeter does it
+      once with a Header Manager at the top of the thread group.
+
+      **`percentile(values, fraction)`.** `ceil(fraction x n)` is the 1-based rank; `max(1, ...)` stops fraction 0 asking
+      for the 0th value.
+
+      **`bucket(ms)`.** The same four ranges as the Locust source. `round(ms, -1)` rounds to the nearest ten; Python rounds
+      halves to even, so 145 becomes 140 and 155 becomes 160 - another reason to read a bucketed value as a range.
+
+      **`locust_percentile`.** `allowed = int(requests * fraction)` is how many requests may be *slower* than the answer. It
+      walks the histogram from the top, and the first bucket where the slower-or-equal count has dropped to `allowed` is
+      the answer. For 10 requests and 0.5 that is the 20 ms bucket, one rank above nearest rank.
+
+      **`cpu_seconds` and `cores_busy`.** CPU seconds are summed over every thread of the tool, so a Java program can show
+      more than one core busy for a single virtual user.
+
+      **`marginal_cpu_per_1000`.** Subtracting a run that sent only a handful of requests removes the one-off cost, leaving
+      the slope. It assumes the cost per request is the same in both runs.
+
+      **`generators_needed`.** `rps_per_core * max_busy` is the safe rate of one core; dividing and rounding up gives whole
+      cores, and `max(1, ...)` never plans zero.
+
+  - id: steps
+    kind: steps
+    concepts: [perf-tc-choose, perf-tc-results]
+    title: How to run a tool pilot
+    body: |
+      1. **Write the requirements down first** - protocols, load model (closed or open), who writes and maintains the
+         scripts, CI and reporting, target rate, the machines you have. Mark each *must* or *nice*.
+      2. **Cut the candidates by the musts.** Use the documentation, not a blog post. Note anything you could not
+         confirm.
+      3. **Pick one real scenario** - a journey you will actually test, with correlation, data and a think time.
+      4. **Write it in each candidate**, and note the effort (hours, lines, who could review it).
+      5. **Make the scenarios identical.** Same requests and names, same data, the pause in the same place, same duration
+         and users. Compare the request mix of the results; stop if they differ.
+      6. **Measure the tool as well as the system.** One short run for start-up cost, one for the cost per request, one
+         with many users for memory per user. Three repeats; keep the range.
+      7. **Calibrate the numbers.** Run both tools on the *same* API and write down the offset in p50 and p95 and the first
+         request. This is what you will need when you migrate.
+      8. **Decide, and write the decision with the evidence and the date.** Say what would make you revisit it.
+
+  - id: example
+    kind: example
+    concepts: [perf-tc-choose]
+    title: A worked example (hypothetical)
+    collapsed: true
+    body: |
+      *Hypothetical: the team, the needs and the targets are invented to show the method; the cost figures are the ones
+      measured above.*
+
+      SandPay's payments team has 4 QA engineers and 6 backend developers. They must load test the card payment API
+      (HTTP/JSON, bearer tokens, idempotency keys) at 1500 requests per second for 20 minutes before each quarterly
+      release, and run a 5-minute smoke check at 100 requests per second on every merge. They own five cloud machines
+      with 4 cores each for test generators.
+
+      **Musts.** HTTP/JSON only: every candidate qualifies. CI headless: every candidate qualifies. A guaranteed arrival
+      rate for the quarterly test (a slow API must not lower the load): that rules out relying on Locust's `wait_time`, so
+      the team needs either an open-model tool or a gate that checks the achieved rate against the plan.
+      **Nice.** Scripts reviewed as code (favours Locust, k6, Gatling); QA could keep using a GUI (favours JMeter).
+
+      **Cost.** From the measured cost per request, 1500 requests per second at 70 % busy needs about
+      1500 / (310 x 0.7) = **7 cores** of JMeter, **5** of `HttpUser` or **2** of `FastHttpUser` - five 4-core machines have
+      20, so cost does not decide. For the 5-minute merge check, JMeter's 7 CPU-seconds of start-up is 2 % of a 5-minute
+      budget on one core; it also adds about 3 seconds of wall time to every run.
+
+      **Decision (invented).** Use Locust with `FastHttpUser` for both, a small shape file for the quarterly ramp, and a
+      gate that fails the run if the achieved rate is under 95 % of the plan (the previous lessons' coordinated omission
+      check). Revisit if the team needs a protocol Locust cannot do.
+
+      Nothing here is a general rule. A team of testers with no programming background might reasonably choose JMeter;
+      the method is what carries over, not the answer.
+
+  - id: tests
+    kind: tests
+    concepts: [perf-tc-models, perf-tc-results]
+    title: How the exercises are tested
+    body: |
+      Three files under `practice/perf/tests/analysis/` check your three modules:
+
+      - `test_tc_summary.py` - nearest rank, Locust's bucketing and rule (including the case where the two differ),
+        `summarise_jtl` and `summarise_locust` on hand-made rows with the arithmetic in a comment, `same_scenario` on
+        hand-made mixes (ten times the traffic and the same mix is the same scenario), the two real saved result files, a
+        Locust run without the sign-in, and **one fresh JMeter run** of the shipped plan.
+      - `test_tc_locustfile.py` - runs your Locust file in real Locust (5 users, 3 seconds) against a fresh practice API
+        and checks the four request names, one sign-in per user, no failures (a missing bearer token would be 401s), the
+        three calls in step, every payment created exactly once with no idempotent replay, and a think time that
+        `TC_WAIT` controls.
+      - `test_tc_sizing.py` - the arithmetic on hand-made runs, then the captured runs (JMeter's start-up cost is many
+        times Locust's, `FastHttpUser` costs well under half of `HttpUser` per request, JMeter's memory grows far faster
+        per user, JMeter needs more cores for the same rate).
+
+      The tests check **behaviour, never absolute times**. Run them as the CI does:
+      `PERF_TARGET=solutions .venv/bin/python -m pytest tests/analysis -q`. For these three files that is 26 tests (9, 12
+      and 5); against the unsolved exercises every one fails.
+
+  - id: mistakes
+    kind: mistakes
+    concepts: [perf-tc-models, perf-tc-results, perf-tc-choose]
+    title: Common mistakes and debugging
+    body: |
+      - **Comparing two tools' numbers without checking the scenario.** Compare the request mix first. A 5 ms difference
+        in p95 is a finding about two tools until proven otherwise.
+      - **Putting JMeter's Constant Timer under the first sampler and calling it "think time after each iteration".** The
+        timer runs before the samplers in its scope. Use a Test Action at the end of the loop, or put the timer under the
+        sampler you mean.
+      - **Forgetting `name=` in Locust.** One row per URL; the statistics become unreadable and the memory grows.
+      - **Running JMeter in GUI mode for the real test.** The manual: "GUI mode should only be used for creating the test
+        script, CLI mode (NON GUI) must be used for load testing". The best-practices page also says to use as few
+        listeners as possible.
+      - **Reading a percentile above 100 ms as exact in Locust.** It is a bucket: 150 stands for 145 to 154.99.
+      - **Calling a one-second test "cheap" in one tool and "expensive" in another.** Take the start-up cost out
+        before dividing by requests.
+      - **Judging the cost from one run.** Three runs, the range, and the load on the machine (it was 2 to 6 here).
+      - **Planning generators from a rate you never measured at that size.** The sizing formula is a plan; run it.
+      - **Choosing from a vendor's chart.** "Optimized for minimal resource consumption" is a claim until your pilot shows
+        it.
+      - **Ignoring the first request.** JMeter's 125 ms sign-in was not slowness in the API.
+
+  - id: tradeoffs
+    kind: tradeoffs
+    concepts: [perf-tc-choose]
+    title: Limits, trade-offs and alternatives
+    body: |
+      - **This lesson measured two tools, one scenario, one machine.** k6 and Gatling are described by their own
+        documentation only. A different scenario - TLS, large bodies, assertions, scripted logic, many data files - moves
+        every cost number; the *method* transfers.
+      - **GUI and plugins against code.** JMeter's GUI, recorder and large plugin ecosystem lower the barrier for a team
+        without programmers; XML plans are harder to review and merge. Locust's Python is easy to review and test; it
+        asks everyone to code.
+      - **Closed against open.** A closed model is natural for "N users" and simple to write; an open model matches "R
+        arrivals per second" and exposes server slowdowns that a closed one hides. Locust and JMeter's main thread group
+        are closed; k6 and Gatling make the open model a first-class choice (documentation, not run here).
+      - **Cost against convenience.** A cheaper generator saves machines at large scale and costs nothing at small
+        scale. Do not trade usability for efficiency you will not use.
+      - **Alternatives.** Two tools can coexist: a JMeter suite for protocols Locust lacks, Locust for the API journeys.
+        Hosted services run the generators for you; this lesson did not look at them. Run your pilot on their data too.
+
+  - id: summary
+    kind: summary
+    concepts: [perf-tc-models, perf-tc-results, perf-tc-choose]
+    title: Summary and quick reference
+    body: |
+      - A load tool = script + load model + generator + results. A virtual user is a **thread** (JMeter), a **greenlet**
+        (Locust), a **VU** (k6) or an **injected user** (Gatling).
+      - **Closed** loops wait for the last iteration; **open** arrivals do not. Locust and a JMeter Thread Group are closed;
+        k6 and Gatling offer both; JMeter's Open Model Thread Group is experimental (docs).
+      - A JMeter timer pauses **before** each sampler in its scope; a Locust `wait_time` pauses **after** the task.
+      - Compare **scenarios** by request mix before you compare numbers.
+      - Percentiles differ: nearest rank on exact values (JTL), or Locust's rule on **bucketed** times (about two
+        significant digits). A tool's first request, and its own client overhead, are inside its numbers.
+      - Measure the generator: **start-up** (JMeter 7.2 CPU-s against Locust 0.9 for one second), **CPU per 1000
+        requests** (3.23, 2.04, 0.67), **memory per user** (0.3-0.5 against 0.03-0.04 MB). Three runs, show the range.
+      - Cores for a target = `target / (rps_per_core x 0.7)`, rounded up, then confirmed with a run.
+      - Choose by **hard requirements**, then people, then cost; settle it with a **pilot** of your own scenario and write the
+        decision down with the evidence.
+
+      Quick checks: same mix? same pause placement? same percentile rule? start-up taken out? three runs? generator CPU
+      healthy? vendor claim or measurement?
+
+exercises:
+  - id: tc-same-scenario
+    type: mcq
+    concept: perf-tc-results
+    skill: analysis
+    title: Locust says 24 ms, JMeter says 19 ms
+    prompt: |
+      A team ran the same checkout test in JMeter and in Locust against the same API and the same 10 users. The payment-list
+      p95 is 19 ms in JMeter and 24 ms in Locust. What should they do first?
+    options:
+      - id: mix
+        text: Check that the two runs sent the same request mix with the same think-time placement and data, then treat the rest as the tools' own offset.
+        feedback: Correct - same scenario first. After that, a few milliseconds is the offset of two different stopwatches, which you can calibrate.
+      - id: slower
+        text: Conclude that Locust is slower and stop using it.
+        feedback: The API did not change. Part of the gap is the Python client's own time, and the tools round and rank percentiles differently.
+      - id: api
+        text: Conclude that the API is faster for JMeter's requests.
+        feedback: Both tools sent the same requests to the same server; nothing about the API depends on the tool.
+      - id: more
+        text: Raise the number of users until the numbers agree.
+        feedback: More users change the load; they do not align two measurements of the same load.
+    correct: [mix]
+    hints:
+      - Which differences are caused by the scenario, and which by the tool?
+    solution: |
+      Verify the scenario (request mix, pauses, data) and then calibrate the tools' offset on the same API.
+
+  - id: tc-timer-scope
+    type: mcq
+    concept: perf-tc-models
+    skill: application
+    title: A think time in two tools
+    prompt: |
+      You want 12 seconds of think time after each iteration. In JMeter you add a Constant Timer of 12000 ms as a child of
+      the first sampler; in Locust you set `wait_time = constant(12)`. What is different in the first 12 seconds?
+    options:
+      - id: delay
+        text: JMeter waits 12 seconds before the first iteration (a timer runs before the sampler in its scope); Locust starts the first iteration at once.
+        feedback: Correct - the manual says a timer delays "before each sampler which is in its scope", and Locust's wait is applied after the task.
+      - id: same
+        text: Nothing; both pause between iterations.
+        feedback: Both pause between iterations, but JMeter's timer also pauses before the very first one.
+      - id: locust
+        text: Locust waits 12 seconds before the first iteration; JMeter starts at once.
+        feedback: It is the other way round.
+      - id: ignore
+        text: JMeter ignores timers that are children of a sampler.
+        feedback: A timer under a sampler applies to that sampler.
+    correct: [delay]
+    hints:
+      - Which element runs first in a JMeter iteration, the timer or the sampler?
+    solution: |
+      The timer runs first, so JMeter starts with a pause. A Test Action pause at the end of the loop matches Locust.
+
+  - id: tc-closed-open
+    type: mcq
+    concept: perf-tc-models
+    skill: recall
+    title: Closed or open
+    prompt: Which statement matches the documentation quoted in the lesson?
+    options:
+      - id: k6
+        text: k6's `constant-arrival-rate` executor is an open model - virtual users arrive independently of iteration completion.
+        feedback: Correct, from the k6 documentation on open and closed models (not run here).
+      - id: locust
+        text: Locust's `constant_throughput` wait launches extra users when the server is slow, to hold the target rate.
+        feedback: The docs say the opposite - wait time "can only constrain the throughput, not launch new Users to reach the target".
+      - id: jmeter
+        text: A JMeter Thread Group is an open model because it uses threads.
+        feedback: Threads loop through the plan one iteration at a time - that is a closed model.
+      - id: gatling
+        text: Gatling has only the closed model.
+        feedback: Gatling documents injectOpen and injectClosed.
+    correct: [k6]
+    hints:
+      - Which tools mention arrival rates?
+    solution: |
+      k6 arrival-rate executors (and Gatling injectOpen, and JMeter's experimental Open Model Thread Group) are open.
+
+  - id: tc-jmeter-gui
+    type: mcq
+    concept: perf-tc-models
+    skill: recall
+    title: Where to run the real test
+    prompt: A colleague builds a JMeter plan in the GUI and then clicks Start for a 30-minute, 500-user test on the same laptop. What does the manual say?
+    options:
+      - id: cli
+        text: "GUI mode should only be used for creating the test script, CLI mode (NON GUI) must be used for load testing."
+        feedback: Correct - that is the Getting Started page.
+      - id: gui
+        text: GUI mode is fine for load tests if the heap is raised.
+        feedback: The manual does not say that; it says CLI mode must be used for load testing.
+      - id: listeners
+        text: Add a View Results Tree listener so you can watch each request.
+        feedback: Best practices says the opposite - use such listeners only while scripting.
+      - id: java
+        text: Run it with Java 7.
+        feedback: JMeter is "compatible with Java 8 or higher".
+    correct: [cli]
+    hints:
+      - Look for the sentence about creating the script.
+    solution: |
+      Build in the GUI, run in CLI mode with as few listeners as possible.
+
+  - id: tc-percentile-rule
+    type: mcq
+    concept: perf-tc-results
+    skill: analysis
+    title: p50 of ten requests
+    prompt: |
+      Ten requests took 10 ms (five of them), 20 ms (three) and 150 ms (two). Nearest rank says p50 = 10 ms and Locust's own
+      rule reports 20 ms. Which statement is right?
+    options:
+      - id: rules
+        text: Both are correct applications of different percentile rules; on thousands of requests they differ by about one rank.
+        feedback: Correct - Locust stops at the first bucket where requests - seen <= int(requests x fraction).
+      - id: bug
+        text: Locust has a bug; it should say 10.
+        feedback: It is a documented-in-source rule applied to a histogram, not a defect.
+      - id: median
+        text: Neither is a median; a median is the mean of the two middle values.
+        feedback: Under that definition the median of these ten is 15, but percentile tools use rank rules, not averages of neighbours.
+      - id: tool
+        text: The 150 ms requests made Locust slower.
+        feedback: The rule, not the slow requests, makes the 20.
+    correct: [rules]
+    hints:
+      - Work out int(10 x 0.5) and walk from the slowest bucket.
+    solution: |
+      allowed = 5; 150 -> seen 2 (8 > 5); 20 -> seen 5 (5 <= 5): 20. Nearest rank is the 5th smallest: 10.
+
+  - id: tc-bucket
+    type: mcq
+    concept: perf-tc-results
+    skill: application
+    title: What does 150 mean?
+    prompt: Locust reports a p95 of 150 ms. What could the real p95 request have taken?
+    options:
+      - id: range
+        text: Anywhere from 145 ms up to just under 155 ms.
+        feedback: Correct - between 100 and 1000 ms Locust rounds to the nearest 10 before counting.
+      - id: exact
+        text: Exactly 150 ms.
+        feedback: The histogram holds rounded times, not the exact ones.
+      - id: under
+        text: Anything up to 150 ms, because it rounds down.
+        feedback: It rounds to the nearest 10, so 147 becomes 150 and 152 becomes 150.
+      - id: any
+        text: Between 100 and 200 ms.
+        feedback: The rounding step is 10 ms in that range, not 100.
+    correct: [range]
+    hints:
+      - Which ranges round to which step?
+    solution: |
+      Nearest 10 ms in 100-999 ms, so 145 to 154.99 all count as 150 (halves round to even, so 145 may become 140).
+
+  - id: tc-startup-cost
+    type: mcq
+    concept: perf-tc-results
+    skill: analysis
+    title: Seven CPU seconds for one second
+    prompt: A one-second JMeter test with one user used 7.2 CPU-seconds and a one-second Locust test used 0.9. The team concludes that JMeter costs eight times as much per request. What is wrong?
+    options:
+      - id: fixed
+        text: Most of that CPU is a fixed start-up cost; per-request cost needs the start-up run subtracted from a longer run.
+        feedback: Correct - marginal cost here was 3.23 against 2.04 CPU-seconds per 1000 requests, not 8 to 1.
+      - id: nothing
+        text: Nothing; CPU seconds per request is the right measure.
+        feedback: It includes the one-off cost of starting the Java virtual machine, which a one-second test cannot spread out.
+      - id: wall
+        text: CPU seconds are meaningless; only wall time counts.
+        feedback: CPU seconds are what you pay for on a generator machine.
+      - id: users
+        text: One user cannot be measured.
+        feedback: It can; the problem is what is in the figure.
+    correct: [fixed]
+    hints:
+      - What happens in a JVM before the first request?
+    solution: |
+      Subtract the start-up run, then divide by the extra requests.
+
+  - id: tc-memory
+    type: mcq
+    concept: perf-tc-results
+    skill: application
+    title: 500 users
+    prompt: |
+      Peak memory with 10 users was 207 MB in JMeter and 52 MB in Locust; with 500 users 352 MB and 70 MB. Which conclusion is
+      supported?
+    options:
+      - id: slope
+        text: JMeter's memory grew by about 0.3 MB per extra user and Locust's by about 0.04 MB, so the gap widens with more users in this scenario.
+        feedback: Correct - (352 - 207) / 490 and (70 - 52) / 490.
+      - id: always
+        text: JMeter always needs 200 MB more than Locust.
+        feedback: The gap was 155 MB at 10 users and 282 MB at 500, so it is not constant.
+      - id: gc
+        text: Memory does not depend on the number of users.
+        feedback: Both rose with users.
+      - id: general
+        text: This proves Locust is ten times better than JMeter for every test.
+        feedback: One scenario on one machine - a method, not a law.
+    correct: [slope]
+    hints:
+      - Divide the growth by the extra users.
+    solution: |
+      A per-user slope from two runs; it applies to this scenario and machine.
+
+  - id: tc-generator-count
+    type: mcq
+    concept: perf-tc-results
+    skill: application
+    title: How many cores of generator
+    prompt: |
+      A tool sustains 400 requests per core-second after its start-up cost. You need 3000 requests per second and want each core at
+      most 70 % busy. How many cores?
+    options:
+      - id: eleven
+        text: 11 cores
+        feedback: Correct - 3000 / (400 x 0.7) = 10.7, rounded up. Then confirm with a run.
+      - id: eight
+        text: 8 cores
+        feedback: 3000 / 400 = 7.5 ignores the headroom.
+      - id: ten
+        text: 10 cores
+        feedback: 10.7 rounds up, not down; with 10 cores each would run at about 75 % busy.
+      - id: thirty
+        text: 30 cores
+        feedback: That divides by 100 instead of 400 x 0.7.
+    correct: [eleven]
+    hints:
+      - Safe rate of one core first.
+    solution: |
+      280 safe requests per core-second; 3000 / 280 = 10.7, so 11.
+
+  - id: tc-protocol-choice
+    type: mcq
+    concept: perf-tc-choose
+    skill: application
+    title: JMS and a database
+    prompt: A team must load test a JMS queue and a JDBC database directly, as well as its HTTP API. They have no time to write protocol clients. What does the documentation quoted in the lesson suggest?
+    options:
+      - id: jmeter
+        text: Look at JMeter first; its home page lists JMS and JDBC among the protocol types it can test. Locust only has built-in HTTP/HTTPS and needs a wrapped client for the others.
+        feedback: Correct - a hard requirement, from the docs. The pilot must still confirm the exact samplers.
+      - id: locust
+        text: Locust, because it is just Python.
+        feedback: Python makes writing a client possible, not free; the Locust docs say only HTTP/HTTPS is built in.
+      - id: any
+        text: Any tool - all load tools test all protocols.
+        feedback: The documentation lists different protocol support for each tool.
+      - id: browser
+        text: Use a browser tool, because JMeter is a browser.
+        feedback: "JMeter is not a browser, it works at protocol level."
+    correct: [jmeter]
+    hints:
+      - Which tool's home page lists the protocols?
+    solution: |
+      JMeter's built-in protocol list matches the musts; Locust would need clients written and gevent-patched.
+
+  - id: tc-vendor-claim
+    type: mcq
+    concept: perf-tc-choose
+    skill: analysis
+    title: A vendor says it uses less resources
+    prompt: A tool's documentation says it is "optimized for minimal resource consumption". How should the team treat that sentence?
+    options:
+      - id: claim
+        text: Treat it as a claim to test - run the team's own scenario on its own hardware, measuring start-up, CPU per request and memory per user.
+        feedback: Correct - the lesson did this for JMeter and Locust; the same method works for any tool.
+      - id: fact
+        text: As a fact; vendors do not exaggerate.
+        feedback: A vendor's sentence is not a measurement of your scenario.
+      - id: ignore
+        text: Ignore it; resource use never matters.
+        feedback: It decides how many generators you need at a high target rate.
+      - id: benchmark
+        text: Replace it with a benchmark chart from a blog.
+        feedback: A blog's scenario is not yours either.
+    correct: [claim]
+    hints:
+      - Whose scenario does the sentence describe?
+    solution: |
+      Treat it as a hypothesis and measure.
+
+  - id: tc-order-pilot
+    type: order
+    concept: perf-tc-choose
+    skill: application
+    title: Running a pilot
+    prompt: Put the steps of a tool pilot in a sensible order.
+    items:
+      - id: req
+        text: Write the requirements and mark each must or nice
+      - id: cut
+        text: Cut the candidates by the musts, from the documentation
+      - id: scen
+        text: Pick one real scenario with correlation, data and a think time
+      - id: write
+        text: Write it in each candidate and note the effort
+      - id: same
+        text: Make the scenarios identical and compare the request mix
+      - id: cost
+        text: Measure start-up, CPU per request and memory per user, three times
+      - id: decide
+        text: Decide, and write the decision with the evidence and the date
+    hints:
+      - Requirements before tools, identical scenarios before numbers.
+    solution: |
+      Requirements, cut by musts, one scenario, write it, make it identical, measure cost, decide and document.
+
+  - id: tc-debug-name
+    type: debug
+    concept: perf-tc-results
+    skill: analysis
+    title: A Locust report with thousands of rows
+    prompt: |
+      After a run the Locust statistics table has one row for every payment that was read, and no total for "read a
+      payment". Which line is the defect?
+    language: python
+    code: |
+      @task
+      def checkout(self):
+          self.client.get("/v1/payments?limit=5", name="GET /v1/payments", headers=self.auth)
+          r = self.client.post("/v1/payments", name="POST /v1/payments",
+                               headers={**self.auth, "Idempotency-Key": str(uuid.uuid4())},
+                               json={"amount_minor": 1250, "currency": "EUR"})
+          self.client.get(f"/v1/payments/{r.json()['id']}", headers=self.auth)
+    correctLines: [7]
+    lineNotes:
+      - line: 3
+        note: The name groups the list requests under one row; that is right.
+      - line: 4
+        note: The creation has a stable URL and a name; the unique key is a header, not part of the URL.
+      - line: 7
+        note: The URL contains a different id every time and no name= is given, so each URL becomes its own row.
+    hints:
+      - Which request has a URL that changes?
+    solution: |
+      Line 7: add `name="GET /v1/payments/{id}"`. Locust groups requests by name, and the default name is the URL.
+
+  - id: tc-short-offset
+    type: short
+    concept: perf-tc-results
+    skill: analysis
+    title: Why two tools disagree
+    prompt: |
+      Give two reasons why the same API can show different p95 values in JMeter and in Locust, and say how you would separate
+      them from a real change in the API.
+    modelAnswer: |
+      One: each tool times a request from inside its own process, so its client's own time is part of the number; the
+      measured offset here was a few milliseconds for the Python client, and JMeter's first call per thread was slower
+      still. Two: the percentile rules differ - nearest rank on exact values for a JTL, a bucketed histogram rounded to
+      about two significant digits and Locust's own rule - and a closed loop run by a slower client finishes fewer
+      iterations. To separate it from a change in the API, run both tools against the **same** API on the same machine,
+      write down the offset, and compare only like with like afterwards (the same tool across builds, or both tools
+      with the offset applied).
+    rubric:
+      - Names client overhead or measurement location as one reason.
+      - Names the percentile rule or rounding as another (or the first-request effect).
+      - Says to calibrate on the same API and compare the same tool across builds.
+    hints:
+      - Where does each stopwatch start and stop?
+    solution: |
+      Client overhead and percentile rules; calibrate on one API and compare like with like.
+
+  - id: tc-testdesign-pilot
+    type: testdesign
+    concept: perf-tc-choose
+    skill: application
+    title: Design a pilot comparing two tools
+    prompt: |
+      Your team is choosing between JMeter and Locust for a payments API that runs 500 requests per second in CI and 3000
+      before releases. Design the pilot: what you build, what you measure, and what result would change your mind.
+    modelAnswer: |
+      Preconditions: the requirements written down; the practice or staging API; one machine of the size the generators
+      would use; no other load on it.
+
+      1. **One real scenario in both tools** - sign-in once, a payment with a unique key, a read-back, a 200 ms think time
+         at the end. Expected: the same request names. Evidence: the result files.
+      2. **Identical scenario check** - compare the request mix; stop if a share differs by more than 2 points.
+      3. **Start-up run** - one user for one second, three times. Evidence: CPU seconds, peak memory, wall time.
+      4. **Rate run** - the CI rate for 60 seconds, three times. Evidence: CPU per 1000 requests after the start-up cost;
+         achieved against planned rate; generator CPU.
+      5. **Scale run** - the many-users case at the pre-release rate (or a fraction with a calculated extrapolation).
+         Evidence: memory per user, cores needed.
+      6. **Offset** - both tools against the same API; p50 and p95 per request, and the first request.
+      7. **Effort** - hours to write and review each scenario, who could maintain it.
+      8. **Decision** - requirements met, measured cost, effort. It changes if a tool cannot reach the pre-release rate
+         within the machines you have, if the achieved rate falls under 95 % of plan, or if nobody can maintain the scripts.
+    rubric:
+      - Uses one real scenario and checks the two are identical.
+      - Measures start-up, per-request cost and per-user memory with repeats.
+      - Compares the offset on the same API and the generator's health.
+      - States what would change the decision.
+    hints:
+      - Which results could make you pick the other tool?
+    solution: |
+      Same scenario, identical check, start-up and rate and scale runs, offset, effort, and explicit reversal conditions.
+
+  - id: tc-interview-choose
+    type: interview
+    concept: perf-tc-choose
+    skill: analysis
+    title: 'Interview: JMeter or Locust'
+    prompt: |
+      "Our load tests are in JMeter. A new team lead wants to move everything to Locust, another wants k6. How would you
+      decide?"
+    modelAnswer: |
+      I would not start with a favourite. I would start with the requirements: which protocols we load (HTTP only, or JMS
+      and a database as well), whether we need an open model so a slow server does not lower the load, who writes and
+      reviews the scripts, how tests run in CI, and our target rate against the machines we have. Those are *musts* I can
+      read from each tool's documentation - JMeter lists its protocols; Locust says only HTTP/HTTPS is built in; k6 and
+      Gatling document open and closed models. Anything that fails a must goes out.
+
+      Then I would run a small pilot with one real scenario in the remaining candidates. I would check that the scenarios
+      are identical by their request mix and the placement of the think time, measure the tool's own cost three times
+      (start-up, CPU per thousand requests, memory per user), and write down the offset in p50 and p95 on the *same* API,
+      because old and new numbers will not match directly. I would compare how long each script took to write and who could
+      review it. I would call out what I could not confirm.
+
+      The decision gets written down with the evidence, the date and the condition that would reopen it. Migrating is a
+      separate project: run both tools in parallel on the same scenario for a few releases and calibrate before comparing
+      any old number with a new one. Hype and a vendor's benchmark would not be part of it.
+    rubric:
+      - Starts from hard requirements and the documentation, not preference.
+      - Runs a pilot with an identical scenario and measures the generator's cost with repeats.
+      - Mentions calibrating the offset between tools before migrating.
+      - Records the decision, evidence and what would reopen it.
+    hints:
+      - What can you read from the docs, and what must you measure?
+    solution: |
+      Requirements, a pilot of one scenario, cost and offset measurements, and a written decision with a reversal condition.
+
+  - id: tc-summary-code
+    type: coding
+    concept: perf-tc-results
+    skill: application
+    title: One summary for two result formats
+    prompt: |
+      Implement `percentile`, `bucket`, `locust_percentile`, `summarise_jtl`, `summarise_locust`, `mix` and `same_scenario`
+      in `exercises/analysis/tc_summary.py`. The tests use hand-made rows and histograms, one real JTL and one real Locust
+      result of the same scenario, and one fresh JMeter run (JMeter must be installed: `scripts/get-jmeter.sh`).
+    project: perf
+    files: [exercises/analysis/tc_summary.py]
+    test: tests/analysis/test_tc_summary.py
+    command: .venv/bin/python -m pytest tests/analysis/test_tc_summary.py
+    modelAnswer: |
+      See "One summary for two result formats". Key points: nearest rank is `ceil(fraction x n)`; the Locust rule walks
+      the histogram from the top until `requests - seen <= int(requests x fraction)`; the rate uses `n - 1` over the
+      active span; shares are compared, not totals.
+    rubric:
+      - Every test in tests/analysis/test_tc_summary.py passes.
+      - Implements Locust's rounding and percentile rule as in its source, not nearest rank.
+      - Compares the request mix, not the totals, in same_scenario.
+    hints:
+      - 'Rank is `max(1, math.ceil(fraction * len(values)))` - index rank - 1.'
+      - Histogram keys may be strings, as in the JSON file.
+      - The rate over the active span is (n - 1) / span.
+    solution: |
+      Seven small functions; the care is in Locust's rule, the fence post in the rate, and shares instead of totals.
+
+  - id: tc-locustfile-code
+    type: coding
+    concept: perf-tc-models
+    skill: application
+    title: The Locust twin of the JMeter plan
+    prompt: |
+      Write the Locust version of the checkout scenario in `exercises/analysis/tc_checkout_locustfile.py` so it matches
+      `support/tc_checkout.jmx`: sign in once, list, create with a new Idempotency-Key, read back, and think for `TC_WAIT`
+      seconds after each iteration. The tests run it in real Locust against a fresh practice API.
+    project: perf
+    files: [exercises/analysis/tc_checkout_locustfile.py]
+    test: tests/analysis/test_tc_locustfile.py
+    command: .venv/bin/python -m pytest tests/analysis/test_tc_locustfile.py
+    modelAnswer: |
+      See "The same scenario in two tools". `on_start` signs in and keeps the bearer header; one task makes the three calls
+      with `name=` set to the JMeter sampler names and a `uuid4` key; `wait_time = constant(float(os.environ.get(
+      "TC_WAIT", "0.2")))`.
+    rubric:
+      - Every test in tests/analysis/test_tc_locustfile.py passes.
+      - Uses the four request names exactly as the JMeter plan does.
+      - Sends a new Idempotency-Key for every payment and the bearer token on every call after the sign-in.
+      - Takes the think time from TC_WAIT and applies it after the iteration.
+    hints:
+      - Wrap the user counter at 50 - the practice API has merchant-1 to merchant-50.
+      - Keep the bearer header on the user in `on_start`.
+      - '`name="GET /v1/payments/{id}"` stops one row per payment id.'
+    solution: |
+      A signed-in user, a three-call task with stable names and a unique key, and a wait read from TC_WAIT.
+
+  - id: tc-sizing-code
+    type: coding
+    concept: perf-tc-results
+    skill: application
+    title: What does the generator cost
+    prompt: |
+      Implement `cpu_seconds`, `cores_busy`, `cpu_per_1000`, `marginal_cpu_per_1000`, `mb_per_user`, `median_of`,
+      `generators_needed` and `cheapest` in `exercises/analysis/tc_sizing.py`. The tests use hand-made runs and the
+      captured runs of the lesson.
+    project: perf
+    files: [exercises/analysis/tc_sizing.py]
+    test: tests/analysis/test_tc_sizing.py
+    command: .venv/bin/python -m pytest tests/analysis/test_tc_sizing.py
+    modelAnswer: |
+      See "What the generator costs, in code". The marginal cost subtracts the start-up run's CPU and requests; memory per
+      user is a slope; the number of cores rounds up after dividing by `rps_per_core x max_busy` and is never below one.
+    rubric:
+      - Every test in tests/analysis/test_tc_sizing.py passes.
+      - Takes the start-up cost out before dividing by requests.
+      - Rounds the number of generators up and never returns zero.
+      - Breaks ties between setups by name.
+    hints:
+      - '`statistics.median` of two values is their mean.'
+      - Round up with `math.ceil`, and keep `max(1, ...)`.
+      - '`min(sorted(names), key=...)` picks the first name on a tie.'
+    solution: |
+      Eight short functions; the care is in subtracting the start-up run and rounding the number of cores up.
+
+placement:
+  - id: tc-place-models
+    type: mcq
+    concept: perf-tc-models
+    skill: application
+    title: Open or closed
+    prompt: You must hold a fixed arrival rate of 200 payments per second even when the API slows down. Which statement about load models is right?
+    options:
+      - id: open
+        text: You need an open model (users arriving on a schedule) or a check that the achieved rate matches the plan; a closed loop slows down with the server.
+        feedback: Correct - k6 and Gatling document open models, JMeter has an experimental one, and a closed loop's rate follows the server.
+      - id: closed
+        text: A closed loop with many users always holds the rate.
+        feedback: Each user waits for its own responses, so a slow server lowers the rate.
+      - id: wait
+        text: Locust's wait_time launches more users when the API is slow.
+        feedback: The documentation says it cannot launch new users.
+    correct: [open]
+    hints:
+      - What does a virtual user do while it waits for a slow answer?
+    solution: |
+      An open model, or a gate that fails the run when the achieved rate falls below the plan.
+
+  - id: tc-place-results
+    type: mcq
+    concept: perf-tc-results
+    skill: application
+    title: Before comparing two tools' numbers
+    prompt: Two tools report different p95 values for the same API. What do you compare first?
+    options:
+      - id: mix
+        text: The request mix of the two runs, then the think-time placement, data and percentile rules.
+        feedback: Correct - same scenario before same numbers.
+      - id: p99
+        text: The p99, because it is more precise.
+        feedback: A different percentile does not answer whether the scenarios match.
+      - id: users
+        text: The number of users only.
+        feedback: The same users can run different scenarios.
+    correct: [mix]
+    hints:
+      - What could make the two runs different before the tools measure anything?
+    solution: |
+      The request mix, then pauses, data and percentile rules.
+
+  - id: tc-place-choose
+    type: mcq
+    concept: perf-tc-choose
+    skill: application
+    title: Choosing a tool
+    prompt: What is the best first step when choosing between two load testing tools?
+    options:
+      - id: musts
+        text: Write down the hard requirements and cut the candidates by what each tool's documentation says, then pilot the rest on your own scenario.
+        feedback: Correct - requirements, documentation, then a measurement.
+      - id: popular
+        text: Pick the most popular tool.
+        feedback: Popularity is not a requirement.
+      - id: chart
+        text: Use a vendor's benchmark chart.
+        feedback: It measures the vendor's scenario, not yours.
+    correct: [musts]
+    hints:
+      - What can you read, and what must you measure?
+    solution: |
+      Requirements first, from the documentation, then a pilot.
+
+recall:
+  - id: tc-recall-vu
+    concept: perf-tc-models
+    prompt: What is a virtual user in JMeter, Locust, k6 and Gatling?
+    answer: A thread of a Thread Group (JMeter), a greenlet (Locust), a VU (k6), a user injected by the injection profile (Gatling).
+  - id: tc-recall-open
+    concept: perf-tc-models
+    prompt: What is the difference between a closed and an open load model?
+    answer: A closed model starts the next iteration only after the last one finished, so a slow server lowers the load; an open model has users arrive on a schedule whatever the server does.
+  - id: tc-recall-timer
+    concept: perf-tc-models
+    prompt: Where does a JMeter timer pause, and where does a Locust wait_time pause?
+    answer: A JMeter timer pauses before each sampler in its scope (so before the first iteration too); Locust applies wait_time after the task. A Test Action pause at the end of the loop matches Locust.
+  - id: tc-recall-percentile
+    concept: perf-tc-results
+    prompt: How do the percentiles of a JTL and of a Locust result differ?
+    answer: A JTL has exact times, so nearest rank works; Locust counts times in a histogram rounded to about two significant digits (nearest 10 ms from 100 ms) and stops at the first bucket where requests - seen <= int(requests x fraction).
+  - id: tc-recall-startup
+    concept: perf-tc-results
+    prompt: How do you get a generator's cost per request?
+    answer: Run a very short test for the start-up cost and a longer one, then (CPU of the long run - CPU of the short run) / (extra requests); repeat three times and keep the range.
+  - id: tc-recall-cores
+    concept: perf-tc-results
+    prompt: How many generator cores does a target rate need?
+    answer: target / (requests per core-second x maximum busy, for example 0.7), rounded up and at least one - then confirm with a run at that rate.
+  - id: tc-recall-choose
+    concept: perf-tc-choose
+    prompt: How do you choose between load tools?
+    answer: Write the hard requirements (protocols, load model, who writes the scripts, CI, scale), cut candidates with each tool's documentation, pilot one real scenario in the rest with an identical-scenario check and repeated cost measurements, and write the decision down with the evidence.
+
+next:
+  - performance-testing-capstone
+  - performance-testing-mock-interview
